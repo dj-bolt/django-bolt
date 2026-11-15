@@ -80,6 +80,12 @@ def _is_function_middleware_callable(spec: Any) -> bool:
 _DICT_MIDDLEWARE_TYPES = ("cors", "rate_limit")
 _DICT_MIDDLEWARE_HINT = 'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).'
 
+# The keys that Rust reads from a dict of each type. They are the keyword arguments of the decorator.
+_DICT_MIDDLEWARE_KEYS = {
+    "cors": ("type", "origins", "origin_regexes", "methods", "headers", "expose_headers", "credentials", "max_age"),
+    "rate_limit": ("type", "rps", "burst", "key"),
+}
+
 # The decorator that does what a keyword argument of @middleware seems to ask for.
 _MIDDLEWARE_KEYWORD_DECORATORS = {
     "cors": "@cors(...)",
@@ -92,22 +98,32 @@ def _check_dict_middleware(spec: dict[str, Any], context: str) -> None:
     """Raise for a dict config that no middleware reads, or that its decorator refuses.
 
     The dict gets the checks of @cors or @rate_limit. The dict itself does not
-    change: Rust reads it. A None value is a missing value, as in Rust.
+    change: Rust reads it. A None value is a missing value, as in Rust. A key
+    that Rust does not read raises TypeError, as an unknown keyword argument
+    of the decorator does.
     """
     if "type" not in spec:
         raise ValueError(f"{context} middleware dict has no 'type'. {_DICT_MIDDLEWARE_HINT}")
     if spec["type"] not in _DICT_MIDDLEWARE_TYPES:
         raise ValueError(f"{context} middleware dict has the unknown type {spec['type']!r}. {_DICT_MIDDLEWARE_HINT}")
 
+    # The config of a route is its complete allow list, so it needs an origin.
+    # The config of an API or a router can keep the allow list of the outer config.
+    on_route = context == "route"
+    where = f"@middleware(type='{spec['type']}')" if on_route else f"{context} {spec['type']} dict"
+    # Nothing reads a key with another name, so the option that its author meant would not apply.
+    known = _DICT_MIDDLEWARE_KEYS[spec["type"]]
+    for name in spec:
+        if name not in known:
+            valid = ", ".join(repr(key) for key in known[:-1])
+            raise TypeError(f"{where} has the unknown key {name!r}. The valid keys are {valid} and {known[-1]!r}.")
+
     options = {name: value for name, value in spec.items() if value is not None}
     if spec["type"] == "rate_limit":
         _checked_rate_limit_config(options.get("rps", 100), options.get("burst"), options.get("key", "ip"))
         return
-    # The config of a route is its complete allow list, so it needs an origin.
-    # The config of an API or a router can keep the allow list of the outer config.
-    on_route = context == "route"
     _checked_cors_config(
-        "@middleware(type='cors')" if on_route else f"{context} cors dict",
+        where,
         origins=options.get("origins"),
         origin_regexes=options.get("origin_regexes"),
         methods=options.get("methods"),

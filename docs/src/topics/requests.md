@@ -220,6 +220,21 @@ async def paint(color: Color, order: Literal["asc", "desc"] = "asc"):
 An `IntEnum` or a `Literal` of numbers converts the text to a number first.
 This applies to path, query, header, cookie and form parameters.
 
+### Durations
+
+A `datetime.timedelta` parameter takes an ISO 8601 duration, such as `PT5S` or `P1DT2H`. It also takes a number of seconds, such as `90`:
+
+```python
+import datetime
+
+@api.get("/wait")
+async def wait(timeout: datetime.timedelta):
+    return {"seconds": timeout.total_seconds()}
+```
+
+`/wait?timeout=PT5S` gives `timedelta(seconds=5)`. Text that is not a duration gives a 422.
+This applies to path, query, header, cookie and form parameters.
+
 ### bytes parameters
 
 A `bytes` parameter gets the UTF-8 bytes of the text value:
@@ -237,12 +252,12 @@ A `msgspec.Meta` constraint such as `max_length` counts the bytes.
 
 A `bytes` field of a [parameter model](#parameter-models) follows the same rule. The model can be a `Query()`, `Form()`, `Header()` or `Cookie()` model.
 
-A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64.
+A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64. The OpenAPI document shows this difference. A `bytes` parameter, form field or field of a parameter model is `{"type": "string"}`. A `bytes` field of a JSON body is `{"type": "string", "contentEncoding": "base64"}`.
 
 ### Types that Bolt cannot convert
 
 A path, query, header, cookie or form parameter gets text from the request.
-Bolt converts the text to `str`, `int`, `float`, `bool`, `Decimal`, `UUID`, `date`, `datetime`, `time`, an `Enum` and a `Literal`.
+Bolt converts the text to `str`, `int`, `float`, `bool`, `Decimal`, `UUID`, `date`, `datetime`, `time`, `timedelta`, an `Enum` and a `Literal`.
 It also builds one `list`, `set`, `frozenset` or `tuple` of these types.
 A parameter with no annotation, or of the type `Any`, gets the text.
 

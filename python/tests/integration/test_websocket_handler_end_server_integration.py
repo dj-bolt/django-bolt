@@ -36,6 +36,13 @@ def test_websocket_exception_closes_the_connection_with_its_code_and_reason(serv
         assert websocket.receive_close() == (4002, "done")
 
 
+@pytest.mark.parametrize("path", ["/ws/invalid-code", "/ws/invalid-reason-set-later"])
+def test_websocket_exception_that_makes_an_invalid_close_frame_is_a_handler_error(server, path):
+    """The client gets a valid close frame: 1011, as for each error of the handler."""
+    with SimpleWebSocketClient(server.host, server.port, path) as websocket:
+        assert websocket.receive_close() == (1011, "Internal error")
+
+
 def test_websocket_exception_before_accept_refuses_the_handshake_with_403(server):
     status_line, _body = attempt_ws_upgrade(server.host, server.port, "/ws/exception-before-accept")
     assert status_line == "HTTP/1.1 403 Forbidden"

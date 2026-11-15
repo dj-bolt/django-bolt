@@ -1052,12 +1052,56 @@ def test_openapi_documents_the_401_and_403_that_a_guarded_route_sends():
     # The document shows what the client gets.
     for response in (no_key, no_key_admin):
         assert response.status_code == 401
-        assert response.headers["www-authenticate"] == "Bearer"
+        # The challenge names the scheme of the API key backend of the route.
+        assert response.headers["www-authenticate"] == "ApiKey"
         assert response.json() == {"detail": "Authentication required"}
     assert not_admin.status_code == 403
     assert not_admin.json() == {"detail": "Permission denied"}
     for response in (no_key, not_admin):
         Draft202012Validator(ERROR_DETAIL_SCHEMA).validate(response.json())
+
+
+@pytest.mark.parametrize(
+    ("backends", "challenge"),
+    [
+        ([JWTAuthentication(secret="openapi-challenge-test-secret-32-b")], "Bearer"),
+        ([JWTAuthentication(secret="openapi-challenge-test-secret-32-b", cookie="token")], "ApiKey"),
+        ([JWTAuthentication(secret="openapi-challenge-test-secret-32-b", header="X-Token")], "ApiKey"),
+        ([APIKeyAuthentication(api_keys={"test-key"})], "ApiKey"),
+        ([SessionAuthentication()], "ApiKey"),
+        (
+            [JWTAuthentication(secret="openapi-challenge-test-secret-32-b"), APIKeyAuthentication(api_keys={"k"})],
+            "Bearer, ApiKey",
+        ),
+    ],
+    ids=["jwt", "jwt-cookie", "jwt-header", "api-key", "session", "jwt-and-api-key"],
+)
+def test_openapi_401_header_agrees_with_the_challenge_of_each_backend(backends, challenge):
+    """The document promises a ``WWW-Authenticate`` header and names no scheme. The 401 has the scheme of the route."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Auth Test API", version="1.0.0"))
+
+    @api.get("/user", auth=backends, guards=[IsAuthenticated()])
+    async def user_only() -> dict:
+        return {}
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        document = _document(client)
+        rejected = client.get("/user")
+
+    operation = document["paths"]["/user"]["get"]
+    documented = operation["responses"]["401"]
+    # The challenge names "Bearer" for an "http" scheme of the document, and "ApiKey" for an "apiKey" scheme.
+    schemes = document["components"]["securitySchemes"]
+    scheme_types = [schemes[name]["type"] for requirement in operation["security"] for name in requirement]
+    assert ", ".join(dict.fromkeys({"http": "Bearer", "apiKey": "ApiKey"}[kind] for kind in scheme_types)) == challenge
+
+    assert documented["headers"] == {"WWW-Authenticate": WWW_AUTHENTICATE_HEADER}
+    # The text is true for each backend: it names no scheme.
+    assert documented["headers"]["WWW-Authenticate"]["description"] == "The authentication challenge of the route"
+    assert "Bearer" not in documented["description"]
+    assert rejected.status_code == 401
+    assert rejected.headers["www-authenticate"] == challenge
 
 
 def test_openapi_auth_errors_show_the_body_of_the_error_formatter():
@@ -1072,7 +1116,7 @@ def test_openapi_auth_errors_show_the_body_of_the_error_formatter():
     assert responses["401"]["headers"] == {"WWW-Authenticate": WWW_AUTHENTICATE_HEADER}
     assert responses["403"]["content"] == problem
     assert (no_key.status_code, not_admin.status_code) == (401, 403)
-    assert no_key.headers["www-authenticate"] == "Bearer"
+    assert no_key.headers["www-authenticate"] == "ApiKey"
     for response in (no_key, not_admin):
         assert response.headers["content-type"] == "application/problem+json"
         msgspec.convert(response.json(), ProblemDetails)

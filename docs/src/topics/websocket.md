@@ -188,7 +188,8 @@ await websocket.close(code=1000, reason="Normal closure")
 ```
 
 A close frame holds a code and a reason of at most 123 bytes of UTF-8 (RFC 6455).
-Use a code from 1000 to 4999, but not 1005, 1006 or 1015. `close()` raises
+Use a code from 1000 to 1003, from 1007 to 1014 or from 3000 to 4999. RFC 6455
+reserves the other codes. `close()` raises
 `ValueError` for a code or a reason that makes an invalid close frame. The
 connection stays open, and `WebSocketTestClient` raises the same error.
 
@@ -206,6 +207,11 @@ async def room(websocket: WebSocket, room: str):
     if room not in OPEN_ROOMS:
         raise WebSocketException(code=4004, reason="No such room")
 ```
+
+`WebSocketException` and `WebSocketClose` do the same check when the handler
+makes the exception. `WebSocketException(code=1005)` raises `ValueError`, and
+the handler then ends with that error: the connection closes with 1011.
+`WebSocketDisconnect` reports the close of the client, so it has no check.
 
 ### Refuse the handshake
 

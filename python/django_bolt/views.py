@@ -51,6 +51,37 @@ def _copy_route_middleware(source: Callable, target: Callable) -> None:
         target.__bolt_skip_middleware__ = set(source.__bolt_skip_middleware__)
 
 
+_REQUEST_PARAM_NAMES = frozenset({"request", "req"})
+
+
+def _plan_request_argument(
+    params: list[inspect.Parameter],
+) -> tuple[list[inspect.Parameter], int | None, str | None, int]:
+    """Find where the handler of a view method gets the request.
+
+    Bolt passes the request to the parameter with the name ``request`` or
+    ``req``. A method with no such parameter gets one in the handler signature,
+    in front. The handler reads it for ``self.request`` and does not pass it on.
+
+    Returns:
+        The handler parameters, the positional index of the request (or None),
+        the keyword name of the request (or None), and the number of leading
+        arguments that the method does not take.
+    """
+    for index, param in enumerate(params):
+        if param.name in _REQUEST_PARAM_NAMES:
+            if param.kind is inspect.Parameter.KEYWORD_ONLY:
+                return params, None, param.name, 0
+            return params, index, None, 0
+
+    kind = (
+        inspect.Parameter.POSITIONAL_ONLY
+        if params and params[0].kind is inspect.Parameter.POSITIONAL_ONLY
+        else inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    return [inspect.Parameter("request", kind), *params], 0, None, 1
+
+
 # PATCH takes a JSON object with a subset of the serializer fields. The body
 # extractor of the framework gives the 422 of a function route for other input.
 _decode_patch_body = create_body_extractor("body", dict[str, Any])
@@ -180,6 +211,10 @@ class APIView:
         sig = inspect.signature(method_handler)
         params = list(sig.parameters.values())[1:]  # Skip 'self' parameter
 
+        # Decide one time where the request is. A method with no request
+        # parameter gets one in the handler signature, for `self.request`.
+        params, request_index, request_name, skip = _plan_request_argument(params)
+
         # Build new signature without 'self'
         new_sig = sig.replace(parameters=params)
 
@@ -198,16 +233,16 @@ class APIView:
             async def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated async view handler that calls bound method directly."""
                 _current_action.set(_action)
-                _current_request.set(args[0])
-                return await bound_method(*args, **kwargs)
+                _current_request.set(args[request_index] if request_name is None else kwargs[request_name])
+                return await bound_method(*args[skip:], **kwargs)
 
         else:
             # Create sync wrapper for sync methods
             def view_handler(*args, _action=action_name, **kwargs):
                 """Auto-generated sync view handler that calls bound method directly."""
                 _current_action.set(_action)
-                _current_request.set(args[0])
-                return bound_method(*args, **kwargs)
+                _current_request.set(args[request_index] if request_name is None else kwargs[request_name])
+                return bound_method(*args[skip:], **kwargs)
 
         view_handler.__wrapped__ = method_handler
 
