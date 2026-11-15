@@ -7,6 +7,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from bolt_mcp import MCP, mount_mcp
 from django.core.management import call_command, execute_from_command_line
 from django.core.management.base import CommandError
 
@@ -579,3 +580,179 @@ def test_merge_apis_serves_the_routes_of_each_api():
             return await websocket.receive_text()
 
     assert asyncio.run(talk()) == "echo:hello"
+
+
+def test_merge_apis_keeps_the_guards_of_a_websocket_route_and_the_handler_of_each_route():
+    first = BoltAPI()
+    second = BoltAPI()
+
+    @first.get("/first")
+    async def first_route():
+        return {"api": "first"}
+
+    @first.websocket("/ws/private", auth=[APIKeyAuthentication(api_keys={"key1"})], guards=[IsAuthenticated()])
+    async def private_echo(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("private:" + await websocket.receive_text())
+
+    @first.websocket("/ws/open")
+    async def open_echo(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("open:" + await websocket.receive_text())
+
+    # These routes come after the WebSocket routes of the first API.
+    @second.get("/second")
+    async def second_route():
+        return {"api": "second"}
+
+    @second.get("/third")
+    async def third_route():
+        return {"api": "third"}
+
+    merged = runbolt_module.Command().merge_apis([("first.api", first), ("second.api", second)])
+
+    async def talk(path: str, headers: dict[str, str] | None = None) -> str:
+        async with WebSocketTestClient(merged, path, headers=headers) as websocket:
+            await websocket.send_text("hello")
+            return await websocket.receive_text()
+
+    with pytest.raises(PermissionError):
+        asyncio.run(talk("/ws/private"))
+    assert asyncio.run(talk("/ws/private", {"X-API-Key": "key1"})) == "private:hello"
+    assert asyncio.run(talk("/ws/open")) == "open:hello"
+    with TestClient(merged) as client:
+        assert client.get("/first").json() == {"api": "first"}
+        assert client.get("/second").json() == {"api": "second"}
+        assert client.get("/third").json() == {"api": "third"}
+
+
+def _api_with_mcp(server_name: str, path: str) -> BoltAPI:
+    api = BoltAPI()
+    mount_mcp(api, MCP(server_name, "1.0"), path=path)
+    return api
+
+
+def test_merge_apis_serves_the_mcp_mount_of_each_api():
+    merged = runbolt_module.Command().merge_apis(
+        [
+            ("first.api", _api_with_mcp("first-server", "/mcp")),
+            ("second.api", _api_with_mcp("second-server", "/tools/mcp")),
+        ]
+    )
+
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}},
+    }
+    with TestClient(merged) as client:
+        for path, server_name in (("/mcp", "first-server"), ("/tools/mcp", "second-server")):
+            response = client.post(path, json=initialize, headers={"Accept": "application/json, text/event-stream"})
+            assert response.status_code == 200
+            assert f'"serverInfo":{{"name":"{server_name}","version":"1.0"}}' in response.text
+
+
+def _conflict_route(api: BoltAPI) -> None:
+    @api.get("/same")
+    async def same():
+        return {}
+
+
+def _conflict_websocket(api: BoltAPI) -> None:
+    @api.websocket("/ws/same")
+    async def same(websocket: WebSocket):
+        await websocket.accept()
+
+
+async def _asgi_app(scope, receive, send):
+    await send({"type": "http.response.start", "status": 204, "headers": []})
+    await send({"type": "http.response.body", "body": b""})
+
+
+def _conflict_mcp_mounts(api: BoltAPI) -> None:
+    mount_mcp(api, MCP("other", "1.0"), path="/other/mcp")
+    mount_mcp(api, MCP("one", "1.0"))
+
+
+def _conflict_mcp_route(api: BoltAPI) -> None:
+    @api.post("/mcp")
+    async def mcp_route():
+        return {}
+
+
+@pytest.mark.parametrize(
+    ("add_first", "add_second", "message"),
+    [
+        (_conflict_route, _conflict_route, "Route conflict: GET /same defined in both first.api and second.api"),
+        (
+            _conflict_websocket,
+            _conflict_websocket,
+            "WebSocket route conflict: WS /ws/same defined in both first.api and second.api",
+        ),
+        (
+            lambda api: api.mount_asgi("/legacy", _asgi_app),
+            lambda api: api.mount_asgi("/legacy", _asgi_app),
+            "ASGI mount conflict: /legacy defined in both first.api and second.api",
+        ),
+        (
+            _conflict_mcp_mounts,
+            lambda api: mount_mcp(api, MCP("two", "1.0")),
+            "MCP mount conflict: /mcp defined in both first.api and second.api",
+        ),
+        # An MCP mount of one API on the path of a route of another API.
+        (
+            _conflict_mcp_route,
+            lambda api: mount_mcp(api, MCP("two", "1.0")),
+            "MCP mount path '/mcp' conflicts with an existing HTTP route",
+        ),
+    ],
+    ids=["route", "websocket", "asgi-mount", "mcp-mount", "mcp-mount-on-a-route"],
+)
+def test_merge_apis_stops_for_one_path_in_two_apis(add_first, add_second, message):
+    first = BoltAPI()
+    second = BoltAPI()
+    # The first API also has a mount that the second API does not have.
+    first.mount_asgi("/only-first", _asgi_app)
+    add_first(first)
+    add_second(second)
+
+    with pytest.raises(CommandError) as error:
+        runbolt_module.Command().merge_apis([("first.api", first), ("second.api", second)])
+
+    assert str(error.value) == message
+
+
+@pytest.mark.parametrize(
+    ("entry", "error_type", "message"),
+    [
+        ("broken_entry_api", CommandError, "expected 'module:attr' path"),
+        ("broken_entry_missing:api", CommandError, "No module named 'broken_entry_missing'"),
+        ("broken_entry_missing.sub:api", CommandError, "No module named 'broken_entry_missing'"),
+        ("broken_entry_package.missing:api", CommandError, "No module named 'broken_entry_package.missing'"),
+        ("broken_entry_api:missing", CommandError, "module 'broken_entry_api' has no attribute 'missing'"),
+        ("broken_entry_api:api:extra", CommandError, "module 'broken_entry_api' has no attribute 'api:extra'"),
+        ("broken_entry_api:other", CommandError, "'broken_entry_api'.other is not a BoltAPI instance"),
+        # The module exists, and one of its imports does not. The cause stays visible.
+        ("broken_entry_dependency:api", ModuleNotFoundError, "No module named 'broken_entry_not_installed'"),
+    ],
+)
+def test_bolt_api_entry_that_cannot_be_imported_stops_startup(
+    settings, tmp_path, monkeypatch, entry, error_type, message
+):
+    (tmp_path / "broken_entry_api.py").write_text(
+        "from django_bolt.api import BoltAPI\napi = BoltAPI()\nother = object()\n"
+    )
+    (tmp_path / "broken_entry_dependency.py").write_text("import broken_entry_not_installed\n")
+    (tmp_path / "broken_entry_package").mkdir()
+    (tmp_path / "broken_entry_package" / "__init__.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_modules(monkeypatch, "broken_entry_api", "broken_entry_dependency", "broken_entry_package")
+    settings.BOLT_API = ["broken_entry_api:api", entry]
+
+    with pytest.raises(error_type) as error:
+        runbolt_module.Command().autodiscover_apis()
+
+    if error_type is CommandError:
+        message = f"BOLT_API entry {entry!r} could not be imported: {message}"
+    assert str(error.value) == message
