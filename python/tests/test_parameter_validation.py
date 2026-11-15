@@ -2,6 +2,7 @@
 Test parameter validation and inference system.
 """
 
+from dataclasses import dataclass
 from typing import Annotated
 
 import msgspec
@@ -13,6 +14,12 @@ from django_bolt.testing import TestClient
 
 
 class UserCreate(msgspec.Struct):
+    name: str
+    email: str
+
+
+@dataclass
+class UserCreateDataclass:
     name: str
     email: str
 
@@ -114,12 +121,13 @@ def test_post_with_struct_inferred_as_body():
     assert user_field.source == "body"
 
 
-def test_post_with_struct_list_inferred_as_body():
-    """A list of msgspec.Struct with no marker is the JSON body, as one Struct is."""
+@pytest.mark.parametrize("item_type", [UserCreate, UserCreateDataclass], ids=["struct", "dataclass"])
+def test_post_with_struct_list_inferred_as_body(item_type):
+    """A list of msgspec.Struct or dataclass items with no marker is the JSON body, as one item is."""
     api = BoltAPI()
 
     @api.post("/users/bulk")
-    async def create_users(users: list[UserCreate]):
+    async def create_users(users: list[item_type]):
         return {"names": [user.name for user in users]}
 
     with TestClient(api) as client:
