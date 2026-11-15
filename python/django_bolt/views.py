@@ -534,6 +534,11 @@ class ViewSet[T: Model](APIView):
         Subclasses can override this and use ``self.action`` / ``self.request``
         for runtime decisions.  When not overridden, class-level action-specific
         serializer attributes provide the default behavior.
+
+        Bolt also calls this method at registration, to find the response type
+        of a standard action with no return annotation. ``self.action`` is
+        "list" for the list route and "retrieve" for the other routes then.
+        ``self.request`` is not available at registration.
         """
         if action is None:
             with suppress(LookupError):

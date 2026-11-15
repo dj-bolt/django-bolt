@@ -1488,14 +1488,18 @@ class BoltAPI:
         """
         Best-effort serializer inference for unannotated viewset actions.
 
-        Called at registration time (no request context), so ``self.action``
-        is unavailable. We pass *action_name* explicitly instead.
+        Called at registration time (no request context). We pass *action_name*
+        explicitly, and ``self.action`` has the same value during the call, so
+        an override can read either of them. ``self.request`` is not available.
         """
+        token = _current_action.set(action_name)
         try:
             view_instance = viewset_cls()
             return view_instance.get_serializer_class(action_name)
         except (AttributeError, TypeError, ValueError):
             return _RESPONSE_MODEL_UNSET
+        finally:
+            _current_action.reset(token)
 
     def _register_custom_actions(
         self,
