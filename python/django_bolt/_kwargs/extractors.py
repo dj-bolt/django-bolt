@@ -1048,9 +1048,17 @@ _BODY_EXTRACTORS: dict[Any, Callable] = {}
 _OPTIONAL_BODY_EXTRACTORS: dict[Callable, Callable] = {}
 
 
-def create_body_extractor(name: str, annotation: Any, default: Any = inspect.Parameter.empty) -> Callable:
+def create_body_extractor(
+    name: str,
+    annotation: Any,
+    default: Any = inspect.Parameter.empty,
+    embed_key: str | None = None,
+) -> Callable:
     """
     Create a pre-compiled extractor for request body.
+
+    With ``embed_key`` (``Body(embed=True)``), the body is a JSON object and
+    the value is at that key. See ``_build_embedded_body_extractor``.
 
     Uses cached msgspec decoder for maximum performance.
     Converts msgspec.DecodeError (JSON parsing errors) to RequestValidationError for proper 422 responses.
@@ -1061,6 +1069,8 @@ def create_body_extractor(name: str, annotation: Any, default: Any = inspect.Par
     An empty body gives the default of a parameter that has one, and None for
     an ``Optional`` type without default. A required parameter gets a 422.
     """
+    if embed_key is not None:
+        return _build_embedded_body_extractor(annotation, embed_key, default)
     try:
         extractor = _BODY_EXTRACTORS[annotation]
     except KeyError:
@@ -1089,6 +1099,40 @@ def _with_empty_body_default(extractor: Callable, default_value: Any) -> Callabl
         return extractor(body_bytes)
 
     return extract_or_default
+
+
+def _build_embedded_body_extractor(annotation: Any, key: str, default: Any) -> Callable:
+    """Build the extractor of a ``Body(embed=True)`` parameter.
+
+    The body is a JSON object, and the value of the parameter is at ``key``:
+    ``{"item": {...}}`` for the parameter ``item``. One Struct with one field
+    decodes the object, so the request pays for one decode, as for a body with
+    no wrapper. The other keys of the object are not read.
+
+    A parameter with a default, or with an ``Optional`` type, takes the
+    default when the key is missing or the request has no body.
+    """
+    if default is inspect.Parameter.empty and is_optional(annotation):
+        default = None
+    has_default = default is not inspect.Parameter.empty
+    # The key is a field name on the wire only. It need not be a Python identifier.
+    wire_field = msgspec.field(name=key, default_factory=lambda: default) if has_default else msgspec.field(name=key)
+    wrapper = msgspec.defstruct("EmbeddedBody", [("value", annotation, wire_field)])
+    decode = msgspec.json.Decoder(wrapper).decode
+
+    def extract(body_bytes: bytes) -> Any:
+        if has_default and not body_bytes:
+            return default
+        try:
+            return decode(body_bytes).value
+        except msgspec.ValidationError:
+            # The error handler makes the 422. ValidationError is a subclass of DecodeError.
+            raise
+        except msgspec.DecodeError as e:
+            error_detail = parse_msgspec_decode_error(e, body_bytes)
+            raise RequestValidationError(errors=[error_detail], body=body_bytes) from e
+
+    return extract
 
 
 def _build_before_body_extractor(annotation: Any, plan: Callable) -> Callable:
@@ -1216,7 +1260,9 @@ def create_extractor_for_field(field: FieldDefinition, other_keys: frozenset[str
             max_files=max_files,
         )
     elif source == "body":
-        return create_body_extractor(name, annotation, default)
+        # Body(embed=True): the value is at the key of the alias or of the parameter name.
+        embed_key = (alias or name) if field.embed else None
+        return create_body_extractor(name, annotation, default, embed_key)
     elif source == "request":
         # Request source is handled directly in the injector
         return None

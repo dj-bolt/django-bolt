@@ -355,6 +355,8 @@ class SchemaGenerator:
         schema = self._type_to_schema(annotation, null_arm=False)
         if isinstance(schema, Schema) and marker and marker.description:
             schema = replace(schema, description=marker.description)
+        if isinstance(schema, Schema) and marker and marker.example is not None:
+            schema = replace(schema, examples=[marker.example])
         if default not in (inspect.Parameter.empty, None):
             schema = self._with_default(schema, default)
         return schema
@@ -1091,6 +1093,12 @@ class SchemaGenerator:
         body_param = meta.get("body_struct_param")
         body_type = meta.get("body_struct_type")
         fields = self._route_fields(meta)
+        # The Body() marker of the handler gives the description and the example.
+        body_field = next((f for f in fields if f.source == "body"), None)
+        marker = body_field.param if body_field is not None else None
+
+        if body_field is not None and body_field.embed:
+            return self._embedded_request_body(body_field)
 
         if not body_param or not body_type:
             # A dependency can read the JSON body.
@@ -1106,12 +1114,6 @@ class SchemaGenerator:
             body_field = next((f for f in fields if f.source == "body"), None)
             if body_field is not None:
                 body_param, body_type, body_required = body_field.name, body_field.annotation, body_field.is_required
-
-        if not body_param or not body_type:
-            # A JSON body of another type, such as a dict.
-            plain_body = next((f for f in fields if f.source == "body"), None)
-            if plain_body is not None:
-                body_param, body_type = plain_body.name, plain_body.annotation
 
         if not body_param or not body_type:
             # A JSON body of another type, such as a dict.
@@ -1179,13 +1181,33 @@ class SchemaGenerator:
 
         # JSON request body
         schema = self._type_to_schema(body_type, register_component=True)
+        if body_field is None or body_field.name != body_param:
+            # The body comes from a dependency or from a ViewSet action.
+            marker = None
 
         return RequestBody(
-            description=f"Request body for {body_param}",
+            description=marker.description if marker and marker.description else f"Request body for {body_param}",
             content={
-                "application/json": OpenAPIMediaType(schema=schema),
+                "application/json": OpenAPIMediaType(schema=schema, example=marker.example if marker else None),
             },
             required=body_required,
+        )
+
+    def _embedded_request_body(self, field: Any) -> RequestBody:
+        """The request body of a ``Body(embed=True)`` parameter: a JSON object with the value at one key."""
+        marker = field.param
+        key = field.alias or field.name
+        schema = self._type_to_schema(field.annotation, register_component=True)
+        has_default = field.default is not inspect.Parameter.empty
+        if has_default and field.default is not None:
+            schema = self._with_default(schema, field.default)
+        required = not has_default and not is_optional(field.annotation)
+        wrapper = Schema(type="object", properties={key: schema}, required=[key] if required else None)
+        example = {key: marker.example} if marker.example is not None else None
+        return RequestBody(
+            description=marker.description or f"Request body for {field.name}",
+            content={"application/json": OpenAPIMediaType(schema=wrapper, example=example)},
+            required=required,
         )
 
     def _response_type_content(self, response_type: Any) -> dict[str, OpenAPIMediaType]:
