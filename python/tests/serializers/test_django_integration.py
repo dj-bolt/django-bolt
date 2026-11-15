@@ -1875,7 +1875,7 @@ class TestComprehensiveSerializer:
             "id",
             "name",
             "sku",
-            "description",
+            "desc",  # The alias of `description` is its key in the output.
             "price",
             "quantity",
             "discount_percent",

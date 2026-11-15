@@ -95,7 +95,6 @@ class _DumpFieldSpec:
 
     field_name: str
     output_key: str
-    alias: str | None
     nested: _ModelOutputNested | None
     default_value: Any = _MISSING
 
@@ -336,6 +335,12 @@ class _SerializerMeta(_STRUCT_META):
     def __new__(mcs, name: str, bases: tuple, namespace: dict, **kwargs):
         # Force kw_only=True for all Serializer subclasses
         kwargs.setdefault("kw_only", True)
+        # field(alias=...) is the name of the field in JSON, for input and for
+        # output. msgspec has one such name for each field, so the alias goes
+        # there. The marker stays the default, as for a field with no alias.
+        for attr_name, value in list(namespace.items()):
+            if isinstance(value, _FieldMarker) and value.config.alias:
+                namespace[attr_name] = msgspec.field(default=value, name=value.config.alias)
         cls = cast(Any, super().__new__(mcs, name, bases, namespace, **kwargs))
 
         # Build rename map (e.g., {"user_name": "userName"} for rename="camel").
@@ -1117,7 +1122,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 _DumpFieldSpec(
                     field_name=field_name,
                     output_key=rename_map.get(field_name, field_name),
-                    alias=field_config.alias if field_config else None,
                     nested=_get_model_output_nested(cls.__cached_type_hints__.get(field_name, Any))
                     if field_name in nested_fields
                     else None,
@@ -2159,7 +2163,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that weren't explicitly set
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys (not yet implemented)
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             Dictionary representation of the serializer
@@ -2236,8 +2240,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if exclude_defaults and spec.default_value is not _MISSING and value == spec.default_value:
                 continue
 
-            # Determine output key: by_alias takes precedence, then rename_map
-            output_key = spec.alias if by_alias and spec.alias else spec.output_key
+            # The wire name of the field: its alias, or the name from the rename option.
+            output_key = spec.output_key
 
             if isinstance(value, (BaseManager, QuerySet)):
                 raise SerializationError(
@@ -2312,7 +2316,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that weren't explicitly set
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             JSON bytes representation
@@ -2343,7 +2347,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that weren't explicitly set
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             List of dictionary representations
@@ -2399,7 +2403,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that weren't explicitly set
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             JSON bytes representation of the list
@@ -2514,7 +2518,7 @@ class SerializerView(Iterable[T]):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that weren't explicitly set
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             Filtered dictionary representation
@@ -2547,7 +2551,7 @@ class SerializerView(Iterable[T]):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that weren't explicitly set
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             List of filtered dictionary representations
