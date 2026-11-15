@@ -557,9 +557,34 @@ fn run_dev_reloader_inner(
         ));
     }
 
+    supervise(
+        &command,
+        &rx,
+        &filter,
+        debounce,
+        recv_timeout,
+        &shutdown,
+        &paint,
+    )
+}
+
+/// The supervisor loop. Start the worker, start a new one after each change,
+/// and return the exit code of the session.
+///
+/// `rx` gives the events of the file watcher. `shutdown` is the flag that the
+/// signal handler sets.
+fn supervise(
+    command: &[String],
+    rx: &Receiver<notify::Result<Event>>,
+    filter: &ReloadFilter,
+    debounce: Duration,
+    recv_timeout: Duration,
+    shutdown: &AtomicBool,
+    paint: &Paint,
+) -> PyResult<i32> {
     let mut reload_count = 0u64;
     // None while the worker is dead and the supervisor waits for a change.
-    let mut worker = Some(spawn_worker(&command, reload_count)?);
+    let mut worker = Some(spawn_worker(command, reload_count)?);
     // The last watcher error logged, so a repeated error is logged once.
     let mut last_watch_error: Option<String> = None;
 
@@ -594,7 +619,7 @@ fn run_dev_reloader_inner(
             )));
         }
 
-        match recv_change(&rx, &filter, debounce, recv_timeout) {
+        match recv_change(rx, filter, debounce, recv_timeout) {
             Ok(Some(changed_path)) => {
                 // After a reload, a watcher error that comes back is news again.
                 last_watch_error = None;
@@ -605,7 +630,7 @@ fn run_dev_reloader_inner(
                 ));
                 reload_count += 1;
                 stop_worker(&mut worker, WORKER_STOP_TIMEOUT_RELOAD)?;
-                worker = Some(spawn_worker(&command, reload_count)?);
+                worker = Some(spawn_worker(command, reload_count)?);
             }
             Ok(None) => {}
             Err(_) if shutdown.load(Ordering::SeqCst) => {
@@ -973,6 +998,19 @@ mod tests {
         assert_eq!(first_relevant_file_in(&file, &filter), None);
     }
 
+    /// root can read a directory with no permission bits. A link to itself
+    /// gives an error for each user, and that error is not "no directory".
+    #[cfg(unix)]
+    #[test]
+    fn a_path_with_another_read_error_triggers_reload() {
+        let root = TempDir::new("link-loop");
+        let link = root.0.join("loop");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        let filter = ReloadFilter::new(vec![], vec![]);
+
+        assert_eq!(first_relevant_file_in(&link, &filter), Some(link.clone()));
+    }
+
     fn modify_event(path: &str) -> Event {
         Event {
             kind: EventKind::Modify(ModifyKind::Data(DataChange::Content)),
@@ -1064,6 +1102,83 @@ mod tests {
         drop(tx);
     }
 
+    /// The supervisor loop with a channel in place of the file watcher, and a
+    /// `sleep` worker.
+    #[cfg(unix)]
+    #[test]
+    fn a_watcher_error_ends_the_session_only_for_a_stopped_watcher_or_a_shutdown() {
+        use super::supervise;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let command = ["sleep", "30"].map(String::from);
+        let filter = ReloadFilter::new(vec![], vec![]);
+        let paint = Paint { enabled: false };
+        let run = |rx: &mpsc::Receiver<notify::Result<Event>>, shutdown: &AtomicBool| {
+            supervise(
+                &command,
+                rx,
+                &filter,
+                Duration::from_millis(50),
+                Duration::from_millis(200),
+                shutdown,
+                &paint,
+            )
+        };
+
+        // No shutdown: a notify error does not end the session. Then the
+        // watcher stops, and the session ends with the exit code 1.
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(notify::Error::generic("inotify watch limit")))
+            .unwrap();
+        drop(tx);
+        let exit_code = run(&rx, &AtomicBool::new(false));
+        assert!(matches!(exit_code, Ok(1)), "{exit_code:?}");
+
+        // A shutdown arrives while the loop waits for the watcher, and the
+        // watcher stops with it. This is a clean stop: the exit code is 0.
+        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+        let shutdown = &AtomicBool::new(false);
+        let exit_code = thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                shutdown.store(true, Ordering::SeqCst);
+                drop(tx);
+            });
+            run(&rx, shutdown)
+        });
+        assert!(matches!(exit_code, Ok(0)), "{exit_code:?}");
+    }
+
+    /// The supervisor loop with a worker that fails at once, as for a port in use.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_first_start_ends_the_session_with_the_exit_code_of_the_worker() {
+        use super::supervise;
+        use std::sync::atomic::AtomicBool;
+
+        let command = ["sh", "-c", "exit 3"].map(String::from);
+        let filter = ReloadFilter::new(vec![], vec![]);
+        // The watcher stays alive while the loop polls the worker. If the loop
+        // waits for changes, the watcher stops later and the exit code is 1.
+        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(5));
+            drop(tx);
+        });
+
+        let exit_code = supervise(
+            &command,
+            &rx,
+            &filter,
+            Duration::from_millis(50),
+            Duration::from_millis(20),
+            &AtomicBool::new(false),
+            &Paint { enabled: false },
+        );
+
+        assert!(matches!(exit_code, Ok(3)), "{exit_code:?}");
+    }
+
     #[test]
     fn wait_for_child_exit_gives_the_status_of_a_child_that_exits_in_time() {
         let mut child = Command::new("sh")
@@ -1095,11 +1210,16 @@ mod tests {
         assert!(waited >= Duration::from_millis(100), "{waited:?}");
     }
 
+    /// The tests that change the action of SIGHUP run one at a time.
+    #[cfg(unix)]
+    static SIGHUP_ACTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     #[test]
     fn sighup_is_ignored_reads_the_current_action() {
         use super::sighup_is_ignored;
 
+        let _action = SIGHUP_ACTION.lock().unwrap();
         // SAFETY: SIG_IGN and SIG_DFL install no Rust code. No test of this
         // binary sends SIGHUP.
         let previous = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
@@ -1110,6 +1230,79 @@ mod tests {
 
         assert!(ignored);
         assert!(!default);
+    }
+
+    /// Wait until the file has `expected` as its content. Stop when the
+    /// supervisor ends first.
+    #[cfg(unix)]
+    fn wait_for_content<T>(
+        path: &std::path::Path,
+        expected: &str,
+        supervisor: &thread::JoinHandle<T>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            if content == expected {
+                return;
+            }
+            assert!(
+                !supervisor.is_finished() && Instant::now() < deadline,
+                "worker starts: {content:?}, expected {expected:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The supervisor loop with a real watcher and a `sh` worker. `ctrlc`
+    /// takes one handler for each process, so only this test starts the loop.
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_starts_a_new_worker_after_a_change_and_stops_on_sigterm() {
+        use super::run_dev_reloader_inner;
+
+        let root = TempDir::new("supervisor");
+        let watched = root.0.join("project");
+        std::fs::create_dir_all(&watched).unwrap();
+        // Outside the watched directory: the worker writes its reload count here.
+        let starts = root.0.join("starts");
+        // The first worker runs until the reload stops it. The next one fails.
+        let script = r#"echo "$DJANGO_BOLT_DEV_RELOAD_COUNT" >> "$0"
+            [ "$DJANGO_BOLT_DEV_RELOAD_COUNT" = 0 ] && exec sleep 30
+            exit 7"#;
+        let command = ["sh", "-c", script, starts.to_str().unwrap()].map(String::from);
+        let watch_paths = vec![
+            // A path that does not exist is not watched, and is not an error.
+            root.0.join("missing").to_string_lossy().into_owned(),
+            watched.to_string_lossy().into_owned(),
+        ];
+
+        let action = SIGHUP_ACTION.lock().unwrap();
+        // As under `nohup`. The supervisor must keep this action.
+        // SAFETY: SIG_IGN installs no Rust code.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        let supervisor = thread::spawn(move || {
+            run_dev_reloader_inner(command.to_vec(), watch_paths, vec![], vec![], 50, false)
+        });
+        wait_for_content(&starts, "0\n", &supervisor);
+        assert!(super::sighup_is_ignored());
+        drop(action);
+
+        std::fs::write(watched.join("views.py"), "VALUE = 1\n").unwrap();
+        // The second worker gets the reload count 1. Its failure is not a
+        // failed first start, so the supervisor continues.
+        wait_for_content(&starts, "0\n1\n", &supervisor);
+        thread::sleep(Duration::from_millis(300));
+        assert!(!supervisor.is_finished());
+
+        // The supervisor has its signal handler: a worker started.
+        // SAFETY: the signal goes to this process, which handles it.
+        unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        let exit_code = supervisor.join().unwrap();
+        assert!(
+            matches!(exit_code, Ok(0)),
+            "the supervisor did not stop cleanly"
+        );
     }
 
     #[test]

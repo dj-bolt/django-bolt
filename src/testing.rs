@@ -1059,25 +1059,6 @@ pub fn handle_test_websocket(
     let client_tuple = pyo3::types::PyTuple::new(py, ["127.0.0.1", "12345"])?;
     scope_dict.set_item("client", client_tuple)?;
 
-    // Add auth context if present
-    if let Some(route_meta) = app.route_metadata.get(handler_id) {
-        let auth_ctx = if !route_meta.auth_backends.is_empty() {
-            authenticate(&header_map, &route_meta.auth_backends)
-        } else {
-            None
-        };
-
-        if let Some(ref auth) = auth_ctx {
-            let ctx_dict = pyo3::types::PyDict::new(py);
-            bolt_core::middleware::auth::populate_auth_context(
-                &ctx_dict.clone().unbind(),
-                auth,
-                py,
-            );
-            scope_dict.set_item("auth_context", ctx_dict)?;
-        }
-    }
-
     Ok((
         true,
         false,

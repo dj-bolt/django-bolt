@@ -35,7 +35,7 @@ if not settings.configured:
     )
     django.setup()
 
-from django_bolt import BoltAPI, WebSocket
+from django_bolt import BoltAPI, WebSocket, WebSocketDisconnect, WebSocketState
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, Requires
 from django_bolt.testing import ConnectionClosed, WebSocketTestClient
 from django_bolt.websocket import CloseCode
@@ -429,10 +429,154 @@ class TestWebSocketErrors:
     async def test_handler_error(self, api):
         """Test handler error handling."""
         with pytest.raises(ValueError) as exc_info:
-            async with WebSocketTestClient(api, "/ws/error"):
-                await asyncio.sleep(0.1)  # Give handler time to error
+            async with WebSocketTestClient(api, "/ws/error") as ws:
+                # The client gets an internal-error close, as on the server.
+                with pytest.raises(ConnectionClosed) as closed:
+                    await ws.receive_text()
+                assert closed.value.code == CloseCode.INTERNAL_ERROR
+                assert ws.closed is True
+                assert ws.close_code == CloseCode.INTERNAL_ERROR
 
         assert "Test error" in str(exc_info.value)
+
+
+class TestWebSocketMessageModes:
+    """The text, binary and JSON modes of the handler object and of the test client."""
+
+    @pytest.fixture
+    def api(self):
+        api = BoltAPI()
+
+        @api.websocket("/ws/json-binary")
+        async def json_binary(websocket: WebSocket):
+            await websocket.accept()
+            data = await websocket.receive_json(mode="binary")
+            await websocket.send_json(data, mode="binary")
+            await websocket.send_json(data, mode="binary")
+            await websocket.send_json(data)
+
+        @api.websocket("/ws/both-frame-types")
+        async def both_frame_types(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_bytes("caf\u00e9".encode())
+            await websocket.send_text("caf\u00e9")
+
+        @api.websocket("/ws/close")
+        async def close(websocket: WebSocket, code: int | None = None, reason: str | None = None):
+            await websocket.accept()
+            if code is None:
+                await websocket.close()
+            else:
+                await websocket.close(code=code, reason=reason)
+
+        return api
+
+    @pytest.mark.asyncio
+    async def test_json_in_binary_mode_uses_binary_frames(self, api):
+        async with WebSocketTestClient(api, "/ws/json-binary") as ws:
+            await ws.send_json({"name": "caf\u00e9"}, mode="binary")
+
+            assert await ws.receive() == {"type": "websocket.accept"}
+            assert await ws.receive() == {"type": "websocket.send", "bytes": b'{"name":"caf\xc3\xa9"}'}
+            assert await ws.receive_json(mode="binary") == {"name": "caf\u00e9"}
+            # The default mode is text.
+            assert await ws.receive() == {"type": "websocket.send", "text": '{"name":"caf\u00e9"}'}
+
+    @pytest.mark.asyncio
+    async def test_client_reads_a_frame_of_the_other_type(self, api):
+        """receive_text() decodes a binary frame, and receive_bytes() encodes a text frame."""
+        async with WebSocketTestClient(api, "/ws/both-frame-types") as ws:
+            assert ws.closed is False
+            assert ws.close_code is None
+            assert await ws.receive_text() == "caf\u00e9"
+            assert await ws.receive_bytes() == b"caf\xc3\xa9"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("query_string", "message"),
+        [
+            ("", {"type": "websocket.close", "code": 1000, "reason": ""}),
+            ("code=4001&reason=bye", {"type": "websocket.close", "code": 4001, "reason": "bye"}),
+        ],
+    )
+    async def test_close_sends_the_code_and_the_reason(self, api, query_string, message):
+        async with WebSocketTestClient(api, "/ws/close", query_string=query_string) as ws:
+            assert await ws.receive() == {"type": "websocket.accept"}
+            assert await ws.receive() == message
+            # The client knows the close before a receive method reads it.
+            assert ws.closed is True
+            assert ws.close_code == message["code"]
+
+    @pytest.mark.asyncio
+    async def test_receive_bytes_raises_connection_closed_with_the_code(self, api):
+        async with WebSocketTestClient(api, "/ws/close", query_string="code=4001&reason=bye") as ws:
+            with pytest.raises(ConnectionClosed) as closed:
+                await ws.receive_bytes()
+
+            assert closed.value.code == 4001
+            assert ws.close_code == 4001
+
+
+class _ClientGone:
+    """ASGI callables of a connection whose client left: each send raises, as the server does."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def receive(self) -> dict:
+        return {"type": "websocket.receive", "text": "x"}
+
+    async def send(self, message: dict) -> None:
+        self.sent.append(message)
+        if message["type"] != "websocket.accept":
+            raise ConnectionResetError("WebSocket client disconnected")
+
+
+@pytest.mark.asyncio
+async def test_send_to_a_client_that_left_raises_disconnect_with_code_1006():
+    connection = _ClientGone()
+    websocket = WebSocket({"type": "websocket", "path": "/ws"}, connection.receive, connection.send)
+    await websocket.accept()
+
+    with pytest.raises(WebSocketDisconnect) as disconnect:
+        await websocket.send_text("late")
+
+    assert disconnect.value.code == CloseCode.ABNORMAL_CLOSURE
+    assert websocket.state is WebSocketState.DISCONNECTED
+    # The connection is closed: a receive gives a normal disconnect, and close() sends nothing.
+    with pytest.raises(WebSocketDisconnect) as closed:
+        await websocket.receive()
+    assert closed.value.code == CloseCode.NORMAL
+    await websocket.close()
+    assert [message["type"] for message in connection.sent] == ["websocket.accept", "websocket.send"]
+
+
+@pytest.mark.asyncio
+async def test_receive_of_a_disconnect_raises_it_with_the_code():
+    async def receive() -> dict:
+        return {"type": "websocket.disconnect", "code": 4000}
+
+    connection = _ClientGone()
+    websocket = WebSocket({"type": "websocket", "path": "/ws"}, receive, connection.send)
+    await websocket.accept()
+
+    with pytest.raises(WebSocketDisconnect) as disconnect:
+        await websocket.receive_text()
+
+    assert disconnect.value.code == 4000
+    assert websocket.state is WebSocketState.DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_close_for_a_client_that_left_raises_no_error():
+    connection = _ClientGone()
+    websocket = WebSocket({"type": "websocket", "path": "/ws"}, connection.receive, connection.send)
+    await websocket.accept()
+
+    await websocket.close()
+
+    assert websocket.state is WebSocketState.DISCONNECTED
+    assert connection.sent[-1] == {"type": "websocket.close", "code": 1000, "reason": ""}
 
 
 class TestWebSocketTimeout:
@@ -445,7 +589,10 @@ class TestWebSocketTimeout:
         @api.websocket("/ws/slow")
         async def slow_handler(websocket: WebSocket):
             await websocket.accept()
-            # Don't send anything - client should timeout
+            # Send nothing and stay connected, so the client times out.
+            # A return here closes the connection with 1000.
+            async for _message in websocket.iter_text():
+                pass
 
         return api
 
@@ -581,6 +728,15 @@ class TestWebSocketGuards:
             await websocket.send_text("cookie")
 
         return api
+
+    @pytest.mark.asyncio
+    async def test_the_test_client_has_no_option_that_replaces_the_token(self, api):
+        """A test authenticates with the headers that the server reads.
+
+        ``auth_context`` was an option that the guards did not read.
+        """
+        with pytest.raises(TypeError, match="auth_context"):
+            WebSocketTestClient(api, "/ws/protected", auth_context={"user_id": "123"})
 
     @pytest.mark.asyncio
     async def test_public_route_no_auth(self, api):

@@ -103,13 +103,17 @@ class OpenAPIConfig:
     render_plugins: list[OpenAPIRenderPlugin] = field(default_factory=lambda: [])
     """Plugins for rendering OpenAPI documentation UIs.
 
-    If empty, ScalarRenderPlugin will be used by default.
+    If empty, Bolt serves each docs UI: Swagger UI at the docs path, ReDoc at
+    ``/redoc``, Scalar at ``/scalar``, RapiDoc at ``/rapidoc`` and Stoplight
+    Elements at ``/stoplight``.
     """
 
     exclude_paths: list[str] = field(default_factory=lambda: ["/admin", "/static"])
     """Path prefixes to exclude from OpenAPI schema generation.
 
     By default excludes Django admin (/admin) and static files (/static).
+    An entry matches whole path segments. "/admin" excludes "/admin" and
+    "/admin/users". It does not exclude "/administrators".
     The OpenAPI docs path (self.path) is always excluded automatically.
     Set to empty list [] to include all routes, or customize as needed.
 
@@ -134,15 +138,20 @@ class OpenAPIConfig:
     include_error_responses: bool = field(default=True)
     """Include 422 validation error responses in OpenAPI schema.
 
-    When enabled, the schema will automatically document 422 Unprocessable Entity
-    responses for endpoints that accept request bodies (JSON, form data, file uploads).
+    When enabled, the schema documents a 422 Unprocessable Entity response for
+    each route whose input Bolt validates: a path, query, header or cookie
+    parameter, or a request body (JSON, form data, file uploads). A route with
+    no parameter and no body gets no 422.
 
-    The 422 response includes detailed validation error information with field-level
-    error messages, making it easier for API consumers to understand what went wrong.
+    The ``detail`` of the 422 body is a list of field errors. For a route with a
+    parameter or a form field, it can also be a text.
 
     With ``BoltAPI(error_formatter=...)``, the 422 shows the body that the
     formatter declares with ``error_schema``. A formatter with no declaration
     gives a 422 with no content.
+
+    A route with an auth backend and a guard also gets the 401 and the 403
+    that the guard can send, with the error body of the API.
 
     Set to False to only document successful responses.
 
@@ -172,7 +181,7 @@ class OpenAPIConfig:
     response (no return annotation / ``response_model``) or any component name
     had to fall back to ``module.qualname`` because two types share a short name.
     An ``error_formatter`` without ``error_schema`` is also an offender when a
-    route has a 422 response.
+    route has a 422, 401 or 403 response.
     Routes with ``include_in_schema=False`` and non-JSON ``response_class`` routes
     are not offenders.
     """

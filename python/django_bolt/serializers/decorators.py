@@ -14,6 +14,13 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 ValidatorMode = Literal["before", "after"]
+_VALIDATOR_MODES = ("before", "after")
+
+
+def _check_validator_mode(decorator: str, mode: Any) -> None:
+    """Reject a mode that Bolt does not run. The error stops the creation of the class."""
+    if mode not in _VALIDATOR_MODES:
+        raise ValueError(f"@{decorator}: mode={mode!r} is not supported. Use mode='before' or mode='after'.")
 
 
 class _ComputedFieldCallable(Protocol):
@@ -64,14 +71,18 @@ def _marked_validator(raw: Any, marker: str, *, allow_classmethod: bool) -> Any 
     Decorators mark the underlying function, so this is the one place that
     decides which descriptor forms are legal — regardless of decorator order.
     A field validator is called as ``func(cls, value)``, so ``@classmethod``
-    is accepted; ``@staticmethod`` has the wrong arity. A model validator
-    receives the constructed instance, so no descriptor can express one.
+    is accepted; ``@staticmethod`` has the wrong arity. A model validator with
+    ``mode="after"`` receives the constructed instance, so no descriptor can
+    express one. A model validator with ``mode="before"`` is called as
+    ``func(cls, data)``, so ``@classmethod`` is accepted.
     Rejecting loudly here matters: silently collecting nothing leaves a
     serializer that looks validated and is not.
     """
     func = _unwrap_descriptor(raw)
     if not (callable(func) and hasattr(func, marker)):
         return None
+    if func.__validator_mode__ == "before":
+        allow_classmethod = True
     if isinstance(raw, staticmethod) or (isinstance(raw, classmethod) and not allow_classmethod):
         kind = type(raw).__name__
         raise TypeError(f"{func.__qualname__}: a validator cannot be a {kind}. Drop the @{kind} decorator.")
@@ -197,11 +208,20 @@ def field_validator(
 
     Args:
         field_name: Name of the field to validate
-        mode: When to run the validator ('before' or 'after' other validators)
+        mode: ``"after"`` (the default): the validator gets the value that the
+            type of the field accepted. If it returns None, the value stays.
+            ``"before"``: the validator gets the raw input value, before the
+            type of the field converts it. Bolt uses the value that it returns,
+            also None, and the type of the field then validates that value.
+            A before validator runs only for a field that the input has.
+            Before validators run before after validators, whatever the order
+            of the definitions. ``"wrap"`` and ``"plain"`` are not supported
+            and raise ValueError.
 
     Example:
         class UserCreate(Serializer):
             email: str
+            tags: list[str] = []
 
             @field_validator('email')
             @classmethod
@@ -209,7 +229,13 @@ def field_validator(
                 if '@' not in value:
                     raise ValueError('Invalid email')
                 return value.lower()
+
+            @field_validator('tags', mode='before')
+            @classmethod
+            def split_tags(cls, value):
+                return value.split(',') if isinstance(value, str) else value
     """
+    _check_validator_mode("field_validator", mode)
 
     def decorator(func: DecoratedT) -> DecoratedT:
         # Mark the underlying function, not the descriptor: `@classmethod` is
@@ -239,11 +265,16 @@ def model_validator(
     mode: ValidatorMode = "after",
 ) -> ModelValidatorFunc | Callable[[ModelValidatorFunc], ModelValidatorFunc]:
     """
-    Decorator to validate an entire Serializer after all fields are set.
+    Decorator to validate an entire Serializer.
 
     Args:
         func: The validator function (if used without parentheses)
-        mode: When to run the validator ('before' or 'after' field validators)
+        mode: ``"after"`` (the default): the validator is a method. It gets the
+            built instance, after the field validators.
+            ``"before"``: the validator is a classmethod. It gets the raw input
+            data (usually a dict) before any field validation, and returns the
+            data to validate. ``"wrap"`` and ``"plain"`` are not supported and
+            raise ValueError.
 
     Example:
         class UserCreate(Serializer):
@@ -254,7 +285,15 @@ def model_validator(
             def validate_passwords(self):
                 if self.password != self.password_confirm:
                     raise ValueError('Passwords must match')
+
+            @model_validator(mode='before')
+            @classmethod
+            def accept_old_key(cls, data):
+                if isinstance(data, dict) and 'pass' in data:
+                    data = {**data, 'password': data['pass']}
+                return data
     """
+    _check_validator_mode("model_validator", mode)
 
     def decorator(
         validator_func: ModelValidatorFunc,
@@ -272,50 +311,68 @@ def model_validator(
     return decorator(func)
 
 
-def collect_field_validators(cls: type[Serializer]) -> dict[str, list[FieldValidatorFunc]]:
+def _collect_marked(cls: type[Serializer], marker: str, *, allow_classmethod: bool) -> list[Any]:
     """
-    Collect all field validators from a class and its bases.
+    The marked validators of a class and its bases: parent before subclass, in definition order.
 
-    Returns a dict mapping field names to lists of validator functions.
+    A name has one entry. A subclass that defines the name again replaces the
+    definition of the parent, at the position of the parent definition (the
+    rule of pydantic). A new definition that is not such a validator removes it.
     """
+    found: dict[str, Any] = {}
+    for base in reversed(cls.__mro__):
+        if not hasattr(base, "__dict__"):
+            continue
+        for name, raw in base.__dict__.items():
+            value = _marked_validator(raw, marker, allow_classmethod=allow_classmethod)
+            if value is not None:
+                found[name] = value
+            else:
+                found.pop(name, None)
+    return list(found.values())
+
+
+def _in_run_order(validators: list[Any], mode: ValidatorMode) -> list[Any]:
+    """
+    The validators of one mode, in the order that they run (the order of pydantic).
+
+    After validators run in definition order, those of a parent class first.
+    Before validators run in the reverse order: the last one defined runs first.
+    """
+    selected = [validator for validator in validators if validator.__validator_mode__ == mode]
+    return selected[::-1] if mode == "before" else selected
+
+
+def collect_field_validators(
+    cls: type[Serializer], mode: ValidatorMode | None = None
+) -> dict[str, list[FieldValidatorFunc]]:
+    """
+    Collect the field validators of a class and its bases.
+
+    Returns a dict mapping field names to lists of validator functions. With a
+    ``mode``, each list has the validators of that mode in the order that they
+    run. With no ``mode``, each list has all the validators in definition
+    order, those of a parent class first. ``subset()`` copies them in that order.
+    A validator that a subclass defines again under the same name is in the
+    list one time: the definition of the subclass.
+    """
+    marked: list[Any] = _collect_marked(cls, "__validator_field__", allow_classmethod=True)
+    if mode is not None:
+        marked = _in_run_order(marked, mode)
     validators: dict[str, list[FieldValidatorFunc]] = {}
-
-    # Walk through MRO to collect validators
-    for base in cls.__mro__:
-        if not hasattr(base, "__dict__"):
-            continue
-
-        for raw in base.__dict__.values():
-            value = _marked_validator(raw, "__validator_field__", allow_classmethod=True)
-            if value is not None:
-                validator = cast(_FieldValidatorCallable, value)
-                field_name = validator.__validator_field__
-                if field_name not in validators:
-                    validators[field_name] = []
-                validators[field_name].append(cast(FieldValidatorFunc, value))
-
+    for value in marked:
+        validators.setdefault(value.__validator_field__, []).append(cast(FieldValidatorFunc, value))
     return validators
 
 
-def collect_model_validators(cls: type[Serializer]) -> list[ModelValidatorFunc]:
+def collect_model_validators(cls: type[Serializer], mode: ValidatorMode = "after") -> list[ModelValidatorFunc]:
     """
-    Collect all model validators from a class and its bases.
+    Collect the model validators of one mode from a class and its bases.
 
-    Returns a list of validator functions in MRO order.
+    Returns a list of validator functions, in the order that they run.
     """
-    validators: list[ModelValidatorFunc] = []
-
-    # Walk through MRO to collect validators
-    for base in cls.__mro__:
-        if not hasattr(base, "__dict__"):
-            continue
-
-        for raw in base.__dict__.values():
-            value = _marked_validator(raw, "__model_validator__", allow_classmethod=False)
-            if value is not None:
-                validators.append(cast(ModelValidatorFunc, value))
-
-    return validators
+    marked = _collect_marked(cls, "__model_validator__", allow_classmethod=False)
+    return cast(list[ModelValidatorFunc], _in_run_order(marked, mode))
 
 
 def collect_computed_fields(cls: type[Serializer]) -> dict[str, ComputedFieldConfig]:

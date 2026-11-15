@@ -22,6 +22,7 @@ from collections.abc import Callable
 from functools import partial
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote_to_bytes
 
 from .._core import RequestLane, populate_response_cookies
 from ..concurrency import drive_on_lane, in_lane_mode, run_orm_blocking
@@ -33,6 +34,7 @@ from ..middleware_response import (
     _response_type_content_type,
     _split_content_type_headers,
 )
+from ..responses import StreamingResponse
 from ..serialization import _BOLT_RESPONSE_TYPES, serialize_bolt_response
 
 try:
@@ -44,18 +46,72 @@ try:
         markcoroutinefunction,
         sync_to_async,
     )
+    from django.core.exceptions import BadRequest, SuspiciousOperation
     from django.http import HttpRequest, HttpResponse, QueryDict
+    from django.http.multipartparser import MultiPartParserError
     from django.utils.deprecation import MiddlewareMixin
+    from django.utils.encoding import repercent_broken_unicode
     from django.utils.functional import LazyObject, empty
     from django.utils.module_loading import import_string
+
+    class _BoltHttpRequest(HttpRequest):
+        """The Django request that a Django middleware gets on a Bolt route.
+
+        It reads POST and FILES on first use, as WSGIRequest does. The base class
+        sets both to empty values. A multipart form needs a parse.
+        """
+
+        def __init__(self):
+            super().__init__()
+            del self._post, self._files
+            self._read_started = False
+
+        def _get_scheme(self) -> str:
+            # The scheme of the Bolt request, as WSGIRequest reads it from the
+            # server. Django applies SECURE_PROXY_SSL_HEADER on top of it.
+            return self.META["wsgi.url_scheme"]
+
+        # Django maps these two errors to a 400 response. Bolt maps SuspiciousOperation to 400.
+        def _set_content_type_params(self, meta):
+            try:
+                super()._set_content_type_params(meta)
+            except BadRequest as exc:
+                raise SuspiciousOperation(str(exc)) from exc
+
+        def _load_post_and_files(self):
+            try:
+                super()._load_post_and_files()
+            except (BadRequest, MultiPartParserError) as exc:
+                raise SuspiciousOperation(str(exc)) from exc
+
+        def _get_post(self):
+            if not hasattr(self, "_post"):
+                self._load_post_and_files()
+            return self._post
+
+        def _set_post(self, post):
+            self._post = post
+
+        def _get_files(self):
+            if not hasattr(self, "_files"):
+                self._load_post_and_files()
+            return self._files
+
+        def _set_files(self, files):
+            self._files = files
+
+        POST = property(_get_post, _set_post)
+        FILES = property(_get_files, _set_files)
 
     DJANGO_AVAILABLE = True
 except ImportError:
     DJANGO_AVAILABLE = False
+    _BoltHttpRequest = None
     async_to_sync = None
     ThreadSensitiveContext = None
     SyncToAsync = None
     HttpRequest = None
+    repercent_broken_unicode = None
     HttpResponse = None
     QueryDict = None
     import_string = None
@@ -65,17 +121,6 @@ except ImportError:
     markcoroutinefunction = None
     LazyObject = None
     empty = None
-
-if DJANGO_AVAILABLE:
-
-    class _BoltDjangoRequest(HttpRequest):
-        """The Django request that a Django middleware gets on a Bolt route."""
-
-        def _get_scheme(self) -> str:
-            # The scheme of the Bolt request, as WSGIRequest reads it from the
-            # server. Django applies SECURE_PROXY_SSL_HEADER on top of it.
-            return self.META["wsgi.url_scheme"]
-
 
 # Lazy singleton for empty QueryDict - avoids requiring Django settings at import time
 _EMPTY_QUERYDICT = None
@@ -563,13 +608,19 @@ class DjangoMiddlewareStack:
 
         Args:
             middleware_classes: List of Django middleware classes (not instances)
-                               in the order they should be applied (outermost first)
+                               in the order they should be applied (outermost first).
+                               An entry can be the dotted path of a class.
         """
         if not DJANGO_AVAILABLE:
             raise ImportError(
                 "Django is required to use DjangoMiddlewareStack. Install Django with: pip install django"
             )
 
+        # A dotted path string becomes its class, as in DjangoMiddleware.
+        middleware_classes = [
+            import_string(middleware) if isinstance(middleware, str) else middleware
+            for middleware in middleware_classes
+        ]
         for middleware in middleware_classes:
             _check_capabilities(middleware)
         self.middleware_classes = middleware_classes
@@ -936,12 +987,18 @@ def _to_django_request(request: Request) -> HttpRequest:
     - Reuse empty dicts/QueryDicts where possible
     - Use direct attribute assignment (faster than setattr)
     """
-    django_request = _BoltDjangoRequest()
+    django_request = _BoltHttpRequest()
 
     # Copy basic attributes (direct assignment is faster)
     django_request.method = request.method
-    django_request.path = request.path
-    django_request.path_info = request.path
+    # Django servers give the decoded path. Rust gives the encoded one.
+    path = request.path
+    if "%" in path:
+        # An invalid UTF-8 sequence stays percent-encoded, as in Django's WSGI handler.
+        path = repercent_broken_unicode(unquote_to_bytes(path)).decode()
+        request.META["PATH_INFO"] = path
+    django_request.path = path
+    django_request.path_info = path
 
     # One META dict per request. Rust builds it once (REMOTE_ADDR from the
     # client-ip resolver, SERVER_NAME from Host, HTTP_* headers) and caches it,
@@ -954,33 +1011,23 @@ def _to_django_request(request: Request) -> HttpRequest:
     # time, ensuring Rust always parses and passes cookies to Python
     django_request.COOKIES = request.raw_cookies
 
-    # Query params - only create mutable QueryDict if we have params
-    if request.query:
-        django_request.GET = QueryDict(mutable=True)
-        for key, value in request.query.items():
-            # A sequence parameter holds the list of the values of its repeated key.
-            if isinstance(value, list):
-                django_request.GET.setlist(key, value)
-            else:
-                django_request.GET[key] = value
+    # Query params. Django parses the encoded query string, so a repeated key
+    # keeps all its values. Rust gives one value for a key that the handler does not declare as a list.
+    query_string = django_request.META["QUERY_STRING"]
+    if query_string:
+        django_request.GET = QueryDict(query_string, mutable=True)
     else:
         django_request.GET = _get_empty_querydict()  # Reuse singleton (no allocation)
 
-    # Parse POST data for form submissions (needed for CSRF token validation)
-    # Django's CsrfViewMiddleware reads request.POST['csrfmiddlewaretoken']
-    content_type = request.headers.get("content-type", "")
-    body = request.body if request.body else b""
-
-    if body and "application/x-www-form-urlencoded" in content_type:
-        # Parse form data into POST QueryDict
-        django_request.POST = QueryDict(body, mutable=False)
-    else:
-        django_request.POST = _get_empty_querydict()  # Reuse singleton (no allocation)
-
     # Store body for raw access
+    body = request.body if request.body else b""
     django_request._body = body
     # An empty body needs a stream too, so request.read() gives b"" as in Django.
     django_request._stream = io.BytesIO(body)
+
+    # Django parses POST and FILES on first read, from the content type.
+    # This gives a multipart form to CsrfViewMiddleware, as with Django.
+    django_request._set_content_type_params(django_request.META)
 
     return django_request
 
@@ -1187,6 +1234,19 @@ def _to_django_response(response: Response) -> HttpResponse:
     return django_response
 
 
+async def _stream_django_response(django_response: HttpResponse):
+    """Yield the chunks of a Django streaming response, then close it."""
+    try:
+        if django_response.is_async:
+            async for chunk in django_response.streaming_content:
+                yield chunk
+        else:
+            for chunk in django_response.streaming_content:
+                yield chunk
+    finally:
+        django_response.close()
+
+
 def _to_bolt_response(django_response: HttpResponse) -> MiddlewareResponse:
     """Convert Django HttpResponse to MiddlewareResponse for chain compatibility."""
     headers = dict(django_response.items())
@@ -1217,13 +1277,18 @@ def _to_bolt_response(django_response: HttpResponse) -> MiddlewareResponse:
                 )
             )
 
-    body = django_response.content
+    # A Django streaming response, such as FileResponse, has no ``content``.
+    streaming = django_response.streaming
+    body = StreamingResponse(_stream_django_response(django_response)) if streaming else django_response.content
     # The headers hold the Content-Type. A response without one stays without one.
     response_type = "json" if django_response.has_header("Content-Type") else "empty"
     body_kind = _BODY_BYTES
 
     if preserved_body is not None:
         body_kind, body = preserved_body
+    elif streaming:
+        body_kind = _BODY_STREAM
+    if body_kind != _BODY_BYTES:
         response_type = "file" if body_kind == _BODY_FILE else "streaming"
         # The final Rust file/stream response computes its own transport length.
         headers = {k: v for k, v in headers.items() if k.lower() not in _REBUILT_BODY_HEADER_NAMES}
