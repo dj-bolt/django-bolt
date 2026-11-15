@@ -426,6 +426,29 @@ def test_documented_type_carries_examples():
     assert props["name"]["examples"] == ["alice", "bob"]
 
 
+def test_extra_json_schema_keys_in_camel_case_reach_the_schema():
+    """A JSON Schema keyword of ``Meta(extra_json_schema=...)`` keeps its camelCase name in the document."""
+
+    class Upload(msgspec.Struct):
+        payload: Annotated[
+            str,
+            msgspec.Meta(
+                extra_json_schema={
+                    "contentEncoding": "base64",
+                    "readOnly": True,
+                    "externalDocs": {"url": "https://example.com/payload"},
+                }
+            ),
+        ]
+
+    assert _get_response_component_schema(Upload)["properties"]["payload"] == {
+        "type": "string",
+        "contentEncoding": "base64",
+        "readOnly": True,
+        "externalDocs": {"url": "https://example.com/payload"},
+    }
+
+
 def test_builtin_custom_types_in_serializer_render_concrete_types():
     """The reported scenario: a Serializer using built-in Email/PositiveInt/HttpsURL.
 
