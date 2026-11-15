@@ -9,22 +9,23 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import sys
 from collections.abc import Callable
 from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import msgspec
 
-from ..analysis import resolve_introspection_target
+from ..analysis import annotation_globals, resolve_introspection_target
 from ..dependencies import (
     compile_dependency,
     decode_body_once,
     dependency_needs_event_loop,
     resolve_dependency,
     resolve_dependency_sync,
+    shared_dependencies,
     sync_form,
 )
 from ..typing import (
+    REQUEST_PARAM_NAMES,
     FieldDefinition,
     HandlerMetadata,
     HandlerPattern,
@@ -41,6 +42,7 @@ from .runtime import extract_path_params
 # store a precomputed bool instead of re-checking inspect.Parameter kinds on
 # every request (hot-path rule: no per-field kind checks at request time).
 _POSITIONAL_KINDS = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+_VARIABLE_KINDS = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
 
 
 def extract_response_metadata(response_type: Any) -> dict[str, Any]:
@@ -89,6 +91,46 @@ def field_has_upload_file(field: FieldDefinition) -> bool:
             if is_upload_file_type(struct_field.type):
                 return True
     return False
+
+
+# The sources whose keys a query, cookie or form struct can get.
+_STRUCT_KEY_SOURCES = {"query": ("query",), "cookie": ("cookie",), "form": ("form", "file")}
+
+
+def _keys_of_other_fields(field: FieldDefinition, fields: list[FieldDefinition]) -> frozenset[str]:
+    """Return the keys that the other parameters read from the source of a struct parameter.
+
+    Only a struct that forbids unknown fields needs them: its extractor gets
+    the complete query, cookie or form map, and the keys of the other
+    parameters are not unknown. For any other field the result is empty.
+    """
+    sources = _STRUCT_KEY_SOURCES.get(field.source)
+    annotation = unwrap_optional(field.annotation)
+    if sources is None or not is_msgspec_struct(annotation) or not annotation.__struct_config__.forbid_unknown_fields:
+        return frozenset()
+    keys: set[str] = set()
+    for other in fields:
+        if other is field or other.source not in sources:
+            continue
+        other_type = unwrap_optional(other.annotation)
+        if is_msgspec_struct(other_type):
+            keys.update(struct_field.encode_name for struct_field in msgspec.structs.fields(other_type))
+        else:
+            keys.add(other.alias or other.name)
+    return frozenset(keys)
+
+
+def _attach_extractors(fields: list[FieldDefinition]) -> None:
+    """Attach the pre-compiled extractor to each field that has one.
+
+    This runs after all fields exist, because the extractor of a struct that
+    forbids unknown fields needs the keys of the other fields.
+    """
+    for field in fields:
+        extractor = create_extractor_for_field(field, _keys_of_other_fields(field, fields))
+        if extractor is not None:
+            # Use object.__setattr__ since FieldDefinition is frozen
+            object.__setattr__(field, "extractor", extractor)
 
 
 def classify_handler_pattern(
@@ -163,10 +205,9 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         TypeError: If GET/HEAD/DELETE/OPTIONS handlers have body parameters
     """
     sig = inspect.signature(fn)
-    # Get the correct namespace for resolving string annotations (from __future__ import annotations)
-    # Use fn.__module__ to get the module where annotations were defined (especially important for
-    # class-based views where the handler wrapper is created in views.py but annotations come from user's module)
-    globalns = sys.modules.get(fn.__module__, {}).__dict__ if fn.__module__ else {}
+    # Get the correct namespace for resolving string annotations (from __future__ import annotations).
+    # The wrapper of a class-based view is made in views.py, but its annotations come from the user's module.
+    globalns = annotation_globals(fn)
     # Class-callable deps (Depends(Backend(...))) expose __call__ — route get_type_hints through it.
     type_hints = get_type_hints(resolve_introspection_target(fn), globalns=globalns, include_extras=True)
 
@@ -186,7 +227,7 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
 
     # Quick path: single parameter that looks like request
     params = list(sig.parameters.values())
-    if len(params) == 1 and params[0].name in {"request", "req"}:
+    if len(params) == 1 and params[0].name in REQUEST_PARAM_NAMES:
         meta["mode"] = "request_only"
         return meta
 
@@ -195,6 +236,13 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
 
     for param in params:
         name = param.name
+        if param.kind in _VARIABLE_KINDS:
+            # Bolt binds each parameter by its name. Without this check, each request got a 422.
+            owner = getattr(fn, "__name__", type(fn).__name__)
+            raise TypeError(
+                f"Parameter '{param}' of {owner}: Bolt cannot bind a *args or **kwargs parameter. "
+                "Declare each parameter by its name."
+            )
         annotation = type_hints.get(name, param.annotation)
 
         # Take the Param or Depends marker out of Annotated[T, ...] or the default. msgspec.Meta stays.
@@ -209,14 +257,11 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
             explicit_marker=explicit_marker,
         )
 
-        # Attach pre-compiled extractor to field (performance optimization)
-        # This allows the injector to call the extractor directly without source checking
-        extractor = create_extractor_for_field(field)
-        if extractor is not None:
-            # Use object.__setattr__ since FieldDefinition is frozen
-            object.__setattr__(field, "extractor", extractor)
-
         field_definitions.append(field)
+
+    # Attach pre-compiled extractors to the fields (performance optimization)
+    # This allows the injector to call the extractor directly without source checking
+    _attach_extractors(field_definitions)
 
     # HTTP Method Validation: Ensure GET/HEAD/DELETE/OPTIONS don't have body params
     body_fields = [f for f in field_definitions if f.source == "body"]
@@ -289,7 +334,7 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
         Metadata dictionary for parameter binding
     """
     sig = inspect.signature(fn)
-    globalns = sys.modules.get(fn.__module__, {}).__dict__ if fn.__module__ else {}
+    globalns = annotation_globals(fn)
     type_hints = get_type_hints(fn, globalns=globalns, include_extras=True)
 
     # Extract path parameters from route pattern
@@ -356,12 +401,10 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
             explicit_marker=explicit_marker,
         )
 
-        # Attach pre-compiled extractor to field
-        extractor = create_extractor_for_field(field)
-        if extractor is not None:
-            object.__setattr__(field, "extractor", extractor)
-
         field_definitions.append(field)
+
+    # Attach pre-compiled extractors to the fields
+    _attach_extractors(field_definitions)
 
     meta["fields"] = field_definitions
 
@@ -613,6 +656,13 @@ def compile_argument_injector(
             ):
                 _async_dep_fns.append(idx)
         _can_parallel = len(_async_dep_fns) >= 2
+        # The dependencies that run at the same time share the cache of the request.
+        # A dependency that two of them need runs first, so each of them reads its value.
+        _shared_deps = (
+            shared_dependencies([(_dep_plan[idx][5], _dep_plan[idx][1]) for idx in _async_dep_fns])
+            if _can_parallel
+            else ()
+        )
 
         if not _async_dep_fns:
             # Every dependency is sync, so the injector needs no event loop. A sync
@@ -700,6 +750,19 @@ def compile_argument_injector(
                 # Pre-resolve all async deps in parallel
                 async def _resolve_one(dependency, dep_meta):
                     return await resolve_dependency(
+                        dependency.dependency,
+                        dependency,
+                        dep_meta,
+                        request,
+                        dep_cache,
+                        params_map,
+                        query_map,
+                        headers_map,
+                        cookies_map,
+                    )
+
+                for dependency, dep_meta in _shared_deps:
+                    await resolve_dependency(
                         dependency.dependency,
                         dependency,
                         dep_meta,
@@ -842,8 +905,9 @@ def compile_argument_injector(
         else:
             form_map, files_map = _EMPTY_FORM_FILES
 
+        # Each body type has one extractor. Parameters of one type share one decode.
         body_obj: Any = None
-        body_loaded: bool = False
+        body_decoder: Any = None
 
         for src_id, extractor, positional, name, needs_files in _extraction_plan:
             if src_id == _SRC_REQUEST:
@@ -861,9 +925,9 @@ def compile_argument_injector(
             elif src_id == _SRC_FILE:
                 value = extractor(files_map)
             else:  # _SRC_BODY
-                if not body_loaded:
+                if extractor is not body_decoder:
                     body_obj = extractor(request["body"])
-                    body_loaded = True
+                    body_decoder = extractor
                 value = body_obj
 
             if positional:

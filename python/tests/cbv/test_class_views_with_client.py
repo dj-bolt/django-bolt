@@ -381,9 +381,9 @@ def test_bolt_api_view_selective_method_registration():
         response = client.post("/items", json={})
         assert response.status_code == 200
 
-        # DELETE should 404 (not registered)
+        # DELETE answers 405: the path has routes, but none for DELETE
         response = client.delete("/items")
-        assert response.status_code == 404
+        assert response.status_code == 405
 
 
 def test_bolt_api_view_unimplemented_method_raises():
@@ -518,6 +518,6 @@ def test_bolt_api_view_method_names_customization():
         response = client.get("/limited")
         assert response.status_code == 200
 
-        # POST should 404 (not registered due to http_method_names)
+        # POST answers 405 (not registered due to http_method_names)
         response = client.post("/limited", json={})
-        assert response.status_code == 404
+        assert response.status_code == 405

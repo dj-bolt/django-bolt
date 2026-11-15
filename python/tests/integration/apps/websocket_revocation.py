@@ -5,12 +5,13 @@
 HTTP routes revoke a ``jti`` or end a session. A revoked token must fail the
 handshake with 401, before the upgrade. ``/ws/two-backends`` has two JWT
 backends with different secrets. Only the first one reads ``REVOKED_JTIS``.
+``/ws/key`` has an API key backend only.
 """
 
 from __future__ import annotations
 
 from django_bolt import BoltAPI, WebSocket
-from django_bolt.auth import IsAuthenticated, JWTAuthentication
+from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
 
 SECRET = "websocket-revocation-secret-longer-than-32-characters"
 OTHER_SECRET = "websocket-revocation-other-secret-longer-than-32-chars"
@@ -65,6 +66,12 @@ async def by_jti(websocket: WebSocket):
     guards=[IsAuthenticated()],
 )
 async def by_session(websocket: WebSocket):
+    await websocket.accept()
+    await websocket.send_text("connected")
+
+
+@api.websocket("/ws/key", auth=[APIKeyAuthentication(api_keys={"key-one"})], guards=[IsAuthenticated()])
+async def by_key(websocket: WebSocket):
     await websocket.accept()
     await websocket.send_text("connected")
 
