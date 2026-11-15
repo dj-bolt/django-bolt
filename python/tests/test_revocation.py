@@ -172,6 +172,11 @@ def test_store_rejects_a_negative_leeway(store_class):
     assert str(raised.value) == f"{store_class.__name__} leeway must be >= 0 seconds."
 
 
+@pytest.mark.parametrize("store_class", [DjangoCacheRevocation, DjangoORMRevocation])
+def test_default_leeway_of_a_store_is_the_default_leeway_of_the_backend(store_class):
+    assert store_class().leeway == JWTAuthentication(secret="s" * 32).leeway == 60
+
+
 def test_jwt_backend_rejects_a_store_with_a_smaller_leeway():
     """An entry of that store would expire while the backend still accepts the token."""
     with pytest.raises(ImproperlyConfigured) as raised:
