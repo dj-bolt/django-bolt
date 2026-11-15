@@ -267,3 +267,33 @@ def test_runbolt_processes_two_bind_failure_stops_with_exit_status_1(make_server
 
     assert process.returncode == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
     assert stderr.count("Address already in use") == 2, stderr
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Multiprocess smoke only runs on Linux.")
+def test_runbolt_respawn_failed_workers_stops_when_no_worker_can_start(make_server_project):
+    """--respawn-failed-workers must not replace a worker that did not start to serve.
+
+    Before, runbolt started a new worker each second and did not stop.
+    """
+    project = make_server_project(api_module=app_module("hello"))
+
+    # Hold the port without SO_REUSEPORT, so the bind of each worker fails.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as blocker:
+        blocker.bind((DEFAULT_HOST, 0))
+        blocker.listen(8)
+        port = int(blocker.getsockname()[1])
+
+        process, _ = project.spawn(port=port, processes=2, extra_args=["--respawn-failed-workers"])
+        try:
+            stdout, stderr = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = _terminate_process(process)
+            pytest.fail(
+                f"runbolt kept running after the bind of port {port} failed\n"
+                f"respawns: {stdout.count('respawning')}\nstdout:\n{stdout[-1500:]}"
+            )
+
+    assert process.returncode == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    assert "Address already in use" in stderr, stderr
+    assert "failed to start" in stdout, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    assert "respawning" not in stdout, f"stdout:\n{stdout}\nstderr:\n{stderr}"
