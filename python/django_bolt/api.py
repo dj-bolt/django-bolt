@@ -73,6 +73,7 @@ from .middleware.compiler import (
     compile_middleware_meta,
     route_auth_backends,
 )
+from .middleware.compression import check_compression, compression_setting
 from .middleware.django_loader import load_django_middleware
 from .middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
 from .middleware_response import MiddlewareResponse
@@ -614,14 +615,10 @@ class BoltAPI:
         # - `compression=CompressionConfig(...)` → caller-provided config
         # `settings.BOLT_COMPRESSION` overrides this at server startup
         # (see `runbolt.py`) and is mirrored by `_rust_compression_config`.
-        if compression is False:
-            self._compression = None
-        elif compression is None:
+        if compression is None:
             self._compression = CompressionConfig()
-        elif isinstance(compression, CompressionConfig):
-            self._compression = compression
         else:
-            raise TypeError(f"compression must be a CompressionConfig, None or False, not {type(compression).__name__}")
+            self._compression = check_compression(compression, "compression")
 
         # OpenAPI configuration - enabled by default with sensible defaults
         if openapi_config is None:
@@ -720,17 +717,16 @@ class BoltAPI:
         Resolution mirrors `runbolt.py` so `TestClient` / `AsyncTestClient` /
         `WebSocketTestClient` see the same compression behavior as production:
 
-        1. If `settings.BOLT_COMPRESSION` is defined and truthy, it wins.
+        1. If `settings.BOLT_COMPRESSION` is a `CompressionConfig`, it wins.
+           A value of a wrong type raises `ImproperlyConfigured`.
         2. If `settings.BOLT_COMPRESSION` is defined and `None`/`False`, that
            explicitly disables compression.
         3. Otherwise fall back to this `BoltAPI`'s own `_compression`.
         """
-        if django_settings is not None and hasattr(django_settings, "BOLT_COMPRESSION"):
-            bolt_compression = django_settings.BOLT_COMPRESSION
-            if bolt_compression is None or bolt_compression is False:
-                return None
-            return bolt_compression.to_rust_config()
-        return self._compression.to_rust_config() if self._compression else None
+        defined, config = compression_setting()
+        if not defined:
+            config = self._compression
+        return config.to_rust_config() if config else None
 
     def get(
         self,

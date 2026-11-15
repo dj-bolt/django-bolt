@@ -285,6 +285,8 @@ BOLT_COMPRESSION = CompressionConfig(
 )
 ```
 
+The setting wins over the `compression` argument of `BoltAPI`. Set `BOLT_COMPRESSION = None` or `False` to switch compression off. Each other value, for example `True` or a dict, stops the server start with `ImproperlyConfigured`.
+
 ## Workers vs Processes
 
 Actix worker threads and Python processes scale different things. `--workers` sets the Actix worker threads in one process. `--processes` sets the number of processes.
