@@ -256,7 +256,7 @@ def test_cors_preflight_to_a_native_route_gets_the_global_cors_headers():
     assert "POST" in response.headers["access-control-allow-methods"]
 
 
-def test_head_to_a_get_only_native_route_is_not_found_as_for_a_python_route():
+def test_head_to_a_get_only_native_route_is_not_allowed_as_for_a_python_route():
     api = native_api()
 
     @api.get("/python")
@@ -267,7 +267,8 @@ def test_head_to_a_get_only_native_route_is_not_found_as_for_a_python_route():
         native = client.head("/items/1")
         python = client.head("/python")
 
-    assert native.status_code == python.status_code == 404
+    assert native.status_code == python.status_code == 405
+    assert native.headers["allow"] == "GET, POST, OPTIONS"
 
 
 def test_automatic_options_includes_native_routes():

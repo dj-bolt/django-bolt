@@ -78,6 +78,33 @@ def test_mount_asgi_scope_root_path_and_subpath():
     assert captured[1]["query_string"] == b"next=%2Fadmin%2F"
 
 
+def test_mount_asgi_scope_path_is_percent_decoded():
+    """``path`` is percent-decoded and ``raw_path`` keeps the request bytes, so Django matches the decoded path."""
+    api = BoltAPI()
+    captured = []
+
+    async def asgi_app(scope, receive, send):
+        await receive()
+        captured.append(scope)
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    api.mount_asgi("/plain", asgi_app)
+    api.mount_django("/django", app=asgi_app)
+
+    with TestClient(api) as client:
+        assert client.get("/plain/caf%C3%A9/a%20b").status_code == 204
+        assert client.get("/django/caf%C3%A9/a%20b").status_code == 204
+
+    plain_scope, django_scope = captured
+    assert plain_scope["path"] == "/café/a b"
+    assert bytes(plain_scope["raw_path"]) == b"/caf%C3%A9/a%20b"
+
+    assert django_scope["path"] == "/django/café/a b"
+    assert bytes(django_scope["raw_path"]) == b"/django/caf%C3%A9/a%20b"
+    assert ASGIRequest(django_scope, io.BytesIO()).path_info == "/café/a b"
+
+
 @pytest.mark.parametrize(
     ("trusted_proxies", "proxy_ssl_header", "scheme", "port", "is_secure"),
     [
@@ -374,6 +401,85 @@ def test_mount_django_with_custom_app_forwards_to_mount_asgi():
         assert response.json() == {"source": "django"}
 
 
+def _scope_echo_app(captured: list):
+    """An ASGI app that records its scope and answers 204."""
+
+    async def app(scope, receive, send):
+        await receive()
+        captured.append(scope)
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    return app
+
+
+@pytest.mark.parametrize(
+    ("mount", "url", "root_path"),
+    [("/legacy", "/api/legacy/page", "/api/legacy"), ("/", "/api/page", "/api")],
+)
+def test_mount_asgi_applies_the_prefix_of_the_api(mount, url, root_path):
+    """The prefix of the API comes before the mount path, and a second mount there is an error."""
+    api = BoltAPI(prefix="/api")
+    captured = []
+    api.mount_asgi(mount, _scope_echo_app(captured))
+
+    with TestClient(api) as client:
+        assert client.get(url).status_code == 204
+
+    assert captured[0]["root_path"] == root_path
+
+    with pytest.raises(ValueError, match="Duplicate ASGI mount prefix"):
+        api.mount_asgi(mount, _scope_echo_app(captured))
+
+
+@pytest.mark.parametrize(("clear_root_path", "root_path"), [(False, "/django"), (True, "")])
+def test_mount_django_gives_the_app_the_full_path(clear_root_path, root_path):
+    """The app gets the request path with the mount prefix. ``clear_root_path`` sets ``root_path`` to ``""``."""
+    api = BoltAPI()
+    captured = []
+    api.mount_django("/django", app=_scope_echo_app(captured), clear_root_path=clear_root_path)
+
+    with TestClient(api) as client:
+        assert client.get("/django/page").status_code == 204
+        assert client.get("/django/a%20b").status_code == 204
+
+    assert captured[0]["root_path"] == root_path
+    assert captured[0]["path"] == "/django/page"
+    assert bytes(captured[1]["raw_path"]) == b"/django/a%20b"
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("/accounts/", "/django/accounts/"),
+        ("/django/accounts/", "/django/accounts/"),
+        ("//other.example/accounts/", "//other.example/accounts/"),
+        ("https://other.example/accounts/", "https://other.example/accounts/"),
+    ],
+    ids=["root-relative", "has-prefix", "scheme-relative", "absolute"],
+)
+def test_mount_django_redirect_location_and_other_headers(status, location, expected):
+    """Only a root-relative Location gets the mount prefix. The headers before and after it stay."""
+    api = BoltAPI()
+
+    async def redirecting_app(scope, receive, send):
+        await receive()
+        headers = [(b"x-before", b"1"), (b"Location", location.encode()), (b"x-after", b"2")]
+        await send({"type": "http.response.start", "status": status, "headers": headers})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    api.mount_django("/django", app=redirecting_app)
+
+    with TestClient(api) as client:
+        response = client.get("/django/start", follow_redirects=False)
+
+    assert response.status_code == status
+    assert response.headers["location"] == expected
+    assert response.headers["x-before"] == "1"
+    assert response.headers["x-after"] == "2"
+
+
 def test_mount_django_redirect_keeps_mount_prefix():
     api = BoltAPI()
 
@@ -651,6 +757,23 @@ def test_mount_asgi_duplicate_response_start_still_raises():
         assert client.get("/double").status_code == 200
 
     assert outcome == {"error": "http.response.start sent more than once"}
+
+
+@pytest.mark.parametrize("status", [0, 99, 1000, 65536])
+def test_mount_asgi_status_that_is_not_an_http_status_is_a_500(status):
+    api = BoltAPI()
+
+    async def bad_status(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": status, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    api.mount_asgi("/bad-status", bad_status)
+
+    with TestClient(api) as client:
+        response = client.get("/bad-status")
+    assert response.status_code == 500
+    assert f"The status in http.response.start must be an int from 100 to 999, got {status}" in response.text
 
 
 def test_mount_asgi_head_request_does_not_fake_a_disconnect():
