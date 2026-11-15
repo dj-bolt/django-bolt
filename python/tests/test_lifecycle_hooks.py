@@ -122,6 +122,59 @@ def test_lifespan_startup_failure_prevents_tests():
         pass
 
 
+def _mounted_apis(events: list[str], *, parent_has_lifespan: bool) -> BoltAPI:
+    """A parent API that mounts ``child``, which mounts ``inner``. Each lifespan records its API."""
+
+    def recording_lifespan(name: str):
+        @asynccontextmanager
+        async def lifespan(app):
+            events.append(f"{name} startup")
+            app._lifespan_name = name
+            yield
+            events.append(f"{name} shutdown")
+
+        return lifespan
+
+    inner = BoltAPI(lifespan=recording_lifespan("inner"))
+    child = BoltAPI(lifespan=recording_lifespan("child"))
+    parent = BoltAPI(lifespan=recording_lifespan("parent")) if parent_has_lifespan else BoltAPI()
+
+    @inner.get("/started")
+    async def started():
+        return {"events": list(events), "inner": inner._lifespan_name, "child": child._lifespan_name}
+
+    child.mount("/inner", inner)
+    parent.mount("/child", child)
+    return parent
+
+
+def test_the_lifespan_of_a_mounted_api_runs():
+    """A mounted API starts after the API that mounts it, and stops before it. Each lifespan gets its own API."""
+    events: list[str] = []
+    parent = _mounted_apis(events, parent_has_lifespan=True)
+
+    with TestClient(parent) as client:
+        assert client.get("/child/inner/started").json() == {
+            "events": ["parent startup", "child startup", "inner startup"],
+            "inner": "inner",
+            "child": "child",
+        }
+
+    assert events[3:] == ["inner shutdown", "child shutdown", "parent shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_the_lifespan_of_a_mounted_api_runs_when_the_parent_has_none():
+    events: list[str] = []
+    parent = _mounted_apis(events, parent_has_lifespan=False)
+
+    async with AsyncTestClient(parent) as client:
+        response = await client.get("/child/inner/started")
+        assert response.json()["events"] == ["child startup", "inner startup"]
+
+    assert events[2:] == ["inner shutdown", "child shutdown"]
+
+
 def _recording_api(events: list[str]) -> BoltAPI:
     @asynccontextmanager
     async def lifespan(app):

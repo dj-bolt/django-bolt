@@ -407,6 +407,19 @@ class TestUpdateInstanceWithDjango:
         original = Author.objects.get(id=author.id)
         assert original.name == "Original Name"
 
+    def test_update_instance_with_omit_defaults_keeps_the_fields_at_their_default(self):
+        """With omit_defaults=True, update_instance() sets only the fields that are not at their default."""
+
+        class AuthorPatch(Serializer, omit_defaults=True):
+            name: str = ""
+            email: str = ""
+            bio: str = ""
+
+        author = Author(name="Original", email="original@example.com", bio="Old bio")
+
+        assert AuthorPatch(email="new@example.com").update_instance(author) is author
+        assert (author.name, author.email, author.bio) == ("Original", "new@example.com", "Old bio")
+
     @pytest.mark.django_db
     def test_update_instance_and_save(self):
         """Test updating and saving model instance."""
@@ -734,6 +747,29 @@ class TestSubsetWithDjango:
 
         assert mini.username == "uppercase"
         assert mini.email == "upper@example.com"
+
+    def test_subset_keeps_each_validator_of_a_field(self):
+        """A subset runs all the validators of a field, as the parent does."""
+
+        class Account(Serializer):
+            id: int
+            name: str
+
+            @field_validator("name")
+            def strip_name(cls, value):
+                return value.strip()
+
+            @field_validator("name")
+            def reject_empty_name(cls, value):
+                if not value:
+                    raise ValueError("Name is empty")
+                return value
+
+        AccountMini = Account.subset("name")
+
+        assert AccountMini(name="  ada  ").name == Account(id=1, name="  ada  ").name == "ada"
+        with pytest.raises(RequestValidationError, match="Name is empty"):
+            AccountMini(name="   ")
 
     @pytest.mark.django_db
     def test_subset_with_computed_field(self):
@@ -1091,6 +1127,21 @@ class TestCreateSerializerHelpersWithDjango:
         assert "email" in UserSerializer.__annotations__
         assert "is_active" in UserSerializer.__annotations__
 
+    def test_create_serializer_keeps_the_order_of_the_fields(self):
+        """The fields have the order of the `fields` argument, or the order of the model."""
+        names = ["updated_at", "email", "id", "is_staff", "username", "created_at", "is_active"]
+
+        assert create_serializer(User, fields=names).__struct_fields__ == tuple(names)
+        assert create_serializer(User, exclude=["password_hash"]).__struct_fields__ == (
+            "id",
+            "username",
+            "email",
+            "is_active",
+            "is_staff",
+            "created_at",
+            "updated_at",
+        )
+
     @pytest.mark.django_db
     def test_create_serializer_config_applies_end_to_end(self):
         """Test create_serializer uses Config metadata for model mapping and dump behavior."""
@@ -1119,6 +1170,34 @@ class TestCreateSerializerHelpersWithDjango:
         assert dumped["email"] == "helper@example.com"
         assert "created_at" in dumped
         assert "password_hash" not in dumped
+
+    def test_create_serializer_selects_the_fields_and_the_set_passes_its_options(self):
+        """exclude, an unknown name and a many-to-many field drop out. Each serializer of the set gets its options."""
+        PostSerializer = create_serializer(BlogPost, fields=["title", "tags", "author", "unknown"], exclude=["title"])
+        TagSerializer = create_serializer(Tag, exclude=["description"])
+
+        assert (PostSerializer.__name__, set(PostSerializer.__struct_fields__)) == ("BlogPostSerializer", {"author"})
+        assert set(TagSerializer.__struct_fields__) == {"id", "name"}
+
+        UserCreate, UserUpdate, UserPublic = create_serializer_set(
+            User,
+            create_fields=["username", "password_hash"],
+            update_fields=["email", "password_hash"],
+            public_fields=["id", "username"],
+            write_only={"password_hash"},
+            read_only={"id"},
+        )
+
+        assert [cls.__name__ for cls in (UserCreate, UserUpdate, UserPublic)] == [
+            "UserCreate",
+            "UserUpdate",
+            "UserPublic",
+        ]
+        assert set(UserPublic.__struct_fields__) == {"id", "username"}
+        assert UserCreate(username="u", password_hash="h").dump() == {"username": "u"}
+        assert UserUpdate(email="u@example.com", password_hash="h").dump() == {"email": "u@example.com"}
+        assert UserPublic.__read_only_fields__ == frozenset({"id"})
+        assert UserCreate.__read_only_fields__ == frozenset()
 
     @pytest.mark.django_db
     def test_create_serializer_set_with_django(self):
@@ -1875,7 +1954,7 @@ class TestComprehensiveSerializer:
             "id",
             "name",
             "sku",
-            "description",
+            "desc",  # The alias of `description` is its key in the output.
             "price",
             "quantity",
             "discount_percent",
