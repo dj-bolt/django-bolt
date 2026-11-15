@@ -32,7 +32,11 @@ const DEFAULT_IDLE_SECONDS: f64 = 10.0;
 
 /// How long `shutdown` and `stop_idle_lanes` wait for busy lanes. A lane can
 /// still run the last call of an async request after the response.
+#[cfg(not(test))]
 const STOP_WAIT: Duration = Duration::from_secs(2);
+/// The unit tests of the wait run for the complete time, so it is short there.
+#[cfg(test)]
+const STOP_WAIT: Duration = Duration::from_millis(200);
 
 static IDLE: OnceLock<Duration> = OnceLock::new();
 
@@ -634,6 +638,119 @@ mod tests {
 
         assert!(spawned.is_err());
         assert!(LANES.lock().is_empty());
+    }
+
+    /// asyncio cancels the future of a queued call when its request stops.
+    /// The lane must not run that call, and it must complete each other one.
+    #[test]
+    fn run_call_completes_the_future_and_skips_a_cancelled_one() {
+        Python::initialize();
+        Python::attach(|py| {
+            let code = c"from concurrent.futures import Future\n\
+                calls = []\n\
+                def work(value, fail=False):\n    \
+                    calls.append(value)\n    \
+                    if fail:\n        \
+                        raise ValueError(value)\n    \
+                    return value * 2\n";
+            let module = PyModule::from_code(py, code, c"lane_calls.py", c"lane_calls").unwrap();
+            let work = || module.getattr("work").unwrap().unbind();
+            let future = || module.getattr("Future").unwrap().call0().unwrap();
+            let args = |value: i32| PyTuple::new(py, [value]).unwrap().unbind();
+            let calls = || -> Vec<i32> { module.getattr("calls").unwrap().extract().unwrap() };
+            let pending = AtomicUsize::new(3);
+
+            let cancelled = future();
+            cancelled.call_method0("cancel").unwrap();
+            run_call(py, work(), args(1), None, cancelled.unbind(), &pending);
+            assert_eq!(calls(), Vec::<i32>::new());
+            assert_eq!(pending.load(Ordering::Relaxed), 2);
+
+            let done = future();
+            run_call(py, work(), args(21), None, done.clone().unbind(), &pending);
+            assert!(done.call_method0("done").unwrap().is_truthy().unwrap());
+            let result: i32 = done.call_method0("result").unwrap().extract().unwrap();
+            assert_eq!(result, 42);
+            assert_eq!(pending.load(Ordering::Relaxed), 1);
+
+            let failed = future();
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("fail", true).unwrap();
+            let kwargs = Some(kwargs.unbind());
+            run_call(
+                py,
+                work(),
+                args(3),
+                kwargs,
+                failed.clone().unbind(),
+                &pending,
+            );
+            assert!(failed.call_method0("done").unwrap().is_truthy().unwrap());
+            let error = failed.call_method0("exception").unwrap();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>());
+            assert_eq!(calls(), vec![21, 3]);
+            assert_eq!(pending.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    /// List a lane with no thread. It never stops, as a lane that is busy.
+    fn list_busy_lane(id: u64) -> Receiver<Job> {
+        let (sender, receiver) = channel::<Job>();
+        LANES.lock().push((id, sender));
+        receiver
+    }
+
+    /// The server must stop when a lane stays with a request that never ends.
+    #[test]
+    fn shutdown_waits_the_stop_time_for_a_busy_lane_and_counts_it() {
+        let _globals = GLOBALS.lock();
+        let receiver = list_busy_lane(u64::MAX - 6);
+        let started = Instant::now();
+
+        let busy = shutdown();
+        let waited = started.elapsed();
+        STOPPING.store(false, Ordering::Relaxed);
+        PYTHON_CLOSED.store(false, Ordering::SeqCst);
+        unlist(u64::MAX - 6);
+
+        assert_eq!(busy, 1);
+        assert!(waited >= STOP_WAIT, "{waited:?}");
+        assert!(matches!(receiver.try_recv(), Ok(Job::Stop(None))));
+    }
+
+    /// A test client waits for a lane that another client still uses, but
+    /// only for the stop time.
+    #[test]
+    fn stop_idle_lanes_stops_an_idle_lane_and_waits_the_stop_time_for_a_busy_one() {
+        let _globals = GLOBALS.lock();
+        let busy = list_busy_lane(u64::MAX - 7);
+        let (idle, idle_jobs) = request_lane(u64::MAX - 8, 0);
+        idle.release();
+        // The thread of the idle lane: it answers the stop, as `lane_main` does.
+        let idle_lane = std::thread::spawn(move || {
+            let mut stops = 0;
+            while let Ok(job) = idle_jobs.recv() {
+                if let Job::Stop(Some(ack)) = job {
+                    stops += 1;
+                    let _ = ack.send(());
+                }
+            }
+            stops
+        });
+        let started = Instant::now();
+
+        Python::initialize();
+        Python::attach(stop_idle_lanes);
+        let waited = started.elapsed();
+        unlist(u64::MAX - 7);
+
+        assert!(waited >= STOP_WAIT, "{waited:?}");
+        // Only the idle lane gets a stop, and it leaves the idle list.
+        assert!(busy.try_recv().is_err());
+        assert!(!take_idle(u64::MAX - 8));
+        // The thread ends when no sender is left, also when no stop came.
+        drop(idle);
+        assert_eq!(idle_lane.join().unwrap(), 1);
     }
 
     #[test]
