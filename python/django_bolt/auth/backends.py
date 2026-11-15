@@ -137,13 +137,16 @@ class JWTAuthentication(BaseAuthentication):
         algorithms: List of allowed JWT algorithms (default: ["HS256"]). The
             token's ``alg`` header must name one of these; all must share one
             key family.
-        header: Header name to extract token from (default: "authorization")
+        header: Header name to extract token from (default: "authorization").
+            An empty string raises ``ImproperlyConfigured``.
         cookie: Optional cookie name to extract the token from. When set, the
             token is read from the named cookie only (the header is ignored).
             The cookie value is the raw token (no "Bearer " prefix needed).
         audience: Optional JWT audience claim to validate. Required with
             ``jwks_url`` to prevent cross-application token substitution.
-        issuer: Optional JWT issuer claim to validate
+        issuer: Optional JWT issuer claim to validate. For ``cookie``,
+            ``audience``, ``issuer`` and ``token_type``, None means "not
+            set". An empty string raises ``ImproperlyConfigured``.
         revoked_token_handler: Async callable that returns True when a token is
             revoked. Bolt calls it for each authenticated request, with the
             ``jti`` of the token: ``handler(jti)``. A handler with two
@@ -280,6 +283,18 @@ class JWTAuthentication(BaseAuthentication):
             raise ImproperlyConfigured("JWTAuthentication leeway must be >= 0 seconds.")
         if secret == "":
             raise ImproperlyConfigured("JWTAuthentication secret must not be empty.")
+        # An empty string is not "not set". Rust would look for a header or a
+        # cookie with no name, or require a claim that is an empty string.
+        if header == "":
+            raise ImproperlyConfigured("JWTAuthentication header must not be empty.")
+        for option, value in (
+            ("cookie", cookie),
+            ("audience", audience),
+            ("issuer", issuer),
+            ("token_type", token_type),
+        ):
+            if value == "":
+                raise ImproperlyConfigured(f"JWTAuthentication {option} must not be empty. Use None for no value.")
         self._secret = secret
         self.public_key = public_key
         self.algorithms = ["HS256"] if algorithms is None else algorithms
@@ -448,7 +463,8 @@ class APIKeyAuthentication(BaseAuthentication):
 
     Args:
         api_keys: Set of valid API keys
-        header: Header name to extract API key from (default: "x-api-key")
+        header: Header name to extract API key from (default: "x-api-key").
+            An empty string raises ``ImproperlyConfigured``.
         key_permissions: Optional mapping of API keys to permission sets
     """
 
@@ -458,6 +474,8 @@ class APIKeyAuthentication(BaseAuthentication):
         header: str = "x-api-key",
         key_permissions: dict[str, set[str]] | None = None,
     ):
+        if header == "":
+            raise ImproperlyConfigured("APIKeyAuthentication header must not be empty.")
         self.api_keys = api_keys or set()
         self.header = header
         self.key_permissions = key_permissions or {}

@@ -48,6 +48,8 @@ JWTAuthentication(
 | `jwks_refresh_interval` | `int`       | `300`             | Periodic remote JWKS refresh interval in seconds |
 | `revocation_store` | RevocationStore | `None`            | Token revocation store  |
 
+For `cookie`, `audience`, `issuer` and `token_type`, `None` means "not set". An empty string for one of them, or for `header`, raises `ImproperlyConfigured`.
+
 #### Supported algorithms
 
 - HMAC: `HS256`, `HS384`, `HS512` — `secret` is the shared secret
@@ -126,6 +128,8 @@ APIKeyAuthentication(
 | `api_keys`        | `set[str]` | `set()`       | Valid API keys             |
 | `header`          | `str`      | `"x-api-key"` | Header containing key      |
 | `key_permissions` | `dict`     | `None`        | Key to permissions mapping |
+
+An empty `header` raises `ImproperlyConfigured`.
 
 ## Permission guards
 
