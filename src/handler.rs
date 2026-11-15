@@ -18,6 +18,7 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
 use bolt_asgi::asgi_http;
+use bolt_core::access_log::AccessLogFilter;
 use bolt_core::error::{self, handle_python_error};
 use bolt_core::form_parsing::{
     DEFAULT_MAX_FIELDS, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT, ERROR_TYPE_PAYLOAD_TOO_LARGE,
@@ -765,7 +766,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 ) -> HttpResponse {
     // Without the access log and an error formatter, this is the whole cost: one Option check.
     if !ACCESS_LOG && state.error_renderer.is_none() {
-        return route_request(req, payload, state, &mut false).await;
+        return route_request(req, payload, state, &mut None).await;
     }
     // ACCESS_LOG: the compiler removes the timer when ACCESS_LOG=false (const generic).
     let access_log_start = if ACCESS_LOG {
@@ -775,15 +776,21 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     };
     let kept_req = req.clone();
     let kept_state = state.clone();
-    let mut route_answered = false;
-    let mut response = route_request(req, payload, state, &mut route_answered).await;
+    let mut access_log_filter = None;
+    let mut response = route_request(req, payload, state, &mut access_log_filter).await;
     if kept_state.error_renderer.is_some() && response.status().as_u16() >= 400 {
         response = crate::error_formatter::format_error_response(response, &kept_req, &kept_state);
     }
     if let Some(start) = access_log_start
-        && route_answered
+        && let Some(filter) = access_log_filter
     {
-        write_access_log(&kept_state, &kept_req, response.status().as_u16(), start);
+        write_access_log(
+            &kept_state,
+            &kept_req,
+            response.status().as_u16(),
+            start,
+            filter,
+        );
     }
     response
 }
@@ -802,7 +809,15 @@ fn access_log_level(status: u16) -> (u8, &'static str) {
 }
 
 /// Write the access-log line of one response to the `django.server` logger.
-fn write_access_log(state: &AppState, req: &HttpRequest, status: u16, start: std::time::Instant) {
+/// `filter` holds the sample rate and the slow-request threshold of the route.
+/// A 4xx or a 5xx always passes it.
+fn write_access_log(
+    state: &AppState,
+    req: &HttpRequest,
+    status: u16,
+    start: std::time::Instant,
+    filter: AccessLogFilter,
+) {
     let (bit, level) = access_log_level(status);
     if state.access_log_levels & bit == 0 {
         return;
@@ -811,6 +826,9 @@ fn write_access_log(state: &AppState, req: &HttpRequest, status: u16, start: std
         return;
     };
     let dur_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if !filter.keeps(status, dur_ms) {
+        return;
+    }
     let msg = format!(
         "{} {} {} {:.1}ms",
         req.method().as_str(),
@@ -833,16 +851,16 @@ fn without_error_info(mut response: HttpResponse, state: &AppState) -> HttpRespo
     response
 }
 
-/// Route one request. `route_answered` becomes `true` when the response is for
-/// a Bolt route: each response after the route match, the redirect to the other
-/// slash form of a route path, and the automatic OPTIONS answer. `handle_request`
-/// writes the access-log line for these. A native route, a mount and a path with
-/// no route leave it `false`.
+/// Route one request. `access_log_filter` becomes `Some` when the response is
+/// for a Bolt route: each response after the route match, the redirect to the
+/// other slash form of a route path, and the automatic OPTIONS answer.
+/// `handle_request` writes the access-log line for these, if the filter keeps
+/// it. A native route, a mount and a path with no route leave it `None`.
 async fn route_request(
     req: HttpRequest,
     mut payload: web::Payload,
     state: web::Data<Arc<AppState>>,
-    route_answered: &mut bool,
+    access_log_filter: &mut Option<AccessLogFilter>,
 ) -> HttpResponse {
     // Keep as &str - no allocation, only clone on error paths
     let method = req.method().as_str();
@@ -879,7 +897,7 @@ async fn route_request(
                     } else {
                         format!("{}?{}", alternate_path, query)
                     };
-                    *route_answered = true;
+                    *access_log_filter = Some(AccessLogFilter::default());
                     return HttpResponse::PermanentRedirect() // 308
                         .insert_header(("Location", location))
                         .finish();
@@ -892,7 +910,7 @@ async fn route_request(
                 if !available_methods.is_empty() {
                     let allow_header = available_methods.join(", ");
                     // CORS headers will be added by CorsMiddleware
-                    *route_answered = true;
+                    *access_log_filter = Some(AccessLogFilter::default());
                     return HttpResponse::NoContent()
                         .insert_header(("Allow", allow_header))
                         .insert_header(("Content-Type", "application/json"))
@@ -958,7 +976,6 @@ async fn route_request(
         ))
         .await;
     }
-    *route_answered = true;
 
     // Method maps to a static str (known fixed set — no per-request alloc);
     // path is dynamic and must be owned for PyRequest.
@@ -968,6 +985,8 @@ async fn route_request(
     // Get parsed route metadata (Rust-native) by reference.
     // NOTE: Fetch metadata EARLY so we can use optimization flags to skip unnecessary parsing.
     let route_metadata = state.route_metadata.get(handler_id);
+    *access_log_filter =
+        Some(route_metadata.map_or_else(AccessLogFilter::default, |meta| meta.access_log_filter));
 
     // OPTIMIZATION: Extract the execution plan bitfield once (Copy u16).
     // All subsequent flag reads are direct bit-tests, avoiding repeated Option::map closures.
