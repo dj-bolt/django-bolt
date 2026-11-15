@@ -518,6 +518,17 @@ class ProblemDetails(msgspec.Struct, kw_only=True):
     errors: list[ProblemFieldError] = []
 
 
+def _add_extension_members(body: dict[str, Any], members: Any) -> None:
+    """Add a dict as extension members, or another value as the "extra" member. A set member stays."""
+    if isinstance(members, dict):
+        for key, value in members.items():
+            # "errors" is a list of field errors, as ProblemDetails declares it.
+            if key != "errors":
+                body.setdefault(key, value)
+    else:
+        body.setdefault("extra", members)
+
+
 @error_schema(ProblemDetails, media_type="application/problem+json")
 def problem_details(error: BoltError, request: Any) -> Response:
     """Format an error as RFC 9457 Problem Details (``application/problem+json``).
@@ -546,14 +557,10 @@ def problem_details(error: BoltError, request: Any) -> Response:
     }
     if error.errors:
         body["errors"] = error.errors
-    for members in (error.extra, structured):
-        if isinstance(members, dict):
-            for key, value in members.items():
-                # "errors" is a list of field errors, as ProblemDetails declares it.
-                if key != "errors":
-                    body.setdefault(key, value)
-        elif members is not None:
-            body.setdefault("extra", members)
+    if error.extra is not None:
+        _add_extension_members(body, error.extra)
+    if structured is not None:
+        _add_extension_members(body, structured)
     return Response(body, status_code=error.status, media_type="application/problem+json")
 
 
