@@ -76,6 +76,26 @@ def _is_function_middleware_callable(spec: Any) -> bool:
     return inspect.isfunction(spec) or inspect.ismethod(spec) or inspect.isbuiltin(spec)
 
 
+# The dict types that Rust reads (crates/bolt-core/src/metadata.rs). Nothing reads another dict.
+_DICT_MIDDLEWARE_TYPES = ("cors", "rate_limit")
+_DICT_MIDDLEWARE_HINT = 'The known types are "cors" (as @cors(...)) and "rate_limit" (as @rate_limit(...)).'
+
+# The decorator that does what a keyword argument of @middleware seems to ask for.
+_MIDDLEWARE_KEYWORD_DECORATORS = {
+    "cors": "@cors(...)",
+    "skip": "@skip_middleware(...)",
+    "rate_limit": "@rate_limit(...)",
+}
+
+
+def _check_dict_middleware(spec: dict[str, Any], context: str) -> None:
+    """Raise ValueError for a dict config that no middleware reads."""
+    if "type" not in spec:
+        raise ValueError(f"{context} middleware dict has no 'type'. {_DICT_MIDDLEWARE_HINT}")
+    if spec["type"] not in _DICT_MIDDLEWARE_TYPES:
+        raise ValueError(f"{context} middleware dict has the unknown type {spec['type']!r}. {_DICT_MIDDLEWARE_HINT}")
+
+
 def normalize_middleware_specs(
     middleware_specs: list[Any] | tuple[Any, ...] | None,
     *,
@@ -88,9 +108,13 @@ def normalize_middleware_specs(
     Allowed forms:
     - Middleware classes (Django-style __init__(get_response))
     - DjangoMiddleware / DjangoMiddlewareStack wrapper instances
-    - Dict middleware metadata (Rust-handled middleware)
+    - Dict middleware metadata (Rust-handled middleware) with the type "cors" or "rate_limit"
     - FunctionMiddlewareSpec (route-level only)
     - Raw middleware functions (route-level only; converted to FunctionMiddlewareSpec)
+
+    Raises:
+        TypeError: An entry is of another kind.
+        ValueError: A dict has no "type", or a type that is not "cors" or "rate_limit".
     """
     normalized: list[Any] = []
     if not middleware_specs:
@@ -98,6 +122,7 @@ def normalize_middleware_specs(
 
     for spec in middleware_specs:
         if isinstance(spec, dict):
+            _check_dict_middleware(spec, context)
             normalized.append(spec)
             continue
 
@@ -348,9 +373,17 @@ def middleware(*args, **kwargs):
     Decorator to attach middleware to a route handler.
 
     Can be used as:
-    - @middleware(MyMiddlewareClass)
-    - @middleware(cors={"origins": ["*"]})
-    - @middleware(skip=["auth"])
+    - @middleware(MyMiddlewareClass, OtherMiddlewareClass)
+    - @middleware on a function `(request, call_next)`, which makes a route decorator
+    - @middleware(type="cors", origins=["https://example.com"]) or the same as one dict.
+      The type is "cors" or "rate_limit". @cors(...) and @rate_limit(...) do the same
+      and check each value.
+
+    To skip a middleware, use @skip_middleware(...).
+
+    Raises:
+        TypeError: A keyword argument without `type`, or an entry that is not a middleware.
+        ValueError: A dict or keyword config whose type is not "cors" or "rate_limit".
 
     Example:
         @api.post("/upload")
@@ -361,6 +394,19 @@ def middleware(*args, **kwargs):
         async def upload_file(request: Request) -> dict:
             return {"uploaded": True}
     """
+    # Keyword arguments are one dict config. Check it here, not in the
+    # decorator: nothing reads a config of another form.
+    if kwargs:
+        if "type" not in kwargs:
+            name = next(iter(kwargs))
+            use = _MIDDLEWARE_KEYWORD_DECORATORS.get(name)
+            hint = (
+                f"Use {use}."
+                if use
+                else 'Give middleware classes as positional arguments. A dict config needs type="cors" or type="rate_limit".'
+            )
+            raise TypeError(f"@middleware() does not take the keyword argument {name!r}. {hint}")
+        _check_dict_middleware(kwargs, "route")
 
     def attach_middleware(handler: Callable, middleware_spec: Any) -> Callable:
         handler_middleware = _ensure_handler_middleware_list(handler)
