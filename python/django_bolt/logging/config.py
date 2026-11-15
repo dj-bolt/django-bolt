@@ -363,7 +363,9 @@ def setup_django_logging(force: bool = False) -> None:
             # App-level logging config remains source of truth; use base_level if unset
             current_level = logger.level or logging.getLevelName(base_level)
             logger.setLevel(current_level)
-            logger.propagate = logger_name == "django"
+            # Each of these loggers has the queue handler. A record that also
+            # went to the root logger would print two times.
+            logger.propagate = False
 
         _LOGGING_CONFIGURED = True
 

@@ -336,6 +336,39 @@ def test_api_key_authentication_with_class_view(api):
         assert response.status_code == 401
 
 
+@pytest.mark.parametrize("kind", ["view", "viewset"])
+def test_arguments_of_view_and_viewset_apply_to_the_routes(api, kind):
+    """``auth``, ``guards``, ``status_code`` and ``validate_response`` of the decorator reach each route."""
+    arguments = {
+        "auth": [APIKeyAuthentication(api_keys={"secret-key-123"})],
+        "guards": [IsAuthenticated()],
+        "status_code": 202,
+        "validate_response": False,
+    }
+
+    if kind == "view":
+
+        @api.view("/items", **arguments)
+        class ItemView(APIView):
+            async def get(self, request) -> UserSchema:
+                return {"not": "a user"}
+
+    else:
+
+        @api.viewset("/items", **arguments)
+        class ItemViewSet(ViewSet):
+            async def list(self, request) -> UserSchema:
+                return {"not": "a user"}
+
+    with TestClient(api) as client:
+        assert client.get("/items").status_code == 401
+
+        # With validation on, this body gives 500, because it is not a UserSchema.
+        response = client.get("/items", headers={"X-API-Key": "secret-key-123"})
+        assert response.status_code == 202
+        assert response.json() == {"not": "a user"}
+
+
 # ============================================================================
 # Guards/Permissions Tests
 # ============================================================================
