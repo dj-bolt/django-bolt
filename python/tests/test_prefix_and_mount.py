@@ -7,12 +7,14 @@ These tests verify:
 """
 
 import asyncio
+from typing import Annotated
 
 import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Router
 from django_bolt.middleware import Middleware
 from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
+from django_bolt.params import Query
 from django_bolt.testing import TestClient
 
 
@@ -121,6 +123,88 @@ class TestMountPathNormalization:
                 f"Mounted route should be accessible at /sub/hello, got {response.status_code}"
             )
             assert response.json() == {"message": "Hello from mounted API"}
+
+    @pytest.mark.parametrize("mount_path", ["/", "//", ""])
+    def test_mount_at_the_root_keeps_the_route_paths(self, mount_path):
+        """A mount at the root serves each route of the mounted API at its own path."""
+        main_api = BoltAPI()
+        sub_api = BoltAPI()
+
+        @sub_api.get("/hello")
+        async def hello():
+            return {"message": "hello"}
+
+        @sub_api.get("/")
+        async def root():
+            return {"message": "root"}
+
+        main_api.mount(mount_path, sub_api)
+
+        with TestClient(main_api) as client:
+            response = client.get("/hello")
+            assert response.status_code == 200
+            assert response.json() == {"message": "hello"}
+            response = client.get("/")
+            assert response.status_code == 200
+            assert response.json() == {"message": "root"}
+
+
+def test_an_api_cannot_mount_itself():
+    """mount() copies the routes of the mounted API. For the API itself, the copy never ends."""
+    api = BoltAPI()
+
+    @api.get("/a")
+    async def handler():
+        return {"ok": True}
+
+    with pytest.raises(ValueError, match="An API cannot mount itself"):
+        api.mount("/s", api)
+    assert [path for _method, path, _id, _handler in api._routes] == ["/a"]
+
+
+def test_an_api_cannot_mount_an_api_that_has_its_routes():
+    first = BoltAPI()
+    second = BoltAPI()
+
+    @first.get("/a")
+    async def handler():
+        return {"ok": True}
+
+    second.mount("/first", first)
+    with pytest.raises(ValueError, match="mount cycle"):
+        first.mount("/second", second)
+
+
+def test_a_mounted_handler_cannot_take_a_mount_path_parameter_as_an_argument():
+    """The mounted route was compiled without the mount path, so the argument reads the query."""
+    api = BoltAPI()
+    child = BoltAPI()
+
+    @child.get("/c")
+    async def handler(x: int):
+        return {"x": x}
+
+    with pytest.raises(ValueError, match=r"GET /c takes the parameter 'x' of the mount path '/t/\{x\}'"):
+        api.mount("/t/{x}", child)
+    assert api._routes == []
+
+
+def test_a_mounted_handler_reads_a_mount_path_parameter_from_the_request():
+    api = BoltAPI()
+    child = BoltAPI()
+
+    @child.get("/c")
+    async def from_request(request):
+        return {"x": request.params["x"]}
+
+    @child.get("/items/{item_id}")
+    async def own_parameter(item_id: int, x: Annotated[int, Query()] = 0):
+        return {"item_id": item_id, "x": x}
+
+    api.mount("/t/{x:int}", child)
+    with TestClient(api) as client:
+        assert client.get("/t/5/c").json() == {"x": "5"}
+        assert client.get("/t/5/items/7?x=9").json() == {"item_id": 7, "x": 9}
 
 
 class TestOpenAPIDocsWithPrefix:
@@ -250,6 +334,17 @@ class TestOpenAPIDocsWithPrefix:
                 f"API route should NOT be at /items (unprefixed), got {response.status_code}"
             )
 
+    def test_prefix_with_trailing_slash(self):
+        """The trailing slash of the prefix does not give a double slash in the route path."""
+        api = BoltAPI(prefix="/api/v1/")
+
+        @api.get("/users")
+        async def list_users():
+            return {"users": []}
+
+        with TestClient(api) as client:
+            assert client.get("/api/v1/users").status_code == 200
+
     def test_custom_docs_path_with_prefix(self):
         """Custom docs path should also be at absolute path."""
         api = BoltAPI(
@@ -305,6 +400,39 @@ class TestOpenAPIDocsWithPrefix:
 
             # API routes should appear
             assert "/api/items" in paths, f"API routes should be in schema: {paths}"
+
+
+@pytest.mark.parametrize(
+    ("route", "url", "expected"),
+    [
+        ("/ü", "/%C3%BC", {"route": "/ü"}),
+        ("/a b", "/a%20b", {"route": "/a b"}),
+        ("/ü/{x}", "/%C3%BC/3", {"route": "/ü/{x}", "x": 3}),
+        ("/a b/{x}/ü", "/a%20b/3/%C3%BC", {"route": "/a b/{x}/ü", "x": 3}),
+        # A path that has the escapes already keeps them.
+        ("/%C3%A9", "/%C3%A9", {"route": "/%C3%A9"}),
+    ],
+)
+def test_a_route_path_with_a_character_that_a_url_escapes_matches_the_request(route, url, expected):
+    """A client sends such a character as a percent escape, and the route answers."""
+    api = BoltAPI()
+
+    if "{x}" in route:
+
+        @api.get(route)
+        async def handler(x: int):
+            return {"route": route, "x": x}
+
+    else:
+
+        @api.get(route)
+        async def handler():
+            return {"route": route}
+
+    with TestClient(api) as client:
+        response = client.get(url)
+        assert response.status_code == 200, response.text
+        assert response.json() == expected
 
 
 class TestEmptyRouteRegistration:
@@ -465,6 +593,54 @@ class TestEmptyRouteRegistration:
             assert response.json() == {"message": "v1 root"}
 
 
+@pytest.mark.parametrize("path", ["/d", "/d/{x}"])
+def test_a_second_handler_for_the_method_and_path_of_a_route_stops_startup(path):
+    """A route does not replace an earlier route with no sign."""
+    api = BoltAPI()
+
+    @api.get(path)
+    async def first():
+        return {"handler": "first"}
+
+    @api.get(path)
+    async def second():
+        return {"handler": "second"}
+
+    with pytest.raises(ValueError, match="Failed to register route"):
+        TestClient(api)
+
+
+def test_two_mounted_apis_with_the_same_route_stop_startup():
+    api = BoltAPI()
+    for name in ("first", "second"):
+        child = BoltAPI()
+
+        @child.get("/d")
+        async def handler(name: str = name):
+            return {"handler": name}
+
+        api.mount("/m", child)
+
+    with pytest.raises(ValueError, match="GET /m/d is already registered"):
+        TestClient(api)
+
+
+def test_the_same_path_with_another_method_is_another_route():
+    api = BoltAPI()
+
+    @api.get("/d")
+    async def read():
+        return {"method": "GET"}
+
+    @api.post("/d")
+    async def write():
+        return {"method": "POST"}
+
+    with TestClient(api) as client:
+        assert client.get("/d").json() == {"method": "GET"}
+        assert client.post("/d").json() == {"method": "POST"}
+
+
 class TestTrailingSlashSetting:
     """Tests for trailing_slash parameter behavior."""
 
@@ -539,6 +715,12 @@ class TestTrailingSlashSetting:
         registered_paths = [path for _method, path, _handler_id, _handler in api._routes]
         assert "/with-slash/" in registered_paths, f"'keep' should preserve slash, got: {registered_paths}"
         assert "/no-slash" in registered_paths, f"'keep' should preserve no slash, got: {registered_paths}"
+
+    @pytest.mark.parametrize("value", ["bogus", "Strip", "", None, True])
+    def test_trailing_slash_refuses_an_unknown_mode(self, value):
+        """An unknown mode behaved as "keep", with no error."""
+        with pytest.raises(ValueError, match='trailing_slash must be "strip", "append" or "keep"'):
+            BoltAPI(trailing_slash=value)
 
     def test_trailing_slash_with_prefix_strip(self):
         """Strip mode with prefix normalizes combined path."""
@@ -647,3 +829,26 @@ def test_a_mounted_api_runs_its_own_python_middleware(handler_is_async):
 
     assert (child_response.json(), child_response.headers.get("x-api")) == ({"from": "child"}, "child")
     assert (plain_response.json(), plain_response.headers.get("x-api")) == ({"from": "plain"}, None)
+
+
+def test_include_router_prefix_applies_to_routes_added_before_and_after():
+    """The prefix of Router.include_router applies to each route of the child, whenever it was added."""
+    parent = Router(prefix="/v1")
+    child = Router(prefix="/users")
+
+    @child.get("/early")
+    async def early():
+        return {"route": "early"}
+
+    parent.include_router(child, prefix="/extra")
+
+    @child.get("/late")
+    async def late():
+        return {"route": "late"}
+
+    api = BoltAPI()
+    api.include_router(parent)
+
+    with TestClient(api) as client:
+        assert client.get("/v1/extra/users/early").json() == {"route": "early"}
+        assert client.get("/v1/extra/users/late").json() == {"route": "late"}

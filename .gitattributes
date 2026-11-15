@@ -1,0 +1,3 @@
+# Two pull requests that each add a CHANGELOG entry at one place do not conflict.
+# Git keeps the lines of the two sides.
+CHANGELOG.md merge=union
