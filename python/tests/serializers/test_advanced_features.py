@@ -404,8 +404,8 @@ class TestDumpMethods:
         [
             (
                 {"exclude_none": True},
-                {"name": "a", "weight": 1},
-                {"title": "untitled", "size": 1},
+                {"name": "a", "w": 1},
+                {"t": "untitled", "size": 1},
             ),
             (
                 {"exclude_defaults": True},
@@ -541,15 +541,16 @@ class TestSerializerViewApi:
         assert _ViewItem.exclude("note").only("id", "note", "name").dump(item) == {"id": 1, "name": "a"}
 
     def test_view_dump_json_forwards_each_option(self):
+        # The alias of a field is its key in each output; by_alias changes nothing.
         view = _ViewItem.exclude("note")
         item = _ViewItem(id=1, nick="y")
-        assert view.dump_json(item) == b'{"id":1,"name":null,"nick":"y"}'
-        assert view.dump_json(item, exclude_none=True) == b'{"id":1,"nick":"y"}'
-        assert view.dump_json(item, exclude_defaults=True) == b'{"id":1,"nick":"y"}'
+        assert view.dump_json(item) == b'{"id":1,"name":null,"nickName":"y"}'
+        assert view.dump_json(item, exclude_none=True) == b'{"id":1,"nickName":"y"}'
+        assert view.dump_json(item, exclude_defaults=True) == b'{"id":1,"nickName":"y"}'
         assert view.dump_json(item, by_alias=True) == b'{"id":1,"name":null,"nickName":"y"}'
-        assert view.dump_many_json([item]) == b'[{"id":1,"name":null,"nick":"y"}]'
-        assert view.dump_many_json([item], exclude_none=True) == b'[{"id":1,"nick":"y"}]'
-        assert view.dump_many_json([item], exclude_defaults=True) == b'[{"id":1,"nick":"y"}]'
+        assert view.dump_many_json([item]) == b'[{"id":1,"name":null,"nickName":"y"}]'
+        assert view.dump_many_json([item], exclude_none=True) == b'[{"id":1,"nickName":"y"}]'
+        assert view.dump_many_json([item], exclude_defaults=True) == b'[{"id":1,"nickName":"y"}]'
         assert view.dump_many_json([item], by_alias=True) == b'[{"id":1,"name":null,"nickName":"y"}]'
 
     def test_validate_returns_a_new_instance_or_raises(self):

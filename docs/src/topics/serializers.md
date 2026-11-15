@@ -138,6 +138,27 @@ user = UserSerializer(username="alice")
 print(user.email)  # None
 ```
 
+### Field aliases
+
+`field(alias=...)` sets the name of a field in JSON. Python code uses the field name:
+
+```python
+from django_bolt.serializers import Serializer, field
+
+class AccountSerializer(Serializer):
+    user_name: str = field(alias="userName")
+    age: int = 0
+
+account = AccountSerializer.model_validate({"userName": "alice"})
+print(account.user_name)  # alice
+print(account.dump())     # {"userName": "alice", "age": 0}
+```
+
+The alias is the key for input and for output: in a request body, in `model_validate()`, in `dump()` and in a response.
+The input does not accept the field name, as with `Field(alias=...)` in pydantic.
+A field has one name in JSON. Thus the `by_alias` argument of `dump()` has no effect.
+The alias wins over the `rename` option of the class.
+
 ## Field validation
 
 ### The field_validator decorator

@@ -93,7 +93,6 @@ class _DumpFieldSpec:
 
     field_name: str
     output_key: str
-    alias: str | None
     nested: _ModelOutputNested | None
     default_value: Any = _MISSING
 
@@ -161,25 +160,22 @@ def _build_rename_map(cls: type[msgspec.Struct]) -> dict[str, str]:
     """
     Build field name -> encoded name mapping for msgspec rename support.
 
-    This extracts the rename mapping (e.g., {"user_name": "userName"} for rename="camel")
-    by inspecting msgspec's field metadata.
+    This extracts the rename mapping (e.g., {"user_name": "userName"} for rename="camel",
+    or {"user_name": "u"} for field(alias="u")). It reads the names that msgspec
+    keeps on the class, so it does not resolve the annotations.
 
     Args:
         cls: A msgspec.Struct subclass
 
     Returns:
         Dict mapping Python field names to their encoded names.
-        Empty dict if no rename is configured or fields can't be resolved.
+        Empty dict if no field has another name in JSON.
     """
-    rename_map: dict[str, str] = {}
-    try:
-        for fi in msgspec_structs.fields(cls):
-            if fi.encode_name != fi.name:
-                rename_map[fi.name] = fi.encode_name
-    except NameError:
-        # Forward reference not resolvable yet
-        pass
-    return rename_map
+    return {
+        name: encode_name
+        for name, encode_name in zip(cls.__struct_fields__, cls.__struct_encode_fields__, strict=True)
+        if name != encode_name
+    }
 
 
 def _resolve_dump_default(default_value: Any) -> Any:
@@ -345,8 +341,18 @@ class _SerializerMeta(_STRUCT_META):
             for field_name, value in namespace.items()
             if isinstance(value, _FieldMarker) and not value.config.has_default()
         }
-        for field_name in required_field_configs:
-            del namespace[field_name]
+        # field(alias=...) is the name of the field in JSON, for input and for
+        # output. msgspec has one such name for each field, so the alias goes
+        # there. A required field keeps only the name. A field with a default
+        # keeps the marker as the default, as for a field with no alias.
+        for field_name, config in required_field_configs.items():
+            if config.alias:
+                namespace[field_name] = msgspec.field(name=config.alias)
+            else:
+                del namespace[field_name]
+        for field_name, value in list(namespace.items()):
+            if isinstance(value, _FieldMarker) and value.config.alias:
+                namespace[field_name] = msgspec.field(default=value, name=value.config.alias)
         cls = cast(Any, super().__new__(mcs, name, bases, namespace, **kwargs))
 
         # A subclass keeps the config of its parents. A field that the subclass
@@ -1268,7 +1274,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 _DumpFieldSpec(
                     field_name=field_name,
                     output_key=rename_map.get(field_name, field_name),
-                    alias=field_config.alias if field_config else None,
                     nested=_get_model_output_nested(cls.__cached_type_hints__.get(field_name, Any))
                     if field_name in nested_fields
                     else None,
@@ -2339,7 +2344,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys (not yet implemented)
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             Dictionary representation of the serializer
@@ -2424,8 +2429,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if exclude_defaults and spec.default_value is not _MISSING and value == spec.default_value:
                 continue
 
-            # Determine output key: by_alias takes precedence, then rename_map
-            output_key = spec.alias if by_alias and spec.alias else spec.output_key
+            # The wire name of the field: its alias, or the name from the rename option.
+            output_key = spec.output_key
 
             if isinstance(value, (BaseManager, QuerySet)):
                 raise SerializationError(
@@ -2500,7 +2505,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             JSON bytes representation
@@ -2531,7 +2536,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             List of dictionary representations
@@ -2592,7 +2597,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             JSON bytes representation of the list
@@ -2707,7 +2712,7 @@ class SerializerView(Iterable[T]):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             Filtered dictionary representation
@@ -2740,7 +2745,7 @@ class SerializerView(Iterable[T]):
             exclude_none: If True, exclude fields with None values
             exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
-            by_alias: If True, use field aliases as keys
+            by_alias: No effect. The alias of a field is its key in each output
 
         Returns:
             List of filtered dictionary representations
