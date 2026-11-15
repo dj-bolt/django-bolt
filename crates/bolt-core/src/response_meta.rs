@@ -247,6 +247,27 @@ mod tests {
         assert_eq!(ResponseType::from_str("unknown"), ResponseType::OctetStream);
     }
 
+    /// Python sends these tags (`_RESPONSE_META_*` in `serialization.py`).
+    #[test]
+    fn each_meta_tag_gives_its_static_meta() {
+        let tags = [
+            (0, ResponseType::Json),
+            (1, ResponseType::PlainText),
+            (2, ResponseType::OctetStream),
+            (3, ResponseType::Empty),
+            (4, ResponseType::Html),
+        ];
+        for (tag, response_type) in tags {
+            let meta = ResponseMeta::from_tag(tag);
+            assert_eq!(
+                meta.map(|meta| meta.response_type),
+                Some(response_type),
+                "tag {tag}"
+            );
+        }
+        assert!(ResponseMeta::from_tag(5).is_none());
+    }
+
     #[test]
     fn test_response_type_content_type() {
         assert_eq!(ResponseType::Empty.content_type(), "");

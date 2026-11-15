@@ -85,6 +85,15 @@ def api():
         """Return the values that the request scheme sets."""
         return {"server_port": request.META["SERVER_PORT"], "absolute_uri": request.build_absolute_uri()}
 
+    @api.get("/meta/scheme-attribute")
+    async def get_scheme_attribute(request):
+        """Return the scheme of the request, and the scheme of its absolute URI."""
+        return {
+            "scheme": request.scheme,
+            "is_secure": request.is_secure(),
+            "absolute_uri": request.build_absolute_uri(),
+        }
+
     @api.get("/meta/absolute")
     async def get_meta_absolute(request):
         """Return the absolute URI of the request."""
@@ -232,6 +241,8 @@ class TestRequestMETA:
         assert meta["SERVER_NAME"] == "example.com"
         assert meta["SERVER_PORT"] == "8080"
         assert meta["SERVER_PROTOCOL"] == "HTTP/1.1"
+        # Bolt does not end TLS, and this client is not a trusted proxy.
+        assert meta["wsgi.url_scheme"] == "http"
 
     def test_meta_server_info_default_port(self, client):
         """META parses Host header without port correctly."""
@@ -306,6 +317,38 @@ class TestRequestMETA:
             response = client.get("/meta/scheme", headers={"Host": "example.com", "X-Forwarded-Proto": "https"})
         assert response.status_code == 200
         assert response.json() == {"server_port": "80", "absolute_uri": "https://example.com/meta/scheme"}
+
+    @pytest.mark.parametrize(
+        ("extra_settings", "forwarded_proto", "scheme"),
+        [
+            ({}, None, "http"),
+            # X-Forwarded-Proto counts only from a peer in BOLT_TRUSTED_PROXIES.
+            ({}, "https", "http"),
+            ({"BOLT_TRUSTED_PROXIES": ["127.0.0.1"]}, "https", "https"),
+            ({"BOLT_TRUSTED_PROXIES": ["127.0.0.1"]}, "ftp", "http"),
+            # SECURE_PROXY_SSL_HEADER applies on top, as in Django.
+            ({"SECURE_PROXY_SSL_HEADER": ("HTTP_X_FORWARDED_PROTO", "https")}, "https", "https"),
+            (
+                {"BOLT_TRUSTED_PROXIES": ["127.0.0.1"], "SECURE_PROXY_SSL_HEADER": ("HTTP_X_SCHEME", "https")},
+                "https",
+                "http",
+            ),
+        ],
+    )
+    def test_scheme_and_is_secure_are_the_scheme_of_build_absolute_uri(
+        self, api, extra_settings, forwarded_proto, scheme
+    ):
+        headers = {"Host": "example.com", "X-Scheme": "http"}
+        if forwarded_proto is not None:
+            headers["X-Forwarded-Proto"] = forwarded_proto
+        with override_settings(**extra_settings), TestClient(api) as client:
+            response = client.get("/meta/scheme-attribute", headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {
+            "scheme": scheme,
+            "is_secure": scheme == "https",
+            "absolute_uri": f"{scheme}://example.com/meta/scheme-attribute",
+        }
 
     def test_build_absolute_uri_allows_the_host_of_the_default_test_client(self, api):
         """Django's test runner adds `testserver` to ALLOWED_HOSTS. TestClient sends that host."""

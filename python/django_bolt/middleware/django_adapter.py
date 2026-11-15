@@ -22,9 +22,13 @@ from collections.abc import Callable
 from functools import partial
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote_to_bytes
+
+import msgspec
 
 from .._core import RequestLane, populate_response_cookies
 from ..concurrency import drive_on_lane, in_lane_mode, run_orm_blocking
+from ..exceptions import HTTPException, ValidationException
 from ..middleware_response import (
     _BODY_BYTES,
     _BODY_FILE,
@@ -33,6 +37,7 @@ from ..middleware_response import (
     _response_type_content_type,
     _split_content_type_headers,
 )
+from ..responses import StreamingResponse
 from ..serialization import _BOLT_RESPONSE_TYPES, serialize_bolt_response
 
 try:
@@ -44,18 +49,72 @@ try:
         markcoroutinefunction,
         sync_to_async,
     )
+    from django.core.exceptions import BadRequest, SuspiciousOperation
     from django.http import HttpRequest, HttpResponse, QueryDict
+    from django.http.multipartparser import MultiPartParserError
     from django.utils.deprecation import MiddlewareMixin
+    from django.utils.encoding import repercent_broken_unicode
     from django.utils.functional import LazyObject, empty
     from django.utils.module_loading import import_string
+
+    class _BoltHttpRequest(HttpRequest):
+        """The Django request that a Django middleware gets on a Bolt route.
+
+        It reads POST and FILES on first use, as WSGIRequest does. The base class
+        sets both to empty values. A multipart form needs a parse.
+        """
+
+        def __init__(self):
+            super().__init__()
+            del self._post, self._files
+            self._read_started = False
+
+        def _get_scheme(self) -> str:
+            # The scheme of the Bolt request, as WSGIRequest reads it from the
+            # server. Django applies SECURE_PROXY_SSL_HEADER on top of it.
+            return self.META["wsgi.url_scheme"]
+
+        # Django maps these two errors to a 400 response. Bolt maps SuspiciousOperation to 400.
+        def _set_content_type_params(self, meta):
+            try:
+                super()._set_content_type_params(meta)
+            except BadRequest as exc:
+                raise SuspiciousOperation(str(exc)) from exc
+
+        def _load_post_and_files(self):
+            try:
+                super()._load_post_and_files()
+            except (BadRequest, MultiPartParserError) as exc:
+                raise SuspiciousOperation(str(exc)) from exc
+
+        def _get_post(self):
+            if not hasattr(self, "_post"):
+                self._load_post_and_files()
+            return self._post
+
+        def _set_post(self, post):
+            self._post = post
+
+        def _get_files(self):
+            if not hasattr(self, "_files"):
+                self._load_post_and_files()
+            return self._files
+
+        def _set_files(self, files):
+            self._files = files
+
+        POST = property(_get_post, _set_post)
+        FILES = property(_get_files, _set_files)
 
     DJANGO_AVAILABLE = True
 except ImportError:
     DJANGO_AVAILABLE = False
+    _BoltHttpRequest = None
     async_to_sync = None
     ThreadSensitiveContext = None
     SyncToAsync = None
     HttpRequest = None
+    repercent_broken_unicode = None
     HttpResponse = None
     QueryDict = None
     import_string = None
@@ -282,7 +341,19 @@ class DjangoMiddleware:
                 _sync_request_attributes(django_request, bolt_request)
 
             # Await the async get_response directly - no bridging needed
-            bolt_resp = await self.get_response(bolt_request)
+            try:
+                bolt_resp = await self.get_response(bolt_request)
+            except Exception as exc:
+                # Django calls process_exception when the view raises.
+                if exception_hook is None or isinstance(exc, _RESPONSE_EXCEPTIONS):
+                    raise
+                if exception_hook is raw_exception_hook:
+                    response = exception_hook(django_request, exc)
+                else:
+                    response = await exception_hook(django_request, exc)
+                if response is None:
+                    raise
+                return response
             return _to_django_response(bolt_resp)
 
         # Mark the bridge as a coroutine function so Django's MiddlewareMixin
@@ -311,6 +382,10 @@ class DjangoMiddleware:
         view_hook = raw_view_hook
         if raw_view_hook is not None and not _is_django_builtin_middleware(self.middleware_class):
             view_hook = sync_to_async(raw_view_hook, thread_sensitive=True)
+        raw_exception_hook = getattr(self._middleware_instance, "process_exception", None)
+        exception_hook = raw_exception_hook
+        if raw_exception_hook is not None and not _is_django_builtin_middleware(self.middleware_class):
+            exception_hook = sync_to_async(raw_exception_hook, thread_sensitive=True)
 
         # Check if the middleware instance is async-capable
         # MiddlewareMixin sets this when get_response is async
@@ -350,11 +425,19 @@ class DjangoMiddleware:
                         return response
                     # process_view can set request attributes for the handler.
                     _sync_request_attributes(django_request, bolt_request)
-                bolt_resp = drive_on_lane(self.get_response(bolt_request))
+                try:
+                    bolt_resp = drive_on_lane(self.get_response(bolt_request))
+                except Exception as exc:
+                    response = _first_exception_response(lane_exception_hooks, django_request, exc)
+                    if response is None:
+                        raise
+                    return response
                 return _to_django_response(bolt_resp)
 
             self._lane_instance = self.middleware_class(lane_get_response, **self.init_kwargs)
             lane_view_hook = getattr(self._lane_instance, "process_view", None)
+            lane_exception_hook = getattr(self._lane_instance, "process_exception", None)
+            lane_exception_hooks = () if lane_exception_hook is None else (lane_exception_hook,)
 
     @property
     def supports_lane_dispatch(self) -> bool:
@@ -439,6 +522,25 @@ class DjangoMiddleware:
 def _noop_get_response(request):
     """Placeholder get_response for hook-based middleware that never gets called."""
     raise RuntimeError("Hook-based middleware should not call get_response")
+
+
+# Bolt answers these exceptions with the response that they describe.
+# They are responses of the API, not errors for ``process_exception``.
+_RESPONSE_EXCEPTIONS = (HTTPException, ValidationException, msgspec.ValidationError)
+
+
+def _first_exception_response(hooks: Any, django_request: HttpRequest, exception: Exception) -> HttpResponse | None:
+    """Call the sync ``process_exception`` hooks in order. Return the first response, or None.
+
+    ``hooks`` holds the hooks in reverse order of the middleware, as Django calls them.
+    """
+    if isinstance(exception, _RESPONSE_EXCEPTIONS):
+        return None
+    for hook in hooks:
+        response = hook(django_request, exception)
+        if response is not None:
+            return response
+    return None
 
 
 def _view_callback(request: Request) -> Callable:
@@ -542,6 +644,8 @@ class DjangoMiddlewareStack:
         "_call_middleware_chain_async",  # Precomputed sync_to_async wrapper
         "_request_phase_async",  # One thread hop for all request-phase hooks
         "_response_phase_async",  # One thread hop for all response-phase hooks
+        "_exception_phase_async",  # One thread hop for all process_exception hooks
+        "_exception_hooks",  # process_exception hooks of the hook middleware, the last one first
         "_compatibility_chain",  # Correctness-first mixed hook/call-only path
         "_ordered_hook_middleware",  # Hook middleware in declared order
     )
@@ -552,13 +656,19 @@ class DjangoMiddlewareStack:
 
         Args:
             middleware_classes: List of Django middleware classes (not instances)
-                               in the order they should be applied (outermost first)
+                               in the order they should be applied (outermost first).
+                               An entry can be the dotted path of a class.
         """
         if not DJANGO_AVAILABLE:
             raise ImportError(
                 "Django is required to use DjangoMiddlewareStack. Install Django with: pip install django"
             )
 
+        # A dotted path string becomes its class, as in DjangoMiddleware.
+        middleware_classes = [
+            import_string(middleware) if isinstance(middleware, str) else middleware
+            for middleware in middleware_classes
+        ]
         for middleware in middleware_classes:
             _check_capabilities(middleware)
         self.middleware_classes = middleware_classes
@@ -569,6 +679,8 @@ class DjangoMiddlewareStack:
         self._call_middleware_chain_async = None
         self._request_phase_async = None
         self._response_phase_async = None
+        self._exception_phase_async = None
+        self._exception_hooks = ()
         self._compatibility_chain = None
         self._ordered_hook_middleware = []
 
@@ -594,7 +706,7 @@ class DjangoMiddlewareStack:
         is_django_builtin = _is_django_builtin_middleware(middleware_class)
         instance = middleware_class(_noop_get_response)
         entry = {"instance": instance, "is_django_builtin": is_django_builtin}
-        for name in ("process_request", "process_view", "process_response"):
+        for name in ("process_request", "process_view", "process_response", "process_exception"):
             raw = getattr(instance, name, None)
             # The plain sync hook. One thread hop runs all of them in order.
             entry[f"raw_{name}"] = raw
@@ -629,6 +741,8 @@ class DjangoMiddlewareStack:
         self._call_middleware_chain_async = None
         self._request_phase_async = None
         self._response_phase_async = None
+        self._exception_phase_async = None
+        self._exception_hooks = ()
         self._compatibility_chain = None
         self._ordered_hook_middleware = []
 
@@ -654,6 +768,15 @@ class DjangoMiddlewareStack:
                 self._request_phase_async = sync_to_async(self._run_request_phase, thread_sensitive=True)
             if any(e["raw_process_response"] for e in entries):
                 self._response_phase_async = sync_to_async(self._run_response_phase, thread_sensitive=True)
+            if any(e["raw_process_exception"] for e in entries):
+                self._exception_phase_async = sync_to_async(self._run_exception_phase, thread_sensitive=True)
+
+        # Django calls process_exception of the last middleware first.
+        self._exception_hooks = tuple(
+            entry["raw_process_exception"]
+            for entry in reversed(self._ordered_hook_middleware)
+            if entry["raw_process_exception"] is not None
+        )
 
         has_hook_middleware = bool(self._ordered_hook_middleware)
         has_call_only_middleware = bool(call_only_classes)
@@ -711,8 +834,14 @@ class DjangoMiddlewareStack:
                 django_response = hook(django_request, django_response)
         return django_response
 
+    def _run_exception_phase(self, django_request: HttpRequest, exception: Exception) -> HttpResponse | None:
+        """Run process_exception of each middleware, in reverse order. The first response wins."""
+        return _first_exception_response(self._exception_hooks, django_request, exception)
+
     def _build_call_only_chain(self, call_only_classes: list) -> Callable:
         """Build the sync middleware chain for __call__-only middleware."""
+        # The loop below fills this list, the last middleware first.
+        exception_hooks: list[Callable] = []
 
         def innermost_sync_handler(django_request):
             """Sync bridge that calls async handler via async_to_sync."""
@@ -720,21 +849,43 @@ class DjangoMiddlewareStack:
             bolt_request = ctx["bolt_request"]
 
             _sync_request_attributes(django_request, bolt_request)
-            if in_lane_mode():
-                bolt_resp = drive_on_lane(self.get_response(bolt_request))
-            else:
-                bolt_resp = async_to_sync(self.get_response)(bolt_request)
+            try:
+                if in_lane_mode():
+                    bolt_resp = drive_on_lane(self.get_response(bolt_request))
+                else:
+                    bolt_resp = async_to_sync(self.get_response)(bolt_request)
+            except Exception as exc:
+                # This function runs on the thread of the request, so the hooks run direct.
+                response = _first_exception_response(exception_hooks, django_request, exc)
+                if response is None:
+                    raise
+                return response
 
             return _to_django_response(bolt_resp)
 
         chain = innermost_sync_handler
         for middleware_class in reversed(call_only_classes):
             chain = middleware_class(chain)
+            hook = getattr(chain, "process_exception", None)
+            if hook is not None:
+                exception_hooks.append(hook)
 
         return chain
 
     def _build_compatibility_chain(self) -> Callable:
         """Build correctness-first chain for mixed hook + __call__ middleware."""
+        # The (raw hook, hook for the loop) pairs of process_exception. The loop
+        # below fills this list, the last middleware first.
+        exception_hooks: list[tuple[Callable, Callable]] = []
+
+        def add_exception_hook(instance: Any, middleware_class: type) -> None:
+            raw = getattr(instance, "process_exception", None)
+            if raw is None:
+                return
+            if _is_django_builtin_middleware(middleware_class):
+                exception_hooks.append((raw, raw))
+            else:
+                exception_hooks.append((raw, sync_to_async(raw, thread_sensitive=True)))
 
         async def terminal(django_request):
             ctx = _request_context.get()
@@ -764,7 +915,16 @@ class DjangoMiddlewareStack:
                 # process_view can set request attributes for the handler.
                 _sync_request_attributes(django_request, bolt_request)
 
-            bolt_response = await self.get_response(bolt_request)
+            try:
+                bolt_response = await self.get_response(bolt_request)
+            except Exception as exc:
+                if isinstance(exc, _RESPONSE_EXCEPTIONS):
+                    raise
+                for raw, hook in exception_hooks:
+                    response = await self._invoke_hook(raw, hook, django_request, exc)
+                    if response is not None:
+                        return response
+                raise
             return _to_django_response(bolt_response)
 
         chain = terminal
@@ -772,6 +932,8 @@ class DjangoMiddlewareStack:
         for middleware_class in reversed(self.middleware_classes):
             if self._has_hook_methods(middleware_class):
                 entry = self._create_hook_entry(middleware_class)
+                if entry["raw_process_exception"] is not None:
+                    exception_hooks.append((entry["raw_process_exception"], entry["process_exception"]))
                 next_layer = chain
 
                 async def hook_layer(django_request, *, _entry=entry, _next=next_layer):
@@ -809,6 +971,7 @@ class DjangoMiddlewareStack:
                 # Django gives an async-only middleware an async get_response.
                 # The layer awaits its result, which can be any awaitable.
                 instance = middleware_class(next_layer)
+                add_exception_hook(instance, middleware_class)
 
                 async def call_layer(django_request, *, _instance=instance):
                     return await _instance(django_request)
@@ -822,6 +985,7 @@ class DjangoMiddlewareStack:
                 return async_to_sync(_next)(django_request)
 
             instance = middleware_class(get_response_sync)
+            add_exception_hook(instance, middleware_class)
             if iscoroutinefunction(instance):
 
                 async def call_layer(django_request, *, _instance=instance):
@@ -882,7 +1046,20 @@ class DjangoMiddlewareStack:
             else:
                 django_response, entered = await self._request_phase_async(django_request, request)
             if django_response is None:
-                django_response = _to_django_response(await self.get_response(request))
+                try:
+                    bolt_response = await self.get_response(request)
+                except Exception as exc:
+                    # Django calls process_exception when the view raises.
+                    if not self._exception_hooks:
+                        raise
+                    if inline or self._exception_phase_async is None:
+                        django_response = self._run_exception_phase(django_request, exc)
+                    else:
+                        django_response = await self._exception_phase_async(django_request, exc)
+                    if django_response is None:
+                        raise
+                else:
+                    django_response = _to_django_response(bolt_response)
             if inline or self._response_phase_async is None:
                 django_response = self._run_response_phase(django_request, django_response, entered)
             else:
@@ -925,12 +1102,18 @@ def _to_django_request(request: Request) -> HttpRequest:
     - Reuse empty dicts/QueryDicts where possible
     - Use direct attribute assignment (faster than setattr)
     """
-    django_request = HttpRequest()
+    django_request = _BoltHttpRequest()
 
     # Copy basic attributes (direct assignment is faster)
     django_request.method = request.method
-    django_request.path = request.path
-    django_request.path_info = request.path
+    # Django servers give the decoded path. Rust gives the encoded one.
+    path = request.path
+    if "%" in path:
+        # An invalid UTF-8 sequence stays percent-encoded, as in Django's WSGI handler.
+        path = repercent_broken_unicode(unquote_to_bytes(path)).decode()
+        request.META["PATH_INFO"] = path
+    django_request.path = path
+    django_request.path_info = path
 
     # One META dict per request. Rust builds it once (REMOTE_ADDR from the
     # client-ip resolver, SERVER_NAME from Host, HTTP_* headers) and caches it,
@@ -943,33 +1126,23 @@ def _to_django_request(request: Request) -> HttpRequest:
     # time, ensuring Rust always parses and passes cookies to Python
     django_request.COOKIES = request.raw_cookies
 
-    # Query params - only create mutable QueryDict if we have params
-    if request.query:
-        django_request.GET = QueryDict(mutable=True)
-        for key, value in request.query.items():
-            # A sequence parameter holds the list of the values of its repeated key.
-            if isinstance(value, list):
-                django_request.GET.setlist(key, value)
-            else:
-                django_request.GET[key] = value
+    # Query params. Django parses the encoded query string, so a repeated key
+    # keeps all its values. Rust gives one value for a key that the handler does not declare as a list.
+    query_string = django_request.META["QUERY_STRING"]
+    if query_string:
+        django_request.GET = QueryDict(query_string, mutable=True)
     else:
         django_request.GET = _get_empty_querydict()  # Reuse singleton (no allocation)
 
-    # Parse POST data for form submissions (needed for CSRF token validation)
-    # Django's CsrfViewMiddleware reads request.POST['csrfmiddlewaretoken']
-    content_type = request.headers.get("content-type", "")
-    body = request.body if request.body else b""
-
-    if body and "application/x-www-form-urlencoded" in content_type:
-        # Parse form data into POST QueryDict
-        django_request.POST = QueryDict(body, mutable=False)
-    else:
-        django_request.POST = _get_empty_querydict()  # Reuse singleton (no allocation)
-
     # Store body for raw access
+    body = request.body if request.body else b""
     django_request._body = body
     # An empty body needs a stream too, so request.read() gives b"" as in Django.
     django_request._stream = io.BytesIO(body)
+
+    # Django parses POST and FILES on first read, from the content type.
+    # This gives a multipart form to CsrfViewMiddleware, as with Django.
+    django_request._set_content_type_params(django_request.META)
 
     return django_request
 
@@ -1176,6 +1349,19 @@ def _to_django_response(response: Response) -> HttpResponse:
     return django_response
 
 
+async def _stream_django_response(django_response: HttpResponse):
+    """Yield the chunks of a Django streaming response, then close it."""
+    try:
+        if django_response.is_async:
+            async for chunk in django_response.streaming_content:
+                yield chunk
+        else:
+            for chunk in django_response.streaming_content:
+                yield chunk
+    finally:
+        django_response.close()
+
+
 def _to_bolt_response(django_response: HttpResponse) -> MiddlewareResponse:
     """Convert Django HttpResponse to MiddlewareResponse for chain compatibility."""
     headers = dict(django_response.items())
@@ -1206,13 +1392,18 @@ def _to_bolt_response(django_response: HttpResponse) -> MiddlewareResponse:
                 )
             )
 
-    body = django_response.content
+    # A Django streaming response, such as FileResponse, has no ``content``.
+    streaming = django_response.streaming
+    body = StreamingResponse(_stream_django_response(django_response)) if streaming else django_response.content
     # The headers hold the Content-Type. A response without one stays without one.
     response_type = "json" if django_response.has_header("Content-Type") else "empty"
     body_kind = _BODY_BYTES
 
     if preserved_body is not None:
         body_kind, body = preserved_body
+    elif streaming:
+        body_kind = _BODY_STREAM
+    if body_kind != _BODY_BYTES:
         response_type = "file" if body_kind == _BODY_FILE else "streaming"
         # The final Rust file/stream response computes its own transport length.
         headers = {k: v for k, v in headers.items() if k.lower() not in _REBUILT_BODY_HEADER_NAMES}
