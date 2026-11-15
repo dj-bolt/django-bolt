@@ -160,25 +160,22 @@ def _build_rename_map(cls: type[msgspec.Struct]) -> dict[str, str]:
     """
     Build field name -> encoded name mapping for msgspec rename support.
 
-    This extracts the rename mapping (e.g., {"user_name": "userName"} for rename="camel")
-    by inspecting msgspec's field metadata.
+    This extracts the rename mapping (e.g., {"user_name": "userName"} for rename="camel",
+    or {"user_name": "u"} for field(alias="u")). It reads the names that msgspec
+    keeps on the class, so it does not resolve the annotations.
 
     Args:
         cls: A msgspec.Struct subclass
 
     Returns:
         Dict mapping Python field names to their encoded names.
-        Empty dict if no rename is configured or fields can't be resolved.
+        Empty dict if no field has another name in JSON.
     """
-    rename_map: dict[str, str] = {}
-    try:
-        for fi in msgspec_structs.fields(cls):
-            if fi.encode_name != fi.name:
-                rename_map[fi.name] = fi.encode_name
-    except NameError:
-        # Forward reference not resolvable yet
-        pass
-    return rename_map
+    return {
+        name: encode_name
+        for name, encode_name in zip(cls.__struct_fields__, cls.__struct_encode_fields__, strict=True)
+        if name != encode_name
+    }
 
 
 def _resolve_dump_default(default_value: Any) -> Any:
