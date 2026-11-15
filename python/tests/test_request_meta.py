@@ -232,6 +232,8 @@ class TestRequestMETA:
         assert meta["SERVER_NAME"] == "example.com"
         assert meta["SERVER_PORT"] == "8080"
         assert meta["SERVER_PROTOCOL"] == "HTTP/1.1"
+        # Bolt does not end TLS, and this client is not a trusted proxy.
+        assert meta["wsgi.url_scheme"] == "http"
 
     def test_meta_server_info_default_port(self, client):
         """META parses Host header without port correctly."""

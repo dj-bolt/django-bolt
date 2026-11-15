@@ -878,6 +878,11 @@ def test_options_on_nonexistent_route(client):
         ("PATCH", "/plain", "GET, OPTIONS"),
         ("PUT", "/items/3", "GET, DELETE, OPTIONS"),
         ("POST", "/files/a/b.txt", "GET, OPTIONS"),
+        # Each form of a %XX escape is the same route path.
+        ("POST", "/%C3%BC", "GET, OPTIONS"),
+        ("POST", "/%c3%bc", "GET, OPTIONS"),
+        ("POST", "/pl%61in", "GET, OPTIONS"),
+        ("PUT", "/items/%33", "GET, DELETE, OPTIONS"),
     ],
 )
 def test_wrong_method_on_a_route_path_answers_405_with_allow(method, path, allow):
@@ -899,6 +904,10 @@ def test_wrong_method_on_a_route_path_answers_405_with_allow(method, path, allow
     @api.get("/files/{file_path:path}")
     async def get_file(file_path: str):
         return {"file_path": file_path}
+
+    @api.get("/ü")
+    async def get_non_ascii():
+        return {"ok": True}
 
     with TestClient(api) as client:
         response = client.request(method, path)
