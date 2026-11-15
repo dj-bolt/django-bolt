@@ -118,6 +118,8 @@ async def get_comment(post_id: int, comment_id: int):
     return {"post_id": post_id, "comment_id": comment_id}
 ```
 
+Give each parameter of a path its own name. A path with one name two times, such as `/d/{x}/{x}`, raises `ValueError` at registration.
+
 See [Request Handling](requests.md) for details on path parameters, query parameters, headers, cookies, form data, and file uploads.
 
 ## Route options
