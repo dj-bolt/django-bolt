@@ -37,6 +37,15 @@ _SOURCE_IDS = {
 }
 
 
+def is_async_dependency(dep_fn: Callable) -> bool:
+    """Whether a call of ``dep_fn`` gives a coroutine.
+
+    This is true for an ``async def`` function, and for an object whose class
+    has ``async def __call__``. Call this at registration.
+    """
+    return inspect.iscoroutinefunction(dep_fn) or inspect.iscoroutinefunction(type(dep_fn).__call__)
+
+
 def compile_dependency(
     dep_fn: Callable,
     handler_meta: dict[Any, dict[str, Any]],
@@ -70,6 +79,7 @@ def _compile_dep_arg_plan(
     and its sync form goes to ``_dep_nested_sync``. All of this is cached in
     dep_meta, so each request iterates plain tuples.
     """
+    _refuse_generator(dep_fn)
     plan: list[tuple[int, Any, bool, str]] = []
     nested_markers: list[tuple[str, DependsMarker, DependsMarker]] = []
     for field in dep_meta["fields"]:
@@ -98,7 +108,7 @@ def _compile_dep_arg_plan(
                 compile_dependency(sync_marker.dependency, handler_meta, compile_binder, http_method, path),
             )
         )
-    dep_meta["_is_async_dep"] = inspect.iscoroutinefunction(dep_fn)
+    dep_meta["_is_async_dep"] = is_async_dependency(dep_fn)
     dep_meta["_is_request_only_dep"] = dep_meta.get("mode") == "request_only"
     dep_meta["_dep_nested"] = nested
     dep_meta["_dep_nested_sync"] = nested_sync
@@ -134,7 +144,7 @@ def dependency_needs_event_loop(
     sync handler, a nested dependency counts in its sync form, as
     :func:`resolve_dependency_sync` resolves it.
     """
-    if inspect.iscoroutinefunction(dep_fn):
+    if is_async_dependency(dep_fn):
         return True
     dep_meta = compile_dependency(dep_fn, handler_meta, compile_binder, http_method, path)
     nested = dep_meta["_dep_nested_sync"] if sync_handler else dep_meta["_dep_nested"]
@@ -144,6 +154,32 @@ def dependency_needs_event_loop(
         )
         for _, marker, _ in nested
     )
+
+
+def shared_dependencies(
+    entries: list[tuple[DependsMarker, dict[str, Any]]],
+) -> tuple[tuple[DependsMarker, dict[str, Any]], ...]:
+    """The cached dependencies that two or more of ``entries`` need.
+
+    Each entry is the (marker, binding) of a dependency that the injector
+    resolves at the same time as the other entries. A dependency that two of
+    them need must have its value in the cache before they start. If not, each
+    one finds an empty cache and calls it. Call this at registration.
+    """
+    owners: dict[Callable, int] = {}
+    shared: dict[Callable, tuple[DependsMarker, dict[str, Any]]] = {}
+
+    def visit(owner: int, marker: DependsMarker, dep_meta: dict[str, Any]) -> None:
+        if marker.use_cache:
+            first_owner = owners.setdefault(marker.dependency, owner)
+            if first_owner != owner:
+                shared.setdefault(marker.dependency, (marker, dep_meta))
+        for _, nested_marker, nested_meta in dep_meta["_dep_nested"]:
+            visit(owner, nested_marker, nested_meta)
+
+    for owner, (marker, dep_meta) in enumerate(entries):
+        visit(owner, marker, dep_meta)
+    return tuple(shared.values())
 
 
 _REQUEST_DATA_SOURCES = frozenset(("path", "query", "header", "cookie", "body", "form", "file"))
@@ -189,6 +225,17 @@ def decode_body_once(request_cache: dict[Any, Any], extractor: Callable, body: b
     if value is _NOT_DECODED:
         value = request_cache[extractor] = extractor(body)
     return value
+
+
+def _refuse_generator(dep_fn: Callable) -> None:
+    """Raise TypeError for a generator function. A call of it gives a generator, not a value."""
+    for fn in (dep_fn, type(dep_fn).__call__):
+        if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
+            name = getattr(dep_fn, "__name__", type(dep_fn).__name__)
+            raise TypeError(
+                f"Dependency {name} is a generator function. Bolt has no cleanup dependencies: "
+                "it does not run the code after `yield`. Return the value, and do the cleanup in the handler."
+            )
 
 
 def _dep_meta(
