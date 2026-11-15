@@ -47,6 +47,27 @@ def test_admin_root_redirect():
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("urlconf", "login_path"),
+    [
+        ("tests.admin_tests.urls_regex_prefix", "/manage/login/"),
+        ("tests.admin_tests.urls_include_before_admin", "/backoffice/login/"),
+    ],
+)
+def test_admin_mount_uses_the_prefix_of_the_admin_site(settings, urlconf, login_path):
+    """The admin answers at the prefix of its URL pattern, also for a regex pattern or a later pattern."""
+    settings.ROOT_URLCONF = urlconf
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        response = client.get(login_path)
+
+    assert response.status_code == 200
+    assert "csrfmiddlewaretoken" in response.text
+
+
+@pytest.mark.django_db(transaction=True)
 def test_admin_login_page():
     """Test /admin/login/ returns HTML page (not empty body) via TestClient."""
     from django_bolt.admin.admin_detection import should_enable_admin  # noqa: PLC0415
