@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Annotated, Any, Literal, get_args, get_origin
 from uuid import UUID
 
@@ -116,7 +117,7 @@ class TestChoicesFieldDetection:
         [
             (models.TextField(), str),
             (models.FloatField(), float),
-            (models.DecimalField(max_digits=5, decimal_places=2), float),
+            (models.DecimalField(max_digits=5, decimal_places=2), Decimal),
             (models.BooleanField(), bool),
             (models.DateTimeField(), datetime),
             (models.DateField(), date),

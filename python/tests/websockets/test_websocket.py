@@ -362,6 +362,11 @@ async def test_websocket_path_param_is_url_decoded(api):
         ("/ws/ü b/{room}", "/ws/%C3%BC%20b/x%20y", "/ws/ü b/x y"),
         # A path that has the escapes already keeps them.
         ("/ws/%C3%A9", "/ws/%C3%A9", "/ws/%C3%A9"),
+        # Each form of an escape matches, as for an HTTP route.
+        ("/ws/ü", "/ws/%c3%bc", "/ws/ü"),
+        ("/ws/ü b/{room}", "/ws/%c3%Bc%20b/x%2fy", "/ws/ü b/x/y"),
+        ("/ws/a:b", "/ws/%61%3ab", "/ws/a:b"),
+        ("/ws/%c3%a9", "/ws/%C3%A9", "/ws/%c3%a9"),
     ],
 )
 async def test_websocket_route_path_with_a_character_that_a_url_escapes_matches(route, url, expected):

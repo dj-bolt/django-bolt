@@ -9,7 +9,7 @@ import pytest
 from django.core.exceptions import ImproperlyConfigured
 
 from django_bolt import BoltAPI
-from django_bolt.param_functions import Body
+from django_bolt.param_functions import Body, Cookie, Form, Header, Query
 from django_bolt.serializers import (
     Serializer,
     SerializerView,
@@ -49,6 +49,16 @@ class ReadOnlyWithBefore(Serializer):
     @classmethod
     def name_to_text(cls, value):
         return str(value)
+
+
+class ReadOnlyParams(Serializer):
+    id: int = field(read_only=True, default=0)
+    name: str = ""
+
+
+class StrictReadOnlyParams(Serializer, forbid_unknown_fields=True):
+    id: int = field(read_only=True, default=0)
+    name: str = ""
 
 
 class TestFieldFunction:
@@ -157,6 +167,41 @@ class TestFieldFunction:
         assert ReadOnlyWithBefore.model_validate({"id": 99, "name": 5}).id == 0
         assert ReadOnlyWithBefore.model_validate_json(b'{"id": 99, "name": 5}').id == 0
         assert ReadOnlyWithBefore(id=4, name="n").id == 4
+
+    @pytest.mark.parametrize("source", ["query", "header", "cookie", "form"])
+    def test_read_only_field_of_a_parameter_model_is_ignored(self, source):
+        """A Query(), Header(), Cookie() or Form() model follows the rule of the JSON body."""
+        marker = {"query": Query, "header": Header, "cookie": Cookie, "form": Form}[source]
+        api = BoltAPI()
+
+        # The marker is a local name, so the annotations are set as objects.
+        for path, model in (("/plain", ReadOnlyParams), ("/strict", StrictReadOnlyParams)):
+
+            async def handler(params):
+                return {"id": params.id, "name": params.name}
+
+            handler.__annotations__ = {"params": Annotated[model, marker()], "return": dict}
+            api.post(path)(handler)
+
+        def send(client, path, values):
+            if source == "cookie":
+                cookie = "; ".join(f"{key}={value}" for key, value in values.items())
+                return client.post(path, headers={"cookie": cookie})
+            keyword = {"query": "params", "header": "headers", "form": "data"}[source]
+            return client.post(path, **{keyword: values})
+
+        with TestClient(api) as client:
+            response = send(client, "/plain", {"id": "99", "name": "n"})
+            assert response.status_code == 200
+            assert response.json() == {"id": 0, "name": "n"}
+
+            # With forbid_unknown_fields=True the value is an error, as an unknown field is.
+            response = send(client, "/strict", {"id": "99", "name": "n"})
+            assert response.status_code == 422
+            assert "unknown field `id`" in response.text
+            response = send(client, "/strict", {"name": "n"})
+            assert response.status_code == 200
+            assert response.json() == {"id": 0, "name": "n"}
 
     def test_request_body_with_a_read_only_field_and_no_default_stops_registration(self):
         api = BoltAPI()

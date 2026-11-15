@@ -708,7 +708,7 @@ user.dump()
 # {'id': 5, 'name': 'alice'}
 ```
 
-Input is a JSON request body, `model_validate()` and `model_validate_json()`. The rule also applies to a nested serializer in that input. `from_model()` and direct construction set the field.
+Input is a JSON request body, `model_validate()` and `model_validate_json()`. A serializer that is a `Query()`, `Header()`, `Cookie()` or `Form()` model is input too. The rule also applies to a nested serializer in that input. `from_model()` and direct construction set the field.
 
 - Bolt ignores the input value. With `forbid_unknown_fields=True` on the serializer, the input value is an error, as an unknown field is.
 - A read-only field must have a default. Without one, route registration and `model_validate()` raise `ImproperlyConfigured`. A serializer that is only a response needs no default.
@@ -889,6 +889,37 @@ users = [
 result = UserSerializer.only("id", "name").dump_many(users)
 # [{'id': 1, 'name': 'John'}, {'id': 2, 'name': 'Jane'}]
 ```
+
+### From serializer to model
+
+`to_model()` makes an unsaved model instance, and `update_instance()` sets the fields of an existing one.
+A `ForeignKey` or `OneToOneField` field can hold the primary key of the related row:
+
+```python
+class PostCreate(Serializer):
+    title: str
+    author: int  # The primary key of the author
+
+post = PostCreate(title="Hello", author=3).to_model(BlogPost)
+# post.author_id == 3
+await post.asave()
+```
+
+Bolt writes the primary key to `author_id`. A model instance in the field goes to `author`, as before.
+`from_model()` reads the primary key from `author_id`, with no query.
+
+### Serializers from a model
+
+`create_serializer()` makes a Serializer class from the fields of a model:
+
+```python
+from django_bolt.serializers import create_serializer
+
+PostSerializer = create_serializer(BlogPost, fields=["id", "title", "author"])
+```
+
+A `ForeignKey` and a `OneToOneField` get the type `int`, the primary key.
+A `DecimalField` gets the type `Decimal`. The JSON output is a string, such as `"19.99"`, so the value keeps each digit. The input can be a JSON string or a JSON number.
 
 ## Config options
 

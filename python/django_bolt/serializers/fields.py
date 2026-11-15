@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Annotated, Any, Literal, TypeVar
 from uuid import UUID
 
@@ -28,8 +29,9 @@ class FieldConfig:
 
     read_only: bool = False
     """
-    If True, input cannot set the field. Input is a JSON request body,
-    model_validate() and model_validate_json(). The field gets its default, so
+    If True, input cannot set the field. Input is a JSON request body, a
+    Query(), Header(), Cookie() or Form() model, model_validate() and
+    model_validate_json(). The field gets its default, so
     it must have one. Python code and from_model() set the field.
     """
 
@@ -264,8 +266,8 @@ def get_msgspec_type_for_django_field(field: models.Field) -> Any:
         base_type = float
 
     elif isinstance(field, models.DecimalField):
-        # Decimal is a complex type, but we can use float for JSON API
-        base_type = float
+        # A float loses digits. JSON sends a Decimal as a string, as Django REST Framework does.
+        base_type = Decimal
 
     elif isinstance(field, models.BooleanField):
         base_type = bool
@@ -288,13 +290,10 @@ def get_msgspec_type_for_django_field(field: models.Field) -> Any:
     elif isinstance(field, models.UUIDField):
         base_type = UUID
 
-    # ForeignKey and relationships (simplified)
+    # ForeignKey and OneToOneField (a subclass of ForeignKey): the primary key
+    # of the related row. from_model() reads it from `<name>_id`, and to_model()
+    # and update_instance() write it there.
     elif isinstance(field, models.ForeignKey):
-        # For now, just use int (the primary key)
-        # Can be enhanced with nested serializers later
-        base_type = int
-
-    elif isinstance(field, models.OneToOneField):
         base_type = int
 
     # ManyToManyField

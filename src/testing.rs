@@ -26,7 +26,7 @@ use bolt_core::metadata::{RateLimitKey, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::middleware::rate_limit::RateLimiters;
-use bolt_core::router::Router;
+use bolt_core::router::{Router, normalize_request_path};
 use bolt_core::state::{
     AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS, find_websocket_mount_in_slice,
 };
@@ -811,8 +811,9 @@ pub fn handle_test_websocket(
         &path
     };
 
-    // Find WebSocket route
-    let (route, path_params) = match app.websocket_router.find(normalized_path) {
+    // Find WebSocket route. Each form of a `%XX` escape matches, as on the server.
+    let route_path = normalize_request_path(normalized_path);
+    let (route, path_params) = match app.websocket_router.find(&route_path) {
         Some((route, params)) => (route, params),
         // No route matched: fall back to a mounted ASGI app, as the server does.
         None => {

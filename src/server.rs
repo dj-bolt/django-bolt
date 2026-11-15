@@ -18,6 +18,7 @@ use bolt_core::middleware::client_ip::TrustedProxies;
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::middleware::rate_limit::{DEFAULT_IPV6_PREFIX, RateLimiters};
+use bolt_core::router::normalize_request_path;
 use bolt_core::settings::{
     DjangoSettings, env_flag, env_non_negative_int, env_positive_int, env_var,
     improperly_configured,
@@ -1083,9 +1084,11 @@ pub async fn websocket_upgrade_handler(
         path
     };
 
-    // Look up in global WebSocket router
+    // Look up in global WebSocket router. Each form of a `%XX` escape matches,
+    // as for an HTTP route.
+    let route_path = normalize_request_path(normalized_path);
     if let Some(ws_router) = GLOBAL_WEBSOCKET_ROUTER.get()
-        && let Some((route, path_params)) = ws_router.find(normalized_path)
+        && let Some((route, path_params)) = ws_router.find(&route_path)
     {
         let (handler, injector) = Python::attach(|py| {
             (
@@ -1161,10 +1164,13 @@ async fn websocket_not_found_handler(
 
     // Actix has each WebSocket route path with no trailing slash. A request path
     // with a trailing slash comes here. Find its route, as the test backend does.
+    // Each form of a `%XX` escape matches, as in `websocket_upgrade_handler`.
     let is_route = normalized_path.len() != path.len()
-        && GLOBAL_WEBSOCKET_ROUTER
-            .get()
-            .is_some_and(|ws_router| ws_router.find(normalized_path).is_some());
+        && GLOBAL_WEBSOCKET_ROUTER.get().is_some_and(|ws_router| {
+            ws_router
+                .find(&normalize_request_path(normalized_path))
+                .is_some()
+        });
     if is_route {
         return websocket_upgrade_handler(req, stream, state).await;
     }

@@ -17,7 +17,7 @@ import msgspec
 from django.db.models import QuerySet
 
 from .._serializer_before import RAW_VALIDATED, before_plan, run_before_validators
-from .._serializer_input import ignore_read_only_input
+from .._serializer_input import ignore_read_only_input, read_only_input_extractor
 from ..concurrency import run_in_orm_executor
 from ..datastructures import UploadFile
 from ..exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
@@ -648,6 +648,7 @@ def _unknown_field_errors(
     ]
 
 
+@read_only_input_extractor
 def _create_param_struct_extractor(
     struct_type: type, default: Any, param_type: str, other_keys: frozenset[str] = frozenset()
 ) -> Callable:
@@ -833,6 +834,7 @@ def _collect_header_struct_errors(
     return errors
 
 
+@read_only_input_extractor
 def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable:
     """Create an extractor that builds a Struct/Serializer from HTTP headers.
 

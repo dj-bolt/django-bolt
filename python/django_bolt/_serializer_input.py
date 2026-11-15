@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar
+from functools import wraps
 from typing import Any
 
 import msgspec
@@ -76,3 +77,33 @@ def ignore_read_only_input(annotation: Any, decode: Callable[[Any], Any]) -> Cal
             INPUT_MODE.reset(token)
 
     return decode_input
+
+
+def read_only_input_extractor(factory: Callable[..., Callable[..., Any]]) -> Callable[..., Callable[..., Any]]:
+    """
+    Decorate the factory of a parameter model extractor (query, header, cookie, form).
+
+    The factory gets the struct type as its first argument, one time at
+    registration. The extractor of a type with no ``read_only`` field comes
+    back unchanged. Each other extractor ignores the input values of
+    ``read_only`` fields, as the JSON body does.
+    """
+
+    @wraps(factory)
+    def build(struct_type: Any, *args: Any, **kwargs: Any) -> Callable[..., Any]:
+        extract = factory(struct_type, *args, **kwargs)
+        if not input_has_read_only_fields(struct_type):
+            return extract
+
+        def extract_input(*maps: Any) -> Any:
+            token = INPUT_MODE.set(True)
+            try:
+                return extract(*maps)
+            finally:
+                INPUT_MODE.reset(token)
+
+        # Callers read attributes of the extractor, such as needs_files_map.
+        extract_input.__dict__.update(extract.__dict__)
+        return extract_input
+
+    return build

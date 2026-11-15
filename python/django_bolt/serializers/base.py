@@ -129,6 +129,23 @@ class _UnloadedRelation:
 
 type _RelationTaskCache = dict[tuple[int, str], asyncio.Task[Any]]
 _DJANGO_RELATION_CACHE: WeakKeyDictionary[type, dict[str, _DjangoRelationInfo | None]] = WeakKeyDictionary()
+# A plain dict: its lookup runs in each to_model() call, and a weak dictionary is slower.
+_RELATION_ATTNAMES: dict[type, dict[str, str]] = {}
+
+
+def _relation_attnames(model_class: type[Model]) -> dict[str, str]:
+    """Map each ForeignKey and OneToOneField name of the model to its column attribute.
+
+    For example ``author`` maps to ``author_id``. Django takes a model instance
+    on the first name and a primary key on the second. The callers read
+    ``_RELATION_ATTNAMES`` first, so the map is made one time for each model.
+    """
+    names = _RELATION_ATTNAMES[model_class] = {
+        field.name: field.attname
+        for field in model_class._meta.concrete_fields
+        if field.is_relation and field.attname != field.name
+    }
+    return names
 
 
 def _iter_field_defaults(cls: type) -> list[tuple[str, Any]]:
@@ -2040,9 +2057,21 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             user_data = UserCreateSerializer(...)
             user = user_data.to_model(User)
             await user.asave()
+
+        A ForeignKey or OneToOneField field can hold the primary key of the
+        related row (``author: int``) or a model instance.
         """
         read_only = self.__read_only_fields__
-        return model_class(**{name: value for name, value in self.to_dict().items() if name not in read_only})
+        data = {name: value for name, value in self.to_dict().items() if name not in read_only}
+        relation_attnames = _RELATION_ATTNAMES.get(model_class)
+        if relation_attnames is None:
+            relation_attnames = _relation_attnames(model_class)
+        for name, attname in relation_attnames.items():
+            # A primary key goes to the column attribute (author_id). A model
+            # instance, and the dict of a nested serializer, stay on the relation.
+            if name in data and not isinstance(data[name], (DjangoModel, dict)):
+                data[attname] = data.pop(name)
+        return model_class(**data)
 
     def update_instance(self: T, instance: Model) -> Model:
         """
@@ -2063,7 +2092,13 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             user_update = UserUpdateSerializer(username="new_name")
             updated_user = user_update.update_instance(user)
             await updated_user.asave()
+
+        A ForeignKey or OneToOneField field can hold the primary key of the
+        related row (``author: int``) or a model instance.
         """
+        relation_attnames = _RELATION_ATTNAMES.get(type(instance))
+        if relation_attnames is None:
+            relation_attnames = _relation_attnames(type(instance))
         # Check if omit_defaults is enabled
         omit_defaults = self.__struct_config__.omit_defaults
 
@@ -2082,6 +2117,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if omit_defaults and field_name in default_values and value == default_values[field_name]:
                 continue
 
+            # A primary key goes to the column attribute (author_id), as in to_model().
+            if field_name in relation_attnames and not isinstance(value, (DjangoModel, dict)):
+                field_name = relation_attnames[field_name]
             setattr(instance, field_name, value)
         return instance
 
