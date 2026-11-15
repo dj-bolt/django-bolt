@@ -1781,8 +1781,9 @@ class BoltAPI:
                 elif isinstance(response_model, dict):
                     # Dict mode: per-status-code response schemas
                     # A bool is an int in Python, but it is not a status code.
+                    # A key of another type, such as "404", matches no status.
                     for code in response_model:
-                        if isinstance(code, bool):
+                        if code is not ... and (isinstance(code, bool) or not isinstance(code, int)):
                             raise TypeError(
                                 f"response_model has the key {code!r}. A key must be an integer status code or `...`."
                             )
