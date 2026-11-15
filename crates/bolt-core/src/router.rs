@@ -616,11 +616,20 @@ mod tests {
         )
     }
 
-    /// Only a native route is unique. A Python route replaces an earlier one.
+    /// A Python route is unique too. The second insert is an error and the first route stays.
     #[test]
-    fn a_python_route_replaces_an_earlier_route_of_the_same_static_path() {
-        let router = router_with(&[("GET", "/items"), ("GET", "/items")]);
-        assert_eq!(lookup(&router, "GET", "/items"), Some((1, None)));
+    fn a_python_route_does_not_replace_an_earlier_route_of_the_same_static_path() {
+        let mut router = router_with(&[("GET", "/items")]);
+        Python::attach(|py| {
+            let error = router
+                .register("GET", "/items", 1, py.None(), py.None(), py.None())
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "ValueError: Failed to register route: GET /items is already registered"
+            );
+        });
+        assert_eq!(lookup(&router, "GET", "/items"), Some((0, None)));
     }
 
     #[test]
