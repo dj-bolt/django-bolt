@@ -476,7 +476,7 @@ def test_an_int_key_at_the_limit_of_the_status_range_registers(key):
 
     @api.get("/item", response_model={key: OkSchema})
     async def handler():
-        return {"id": 1, "name": "x"}
+        return key, {"id": 1, "name": "x"}
 
     with TestClient(api) as client:
         assert client.get("/item").status_code == key
