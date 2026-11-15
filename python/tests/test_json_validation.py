@@ -316,6 +316,13 @@ class TestParseMsgspecDecodeError:
         assert detail["ctx"]["byte_position"] == body.index(b"}")
         assert detail["msg"].endswith(f"\n  {text}\n  {' ' * text.index('}')}^")
 
+    def test_message_shows_only_the_error_line(self):
+        """Test that the message quotes the failing line, not the lines after it."""
+        body = b'{"a": 1,\n "b": oops,\n "c": 2,\n "d": 3}'
+        detail = self._parse(body)
+
+        assert detail["msg"].endswith('\n   "b": oops,\n        ^')
+
     def test_column_on_later_line_counts_characters(self):
         """Test the line number and the column after a newline."""
         line_before_error = '  "é€": '
