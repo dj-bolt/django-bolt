@@ -126,10 +126,8 @@ APIKeyAuthentication(
 | Parameter         | Type       | Default       | Description                |
 | ----------------- | ---------- | ------------- | -------------------------- |
 | `api_keys`        | `set[str]` | `set()`       | Valid API keys             |
-| `header`          | `str`      | `"x-api-key"` | Header containing key      |
+| `header`          | `str`      | `"x-api-key"` | Header containing key. An empty string raises `ImproperlyConfigured` |
 | `key_permissions` | `dict`     | `None`        | Key to permissions mapping |
-
-An empty `header` raises `ImproperlyConfigured`.
 
 ## Permission guards
 

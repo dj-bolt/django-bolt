@@ -463,8 +463,7 @@ class APIKeyAuthentication(BaseAuthentication):
 
     Args:
         api_keys: Set of valid API keys
-        header: Header name to extract API key from (default: "x-api-key").
-            An empty string raises ``ImproperlyConfigured``.
+        header: Header name to extract API key from (default: "x-api-key")
         key_permissions: Optional mapping of API keys to permission sets
     """
 
@@ -474,11 +473,12 @@ class APIKeyAuthentication(BaseAuthentication):
         header: str = "x-api-key",
         key_permissions: dict[str, set[str]] | None = None,
     ):
-        if header == "":
-            raise ImproperlyConfigured("APIKeyAuthentication header must not be empty.")
         self.api_keys = api_keys or set()
         self.header = header
         self.key_permissions = key_permissions or {}
+        # Rust would look for a header with no name, and reject each request.
+        if header == "":
+            raise ImproperlyConfigured("APIKeyAuthentication header must not be empty.")
 
     @property
     def scheme_name(self) -> str:
