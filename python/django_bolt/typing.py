@@ -396,6 +396,10 @@ def is_dataclass_type(annotation: Any) -> bool:
         return False
 
 
+# A parameter with one of these names gets the request, unless it is a path parameter or has a marker.
+REQUEST_PARAM_NAMES = frozenset({"request", "req"})
+
+
 def infer_param_source(name: str, annotation: Any, path_params: set[str], http_method: str) -> str:
     """
     Infer parameter source based on type and context.
@@ -421,7 +425,7 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
         return "path"
 
     # 2. Special request parameter
-    if name in {"request", "req"}:
+    if name in REQUEST_PARAM_NAMES:
         return "request"
 
     # Unwrap Optional and msgspec.Meta if present

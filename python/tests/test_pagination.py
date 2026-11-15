@@ -299,6 +299,40 @@ def test_page_number_pagination_with_filtering(sample_articles):
 
 
 @pytest.mark.django_db(transaction=True)
+def test_paginate_gets_the_request_that_the_handler_does_not_take_first(sample_articles):
+    """@paginate reads the page when the handler has no request, or has it after a parameter."""
+    api = BoltAPI()
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 2
+
+    @api.get("/by-author")
+    @paginate(SmallPagePagination)
+    async def list_by_author(author: str = "Author 1"):
+        return Article.objects.filter(author=author).order_by("id")
+
+    @api.get("/search")
+    @paginate(SmallPagePagination)
+    async def search_articles(search: str, req: Request):
+        return Article.objects.filter(title__startswith=search).order_by("id")
+
+    with TestClient(api) as client:
+        # "Author 1" wrote the articles 1, 11, 21, 31 and 41.
+        response = client.get("/by-author?page=2")
+        assert response.status_code == 200
+        data = response.json()
+        assert (data["page"], data["total"]) == (2, 5)
+        assert [item["title"] for item in data["items"]] == ["Article 21", "Article 31"]
+
+        # The titles that start with "Article 4" are 4 and 40 to 49.
+        response = client.get("/search?search=Article 4&page=2")
+        assert response.status_code == 200
+        data = response.json()
+        assert (data["page"], data["total"]) == (2, 11)
+        assert [item["title"] for item in data["items"]] == ["Article 41", "Article 42"]
+
+
+@pytest.mark.django_db(transaction=True)
 def test_page_number_pagination_with_ordering(sample_articles):
     """Test pagination respects queryset ordering"""
     api = BoltAPI()
