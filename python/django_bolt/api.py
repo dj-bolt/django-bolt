@@ -8,7 +8,6 @@ import inspect
 import logging
 import os
 import re
-import sys
 import threading
 from collections.abc import Callable, Collection, Sequence
 from contextlib import suppress
@@ -39,7 +38,7 @@ from ._kwargs import (
 )
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
-from .analysis import analyze_dependency_tree, analyze_handler
+from .analysis import analyze_dependency_tree, analyze_handler, annotation_globals
 from .auth import register_auth_backend
 from .auth.backends import revocation_takes_claims
 from .auth.session import auth_without_session, build_session_guard_check, session_middleware, uses_session
@@ -1390,7 +1389,7 @@ class BoltAPI:
 
                 # Extract response model from type hints if not already determined
                 if method_response_model is _RESPONSE_MODEL_UNSET:
-                    globalns = sys.modules.get(handler.__module__, {}).__dict__ if handler.__module__ else {}
+                    globalns = annotation_globals(handler)
                     type_hints = get_type_hints(handler, globalns=globalns, include_extras=True)
                     method_response_model = type_hints.get("return", _RESPONSE_MODEL_UNSET)
 
@@ -1821,7 +1820,7 @@ class BoltAPI:
                 # No response_model - check for return annotation
                 meta["is_multi_response"] = False
                 # Need to resolve string annotations (from __future__ import annotations)
-                globalns = sys.modules.get(fn.__module__, {}).__dict__ if fn.__module__ else {}
+                globalns = annotation_globals(fn)
                 type_hints = get_type_hints(fn, globalns=globalns, include_extras=True)
                 final_response_type = type_hints.get("return", None)
 
