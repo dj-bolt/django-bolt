@@ -1926,8 +1926,10 @@ class BoltAPI:
                         if success_codes:
                             effective_status = success_codes[0]
 
-                    # Set response_type to default code's type (backward compat)
-                    default_code = effective_status if effective_status is not None else int_codes[0]
+                    # Set response_type to default code's type (backward compat).
+                    # A map with no 2xx code keeps the default status 200: a map of
+                    # error types does not make an error status the default.
+                    default_code = effective_status if effective_status is not None else 200
                     default_type = response_model.get(default_code)
                     if default_type is not None:
                         final_response_type = default_type

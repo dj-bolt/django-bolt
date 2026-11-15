@@ -525,7 +525,7 @@ return 404, {"detail": "Not found"}       # documented as Error
 return JSON({"detail": "Not found"}, status_code=404)
 ```
 
-**Bare return** — A plain dict or list uses the default status code (lowest 2xx in the map):
+**Bare return** — A plain dict or list uses the default status code. That is the `status_code` of the decorator, or else the lowest 2xx code in the map. A map with no 2xx code, such as `{404: Error}`, keeps the default status 200:
 
 ```python
 @api.get("/items", response_model={200: list[Item], 400: Error})
