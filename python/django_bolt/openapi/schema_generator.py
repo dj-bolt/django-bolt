@@ -75,6 +75,11 @@ _RESPONSE_CLASS_MEDIA: tuple[tuple[type, str, Schema], ...] = (
 )
 
 
+# The response of a handler that returns a plain ``str`` or plain ``bytes``.
+_STR_MEDIA: tuple[str, Schema] = ("text/plain", Schema(type="string"))
+_BYTES_MEDIA: tuple[str, Schema] = ("application/octet-stream", Schema(type="string", format="binary"))
+
+
 def _response_class_media(response_class: type | None) -> tuple[str, Schema] | None:
     if response_class is None:
         return None
@@ -1086,6 +1091,10 @@ class SchemaGenerator:
             response_class = meta.get("response_class")
             has_type = bool(response_type) and response_type != inspect._empty
             media = _response_class_media(response_class)
+            if response_class is None and (response_type is str or response_type is bytes):
+                # Bolt sends a str as text and bytes as they are. Neither is a JSON body.
+                media = _STR_MEDIA if response_type is str else _BYTES_MEDIA
+                has_type = False
 
             if response_class is not None and issubclass(response_class, Redirect):
                 # A redirect has no body; the default 200 is meaningless here.

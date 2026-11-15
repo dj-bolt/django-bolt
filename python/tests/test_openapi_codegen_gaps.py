@@ -325,6 +325,35 @@ def test_response_class_redirect_documents_3xx_without_content():
     assert responses["307"]["headers"]["Location"]["schema"] == {"type": "string"}
 
 
+@pytest.mark.parametrize(
+    ("return_type", "value", "media_type", "expected_schema"),
+    [
+        (str, "hello", "text/plain", {"type": "string"}),
+        (bytes, b"\x00\x01", "application/octet-stream", {"type": "string", "format": "binary"}),
+    ],
+    ids=["str", "bytes"],
+)
+def test_str_or_bytes_return_type_documents_the_media_type_that_the_route_sends(
+    return_type, value, media_type, expected_schema
+):
+    api = BoltAPI(openapi_config=_config())
+
+    async def thing():
+        return value
+
+    thing.__annotations__["return"] = return_type
+    api.get("/thing")(thing)
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        content = _ok_response(client.get("/docs/openapi.json").json(), "/thing")["content"]
+        sent = client.get("/thing")
+
+    assert sent.headers["content-type"].split(";")[0] == media_type
+    assert list(content) == [media_type]
+    assert content[media_type]["schema"] == expected_schema
+
+
 # ---------------------------------------------------------------------------
 # #290 — strict mode
 # ---------------------------------------------------------------------------
