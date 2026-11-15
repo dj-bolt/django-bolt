@@ -236,7 +236,12 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
                 "reader_removed": True,
                 "writer_removed": True,
             }
-            assert server.get("/t-signal").json() == {"received": True, "removed": True}
+            assert server.get("/t-signal").json() == {
+                "received": True,
+                "removed": True,
+                "argument": "argument",
+                "context": "when-added",
+            }
             assert server.get("/t-worker-server").json() == {"reply": "worker-server"}
             server_api = server.get("/t-server-api").json()
             assert server_api["get_loop_is_running_loop"] is True

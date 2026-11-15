@@ -31,6 +31,7 @@ Probe map:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
 import signal
 import socket
@@ -390,17 +391,30 @@ async def t_fd_read_write():
         peer.close()
 
 
+_SIGNAL_CONTEXT = contextvars.ContextVar("signal_context", default="unset")
+
+
 @api.get("/t-signal")
 async def t_signal():
     loop = asyncio.get_running_loop()
     received = asyncio.Event()
-    loop.add_signal_handler(signal.SIGUSR1, received.set)
+    seen = {}
+
+    def on_signal(argument):
+        seen["argument"] = argument
+        seen["context"] = _SIGNAL_CONTEXT.get()
+        received.set()
+
+    # As in the stdlib loops, the handler runs in a copy of the context at this call.
+    _SIGNAL_CONTEXT.set("when-added")
+    loop.add_signal_handler(signal.SIGUSR1, on_signal, "argument")
+    _SIGNAL_CONTEXT.set("after-add")
     try:
         os.kill(os.getpid(), signal.SIGUSR1)
         await asyncio.wait_for(received.wait(), 1)
     finally:
         removed = loop.remove_signal_handler(signal.SIGUSR1)
-    return {"received": received.is_set(), "removed": removed}
+    return {"received": received.is_set(), "removed": removed, **seen}
 
 
 @api.get("/t-worker-server")

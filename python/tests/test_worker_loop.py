@@ -129,3 +129,72 @@ def test_descriptor_watchers_accept_and_use_a_context():
         response = client.get("/watch")
     assert response.status_code == 200, response.text
     assert response.json() == {"reader": "watched", "writer": "watched"}
+
+
+def test_a_timer_callback_runs_in_the_context_that_the_caller_gives():
+    """``call_later(..., context=...)`` runs the callback in that context.
+
+    With no ``context``, the callback runs in a copy of the context of the caller.
+    """
+    api = BoltAPI()
+    var = contextvars.ContextVar("var", default="unset")
+
+    @api.get("/timers")
+    async def timers():
+        loop = asyncio.get_running_loop()
+        seen = {}
+
+        def record(name):
+            seen[name] = var.get()
+
+        context = contextvars.copy_context()
+        context.run(var.set, "given")
+        var.set("caller")
+        loop.call_later(0.01, record, "with-context", context=context)
+        loop.call_later(0.01, record, "no-context")
+        await asyncio.sleep(0.1)
+        return seen
+
+    with TestClient(api) as client:
+        response = client.get("/timers")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"with-context": "given", "no-context": "caller"}
+
+
+def test_a_callback_that_raises_system_exit_goes_to_the_exception_handler_of_the_loop():
+    """``Handle._run`` lets SystemExit escape. The loop reports it, and the worker serves the next request."""
+    api = BoltAPI()
+
+    @api.get("/exit-in-callback")
+    async def exit_in_callback():
+        loop = asyncio.get_running_loop()
+        reports = []
+
+        def stop():
+            raise SystemExit(3)
+
+        # The loop lives as long as the process, so put its handler back.
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: reports.append(context))
+        try:
+            handle = loop.call_soon(stop)
+            await asyncio.sleep(0.05)
+        finally:
+            loop.set_exception_handler(previous)
+        return [
+            {
+                "message": report["message"],
+                "exception": repr(report["exception"]),
+                "is_the_handle": report["handle"] is handle,
+            }
+            for report in reports
+        ]
+
+    with TestClient(api) as client:
+        response = client.get("/exit-in-callback")
+        next_response = client.get("/exit-in-callback")
+    assert response.status_code == 200, response.text
+    assert response.json() == [
+        {"message": "Exception in WorkerLoop callback", "exception": "SystemExit(3)", "is_the_handle": True}
+    ]
+    assert next_response.status_code == 200, next_response.text
