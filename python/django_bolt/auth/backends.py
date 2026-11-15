@@ -518,12 +518,16 @@ class SessionAuthentication(BaseAuthentication):
         }
 
 
-def get_default_authentication_classes() -> list[BaseAuthentication]:
+def get_default_authentication_classes(*, needs_user: bool = False) -> list[BaseAuthentication]:
     """
-    Get default authentication classes from Django settings.
+    Get the default authentication classes of a route with no ``auth``.
 
-    Looks for BOLT_AUTHENTICATION_CLASSES in settings. If not found,
-    returns an empty list (no authentication by default).
+    Returns ``BOLT_AUTHENTICATION_CLASSES`` when the setting is there, also
+    when it is an empty list. Without the setting, the result follows the
+    guards of the route. ``needs_user`` says that a guard of the route needs
+    an authenticated user. Such a route gets ``[JWTAuthentication()]``, which
+    verifies an HS256 token with ``SECRET_KEY``. Each other route gets an
+    empty list (no authentication).
     """
     try:
         try:
@@ -535,4 +539,5 @@ def get_default_authentication_classes() -> list[BaseAuthentication]:
     except (ImportError, AttributeError):
         pass
 
-    return []
+    # With no backend, the guard would reject each request with a 401.
+    return [JWTAuthentication()] if needs_user else []

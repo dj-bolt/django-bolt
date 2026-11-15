@@ -1116,7 +1116,7 @@ class BoltAPI:
 
             # The handshake awaits this check before the upgrade: a revoked
             # token gets 401, as on an HTTP route.
-            revocation_handlers = _revocation_handlers(route_auth_backends(ws_auth))
+            revocation_handlers = _revocation_handlers(route_auth_backends(ws_auth, guards))
             if revocation_handlers is not None:
                 middleware_meta = middleware_meta or {}
                 middleware_meta["websocket_revocation_check"] = functools.partial(
@@ -1744,7 +1744,7 @@ class BoltAPI:
             # Resolve the auth backends once (explicit > defaults), in the
             # order Rust gets them. A session backend needs Django's session
             # and auth middleware. Add the missing ones before the router middleware.
-            effective_auth_backends = route_auth_backends(auth)
+            effective_auth_backends = route_auth_backends(auth, guards)
             if uses_session(effective_auth_backends):
                 router_middleware = [
                     *session_middleware(
