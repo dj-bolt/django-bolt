@@ -42,6 +42,21 @@ def test_a_revoked_token_fails_the_websocket_handshake(make_server_project, path
             assert websocket.receive_text() == "connected"
 
 
+def test_a_refused_handshake_names_the_scheme_of_the_route(make_server_project):
+    """The 401 of a handshake has the challenge of the backends of the route."""
+    project = make_server_project(api_module=app_module("websocket_revocation"))
+    upgrade = {
+        "Connection": "Upgrade",
+        "Upgrade": "websocket",
+        "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "Sec-WebSocket-Version": "13",
+    }
+    with project.start() as server:
+        for path, challenge in [("/ws/jti", "Bearer"), ("/ws/key", "ApiKey")]:
+            response = server.get(path, headers=upgrade)
+            assert (response.status_code, response.headers.get("www-authenticate")) == (401, challenge), path
+
+
 def test_each_jwt_backend_checks_its_own_handshake_tokens(make_server_project):
     """Both backends have the scheme name "jwt". Only the first backend revokes the jti."""
     project = make_server_project(api_module=app_module("websocket_revocation"))

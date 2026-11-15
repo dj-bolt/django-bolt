@@ -642,6 +642,16 @@ def test_configuration_error_message_names_the_mistake(kwargs, message):
     assert str(raised.value) == message
 
 
+@pytest.mark.parametrize("option", ["header", "cookie", "audience", "issuer", "token_type"])
+def test_an_empty_string_option_is_a_configuration_error(option):
+    """An empty string is not "not set". It would reject each token that has no empty claim."""
+    with pytest.raises(ImproperlyConfigured) as raised:
+        JWTAuthentication(secret=SECRET_FOR_ERRORS, **{option: ""})
+
+    hint = "" if option == "header" else " Use None for no value."
+    assert str(raised.value) == f"JWTAuthentication {option} must not be empty.{hint}"
+
+
 AUTH_LOGGER = "django_bolt.auth"
 
 
