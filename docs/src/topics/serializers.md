@@ -571,6 +571,29 @@ mini_user = UserMini.from_parent(full_user)
 print(mini_user.dump())  # {'id': 1, 'name': 'John'}
 ```
 
+## Field options for the OpenAPI document
+
+`field()` takes options that describe a field in the OpenAPI schema of the serializer. They do not change validation or `dump()`.
+
+```python
+from django_bolt.serializers import Serializer, field
+
+class ProductSerializer(Serializer):
+    sku: str = field(description="Stock unit", title="SKU", examples=["AB-1"])
+    old_code: str = field(default="", deprecated=True)
+    trace_id: str = field(default="", include_in_schema=False)
+```
+
+| Option | Effect on the property schema |
+|--------|-------------------------------|
+| `description` | Sets `description`. |
+| `title` | Sets `title`. |
+| `examples` | Sets `examples`, a list of example values. |
+| `deprecated=True` | Sets `deprecated: true`. |
+| `include_in_schema=False` | Leaves the property out of the schema, also out of `required`. |
+
+The options apply to the request body schema and to the response schema. A field with `include_in_schema=False` still validates input and is still in the output of `dump()`.
+
 ## Write-only fields
 
 Hide sensitive fields from output:
