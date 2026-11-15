@@ -129,7 +129,7 @@ def normalize_middleware_specs(
     Normalize and validate middleware specs.
 
     Allowed forms:
-    - Middleware classes (Django-style __init__(get_response))
+    - Middleware classes (Django-style __init__(get_response), with callable instances)
     - DjangoMiddleware / DjangoMiddlewareStack wrapper instances
     - Dict middleware metadata (Rust-handled middleware) with the type "cors" or "rate_limit"
     - FunctionMiddlewareSpec (route-level only)
@@ -172,6 +172,13 @@ def normalize_middleware_specs(
             continue
 
         if isinstance(spec, type):
+            # The chain calls the instance with the request. `type` gives each
+            # class a __call__ that builds an instance, so read the classes.
+            if not any("__call__" in vars(base) for base in spec.__mro__ if base is not object):
+                raise TypeError(
+                    f"{context} middleware class {spec.__name__} has no __call__. "
+                    "A middleware class takes get_response in __init__, and Bolt calls its instance with the request."
+                )
             normalized.append(spec)
             continue
 
@@ -225,7 +232,8 @@ class MiddlewareProtocol(Protocol):
 
     The middleware can:
     - Modify the request before passing it on
-    - Short-circuit by returning a response directly
+    - Short-circuit by returning a response directly: a response object such
+      as JSON, or another value that a handler can return
     - Modify the response after the handler executes
     - Add data to request.state for downstream handlers
     """
@@ -326,7 +334,9 @@ class BaseMiddleware(ABC):
         """
         Process the request. Override this in subclasses.
 
-        Call self.get_response(request) to continue the chain.
+        Call self.get_response(request) to continue the chain. To answer
+        without the handler, return a response object such as JSON, or another
+        value that a handler can return.
 
         Args:
             request: The incoming request
@@ -367,7 +377,9 @@ class Middleware(ABC):
         """
         Process the request.
 
-        Call self.get_response(request) to continue the chain.
+        Call self.get_response(request) to continue the chain. To answer
+        without the handler, return a response object such as JSON, or another
+        value that a handler can return.
 
         Args:
             request: The incoming request object
@@ -449,14 +461,13 @@ def middleware(*args, **kwargs):
     def decorator(handler: Callable) -> Callable:
         normalized = normalize_middleware_specs(args, context="route", allow_function_middleware=True)
         for spec in normalized:
-            if isinstance(spec, dict) and spec.get("type") == "cors":
-                _reject_second_cors(handler)
+            if isinstance(spec, dict):
+                _reject_second_config(handler, spec.get("type"))
             attach_middleware(handler, spec)
 
         # Support dict-style middleware metadata (e.g. @middleware(type="cors", ...))
         if kwargs:
-            if kwargs.get("type") == "cors":
-                _reject_second_cors(handler)
+            _reject_second_config(handler, kwargs.get("type"))
             attach_middleware(handler, kwargs)
 
         return handler
@@ -525,8 +536,8 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
 
     Raises:
         TypeError: rps or burst is not an int, or key is not a str.
-        ValueError: rps or burst is less than 1, or key is empty or is not a
-            valid header name.
+        ValueError: rps or burst is less than 1, key is empty or is not a
+            valid header name, or the route already has a @rate_limit.
 
     Example:
         @api.get("/api/data")
@@ -540,6 +551,7 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     config = _checked_rate_limit_config(rps, burst, key)
 
     def decorator(func):
+        _reject_second_config(func, "rate_limit")
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
         func.__bolt_middleware__.append(dict(config))
@@ -548,15 +560,26 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     return decorator
 
 
-def _reject_second_cors(handler: Callable) -> None:
-    """Raise ValueError when the handler already has a cors config.
+# What to do in place of a second config of one type on a function.
+_SECOND_CONFIG_ADVICE = {
+    "cors": "Merge the origins into one @cors",
+    "rate_limit": "Keep one @rate_limit with the limit of the route",
+}
 
-    Two cors configs on one route have no clear order. The config stays on the
-    function, so one function cannot serve two routes with different origins.
+
+def _reject_second_config(handler: Callable, mw_type: Any) -> None:
+    """Raise ValueError when the handler already has a config of this type: cors or rate_limit.
+
+    Two configs of one type on one route have no clear order: Rust uses one of
+    them and drops the other. The config stays on the function, so one
+    function cannot serve two routes with different configs.
     """
-    if any(isinstance(mw, dict) and mw.get("type") == "cors" for mw in getattr(handler, "__bolt_middleware__", ())):
+    if mw_type not in ("cors", "rate_limit"):
+        return
+    if any(isinstance(mw, dict) and mw.get("type") == mw_type for mw in getattr(handler, "__bolt_middleware__", ())):
         raise ValueError(
-            "The function already has a @cors. Merge the origins into one @cors, or give each route its own function."
+            f"The function already has a @{mw_type}. {_SECOND_CONFIG_ADVICE[mw_type]}, "
+            "or give each route its own function."
         )
 
 
@@ -684,7 +707,8 @@ def cors(
                  use Django settings instead.
         origin_regexes: Patterns for allowed origins, as in CORS_ALLOWED_ORIGIN_REGEXES. Start
                  each pattern with ^ and end it with $. Patterns use the syntax of the Rust
-                 regex crate, which has no look-around and no back-references.
+                 regex crate, which has no look-around and no back-references. A pattern
+                 that does not compile stops startup with ValueError.
         methods: Allowed methods, as a list of str (default: GET, POST, PUT, PATCH, DELETE,
                  OPTIONS, QUERY)
         headers: Allowed headers, as a list of str (default: Content-Type, Authorization)
@@ -723,7 +747,7 @@ def cors(
             max_age=max_age,
         )
 
-        _reject_second_cors(func)
+        _reject_second_config(func, "cors")
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
 
@@ -742,7 +766,7 @@ def cors(
     return decorator
 
 
-def skip_middleware(*middleware_names: str):
+def skip_middleware(*middleware_names: str | type):
     """
     Skip specific middleware for this route.
 
@@ -750,9 +774,13 @@ def skip_middleware(*middleware_names: str):
         middleware_names: Names of middleware to skip. A name is "cors",
             "rate_limit" or "compression" for a Rust middleware. For a Python
             middleware, a name is the name or the dotted path of its class or
-            function. "*" skips each Bolt middleware, Python and Rust. "*"
-            does not skip a Django middleware. Give the name of a Django
-            middleware class to skip it, for example "CsrfViewMiddleware".
+            function, or the class itself. "*" skips each Bolt middleware,
+            Python and Rust. "*" does not skip a Django middleware. Give the
+            name of a Django middleware class, or the class, to skip it, for
+            example "CsrfViewMiddleware". A name ignores the letter case.
+
+    Raises:
+        TypeError: A value is not a str or a class.
 
     Examples:
         @api.get("/no-compression")
@@ -771,10 +799,23 @@ def skip_middleware(*middleware_names: str):
             return {"fast": True}
     """
 
+    # Keep each name in lower case, and a class as its dotted path. Rust reads
+    # the names as a list of str and compares them in lower case.
+    names: list[str] = []
+    for name in middleware_names:
+        if isinstance(name, type):
+            name = f"{name.__module__}.{name.__qualname__}"
+        elif not isinstance(name, str):
+            raise TypeError(
+                "@skip_middleware() takes the name of a middleware or a middleware class, "
+                f"not {type(name).__name__} {name!r}"
+            )
+        names.append(name.lower())
+
     def decorator(func):
         if not hasattr(func, "__bolt_skip_middleware__"):
             func.__bolt_skip_middleware__ = set()
-        func.__bolt_skip_middleware__.update(middleware_names)
+        func.__bolt_skip_middleware__.update(names)
         return func
 
     return decorator

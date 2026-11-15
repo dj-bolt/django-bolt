@@ -12,6 +12,7 @@ from typing import Annotated
 import jwt
 import msgspec
 import pytest
+import yaml
 from django.contrib.auth import alogin
 from django.contrib.auth.models import User
 from django.test import override_settings
@@ -26,11 +27,27 @@ from django_bolt.auth import (
     SessionAuthentication,
 )
 from django_bolt.datastructures import UploadFile
-from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, SwaggerRenderPlugin
-from django_bolt.openapi.spec import Components, SecurityScheme
+from django_bolt.openapi import (
+    OpenAPIConfig,
+    RapidocRenderPlugin,
+    RedocRenderPlugin,
+    ScalarRenderPlugin,
+    StoplightRenderPlugin,
+    SwaggerRenderPlugin,
+)
+from django_bolt.openapi.spec import (
+    Components,
+    Contact,
+    ExternalDocumentation,
+    License,
+    SecurityScheme,
+    Server,
+    Tag,
+)
 from django_bolt.params import File, Form
 from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
+from django_bolt.websocket.types import WebSocket
 
 
 class Item(msgspec.Struct):
@@ -84,6 +101,35 @@ def test_openapi_json_endpoint():
         # Verify our routes are in the schema
         assert "/items/{item_id}" in data["paths"]
         assert "/items" in data["paths"]
+
+
+@pytest.mark.parametrize(
+    ("names", "title"),
+    [
+        ({"PROJECT_NAME": "Shop", "SITE_NAME": "Site"}, "Shop"),
+        ({"SITE_NAME": "Site"}, "Site"),
+        ({}, "API"),
+    ],
+    ids=["project-name", "site-name", "no-name"],
+)
+def test_default_openapi_config_takes_the_title_from_the_settings(settings, names, title):
+    """With no ``openapi_config``, the title is PROJECT_NAME, then SITE_NAME, then "API"."""
+    for name, value in names.items():
+        setattr(settings, name, value)
+
+    api = BoltAPI()
+
+    @api.get("/items")
+    async def items():
+        return []
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get("/docs/openapi.json")
+
+    assert response.status_code == 200
+    assert response.json()["info"] == {"title": title, "version": "1.0.0"}
 
 
 def test_swagger_ui_endpoint():
@@ -144,6 +190,231 @@ def test_redoc_endpoint_uses_available_bundle(options, expected_url):
     assert f'<script src="{expected_url}" crossorigin></script>' in response.text
     assert "Redoc.init(" in response.text
     assert '"/items"' in response.text
+
+
+def test_docs_pages_escape_the_text_of_the_api():
+    """The title, a docstring and the Scalar options are text. They do not end a tag or a script of the page."""
+    api = BoltAPI(
+        openapi_config=OpenAPIConfig(
+            title="Tom & <b>Co</b> API",
+            version="1.0.0",
+            render_plugins=[
+                SwaggerRenderPlugin(path="/swagger"),
+                RedocRenderPlugin(path="/redoc"),
+                ScalarRenderPlugin(path="/scalar", options={"title": "Tom's API"}),
+                RapidocRenderPlugin(path="/rapidoc"),
+                StoplightRenderPlugin(path="/stoplight"),
+            ],
+        )
+    )
+
+    @api.get("/items")
+    async def get_items():
+        """Give the items as </script><script>alert(1)</script> shows them."""
+        return []
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        pages = {
+            name: client.get(f"/docs/{name}").text for name in ("swagger", "redoc", "scalar", "rapidoc", "stoplight")
+        }
+        description = client.get("/docs/openapi.json").json()["paths"]["/items"]["get"]["summary"]
+
+    assert description == "Give the items as </script><script>alert(1)</script> shows them."
+    for name, page in pages.items():
+        assert "<title>Tom &amp; &lt;b&gt;Co&lt;/b&gt; API</title>" in page, name
+        assert "<script>alert(1)</script>" not in page, name
+    # The page holds the docstring as JSON text that the browser reads back to the same string.
+    for name in ("swagger", "redoc"):
+        assert r"\u003c/script\u003e\u003cscript\u003ealert(1)\u003c/script\u003e" in pages[name], name
+    # The apostrophe does not end a JavaScript string.
+    assert """dataset.configuration = JSON.stringify({"title":"Tom's API"})""" in pages["scalar"]
+
+
+@pytest.mark.parametrize(
+    ("plugin", "url", "expected_parts"),
+    [
+        (
+            RapidocRenderPlugin(),
+            "/docs/rapidoc",
+            [
+                "<title>Docs UI API</title>",
+                '<script src="https://unpkg.com/rapidoc@9.3.4/dist/rapidoc-min.js" crossorigin></script>',
+                '<rapi-doc spec-url="/docs/openapi.json" />',
+            ],
+        ),
+        (
+            StoplightRenderPlugin(),
+            "/docs/elements",
+            [
+                "<title>Docs UI API</title>",
+                '<link rel="stylesheet" href="https://unpkg.com/@stoplight/elements@7.7.18/styles.min.css">',
+                '<script src="https://unpkg.com/@stoplight/elements@7.7.18/web-components.min.js" crossorigin></script>',
+                'apiDescriptionUrl="/docs/openapi.json"',
+                'router="hash"',
+                'layout="sidebar"',
+            ],
+        ),
+    ],
+)
+def test_rapidoc_and_stoplight_endpoints_render_the_page(plugin, url, expected_parts):
+    """Each UI page names the API title, its bundle and the schema URL."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Docs UI API", version="1.0.0", render_plugins=[plugin]))
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.text.lstrip().startswith("<!DOCTYPE html>")
+    for part in expected_parts:
+        assert part in response.text
+    assert plugin.favicon in response.text
+    assert plugin.style in response.text
+    assert '<meta charset="utf-8"/>' in response.text
+    assert 'name="viewport"' in response.text
+
+
+_FAVICON = '<link rel="icon" href="/static/docs.ico">'
+_STYLE = "<style>body { margin: 4px }</style>"
+
+
+@pytest.mark.parametrize(
+    ("plugin_class", "options", "url", "present", "absent"),
+    [
+        (
+            SwaggerRenderPlugin,
+            {"version": "5.40.0"},
+            "/docs/swagger",
+            [
+                '<link href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.40.0/swagger-ui.css" rel="stylesheet">',
+                '<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.40.0/swagger-ui-bundle.js" crossorigin>',
+                '<script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.40.0/swagger-ui-standalone-preset.js"',
+            ],
+            [],
+        ),
+        (
+            SwaggerRenderPlugin,
+            {"js_url": "/static/ui.js", "css_url": "/static/ui.css", "standalone_preset_js_url": "/static/preset.js"},
+            "/docs/swagger",
+            [
+                '<link href="/static/ui.css" rel="stylesheet">',
+                '<script src="/static/ui.js" crossorigin>',
+                '<script src="/static/preset.js" crossorigin>',
+            ],
+            ["cdn.jsdelivr.net"],
+        ),
+        (RedocRenderPlugin, {}, "/docs/redoc", ['<link href="https://fonts.googleapis.com/css?family='], []),
+        (RedocRenderPlugin, {"google_fonts": False}, "/docs/redoc", ["Redoc.init("], ["fonts.googleapis.com"]),
+        (
+            ScalarRenderPlugin,
+            {"version": "1.25.0"},
+            "/docs/scalar",
+            [
+                '<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.25.0" crossorigin>',
+                f'<link rel="stylesheet" type="text/css" href="{ScalarRenderPlugin._default_css_url}">',
+                'data-url="/docs/openapi.json"',
+            ],
+            ["dataset.configuration"],
+        ),
+        (
+            ScalarRenderPlugin,
+            {"js_url": "/static/scalar.js", "css_url": "/static/scalar.css", "options": {"theme": "moon"}},
+            "/docs/scalar",
+            [
+                '<script src="/static/scalar.js" crossorigin>',
+                '<link rel="stylesheet" type="text/css" href="/static/scalar.css">',
+                "dataset.configuration = ",
+                '{"theme":"moon"}',
+            ],
+            ["cdn.jsdelivr.net"],
+        ),
+        (
+            RapidocRenderPlugin,
+            {"version": "9.3.8"},
+            "/docs/rapidoc",
+            ['<script src="https://unpkg.com/rapidoc@9.3.8/dist/rapidoc-min.js" crossorigin>'],
+            [],
+        ),
+        (
+            RapidocRenderPlugin,
+            {"js_url": "/static/rapidoc.js"},
+            "/docs/rapidoc",
+            ['<script src="/static/rapidoc.js" crossorigin>'],
+            ["unpkg.com"],
+        ),
+        (
+            StoplightRenderPlugin,
+            {"version": "8.0.0"},
+            "/docs/elements",
+            [
+                '<link rel="stylesheet" href="https://unpkg.com/@stoplight/elements@8.0.0/styles.min.css">',
+                '<script src="https://unpkg.com/@stoplight/elements@8.0.0/web-components.min.js" crossorigin>',
+            ],
+            [],
+        ),
+        (
+            StoplightRenderPlugin,
+            {"js_url": "/static/elements.js", "css_url": "/static/elements.css"},
+            "/docs/elements",
+            ['<link rel="stylesheet" href="/static/elements.css">', '<script src="/static/elements.js" crossorigin>'],
+            ["unpkg.com"],
+        ),
+    ],
+    ids=[
+        "swagger-version",
+        "swagger-urls",
+        "redoc-fonts",
+        "redoc-no-fonts",
+        "scalar-version",
+        "scalar-urls-options",
+        "rapidoc-version",
+        "rapidoc-url",
+        "stoplight-version",
+        "stoplight-urls",
+    ],
+)
+def test_docs_page_options_change_the_page(plugin_class, options, url, present, absent):
+    """A UI plugin serves its page at its default path, with the options of its constructor."""
+    plugin = plugin_class(favicon=_FAVICON, style=_STYLE, **options)
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Options API", version="1.0.0", render_plugins=[plugin]))
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    page = response.text
+    assert "<title>Options API</title>" in page
+    assert _FAVICON in page
+    assert _STYLE in page
+    for part in present:
+        assert part in page
+    for part in absent:
+        assert part not in page
+
+
+def test_openapi_root_serves_the_plugin_with_the_root_path():
+    """The docs root serves the plugin that has the "/" path. With no such plugin, it serves the first plugin."""
+    scalar_last = BoltAPI(
+        openapi_config=OpenAPIConfig(
+            title="Root API", version="1.0.0", render_plugins=[RedocRenderPlugin(), ScalarRenderPlugin()]
+        )
+    )
+    no_root = BoltAPI(
+        openapi_config=OpenAPIConfig(
+            title="Root API", version="1.0.0", render_plugins=[RapidocRenderPlugin(), RedocRenderPlugin()]
+        )
+    )
+    scalar_last._register_openapi_routes()
+    no_root._register_openapi_routes()
+
+    with TestClient(scalar_last) as client:
+        assert 'id="api-reference"' in client.get("/docs").text
+        assert "Redoc.init(" in client.get("/docs/redoc").text
+    with TestClient(no_root) as client:
+        assert "<rapi-doc" in client.get("/docs").text
 
 
 def test_swagger_ui_supports_openapi_3_2_query_specs():
@@ -285,6 +556,34 @@ def test_openapi_disabled_returns_404():
         assert response.status_code == 404, f"Disabled docs UI should return 404, got {response.status_code}"
 
 
+def test_openapi_exclude_paths_match_whole_path_segments():
+    """`/admin` hides `/admin` and `/admin/users`. It does not hide `/administrators`."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0", exclude_paths=["/admin", "/ws"]))
+
+    async def handler():
+        return {}
+
+    for path in ("/admin", "/admin/users", "/administrators", "/docs-archive", "/visible"):
+        api.get(path)(handler)
+
+    @api.websocket("/ws/internal")
+    async def internal_socket(websocket: WebSocket):
+        await websocket.accept()
+
+    @api.websocket("/wsx")
+    async def public_socket(websocket: WebSocket):
+        await websocket.accept()
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        paths = client.get("/docs/openapi.json").json()["paths"]
+        # The routes are not documented, but the server serves them.
+        assert client.get("/admin/users").status_code == 200
+
+    assert sorted(paths) == ["/administrators", "/docs-archive", "/visible", "/wsx"]
+
+
 def test_openapi_protected_without_auth_returns_401():
     """Test that protected docs without authentication return 401."""
     api = BoltAPI(
@@ -399,6 +698,80 @@ def _docs_api_with_login(**config) -> BoltAPI:
 
     api._register_openapi_routes()
     return api
+
+
+def test_openapi_yaml_endpoints_serve_the_same_document_as_json():
+    """Both YAML paths return 200, a YAML media type and the document of the JSON path."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/items")
+    async def list_items() -> list[Item]:
+        return []
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        document = client.get("/docs/openapi.json").json()
+        for path in ("/docs/openapi.yaml", "/docs/openapi.yml"):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert response.headers["content-type"] == "text/yaml; charset=utf-8", path
+            assert yaml.safe_load(response.text) == document, path
+
+
+def test_openapi_config_fields_reach_the_document():
+    """Info, servers, security and external docs of the config appear in the document."""
+    config = OpenAPIConfig(
+        title="Test API",
+        version="2.1.0",
+        description="Long text.",
+        summary="Short text.",
+        terms_of_service="https://example.com/terms",
+        contact=Contact(name="Team", email="team@example.com"),
+        license=License(name="MIT"),
+        servers=[Server(url="https://api.example.com")],
+        security=[{"BearerAuth": []}],
+        external_docs=ExternalDocumentation(url="https://example.com/docs"),
+        tags=[Tag(name="items", description="Item routes")],
+    )
+    api = BoltAPI(openapi_config=config)
+
+    @api.get("/items", tags=["items"])
+    async def list_items() -> list[Item]:
+        return []
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        document = client.get("/docs/openapi.json").json()
+
+    assert document["info"] == {
+        "title": "Test API",
+        "version": "2.1.0",
+        "description": "Long text.",
+        "summary": "Short text.",
+        "termsOfService": "https://example.com/terms",
+        "contact": {"name": "Team", "email": "team@example.com"},
+        "license": {"name": "MIT"},
+    }
+    assert document["servers"] == [{"url": "https://api.example.com"}]
+    assert document["security"] == [{"BearerAuth": []}]
+    assert document["externalDocs"] == {"url": "https://example.com/docs"}
+    assert {"name": "items", "description": "Item routes"} in document["tags"]
+
+
+def test_openapi_docs_ignore_the_prefix_of_the_api():
+    """The docs routes keep their absolute path when the API has a prefix."""
+    api = BoltAPI(prefix="/api", openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/items")
+    async def list_items() -> list[Item]:
+        return []
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        for path in ("/docs/openapi.json", "/docs/openapi.yaml", "/docs", "/docs/redoc"):
+            assert client.get(path).status_code == 200, path
+        assert client.get("/api/docs/openapi.json").status_code == 404
+        assert "/api/items" in client.get("/docs/openapi.json").json()["paths"]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -598,3 +971,44 @@ def test_openapi_form_serializer_flattens_struct_fields():
         assert props["attachments"] == {"type": "array", "items": {"type": "string", "format": "binary"}}
 
         assert set(media["required"]) == {"username", "age", "email", "attachments", "profile_picture"}
+
+
+def test_openapi_request_body_lists_the_content_types_that_the_route_accepts():
+    """A route with a file accepts multipart only. A route with only form fields accepts both form types."""
+
+    class Report(Serializer):
+        title: str
+        pages: list[UploadFile]
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.post("/avatar")
+    async def avatar(file: Annotated[UploadFile, File()], title: Annotated[str, Form()]):
+        return {"title": title}
+
+    @api.post("/report")
+    async def report(payload: Annotated[Report, Form()]):
+        return {"title": payload.title}
+
+    @api.post("/login")
+    async def login(username: Annotated[str, Form()]):
+        return {"username": username}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        paths = client.get("/docs/openapi.json").json()["paths"]
+        content = {path: list(paths[path]["post"]["requestBody"]["content"]) for path in paths}
+
+        assert content == {
+            "/avatar": ["multipart/form-data"],
+            "/report": ["multipart/form-data"],
+            "/login": ["multipart/form-data", "application/x-www-form-urlencoded"],
+        }
+        # The document shows what the server does.
+        assert client.post("/avatar", data={"title": "a", "file": "text"}).status_code == 422
+        assert client.post("/avatar", data={"title": "a"}, files={"file": ("a.txt", b"x")}).json() == {"title": "a"}
+        assert client.post("/login", data={"username": "ann"}).json() == {"username": "ann"}
+        assert client.post("/login", data={"username": "ann"}, files={"x": ("a.txt", b"x")}).json() == {
+            "username": "ann"
+        }

@@ -11,8 +11,9 @@ Each value arrives with its declared type, and a bad value gives a 422:
 
 # No ``from __future__ import annotations``: the tests declare the handlers
 # with local types, and the handlers must resolve them.
+import enum
 from decimal import Decimal
-from typing import Annotated, NewType
+from typing import Annotated, Literal, NewType
 from urllib.parse import parse_qsl
 
 import msgspec
@@ -215,6 +216,32 @@ def test_a_sequence_header_or_cookie_gives_one_item(form_client):
     assert form_client.get("/cookie", headers={"Cookie": "tags=a"}).json() == {"value": ["a"], "type": "set"}
 
 
+class _TagHeaders(msgspec.Struct):
+    x_name: str = "none"
+    x_tags: list[str] = []
+    x_ids: set[int] | None = None
+
+
+def test_a_sequence_field_of_a_header_model_gives_one_item():
+    api = BoltAPI()
+
+    @api.get("/model")
+    async def model(headers: Annotated[_TagHeaders, Header()]):
+        return {"name": headers.x_name, "tags": headers.x_tags, "ids": _show(headers.x_ids)}
+
+    with TestClient(api) as client:
+        response = client.get("/model", headers={"X-Name": "bo", "X-Tags": "a, b", "X-Ids": "4"})
+        assert response.status_code == 200, response.text
+        # The value is one item, as for a sequence header parameter. Bolt does not split it at a comma.
+        assert response.json() == {"name": "bo", "tags": ["a, b"], "ids": {"value": [4], "type": "set"}}
+        assert client.get("/model").json() == {"name": "none", "tags": [], "ids": {"value": None, "type": "NoneType"}}
+
+        bad = client.get("/model", headers={"X-Ids": "x"})
+        assert bad.status_code == 422
+        assert bad.json()["detail"][0]["loc"] == ["header", "x-ids"]
+        assert bad.json()["detail"][0]["input"] == ["x"]
+
+
 @pytest.mark.parametrize(
     ("route", "annotation"),
     [
@@ -287,6 +314,103 @@ def test_a_one_item_or_variadic_tuple_header_takes_the_value():
 
     assert response.status_code == 200, response.text
     assert response.json() == {"one": {"value": [4], "type": "tuple"}, "many": {"value": [5], "type": "tuple"}}
+
+
+# --- bytes --------------------------------------------------------------------------
+
+
+def _show_bytes(value):
+    """Describe a bytes value, or each item of a sequence of bytes values."""
+    if isinstance(value, (bytes, bytearray)):
+        return {"type": type(value).__name__, "hex": bytes(value).hex()}
+    if value is None or isinstance(value, str):
+        return {"type": type(value).__name__}
+    return {"type": type(value).__name__, "items": [_show_bytes(item) for item in value]}
+
+
+@pytest.fixture
+def bytes_client():
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(b: bytes):
+        return _show_bytes(b)
+
+    @api.get("/query-sync")
+    def query_sync(b: bytes):
+        return _show_bytes(b)
+
+    @api.get("/optional")
+    async def optional(b: bytes | None = None):
+        return _show_bytes(b)
+
+    @api.get("/list")
+    async def as_list(b: list[bytes]):
+        return _show_bytes(b)
+
+    @api.get("/short")
+    async def short(b: Annotated[bytes, msgspec.Meta(max_length=3)]):
+        return _show_bytes(b)
+
+    @api.get("/bytearray")
+    async def as_bytearray(b: bytearray):
+        return _show_bytes(b)
+
+    @api.get("/path/{b}")
+    async def path(b: bytes):
+        return _show_bytes(b)
+
+    @api.get("/header")
+    async def header(x_b: Annotated[bytes, Header()], x_list: Annotated[list[bytes] | None, Header()] = None):
+        return [_show_bytes(x_b), _show_bytes(x_list)]
+
+    @api.get("/cookie")
+    async def cookie(b: Annotated[bytes, Cookie()]):
+        return _show_bytes(b)
+
+    @api.post("/form")
+    async def form(b: Annotated[bytes, Form()], items: Annotated[list[bytes], Form()]):
+        return [_show_bytes(b), _show_bytes(items)]
+
+    return TestClient(api)
+
+
+def _utf8(text):
+    return {"type": "bytes", "hex": text.encode().hex()}
+
+
+def test_a_bytes_parameter_gets_the_utf8_bytes_of_the_text(bytes_client):
+    """The value of a parameter is text. A ``bytes`` parameter gets its UTF-8 bytes, with no base64 decoding."""
+    # "YWJj" is base64 for "abc". The handler gets the four characters.
+    for text in ("abc", "YWJj", "123", "caf\u00e9"):
+        assert bytes_client.get("/query", params={"b": text}).json() == _utf8(text)
+        assert bytes_client.get("/query-sync", params={"b": text}).json() == _utf8(text)
+    assert bytes_client.get("/optional", params={"b": "abc"}).json() == _utf8("abc")
+    assert bytes_client.get("/optional").json() == {"type": "NoneType"}
+    assert bytes_client.get("/list?b=abc&b=YWJj").json() == {"type": "list", "items": [_utf8("abc"), _utf8("YWJj")]}
+    assert bytes_client.get("/bytearray?b=abc").json() == {"type": "bytearray", "hex": b"abc".hex()}
+    assert bytes_client.get("/path/abc").json() == _utf8("abc")
+    assert bytes_client.get("/header", headers={"x-b": "abc"}).json() == [_utf8("abc"), {"type": "NoneType"}]
+    assert bytes_client.get("/header", headers={"x-b": "abc", "x-list": "YWJj"}).json() == [
+        _utf8("abc"),
+        {"type": "list", "items": [_utf8("YWJj")]},
+    ]
+    assert bytes_client.get("/cookie", headers={"cookie": "b=abc"}).json() == _utf8("abc")
+    response = bytes_client.post("/form", data={"b": "abc", "items": ["x", "YWJj"]})
+    assert response.json() == [_utf8("abc"), {"type": "list", "items": [_utf8("x"), _utf8("YWJj")]}]
+
+
+def test_a_bytes_parameter_checks_its_constraints_on_the_bytes(bytes_client):
+    assert bytes_client.get("/short?b=abc").json() == _utf8("abc")
+    # Two characters, but three bytes in UTF-8.
+    assert bytes_client.get("/short", params={"b": "\u00e9a"}).json() == _utf8("\u00e9a")
+
+    response = bytes_client.get("/short?b=YWJj")
+    assert response.status_code == 422
+    assert response.json()["detail"] == [
+        {"type": "validation_error", "loc": ["query", "b"], "msg": "Expected `bytes` of length <= 3", "input": "YWJj"}
+    ]
+    assert bytes_client.get("/query").status_code == 422
 
 
 # --- NewType and type aliases ----------------------------------------------------------
@@ -397,6 +521,67 @@ def test_a_parameterized_type_alias_converts_as_the_type_it_names(generic_alias_
 def test_a_bad_parameterized_type_alias_value_is_a_422(generic_alias_client, url):
     response = generic_alias_client.get(url)
     assert response.status_code == 422, response.text
+
+
+# --- Enum and Literal ---------------------------------------------------------------
+
+
+class _Color(enum.Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class _Level(enum.IntEnum):
+    LOW = 1
+    HIGH = 2
+
+
+def test_an_enum_or_literal_parameter_converts_its_value_and_rejects_another_value():
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(color: _Color, level: _Level = _Level.LOW, mode: Literal["asc", "desc"] | None = None):
+        return {"color": color.name, "level": level.name, "mode": mode}
+
+    @api.get("/path/{color}")
+    async def path(color: _Color):
+        return {"color": color.name}
+
+    @api.get("/header")
+    async def header(x_color: Annotated[_Color, Header()], level: Annotated[_Level | None, Cookie()] = None):
+        return {"color": x_color.name, "level": level and level.name}
+
+    @api.post("/form")
+    async def form(color: Annotated[_Color, Form()]):
+        return {"color": color.name}
+
+    with TestClient(api) as client:
+        assert client.get("/query?color=red").json() == {"color": "RED", "level": "LOW", "mode": None}
+        assert client.get("/query?color=blue&level=2&mode=desc").json() == {
+            "color": "BLUE",
+            "level": "HIGH",
+            "mode": "desc",
+        }
+        assert client.get("/path/blue").json() == {"color": "BLUE"}
+        assert client.get("/header", headers={"x-color": "red"}).json() == {"color": "RED", "level": None}
+        assert client.get("/header", headers={"x-color": "red", "cookie": "level=2"}).json() == {
+            "color": "RED",
+            "level": "HIGH",
+        }
+        assert client.post("/form", data={"color": "blue"}).json() == {"color": "BLUE"}
+
+        bad = [
+            (client.get("/query?color=green"), ["query", "color"]),
+            (client.get("/query?color=red&level=3"), ["query", "level"]),
+            (client.get("/query?color=red&mode=up"), ["query", "mode"]),
+            (client.get("/path/green"), ["path", "color"]),
+            (client.get("/header", headers={"x-color": "green"}), ["header", "x-color"]),
+            (client.get("/header", headers={"x-color": "red", "cookie": "level=3"}), ["cookie", "level"]),
+            (client.post("/form", data={"color": "green"}), ["body", "color"]),
+        ]
+        for response, loc in bad:
+            assert response.status_code == 422, loc
+            assert response.json()["detail"][0]["loc"] == loc
 
 
 # --- msgspec.Meta constraints ----------------------------------------------------------
@@ -721,6 +906,17 @@ def test_a_missing_form_field_takes_its_default_or_none(form_field_client):
     assert form_field_client.post("/limited-default", data={}).json() == {"value": 5, "type": "int"}
     assert form_field_client.post("/limited-optional", data={}).json() == {"value": None, "type": "NoneType"}
     assert form_field_client.post("/limited-optional", data={"count": "2"}).json() == {"value": 2, "type": "int"}
+
+
+def test_a_repeated_form_field_that_is_not_a_sequence_keeps_its_last_value(form_field_client):
+    for url, name in [("/required", "name"), ("/default", "nick"), ("/optional", "alt")]:
+        response = form_field_client.post(url, data={name: ["a", "b"]})
+        assert response.json() == {"value": "b", "type": "str"}, url
+    for url in ["/limited", "/limited-default", "/limited-optional"]:
+        response = form_field_client.post(url, data={"count": ["3", "4"]})
+        assert response.json() == {"value": 4, "type": "int"}, url
+    # The constraint applies to the value that the handler gets.
+    assert form_field_client.post("/limited", data={"count": ["3", "0"]}).status_code == 422
 
 
 def test_a_form_field_outside_its_constraint_names_the_field(form_field_client):
