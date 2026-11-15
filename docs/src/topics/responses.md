@@ -20,6 +20,16 @@ async def get_items():
     return [{"id": 1}, {"id": 2}]
 ```
 
+A scalar is also a JSON response. Return an `int`, a `float`, a `bool`, a `Decimal`, a `UUID`, an `Enum` member, or a `date`, `time`, `datetime` or `timedelta`:
+
+```python
+@api.get("/count")
+async def count() -> int:
+    return 3  # Body: 3, Content-Type: application/json
+```
+
+`None` is the JSON `null` when the response type allows it, such as `-> None` or `-> int | None`. With no such response type, a `None` result is an error, because the handler has no `return`. A `str` and `bytes` are not JSON, see [Returning strings and bytes](#returning-strings-and-bytes).
+
 ### Custom status codes and headers
 
 Use the `JSON` class for more control:
