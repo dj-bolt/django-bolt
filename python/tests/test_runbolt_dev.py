@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
+import os
 import sys
 from types import SimpleNamespace
 
@@ -8,7 +10,10 @@ import pytest
 from django.core.management import call_command, execute_from_command_line
 from django.core.management.base import CommandError
 
+from django_bolt import BoltAPI, WebSocket
+from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
 from django_bolt.management.commands import runbolt as runbolt_module
+from django_bolt.testing import TestClient, WebSocketTestClient
 
 
 def _clear_modules(monkeypatch, *module_names: str) -> None:
@@ -247,6 +252,104 @@ def test_execute_from_command_line_dev_calls_reloader_with_debounce(monkeypatch)
     }
 
 
+@pytest.mark.parametrize(
+    ("argv", "warnings"),
+    [
+        (["--processes", "4"], ["Warning: dev mode forces --processes=1 for auto-reload"]),
+        (["--max-rss", "64"], ["Warning: worker recycling options are ignored in dev mode"]),
+        (["--workers-lifetime", "60"], ["Warning: worker recycling options are ignored in dev mode"]),
+        (["--respawn-failed-workers"], ["Warning: worker recycling options are ignored in dev mode"]),
+        (["--processes", "1", "--reload-dir", "/tmp/plugins"], []),
+    ],
+)
+def test_runbolt_dev_warns_about_the_options_that_it_ignores(monkeypatch, capsys, argv, warnings):
+    monkeypatch.setattr(runbolt_module, "_collect_dev_watch_paths", lambda _reload_dirs: ["/tmp/project"])
+    monkeypatch.setattr(runbolt_module, "_collect_dev_ignore_paths", lambda: ["/tmp/venv"])
+    monkeypatch.setattr(runbolt_module, "_core", SimpleNamespace(run_dev_reloader=lambda *_args: 0))
+
+    call_command("runbolt", "--dev", *argv)
+
+    lines = [line.strip() for line in capsys.readouterr().out.splitlines() if "Warning" in line]
+    assert lines == warnings
+
+
+_LIFESPAN_API_SOURCE = """
+from contextlib import asynccontextmanager
+
+from django_bolt.api import BoltAPI
+
+EVENTS = []
+
+
+@asynccontextmanager
+async def lifespan(app):
+    EVENTS.append("startup")
+    yield
+    EVENTS.append("shutdown")
+
+
+api = BoltAPI(lifespan=lifespan)
+
+
+@api.get("/pong")
+async def pong():
+    return {}
+"""
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("argv", "backlog", "mounts", "warnings"),
+    [
+        ([], "1024", ["/admin"], []),
+        (["--backlog", "77"], "77", ["/admin"], []),
+        (["--no-admin"], "1024", [], []),
+        (["--reload-dir", "/tmp/plugins"], "1024", ["/admin"], ["Warning: --reload-dir is ignored without --dev"]),
+    ],
+)
+def test_runbolt_passes_its_options_to_the_server(
+    settings, tmp_path, monkeypatch, capsys, argv, backlog, mounts, warnings
+):
+    (tmp_path / "options_api.py").write_text(
+        "from django_bolt.api import BoltAPI\napi = BoltAPI()\n\n\n@api.get('/ping')\nasync def ping():\n    return {}\n"
+    )
+    (tmp_path / "options_lifespan_api.py").write_text(_LIFESPAN_API_SOURCE)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_modules(monkeypatch, "options_api", "options_lifespan_api")
+    settings.BOLT_API = ["options_api:api", "options_lifespan_api:api"]
+    # runbolt writes these variables. monkeypatch puts the old values back after the test.
+    for name in ("DJANGO_BOLT_WORKERS", "DJANGO_BOLT_BACKLOG", "DJANGO_BOLT_SHUTDOWN_TIMEOUT"):
+        monkeypatch.setenv(name, "0")
+    started = {"mounts": []}
+
+    def fake_start_server(dispatch, host, port, compression, error_renderer):
+        started["backlog"] = os.environ["DJANGO_BOLT_BACKLOG"]
+        started["address"] = (host, port)
+        sys.modules["options_lifespan_api"].EVENTS.append("serve")
+
+    monkeypatch.setattr(
+        runbolt_module,
+        "_core",
+        SimpleNamespace(
+            register_routes=lambda routes, _native_routes: started.update(paths=[route[1] for route in routes]),
+            register_asgi_mounts=lambda asgi_mounts: started.update(mounts=[prefix for prefix, _ in asgi_mounts]),
+            register_middleware_metadata=lambda _metadata: None,
+            start_server=fake_start_server,
+        ),
+    )
+
+    call_command("runbolt", "--host", "127.0.0.1", "--port", "8123", *argv)
+
+    assert started["address"] == ("127.0.0.1", 8123)
+    # The two APIs of BOLT_API are one server, and the lifespan of the second API runs around it.
+    assert {"/ping", "/pong"} <= set(started["paths"])
+    assert sys.modules["options_lifespan_api"].EVENTS == ["startup", "serve", "shutdown"]
+    assert started["backlog"] == backlog
+    assert started["mounts"] == mounts
+    lines = [line.strip() for line in capsys.readouterr().out.splitlines() if "Warning" in line]
+    assert lines == warnings
+
+
 def test_collect_dev_watch_paths_includes_api_transitive_imports(settings, tmp_path, monkeypatch):
     """The dev supervisor must watch modules imported BY api.py, not just api.py.
 
@@ -378,3 +481,101 @@ def test_autodiscover_apis_prefers_package_api_for_package_root_urlconf(settings
     apis = runbolt_module.Command().autodiscover_apis()
 
     assert [api_path for api_path, _ in apis] == ["urls.api:api"]
+
+
+def test_autodiscover_apis_finds_the_apis_of_installed_apps(settings, tmp_path, monkeypatch):
+    def write_app(name: str, files: dict[str, str]) -> None:
+        package = tmp_path / name
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        for file_name, source in files.items():
+            (package / file_name).write_text("from django_bolt.api import BoltAPI\n" + source)
+
+    write_app("discover_project", {"urls.py": "urlpatterns = []\n", "api.py": "api = BoltAPI()\n"})
+    # The project API covers each app below the project package.
+    (tmp_path / "discover_project" / "billing").mkdir()
+    (tmp_path / "discover_project" / "billing" / "__init__.py").write_text("")
+    (tmp_path / "discover_project" / "billing" / "api.py").write_text(
+        "from django_bolt.api import BoltAPI\napi = BoltAPI()\n"
+    )
+    write_app(
+        "discover_shop", {"api.py": "first = BoltAPI()\nsecond = BoltAPI()\n", "bolt_api.py": "api = BoltAPI()\n"}
+    )
+    write_app("discover_blog", {"bolt_api.py": "api = BoltAPI()\n"})
+    write_app("discover_hinted", {"api.py": "api = BoltAPI()\n", "custom.py": "custom_api = BoltAPI()\n"})
+    write_app("discover_plain", {"models.py": ""})
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    app_configs = [
+        SimpleNamespace(name="django_bolt"),
+        SimpleNamespace(name="discover_project.billing"),
+        SimpleNamespace(name="discover_shop"),
+        SimpleNamespace(name="discover_plain"),
+        SimpleNamespace(name="discover_hinted", bolt_api="discover_hinted.custom:custom_api"),
+        SimpleNamespace(name="discover_blog"),
+    ]
+    monkeypatch.setattr(runbolt_module, "apps", SimpleNamespace(get_app_configs=lambda: app_configs))
+    settings.ROOT_URLCONF = "discover_project.urls"
+    try:
+        apis = runbolt_module.Command().autodiscover_apis()
+    finally:
+        _clear_modules(
+            monkeypatch,
+            *(name for name in list(sys.modules) if name.startswith("discover_")),
+        )
+
+    assert [api_path for api_path, _ in apis] == [
+        "discover_project.api:api",
+        "discover_shop.api:first",
+        "discover_hinted.custom:custom_api",
+        "discover_blog.bolt_api:api",
+    ]
+
+
+def test_merge_apis_serves_the_routes_of_each_api():
+    first = BoltAPI()
+    second = BoltAPI()
+
+    @first.get("/first")
+    async def first_route():
+        return {"api": "first"}
+
+    @second.post("/second", status_code=201)
+    async def second_route(count: int):
+        return {"api": "second", "count": count}
+
+    @second.get("/private", auth=[APIKeyAuthentication(api_keys={"key1"})], guards=[IsAuthenticated()])
+    async def private_route():
+        return {"api": "second", "private": True}
+
+    @second.websocket("/ws/echo")
+    async def echo(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("echo:" + await websocket.receive_text())
+
+    async def asgi_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"mounted"})
+
+    second.mount_asgi("/legacy", asgi_app)
+
+    # One API needs no merge.
+    assert runbolt_module.Command().merge_apis([("first.api", first)]) is first
+
+    merged = runbolt_module.Command().merge_apis([("first.api", first), ("second.api", second)])
+
+    with TestClient(merged, use_http_layer=True) as client:
+        assert client.get("/first").json() == {"api": "first"}
+        created = client.post("/second?count=3")
+        assert (created.status_code, created.json()) == (201, {"api": "second", "count": 3})
+        assert client.post("/second?count=x").status_code == 422
+        assert client.get("/private").status_code == 401
+        assert client.get("/private", headers={"X-API-Key": "key1"}).json() == {"api": "second", "private": True}
+        assert client.get("/legacy/page").text == "mounted"
+
+    async def talk() -> str:
+        async with WebSocketTestClient(merged, "/ws/echo") as websocket:
+            await websocket.send_text("hello")
+            return await websocket.receive_text()
+
+    assert asyncio.run(talk()) == "echo:hello"
