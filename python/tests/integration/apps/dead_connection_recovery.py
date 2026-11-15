@@ -17,6 +17,9 @@ since server projects start with an unmigrated database. ``SECRET`` and
 ``/me-inline`` is ``/me`` with no await, so Bolt dispatches it synchronously
 on the worker thread.
 
+``/me-async-loader`` loads the user with ``await request.auser()``. Its backend
+overrides ``get_user`` and calls the ``get_user`` of ``JWTAuthentication``.
+
 ``/echo`` sends a token through a query and returns what the database sent
 back, with the process that served it. Two processes that share a socket read
 each other's results, so a token that comes back wrong shows the sharing.
@@ -50,6 +53,10 @@ of the streaming thread fails when the body ends.
 ``/autocommit-off-then-fail`` runs a call on the ORM pool that turns autocommit
 off, creates a temporary table and raises. Then it returns the state of the
 connection that the next call gets.
+
+``/query-in-a-helper`` is a sync handler with no query in its own source, so
+Bolt runs it on the worker thread that accepted the request. Its helper
+queries. With ``fail``, the handler raises after the query.
 
 ``lane_api`` is a second API, under ``/lane``, with a Django middleware stack.
 Its sync route ``/lane/query`` runs complete on a request lane. A test project
@@ -117,6 +124,17 @@ async def me_inline(request):
     # No await: Bolt runs this handler on the worker thread with no event
     # loop step, and the lazy user load blocks the loop of that thread.
     return {"username": request.user.username}
+
+
+class _AsyncLoader(JWTAuthentication):
+    async def get_user(self, user_id, auth_context):
+        return await super().get_user(user_id, auth_context)
+
+
+@api.get("/me-async-loader", auth=[_AsyncLoader(secret=SECRET)], guards=[IsAuthenticated()])
+async def me_async_loader(request):
+    user = await request.auser()
+    return {"username": user.username}
 
 
 @api.get("/orm-threads")
@@ -312,6 +330,14 @@ async def autocommit_off_then_fail():
     with contextlib.suppress(ValueError):
         await run_in_orm_executor(_autocommit_off_then_fail)
     return await run_in_orm_executor(_connection_state)
+
+
+@api.get("/query-in-a-helper")
+def query_in_a_helper(fail: bool = False):
+    result = _select_one()
+    if fail:
+        raise ValueError("the handler failed after its query")
+    return {"result": result, "thread": threading.current_thread().name}
 
 
 class _QueryMiddleware(MiddlewareMixin):

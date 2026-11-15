@@ -217,6 +217,36 @@ def test_runbolt_stops_when_the_host_has_no_address(make_server_project):
     assert f'cannot resolve host "{host}"' in stderr, stderr
 
 
+@pytest.mark.parametrize(
+    "processes",
+    [
+        1,
+        pytest.param(
+            2,
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("linux"), reason="Multiprocess smoke only runs on Linux."
+            ),
+        ),
+    ],
+)
+def test_runbolt_with_no_bolt_api_stops_with_an_error(make_server_project, processes):
+    """A project with no BoltAPI has nothing to serve. runbolt must not report success."""
+    project = make_server_project()
+    project.write_file(f"{project.package_name}/api.py", "NOT_AN_API = 1\n")
+
+    process, port = project.spawn(processes=processes)
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _terminate_process(process)
+        pytest.fail(f"runbolt kept running with no BoltAPI on port {port}\nstderr:\n{stderr}")
+
+    assert process.returncode == 1, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    assert "CommandError: No BoltAPI instances found." in stderr, stderr
+    # The supervisor must not start workers that have nothing to serve.
+    assert "exited unexpectedly" not in stdout + stderr, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Multiprocess smoke only runs on Linux.")
 def test_runbolt_processes_two_bind_failure_stops_with_exit_status_1(make_server_project):
     """No worker can bind the port. The supervisor must stop and report the failure."""

@@ -108,6 +108,9 @@ DEV_RELOAD_IGNORE_DIRS = (
     "target",
 )
 
+_NO_API_MESSAGE = (
+    "No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment, e.g., api = BoltAPI()"
+)
 _DEV_BROWSER_HOST = "127.0.0.1"
 _WILDCARD_BIND_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "0:0:0:0:0:0:0:0"})
 
@@ -823,12 +826,8 @@ class Command(BaseCommand):
 
         apis = self.autodiscover_apis()
         if not apis:
-            self.stdout.write(
-                self.style.WARNING(
-                    "No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment, e.g., api = BoltAPI()"
-                )
-            )
-            return
+            # Stop before the fork. A worker has nothing to serve.
+            raise CommandError(_NO_API_MESSAGE)
 
         merged_api = self.merge_apis(apis)
         _user_route_count = len(merged_api._routes) + len(merged_api._native_routes)
@@ -916,12 +915,8 @@ class Command(BaseCommand):
         apis = self.autodiscover_apis()
 
         if not apis:
-            self.stdout.write(
-                self.style.WARNING(
-                    "No BoltAPI instances found. Create api.py files with a top-level BoltAPI() assignment"
-                )
-            )
-            return
+            # A server with no API has nothing to serve. Stop with exit status 1.
+            raise CommandError(_NO_API_MESSAGE)
 
         # Merge all APIs and collect routes FIRST
         merged_api = self.merge_apis(apis)

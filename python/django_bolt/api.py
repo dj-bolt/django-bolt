@@ -49,6 +49,8 @@ from .auth.user_loader import (
 from .concurrency import (
     LaneAffinityError,
     _drop_broken_connections_after_error,
+    _thread_state,
+    release_pooled_connections_after_sync_dispatch,
     run_in_orm_executor,
     run_on_request_lane,
     sync_to_thread,
@@ -3803,6 +3805,10 @@ class BoltAPI:
             _drop_broken_connections_after_error()
             return self._handle_generic_exception(e, request=request)
         finally:
+            # A handler that ran the ORM inline on this thread holds a pooled
+            # connection. An idle worker thread must not keep a pool slot.
+            if _thread_state.holds_pooled:
+                release_pooled_connections_after_sync_dispatch()
             if meta["has_file_uploads"]:
                 upload_files = request.state.get("_upload_files", [])
                 for upload in upload_files:

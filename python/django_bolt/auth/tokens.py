@@ -290,19 +290,20 @@ async def rotate_refresh_token(
         except (KeyError, TypeError, ValueError) as exc:
             raise TokenRotationError("Refresh token has invalid expiry") from exc
 
-    # The Rust validator accepts tokens for `leeway` seconds after exp. Keep
-    # the consumed marker for that same window or a near-expiry token could be
-    # replayed after its marker disappeared but while signature validation
-    # still accepts it.
-    consume_exp = None if token_exp is None else max(token_exp, now + leeway)
+    # The Rust validator accepts a token until `exp + leeway`. A store can keep
+    # an entry only until the `exp` that it gets. Thus the consumed marker gets
+    # `exp + leeway`, or a used token could be replayed after its marker
+    # disappeared but while signature validation still accepts it.
+    consume_exp = None if token_exp is None else max(token_exp, now) + leeway
     if rotate and not await _consume(store, jti, exp=consume_exp):
         # A revoked-but-presented token under rotation is a replay: burn the
         # family so the legitimate holder's chain dies too (reuse detection).
         if fam is not None:
             # The marker must outlive every descendant, not just this replayed
             # token: a descendant minted from a later rotation can expire up to
-            # refresh_ttl from now, so retain the marker at least that long.
-            family_exp = max(now + refresh_ttl, consume_exp or 0)
+            # refresh_ttl from now, and the validator accepts it for `leeway`
+            # seconds more, so retain the marker at least that long.
+            family_exp = max(now + refresh_ttl + leeway, consume_exp or 0)
             await _revoke_family(store, fam, exp=family_exp)
         raise TokenRotationError("Refresh token revoked or already used")
 
