@@ -34,6 +34,7 @@ from ..middleware_response import (
     _response_type_content_type,
     _split_content_type_headers,
 )
+from ..responses import StreamingResponse
 from ..serialization import _BOLT_RESPONSE_TYPES, serialize_bolt_response
 
 try:
@@ -1225,6 +1226,19 @@ def _to_django_response(response: Response) -> HttpResponse:
     return django_response
 
 
+async def _stream_django_response(django_response: HttpResponse):
+    """Yield the chunks of a Django streaming response, then close it."""
+    try:
+        if django_response.is_async:
+            async for chunk in django_response.streaming_content:
+                yield chunk
+        else:
+            for chunk in django_response.streaming_content:
+                yield chunk
+    finally:
+        django_response.close()
+
+
 def _to_bolt_response(django_response: HttpResponse) -> MiddlewareResponse:
     """Convert Django HttpResponse to MiddlewareResponse for chain compatibility."""
     headers = dict(django_response.items())
@@ -1255,13 +1269,18 @@ def _to_bolt_response(django_response: HttpResponse) -> MiddlewareResponse:
                 )
             )
 
-    body = django_response.content
+    # A Django streaming response, such as FileResponse, has no ``content``.
+    streaming = django_response.streaming
+    body = StreamingResponse(_stream_django_response(django_response)) if streaming else django_response.content
     # The headers hold the Content-Type. A response without one stays without one.
     response_type = "json" if django_response.has_header("Content-Type") else "empty"
     body_kind = _BODY_BYTES
 
     if preserved_body is not None:
         body_kind, body = preserved_body
+    elif streaming:
+        body_kind = _BODY_STREAM
+    if body_kind != _BODY_BYTES:
         response_type = "file" if body_kind == _BODY_FILE else "streaming"
         # The final Rust file/stream response computes its own transport length.
         headers = {k: v for k, v in headers.items() if k.lower() not in _REBUILT_BODY_HEADER_NAMES}
