@@ -26,8 +26,13 @@ class CloseCode:
 # RFC 6455 5.5: the payload of a control frame is at most 125 bytes. The close code takes 2.
 MAX_CLOSE_REASON_BYTES = 123
 
-# RFC 6455 7.4.1: an endpoint must not send these codes in a close frame.
-_CODES_NOT_FOR_A_FRAME = frozenset({CloseCode.NO_STATUS_RECEIVED, CloseCode.ABNORMAL_CLOSURE, CloseCode.TLS_HANDSHAKE})
+# The codes that RFC 6455 7.4.1 defines for a close frame. 1004 is reserved, and an
+# endpoint must not send 1005, 1006 and 1015.
+_FIRST_DEFINED_CODES = range(1000, 1004)
+_LAST_DEFINED_CODES = range(1007, 1015)
+# RFC 6455 7.4.2: 3000 to 4999 are for libraries, frameworks and applications.
+# 1016 to 2999 are reserved for the protocol and its extensions.
+_PRIVATE_CODES = range(3000, 5000)
 
 
 def check_close_frame(code: int, reason: str) -> None:
@@ -35,8 +40,10 @@ def check_close_frame(code: int, reason: str) -> None:
 
     The server does the same check on each ``websocket.close`` message.
     """
-    if not isinstance(code, int) or not 1000 <= code <= 4999 or code in _CODES_NOT_FOR_A_FRAME:
-        raise ValueError(f"WebSocket close code {code} is not valid: use 1000 to 4999, but not 1005, 1006 or 1015")
+    if not isinstance(code, int) or not (
+        code in _FIRST_DEFINED_CODES or code in _LAST_DEFINED_CODES or code in _PRIVATE_CODES
+    ):
+        raise ValueError(f"WebSocket close code {code} is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999")
     size = len(reason.encode("utf-8"))
     if size > MAX_CLOSE_REASON_BYTES:
         raise ValueError(

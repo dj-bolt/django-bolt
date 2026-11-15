@@ -8,7 +8,7 @@ from .helpers import SimpleWebSocketClient
 pytestmark = pytest.mark.server_integration
 
 REASON_ERROR = "ValueError: WebSocket close reason is {} bytes: the limit is 123 bytes of UTF-8"
-CODE_ERROR = "ValueError: WebSocket close code {} is not valid: use 1000 to 4999, but not 1005, 1006 or 1015"
+CODE_ERROR = "ValueError: WebSocket close code {} is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"
 
 
 @pytest.fixture
@@ -25,9 +25,13 @@ def server(make_server_project):
         ("/ws/reason-124-bytes-62-characters", REASON_ERROR.format(124)),
         ("/ws/code-70000", CODE_ERROR.format(70000)),
         ("/ws/code-1006", CODE_ERROR.format(1006)),
+        # RFC 6455 7.4.1 and 7.4.2: 1004 and 1016 to 2999 are reserved.
+        ("/ws/code-1004", CODE_ERROR.format(1004)),
+        ("/ws/code-1016", CODE_ERROR.format(1016)),
         # A mounted ASGI app sends the close message with no WebSocket wrapper.
         ("/raw/reason-200-bytes", REASON_ERROR.format(200)),
         ("/raw/code-70000", CODE_ERROR.format(70000)),
+        ("/raw/code-2999", CODE_ERROR.format(2999)),
     ],
 )
 def test_close_that_makes_an_invalid_frame_raises_value_error(server, path, error):
@@ -41,3 +45,14 @@ def test_close_that_makes_an_invalid_frame_raises_value_error(server, path, erro
 def test_close_sends_a_reason_of_123_bytes(server):
     with SimpleWebSocketClient(server.host, server.port, "/ws/reason-123-bytes") as websocket:
         assert websocket.receive_close() == (4001, "é" * 61 + "x")
+
+
+def test_close_sends_the_last_code_before_the_reserved_range(server):
+    with SimpleWebSocketClient(server.host, server.port, "/ws/code-1014") as websocket:
+        assert websocket.receive_close() == (1014, "")
+
+
+def test_raw_close_with_a_none_reason_sends_an_empty_reason(server):
+    """The ASGI specification permits None for the reason of websocket.close."""
+    with SimpleWebSocketClient(server.host, server.port, "/raw/reason-none") as websocket:
+        assert websocket.receive_close() == (4001, "")

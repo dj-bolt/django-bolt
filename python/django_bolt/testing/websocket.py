@@ -285,7 +285,9 @@ class WebSocketTestClient:
 
         elif msg_type == "websocket.close":
             # The server refuses a close that makes an invalid close frame.
-            check_close_frame(message.get("code", CloseCode.NORMAL), message.get("reason", ""))
+            # The ASGI specification permits None for the reason.
+            reason = message.get("reason")
+            check_close_frame(message.get("code", CloseCode.NORMAL), "" if reason is None else reason)
             # Close before accept refuses the handshake with 403, as on the server.
             if not self._accepted:
                 self._decide(403)

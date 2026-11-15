@@ -71,11 +71,15 @@ async def test_the_test_client_refuses_what_the_server_refuses():
             "/ws/reason-124-bytes-62-characters",
             "WebSocket close reason is 124 bytes: the limit is 123 bytes of UTF-8",
         ),
-        ("/ws/code-70000", "WebSocket close code 70000 is not valid: use 1000 to 4999, but not 1005, 1006 or 1015"),
-        ("/ws/code-1006", "WebSocket close code 1006 is not valid: use 1000 to 4999, but not 1005, 1006 or 1015"),
+        ("/ws/code-70000", "WebSocket close code 70000 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+        ("/ws/code-1006", "WebSocket close code 1006 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+        # RFC 6455 7.4.1 and 7.4.2: 1004 and 1016 to 2999 are reserved.
+        ("/ws/code-1004", "WebSocket close code 1004 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+        ("/ws/code-1016", "WebSocket close code 1016 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
         # A mounted ASGI app sends the close message with no WebSocket wrapper.
         ("/raw/reason-200-bytes", "WebSocket close reason is 200 bytes: the limit is 123 bytes of UTF-8"),
-        ("/raw/code-70000", "WebSocket close code 70000 is not valid: use 1000 to 4999, but not 1005, 1006 or 1015"),
+        ("/raw/code-70000", "WebSocket close code 70000 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
+        ("/raw/code-2999", "WebSocket close code 2999 is not valid: use 1000 to 1003, 1007 to 1014 or 3000 to 4999"),
     ],
 )
 async def test_the_test_client_refuses_the_close_frames_that_the_server_refuses(path, error):
@@ -94,6 +98,16 @@ async def test_the_test_client_accepts_a_close_reason_of_123_bytes():
         with pytest.raises(ConnectionClosed) as closed:
             await ws.receive_text()
     assert closed.value.code == 4001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "code"), [("/ws/code-1014", 1014), ("/raw/reason-none", 4001)])
+async def test_the_test_client_accepts_the_close_frames_that_the_server_accepts(path, code):
+    """1014 is the last code before the reserved range. The ASGI specification permits a None reason."""
+    async with WebSocketTestClient(close_frame_api, path) as ws:
+        with pytest.raises(ConnectionClosed) as closed:
+            await ws.receive_text()
+    assert closed.value.code == code
 
 
 @pytest.mark.asyncio
