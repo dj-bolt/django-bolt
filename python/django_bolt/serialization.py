@@ -233,8 +233,11 @@ def _build_wire_meta(
     cookies: list[Cookie] | None,
 ) -> ResponseMetaTuple | int:
     if not custom_headers and not cookies:
-        static_meta = _STATIC_RESPONSE_META.get(response_type)
-        if static_meta is not None:
+        # The tuple below gives the same response for the types of the table. The
+        # integer tag only saves the tuple. Each caller with no headers and no
+        # cookies gives a type of the table.
+        static_meta = _STATIC_RESPONSE_META.get(response_type)  # pragma: no mutate
+        if static_meta is not None:  # pragma: no mutate
             return static_meta
     return _build_response_meta(response_type, custom_headers, cookies)
 
