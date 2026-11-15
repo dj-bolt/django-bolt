@@ -334,12 +334,14 @@ A tuple from a middleware is the internal wire tuple of Bolt, not `(status, data
 
 ### Allowed middleware entries
 
-- Middleware classes (`__init__(get_response)`)
+- Middleware classes (`__init__(get_response)` and `__call__(request)`)
 - `DjangoMiddleware(...)` wrappers
 - `DjangoMiddlewareStack(...)` wrappers
 - Dict middleware configs for Rust-handled middleware (`cors`, `rate_limit`)
 
 Passing plain middleware instances in these lists fails fast with `TypeError` (`pass class, not instance`).
+
+A class with no `__call__` method, for example `int`, also raises `TypeError`. Bolt calls the instance with the request.
 
 A dict config needs `"type": "cors"` or `"type": "rate_limit"`. A dict with no type or with another type raises `ValueError`, because no middleware reads it. `@middleware(type="cors", ...)` is the same dict as keyword arguments. Other keyword arguments of `@middleware` raise `TypeError`. Use `@cors(...)`, `@rate_limit(...)` and `@skip_middleware(...)`.
 
