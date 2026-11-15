@@ -25,14 +25,14 @@ async def profile(request):
 
 This endpoint:
 
-1. Expects a JWT token in the `Authorization` header: `Bearer <token>`
+1. Expects a JWT token in the `Authorization` header: `Bearer <token>`. The scheme name has no case, so `bearer <token>` also works.
 2. Validates the token signature and expiration
 3. Rejects the request with 401 if the token is invalid
 4. Populates `request.context` with token claims
 
 !!! warning "`auth` attempts, `guards` enforce"
 
-    `auth=[...]` alone does **not** reject unauthenticated requests — it only *attempts* to validate credentials. If the token is missing, expired, or has an invalid signature, the handler still runs with `request.context = None` and `request.user = AnonymousUser`. This is intentional so that endpoints can support optional authentication (e.g. personalize if logged in, otherwise public).
+    `auth=[...]` alone does **not** reject unauthenticated requests — it only *attempts* to validate credentials. If the token is missing, expired, or has an invalid signature, the handler still runs with `request.context = None` and `request.user = None`. `await request.auser()` gives `AnonymousUser` then. This is intentional so that endpoints can support optional authentication (e.g. personalize if logged in, otherwise public).
 
     To require a valid token, pair `auth` with a guard like `guards=[IsAuthenticated()]`. Without it, invalid credentials fall through silently.
 
@@ -41,7 +41,7 @@ This endpoint:
     @api.get("/profile", auth=[JWTAuthentication()])
     async def profile(request):
         print(request.context)  # None when token is invalid/missing
-        print(request.user)     # AnonymousUser
+        print(request.user)     # None
 
     # ✅ Protected — returns 401 when token is invalid/missing
     @api.get("/profile", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
@@ -150,6 +150,8 @@ def home(user: OptionalCurrentUser):
 ```
 
 `CurrentUser` answers 401 when the request has no authenticated user. `OptionalCurrentUser` gives `None` then. In an async handler, both load the user with `await request.auser()`. In a sync handler, both read `request.user`, so the handler keeps its sync dispatch. For the type of your user model, make your own alias: `Annotated[User, Depends(require_current_user)]`.
+
+A valid token can name a user that does not exist, for example a deleted user. Bolt loads the user at the first read, so `request.user` is not `None` then. It is a falsy object: `not request.user` is `True`, and `await request.auser()` gives `None`. The read of an attribute, such as `request.user.id`, answers 401, as `CurrentUser` does.
 
 An async handler can also read `request.user`. The read loads the user when it occurs, and the worker thread waits for that query. Use `await request.auser()` when the loop must serve other requests during the query, for example with a networked database. The query runs on that worker thread, or on the lane of a request with Django middleware. On the lane, it sees the thread-local state of the request, for example a tenant schema. With `DEBUG = True` or `runbolt --dev`, Bolt logs each such read that blocks the event loop for more than 50 ms, with its file and line.
 
@@ -401,6 +403,35 @@ With the default credential check, `/auth/login` and `/auth/refresh` refuse an
 inactive user with a 401. `/auth/refresh` reads the user row for this check.
 With a `credential_validator=`, `/auth/refresh` does not load the user.
 
+The views sign with `HS256` and Django's `SECRET_KEY` by default. For an
+asymmetric algorithm, pass the PEM private key as `secret` and the PEM public
+key as `public_key`. The views sign with the private key and verify the refresh
+token with the public key:
+
+```python
+from pathlib import Path
+
+from django_bolt.auth import InMemoryRevocation, JWTAuthentication, JWTAuthViews
+
+PUBLIC_KEY = Path("jwt-public.pem").read_text()
+
+auth_views = JWTAuthViews(
+    store=InMemoryRevocation(),
+    algorithm="RS256",
+    secret=Path("jwt-private.pem").read_text(),
+    public_key=PUBLIC_KEY,
+    kid="signing-key-2026-07",
+)
+auth_views.register(api)
+
+# Other routes, and other services, need only the public key.
+access_auth = JWTAuthentication(public_key=PUBLIC_KEY, algorithms=["RS256"], cookie="access_token")
+```
+
+An asymmetric algorithm with no `secret` or no `public_key` raises
+`ImproperlyConfigured` at startup. So does a `public_key` with an `HS*`
+algorithm.
+
 ### Issuing a pair
 
 Call `create_token_pair()` once the user has proved who they are — by
@@ -479,7 +510,11 @@ async def refresh(request):
 By the time your handler runs, the token's signature, expiry, and type
 have already been verified in Rust. `rotate_refresh_token()` performs
 the stateful checks against the revocation store, atomically consumes the
-old refresh token, and returns a new pair. A custom store used for full
+old refresh token, and returns a new pair. It also raises
+`TokenRotationError` for claims whose `typ` is not `refresh`. Thus a route
+without `token_type="refresh"` cannot rotate an access token.
+
+A custom store used for full
 rotation must implement `consume(jti, *, exp=None)` as an atomic
 check-and-set and support family revocation; rotation fails closed if it
 cannot. If the validating `JWTAuthentication` uses a non-default `leeway`,
@@ -577,6 +612,8 @@ async def internal_endpoint(request):
 
 API keys are sent in the `X-API-Key` header by default.
 
+`api_keys` must be a set, list or tuple of non-empty strings. A str, such as `api_keys="sk-prod-123abc"`, or an empty key raises `ImproperlyConfigured`. Thus a missing environment variable in `api_keys={os.environ.get("API_KEY", "")}` stops startup.
+
 ### API key permissions (In Development)
 
 Assign different permissions to different keys:
@@ -592,6 +629,8 @@ APIKeyAuthentication(
     key_permissions=key_permissions
 )
 ```
+
+Each key of `key_permissions` must be in `api_keys`. Each value must be a set, list or tuple of strings.
 
 ### Custom header
 
@@ -630,7 +669,7 @@ Django does the session work:
 1. Bolt adds Django's `SessionMiddleware` and `AuthenticationMiddleware` to each route that uses the backend. When the middleware of the API, router or route already has both, Bolt adds nothing. When it has only one of them, startup fails, because a second `SessionMiddleware` would load and save the session again.
 2. Rust rejects a request with no session cookie with 401. No Python runs.
 3. For a request with the cookie, Django loads the session and the user.
-4. Bolt checks the guards of the route against `request.user`, before the handler.
+4. Bolt checks the guards of the route against `request.user`, before the handler. A rejection is the same 401 or 403 as for a token. It has the `WWW-Authenticate` header of a 401, and the `error_formatter` of the API formats it.
 
 A guard can read `is_staff`, `is_superuser` and `permissions` of the Django user. `Requires("permissions", "app.perm")` uses the permissions of the user and of its groups. A `Requires` on another claim rejects a session request with 403. A `none_of` guard on another claim is an error at startup, because it would let every session user in. Startup also fails when a guard reads a field that your user model does not have.
 
@@ -856,10 +895,10 @@ to call `is_revoked()` manually.
 !!! tip "Always pass the token's `exp`"
 
     `revoke()` accepts an `exp` keyword argument. Pass the token's own
-    `exp` claim so the revocation entry expires exactly when the token
-    would have anyway — no security gap, no wasted storage. Without
-    `exp`, the entry falls back to the store's `default_ttl` (7 days
-    by default).
+    `exp` claim. `JWTAuthentication` accepts a token until `exp + leeway`
+    (60 seconds after `exp` by default). The store keeps the entry until
+    that time. Without `exp`, the entry lives for the `default_ttl` of
+    the store (7 days by default).
 
 ### In-memory revocation (development)
 
@@ -896,6 +935,7 @@ store = DjangoCacheRevocation(
     cache_alias="default",
     key_prefix="revoked_tokens:",
     default_ttl=86400 * 7,  # 7 days — fallback when revoke() is called without `exp`
+    leeway=60,  # the `leeway` of the JWTAuthentication that reads this store
 )
 ```
 
@@ -920,7 +960,7 @@ INSTALLED_APPS = [
 ```python
 from django_bolt.auth import DjangoORMRevocation
 
-store = DjangoORMRevocation(default_ttl=86400 * 7)
+store = DjangoORMRevocation(default_ttl=86400 * 7, leeway=60)
 ```
 
 The store works with `JWTAuthViews`, including logout-all. A periodic
@@ -1008,12 +1048,35 @@ an internal module of allauth, so check them when you upgrade allauth.
 
 `revoke()` resolves the entry's lifetime in this order:
 
-1. **`exp` keyword arg** — derived as `max(0, exp - now)`. Use this whenever
-   you have the token's full claims (i.e. always, in a logout handler).
+1. **`exp` keyword arg** — derived as `max(0, exp + store.leeway - now)`. Use
+   this whenever you have the token's full claims (i.e. always, in a logout
+   handler).
 2. **`store.default_ttl`** — set on the constructor. Used when `revoke()`
    is called without `exp` (e.g. an admin action that revokes by JTI).
 3. **`_DEFAULT_TTL_SECONDS`** — module-level fallback (7 days) if neither
    of the above is supplied.
+
+### Store leeway
+
+`JWTAuthentication` accepts a token until `exp + leeway`. A revocation
+entry must live until that time. If it expires at `exp`, the backend
+accepts the revoked token again for `leeway` seconds.
+
+`DjangoCacheRevocation` and `DjangoORMRevocation` have a `leeway`
+argument for this. Its default is 60 seconds, the same as the default of
+`JWTAuthentication`. If you set a larger `leeway` on the backend, pass
+the same value to the store:
+
+```python
+from django_bolt.auth import DjangoCacheRevocation, JWTAuthentication
+
+store = DjangoCacheRevocation(leeway=120)
+jwt_auth = JWTAuthentication(leeway=120, revocation_store=store)
+```
+
+`JWTAuthentication` raises `ImproperlyConfigured` when the `leeway` of
+its store is smaller than its own. `InMemoryRevocation` keeps each entry
+until the process stops, so it has no `leeway`.
 
 ## Endpoints without authentication
 
@@ -1068,3 +1131,20 @@ async def public():
 async def api_only(request):
     return {"status": "ok"}
 ```
+
+### A guard with no auth backend
+
+A guard such as `IsAuthenticated()` or `Requires(...)` needs a user. When a route has such a guard, no `auth` argument and no `BOLT_AUTHENTICATION_CLASSES` setting, Bolt gives the route `JWTAuthentication()`. That backend verifies an HS256 token in the `Authorization: Bearer <token>` header with `SECRET_KEY`:
+
+```python
+# No auth and no BOLT_AUTHENTICATION_CLASSES: the route uses JWTAuthentication().
+@api.get("/profile", guards=[IsAuthenticated()])
+async def profile(request):
+    return {"user_id": request.context["user_id"]}
+```
+
+The rule is the same for the guards of a router, a class-based view, a `@action`, `BOLT_DEFAULT_PERMISSION_CLASSES`, a WebSocket route and an MCP mount. Bolt applies it when it registers the route.
+
+- A route with no guard, or with `AllowAny()` as its first guard, gets no backend. It does no token work.
+- `auth=[]` on the route and `BOLT_AUTHENTICATION_CLASSES = []` in the settings mean no backend. A guard that needs a user then rejects each request with 401.
+- To use another secret, another algorithm or another backend, set `auth=[...]` or `BOLT_AUTHENTICATION_CLASSES`.

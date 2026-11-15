@@ -40,6 +40,10 @@ HTTPException(
 | `headers` | `dict` | Headers to include in response |
 | `extra` | `dict \| list` | Additional data in response |
 
+A `str` in the first position is the detail. Thus `NotFound("User not found")` is the same as `NotFound(detail="User not found")`, and `HTTPException("Storage is down")` is a 500.
+
+A status with no standard phrase, such as 499, gets the detail `Client Error` (4xx) or `Server Error` (5xx).
+
 **Response format:**
 
 ```json
