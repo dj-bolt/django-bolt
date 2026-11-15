@@ -1112,6 +1112,47 @@ def test_python_middleware_replaces_the_content_type_in_any_letter_case():
     assert response.text == "<p>x</p>"
 
 
+class ReshapeResponse(Middleware):
+    """Replace the headers with a plain dict, set a bytearray body, or read a missing header."""
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        how = request.query.get("how")
+        if how == "plain-dict":
+            response.headers = {"Content-Type": "text/x-plain", "X-Plain": "1"}
+        elif how == "bytearray":
+            response.body = bytearray(b"hello")
+        elif how == "missing-header":
+            response.headers["x-default"] = response.headers.get("X-Nope", "fallback")
+        return response
+
+
+@pytest.mark.parametrize(
+    ("how", "content_type", "extra_header", "body"),
+    [
+        ("plain-dict", "text/x-plain", ("x-plain", "1"), "<p>x</p>"),
+        ("bytearray", "text/html; charset=utf-8", None, "hello"),
+        ("missing-header", "text/html; charset=utf-8", ("x-default", "fallback"), "<p>x</p>"),
+    ],
+)
+def test_python_middleware_reshapes_the_response(how, content_type, extra_header, body):
+    """The client gets the headers and the body that middleware sets, in any container type."""
+    api = BoltAPI(middleware=[ReshapeResponse])
+
+    @api.get("/html")
+    async def html():
+        return HTML("<p>x</p>")
+
+    with TestClient(api) as client:
+        response = client.get("/html", params={"how": how})
+
+    assert response.status_code == 200
+    assert response.headers.get_list("content-type") == [content_type]
+    if extra_header:
+        assert response.headers.get(extra_header[0]) == extra_header[1]
+    assert response.text == body
+
+
 class StateTag(BaseMiddleware):
     """Add a header to each response that this middleware handles."""
 
