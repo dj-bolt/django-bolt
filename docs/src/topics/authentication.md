@@ -1125,3 +1125,20 @@ async def public():
 async def api_only(request):
     return {"status": "ok"}
 ```
+
+### A guard with no auth backend
+
+A guard such as `IsAuthenticated()` or `Requires(...)` needs a user. When a route has such a guard, no `auth` argument and no `BOLT_AUTHENTICATION_CLASSES` setting, Bolt gives the route `JWTAuthentication()`. That backend verifies an HS256 token in the `Authorization: Bearer <token>` header with `SECRET_KEY`:
+
+```python
+# No auth and no BOLT_AUTHENTICATION_CLASSES: the route uses JWTAuthentication().
+@api.get("/profile", guards=[IsAuthenticated()])
+async def profile(request):
+    return {"user_id": request.context["user_id"]}
+```
+
+The rule is the same for the guards of a router, a class-based view, a `@action`, `BOLT_DEFAULT_PERMISSION_CLASSES`, a WebSocket route and an MCP mount. Bolt applies it when it registers the route.
+
+- A route with no guard, or with `AllowAny()` as its first guard, gets no backend. It does no token work.
+- `auth=[]` on the route and `BOLT_AUTHENTICATION_CLASSES = []` in the settings mean no backend. A guard that needs a user then rejects each request with 401.
+- To use another secret, another algorithm or another backend, set `auth=[...]` or `BOLT_AUTHENTICATION_CLASSES`.

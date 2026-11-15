@@ -335,7 +335,9 @@ JWTAuthentication(secret="custom-jwt-secret")
 
 Default authentication backends applied to all endpoints.
 
-**Default:** `[]` (no authentication)
+**Default:** not set. A route with no guard then has no authentication. A route with a guard that needs a user, such as `IsAuthenticated()`, then uses `JWTAuthentication()`. See [A guard with no auth backend](../topics/authentication.md#a-guard-with-no-auth-backend).
+
+Set the setting to `[]` to give no route a default backend.
 
 ### BOLT_DEFAULT_PERMISSION_CLASSES
 
@@ -549,7 +551,7 @@ api = BoltAPI(
 | `BOLT_EMIT_SIGNALS` | `bool` | `False` | Enable Django request signals |
 | `BOLT_DEV_FORCE_POLLING` | `bool` | `False` | Force `--dev` reloader to use polling instead of native file events |
 | `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |
-| `BOLT_AUTHENTICATION_CLASSES` | `list` | `[]` | Default authentication backends |
+| `BOLT_AUTHENTICATION_CLASSES` | `list` | not set | Default authentication backends. Not set: `JWTAuthentication()` for a route with a guard that needs a user |
 | `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |
 | `DJANGO_BOLT_MAX_PARAM_LENGTH` | `int` (env var) | `8192` | Max path/query/form parameter size in bytes, from `1` to `1048576` (1 MB); requests over the limit return `422` |
 | `DJANGO_BOLT_ORM_THREADS` | `int` (env var) | `1` (SQLite) or `4` | Threads in the ORM pool of each process |
