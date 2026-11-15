@@ -14,11 +14,12 @@ permissions:
   contents: read
 
 # One group per pull request: a new push cancels the run for the old commit.
-# Each other run (master, tags, by hand) gets a group of its own. GitHub cancels
-# a run that waits in a shared group when a newer run comes, so a shared group
-# could drop a master run. A release run always finishes.
+# One group per branch for a push (master): one run at a time. The run in
+# progress finishes. GitHub keeps only the newest run that waits, so a series
+# of merges gives one run for the last commit, not one run for each commit.
+# A tag or a run by hand gets a group of its own. A release run always finishes.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
