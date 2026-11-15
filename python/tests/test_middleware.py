@@ -1462,6 +1462,64 @@ def test_a_middleware_answer_of_another_type_is_a_500_that_names_the_type():
     ) in response.text
 
 
+class HeaderMapping(Middleware):
+    """Use each mapping operation on the response headers, in other letter cases."""
+
+    seen: dict = {}
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        headers = response.headers
+        seen = type(self).seen
+        seen["in"] = ("X-KEEP" in headers, "x-missing" in headers, 1 in headers)
+        seen["getitem"] = headers["X-Keep"]
+        try:
+            headers["X-Missing"]
+        except KeyError:
+            seen["getitem_missing"] = "KeyError"
+        seen["pop"] = headers.pop("X-POP")
+        seen["pop_default"] = (headers.pop("X-Gone", "fallback"), headers.pop("X-Gone", None))
+        try:
+            headers.pop("X-Gone")
+        except KeyError:
+            seen["pop_missing"] = "KeyError"
+        headers.update({"X-Upd-Dict": "1"})
+        headers.update([("X-Upd-Pair", "2")])
+        headers.update({"X-Keep": "updated"}, **{"X-Kw": "3"})
+        headers |= {"X-Ior-Dict": "4"}
+        headers |= [("X-Ior-Pair", "5")]
+        return response
+
+
+def test_python_middleware_response_headers_behave_as_a_case_insensitive_mapping():
+    """Python middleware reads and edits the response headers like a dict, whatever the letter case."""
+    HeaderMapping.seen = {}
+    api = BoltAPI(middleware=[HeaderMapping])
+
+    @api.get("/h")
+    async def handler():
+        return JSON({"ok": True}, headers={"X-Keep": "kept", "X-Pop": "popped"})
+
+    with TestClient(api) as client:
+        response = client.get("/h")
+
+    assert HeaderMapping.seen == {
+        "in": (True, False, False),
+        "getitem": "kept",
+        "getitem_missing": "KeyError",
+        "pop": "popped",
+        "pop_default": ("fallback", None),
+        "pop_missing": "KeyError",
+    }
+    assert "x-pop" not in response.headers
+    assert response.headers["x-keep"] == "updated"
+    assert response.headers["x-upd-dict"] == "1"
+    assert response.headers["x-upd-pair"] == "2"
+    assert response.headers["x-kw"] == "3"
+    assert response.headers["x-ior-dict"] == "4"
+    assert response.headers["x-ior-pair"] == "5"
+
+
 if __name__ == "__main__":
     # Run basic tests
     print("Testing middleware decorators...")
