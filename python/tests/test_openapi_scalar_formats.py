@@ -222,8 +222,10 @@ def test_bytes_in_a_parameter_are_plain_text():
         ("cookie", "session"): {**text, "default": ""},
     }
     assert parameters("/query-model") == {("query", name): schema for name, schema in model_fields.items()}
-    assert parameters("/header-model")[("header", "params")]["properties"] == model_fields
-    assert parameters("/cookie-model")[("cookie", "params")]["properties"] == model_fields
+    # A header or a cookie gives one value, so an array field holds one item at most.
+    one_value = {**model_fields, "tags": {**model_fields["tags"], "maxItems": 1}}
+    assert parameters("/header-model") == {("header", name): schema for name, schema in one_value.items()}
+    assert parameters("/cookie-model") == {("cookie", name): schema for name, schema in one_value.items()}
     # A form field is text. A file part stays binary.
     assert _form_schema(spec, "/form")["properties"] == {"name": text, "raw": {"type": "string", "format": "binary"}}
     form_model_fields = _form_schema(spec, "/form-model")["properties"]
@@ -235,6 +237,71 @@ def test_bytes_in_a_parameter_are_plain_text():
         "type": "string",
         "contentEncoding": "base64",
     }
+
+
+class TraceParams(msgspec.Struct):
+    token: str
+    x_request_id: str = "none"
+    retries: Annotated[int, msgspec.Meta(ge=0)] | None = None
+    custom: str = msgspec.field(default="std", name="X_Custom")
+
+
+def test_a_header_or_cookie_model_is_one_parameter_for_each_field():
+    """A parameter model is one parameter for each field, with the name that Bolt reads on the wire."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/query")
+    async def query_model(params: Annotated[TraceParams, Query()]):
+        return msgspec.to_builtins(params)
+
+    @api.get("/header")
+    async def header_model(params: Annotated[TraceParams, Header()]):
+        return msgspec.to_builtins(params)
+
+    @api.get("/cookie")
+    async def cookie_model(params: Annotated[TraceParams, Cookie()]):
+        return msgspec.to_builtins(params)
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+        # The wire form that the document describes.
+        from_headers = client.get(
+            "/header", headers={"token": "t", "x-request-id": "rid", "retries": "3", "x-custom": "c"}
+        )
+        from_cookies = client.get("/cookie", headers={"cookie": "token=t; x_request_id=rid; retries=3; X_Custom=c"})
+        no_token = client.get("/header", headers={"x-request-id": "rid"})
+
+    sent = {"token": "t", "x_request_id": "rid", "retries": 3, "X_Custom": "c"}
+    assert (from_headers.status_code, from_headers.json()) == (200, sent)
+    assert (from_cookies.status_code, from_cookies.json()) == (200, sent)
+    assert no_token.status_code == 422
+
+    validate(spec)
+
+    def parameters(path):
+        return [(p["in"], p["name"], p["required"], p["schema"]) for p in spec["paths"][path]["get"]["parameters"]]
+
+    schemas = [
+        {"type": "string"},
+        {"type": "string", "default": "none"},
+        {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}], "default": None},
+        {"type": "string", "default": "std"},
+    ]
+    required = [True, False, False, False]
+    assert parameters("/query") == [
+        ("query", name, *rest)
+        for name, *rest in zip(["token", "x_request_id", "retries", "X_Custom"], required, schemas, strict=True)
+    ]
+    # Bolt reads a header field in lower case, with "-" for each "_".
+    assert parameters("/header") == [
+        ("header", name, *rest)
+        for name, *rest in zip(["token", "x-request-id", "retries", "x-custom"], required, schemas, strict=True)
+    ]
+    assert parameters("/cookie") == [
+        ("cookie", name, *rest)
+        for name, *rest in zip(["token", "x_request_id", "retries", "X_Custom"], required, schemas, strict=True)
+    ]
 
 
 class UserGender(enum.StrEnum):

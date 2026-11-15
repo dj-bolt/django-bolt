@@ -918,17 +918,26 @@ class SchemaGenerator:
                 or (default == inspect.Parameter.empty and not is_optional(annotation))
             )
 
-            # Handle msgspec.Struct in query parameters
-            if source == "query" and is_msgspec_struct(annotation):
+            # A query, header or cookie model is one parameter for each field.
+            if is_msgspec_struct(annotation):
                 struct_info = msgspec.inspect.type_info(annotation)
                 for struct_field in struct_info.fields:
                     field_name, field_schema, field_required = self._msgspec_field_schema(struct_field)
+                    field_schema = self._text_value_schema(field_schema)
+                    if source == "header":
+                        # Bolt reads the x_request_id field from the x-request-id header.
+                        field_name = field_name.lower().replace("_", "-")
+                    if source != "query" and isinstance(field_schema, Schema) and field_schema.type == "array":
+                        # A header or a cookie gives one value, so its array holds exactly one item.
+                        # An empty default must stay valid for the schema, so it sets no minimum.
+                        min_items = None if field_schema.default == [] else 1
+                        field_schema = replace(field_schema, min_items=min_items, max_items=1)
                     parameters.append(
                         Parameter(
                             name=field_name,
-                            param_in="query",
+                            param_in=param_in,
                             required=field_required,
-                            schema=self._text_value_schema(field_schema),
+                            schema=field_schema,
                             description=f"Parameter {field_name}",
                         )
                     )

@@ -543,6 +543,8 @@ async def get_preferences(cookies: Annotated[SessionCookies, Cookie()]):
     return {"theme": cookies.theme, "language": cookies.language}
 ```
 
+The OpenAPI document shows a query, header or cookie model as one parameter for each field. The name of each parameter is the name that Bolt reads. For a header field, that name is in lower case with `-` for each `_`, for example `x-api-key`.
+
 ### Benefits of parameter models
 
 | Feature | Individual params | Parameter models |
