@@ -216,7 +216,7 @@ A `msgspec.Meta` constraint such as `max_length` counts the bytes.
 
 A `bytes` field of a [parameter model](#parameter-models) follows the same rule. The model can be a `Query()`, `Form()`, `Header()` or `Cookie()` model.
 
-A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64.
+A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64. The OpenAPI document shows this difference. A `bytes` parameter, form field or field of a parameter model is `{"type": "string"}`. A `bytes` field of a JSON body is `{"type": "string", "contentEncoding": "base64"}`.
 
 ## Request body
 

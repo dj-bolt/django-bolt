@@ -333,6 +333,28 @@ class SchemaGenerator:
             return replace(schema, items=cls._file_part_schema(schema.items))
         return schema
 
+    @classmethod
+    def _text_value_schema(cls, schema: Schema | Reference) -> Schema | Reference:
+        """The schema of a value that the request gives as text.
+
+        A path, query, header, cookie or form value of the type ``bytes`` is the
+        UTF-8 bytes of the text. Only a JSON body holds bytes as base64 text.
+        """
+        if not isinstance(schema, Schema):
+            return schema
+        changes: dict[str, Any] = {}
+        if schema.content_encoding == "base64":
+            changes["content_encoding"] = None
+        if schema.items is not None:
+            changes["items"] = cls._text_value_schema(schema.items)
+        for name in ("any_of", "one_of", "all_of", "prefix_items"):
+            members = getattr(schema, name)
+            if members:
+                changes[name] = [cls._text_value_schema(member) for member in members]
+        if schema.properties:
+            changes["properties"] = {key: cls._text_value_schema(value) for key, value in schema.properties.items()}
+        return replace(schema, **changes) if changes else schema
+
     @staticmethod
     def _enum_values_schema(values: list[Any] | tuple[Any, ...]) -> Schema:
         """Infer the narrowest enum schema that fits the provided values."""
@@ -906,14 +928,14 @@ class SchemaGenerator:
                             name=field_name,
                             param_in="query",
                             required=field_required,
-                            schema=field_schema,
+                            schema=self._text_value_schema(field_schema),
                             description=f"Parameter {field_name}",
                         )
                     )
                 continue
 
             # Get schema for parameter type
-            schema = self._type_to_schema(annotation)
+            schema = self._text_value_schema(self._type_to_schema(annotation))
             # A path, a header or a cookie gives one value, so its array holds exactly one item.
             if param_in != "query" and isinstance(schema, Schema) and schema.type == "array":
                 schema = replace(schema, min_items=1, max_items=1)
@@ -1001,7 +1023,7 @@ class SchemaGenerator:
                             sub_name, sub_schema, sub_required = self._msgspec_field_schema(
                                 struct_field, register_component=False
                             )
-                            properties[sub_name] = sub_schema
+                            properties[sub_name] = self._text_value_schema(sub_schema)
                             if sub_required:
                                 required.append(sub_name)
                         continue
@@ -1009,6 +1031,8 @@ class SchemaGenerator:
                     field_schema = self._form_field_schema(annotation, field.param, default)
                     if field.source == "file":
                         field_schema = self._file_part_schema(field_schema)
+                    else:
+                        field_schema = self._text_value_schema(field_schema)
                     properties[name] = field_schema
                     if default == inspect.Parameter.empty and not is_optional(annotation):
                         required.append(name)
