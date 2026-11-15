@@ -178,6 +178,8 @@ class ArticleViewSet(ModelViewSet):
     pagination_class = PageNumberPagination
 ```
 
+The `create` action only inserts. A primary key or a unique value that a row already has answers 409 Conflict, and the row does not change. `perform_create()` saves with `force_insert=True`. If you override `perform_create()`, call `super().perform_create(obj)` or save with `force_insert=True` to keep this.
+
 ### Serializer output
 
 When `serializer_class` is a `Serializer`, generated `list` and `retrieve`

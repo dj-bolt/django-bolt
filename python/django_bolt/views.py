@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError
 from django.db.models import AutoField, Model, ObjectDoesNotExist, QuerySet
 
 from ._kwargs.extractors import create_body_extractor
@@ -609,7 +610,8 @@ class ViewSet[T: Model](APIView):
         return self.__class__._get_default_serializer_class(action)
 
     async def perform_create(self, obj: T):
-        await obj.asave()
+        # INSERT only. A primary key from the request body must not update a row.
+        await obj.asave(force_insert=True)
 
     def _unwritable_fields(self, serializer_class: type[Serializer], obj: T) -> frozenset[str]:
         """Return the serializer fields that an update action does not write.
@@ -701,6 +703,9 @@ class CreateMixin(_ViewSet):
 
         The new object does not get a ``read_only`` field of the body. It does not
         get the primary key of the body when the database gives the primary key.
+
+        Does not update an existing row. A primary key or a unique value that
+        a row already has answers 409.
         """
         serializer_class = self.get_serializer_class("create")
         validated_obj = _validate_json_body(serializer_class, request.body)
@@ -714,7 +719,10 @@ class CreateMixin(_ViewSet):
         if _has_database_primary_key(model):
             skip = skip | _primary_key_names(model)
         obj = model(**{name: value for name, value in validated_obj.to_dict().items() if name not in skip})
-        await self.perform_create(obj)
+        try:
+            await self.perform_create(obj)
+        except IntegrityError as e:
+            raise HTTPException(status_code=409, detail="The object conflicts with an existing object") from e
 
         return obj
 
