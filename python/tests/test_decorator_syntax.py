@@ -4,6 +4,8 @@ Tests for decorator syntax (@api.view and @api.viewset).
 This test suite verifies that the decorator pattern works correctly.
 """
 
+import functools
+
 import msgspec
 import pytest
 
@@ -62,6 +64,42 @@ def test_view_decorator_with_multiple_methods(api):
     response = client.post("/items", json={"name": "test"})
     assert response.status_code == 200
     assert response.json()["created"] is True
+
+
+class _AsyncCallable:
+    async def __call__(self, q: int = 0):
+        """Answer with the query value."""
+        return {"kind": "async", "q": q}
+
+
+class _SyncCallable:
+    def __call__(self, q: int = 0):
+        return {"kind": "sync", "q": q}
+
+
+@pytest.mark.parametrize(("handler", "kind"), [(_AsyncCallable(), "async"), (_SyncCallable(), "sync")])
+def test_an_object_with_call_is_a_route_handler(api, handler, kind):
+    """The route registers the bound __call__ method, and the decorator returns the object."""
+    assert api.get("/call")(handler) is handler
+
+    with TestClient(api) as client:
+        response = client.get("/call?q=5")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"kind": kind, "q": 5}
+        assert client.get("/call?q=x").status_code == 422
+
+
+def test_a_partial_as_route_handler_raises_a_clear_error(api):
+    async def handler(request, k: int = 1):
+        return {"k": k}
+
+    with pytest.raises(TypeError, match="A route handler cannot be a functools.partial"):
+        api.get("/partial")(functools.partial(handler, k=2))
+
+
+def test_a_route_handler_that_is_not_callable_raises_a_clear_error(api):
+    with pytest.raises(TypeError, match="A route handler must be callable, not str 'handler'"):
+        api.get("/text")("handler")
 
 
 @pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete", "query"])

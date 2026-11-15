@@ -237,6 +237,23 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
     return execute
 
 
+def _route_handler(fn: Any) -> Callable:
+    """Return the callable that a route registers for `fn`.
+
+    Registration reads the name, the module, the type hints and the code of a
+    handler. A function or a method has them. An object with `__call__` gives
+    its bound `__call__` method. A `functools.partial` has none of them, and
+    its keyword arguments would become parameters that a request can set.
+    """
+    if isinstance(fn, functools.partial):
+        raise TypeError(f"A route handler cannot be a functools.partial ({fn!r}). Register a function that calls it.")
+    if inspect.isroutine(fn) or isinstance(fn, type):
+        return fn
+    if callable(fn):
+        return fn.__call__
+    raise TypeError(f"A route handler must be callable, not {type(fn).__name__} {fn!r}")
+
+
 def _defer_async_websocket_injector(handler: Callable, injector: Callable) -> tuple[Callable, Callable]:
     """Return a handler and a sync injector that run ``injector`` in the handler coroutine.
 
@@ -2216,7 +2233,12 @@ class BoltAPI:
 
             return fn
 
-        return decorator
+        def normalizing_decorator(fn: Callable):
+            # Register the normalized handler. Return the object that the caller gave.
+            decorator(_route_handler(fn))
+            return fn
+
+        return normalizing_decorator
 
     def _compile_binder(self, fn: Callable, http_method: str = "", path: str = "") -> HandlerMetadata:
         """Delegate to compile_binder in api_compilation module."""
