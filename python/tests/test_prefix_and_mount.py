@@ -250,6 +250,17 @@ class TestOpenAPIDocsWithPrefix:
                 f"API route should NOT be at /items (unprefixed), got {response.status_code}"
             )
 
+    def test_prefix_with_trailing_slash(self):
+        """The trailing slash of the prefix does not give a double slash in the route path."""
+        api = BoltAPI(prefix="/api/v1/")
+
+        @api.get("/users")
+        async def list_users():
+            return {"users": []}
+
+        with TestClient(api) as client:
+            assert client.get("/api/v1/users").status_code == 200
+
     def test_custom_docs_path_with_prefix(self):
         """Custom docs path should also be at absolute path."""
         api = BoltAPI(
