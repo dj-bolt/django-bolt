@@ -9,7 +9,9 @@ import functools
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI, ViewSet, action
+from django_bolt import BoltAPI, Router, ViewSet, action
+from django_bolt.middleware import TimingMiddleware, cors, middleware, no_compress, rate_limit, skip_middleware
+from django_bolt.pagination import PageNumberPagination, paginate
 from django_bolt.testing import TestClient
 from django_bolt.views import APIView
 
@@ -39,6 +41,84 @@ def test_view_decorator_syntax(api):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
+
+
+async def _demo_function_middleware(request, call_next):
+    return await call_next(request)
+
+
+@pytest.mark.parametrize(
+    ("name", "config_decorator"),
+    [
+        ("rate_limit", rate_limit(rps=1, burst=1)),
+        ("cors", cors(origins=["https://example.com"])),
+        ("skip_middleware", skip_middleware("compression")),
+        ("skip_middleware", no_compress),
+        ("middleware", middleware(TimingMiddleware)),
+        ("middleware", middleware(_demo_function_middleware)),
+        ("paginate", paginate(PageNumberPagination)),
+    ],
+)
+def test_a_config_decorator_above_the_route_decorator_raises(api, name, config_decorator):
+    """The route decorator reads the configuration, so a decorator above it has no effect."""
+
+    @config_decorator
+    @api.get("/items")
+    async def handler(request):
+        return {"ok": True}
+
+    with pytest.raises(TypeError, match=rf"@{name} is above the route decorator of GET /items, so it has no effect"):
+        TestClient(api)
+
+
+def test_a_config_decorator_above_the_websocket_decorator_raises(api):
+    @rate_limit(rps=1, burst=1)
+    @api.websocket("/ws")
+    async def handler(websocket):
+        await websocket.accept()
+
+    with pytest.raises(
+        TypeError, match="@rate_limit is above the route decorator of WEBSOCKET /ws, so it has no effect"
+    ):
+        TestClient(api)
+
+
+def test_a_config_decorator_below_the_route_decorator_applies(api):
+    @api.get("/limited")
+    @rate_limit(rps=1, burst=1)
+    async def handler():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        assert [client.get("/limited").status_code for _ in range(3)] == [200, 429, 429]
+
+
+def test_a_config_decorator_between_two_route_decorators_applies_to_the_upper_route(api):
+    """One function can serve two routes. The upper route decorator reads the configuration."""
+
+    @api.get("/limited")
+    @rate_limit(rps=1, burst=1)
+    @api.get("/free")
+    async def handler():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        assert [client.get("/free").status_code for _ in range(3)] == [200, 200, 200]
+        assert [client.get("/limited").status_code for _ in range(3)] == [200, 429, 429]
+
+
+def test_a_config_decorator_above_a_router_decorator_applies(api):
+    """A router registers its routes in include_router(), after each decorator ran."""
+    router = Router()
+
+    @rate_limit(rps=1, burst=1)
+    @router.get("/limited")
+    async def handler():
+        return {"ok": True}
+
+    api.include_router(router)
+    with TestClient(api) as client:
+        assert [client.get("/limited").status_code for _ in range(3)] == [200, 429, 429]
 
 
 def test_view_decorator_with_multiple_methods(api):
