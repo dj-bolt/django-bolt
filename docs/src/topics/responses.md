@@ -625,7 +625,7 @@ async def count() -> int:
 
 A `str` that the response type converts is JSON. For example, `-> UUID` with a `str` result sends the UUID in quotes as `application/json`.
 
-This applies to `-> dict` and `-> list` too. A `str` or `bytes` result of such a route is a response validation error, for each kind of handler.
+This applies to `-> dict` and `-> list` too. A `-> dict` route takes a `dict`. A `-> list` route takes a `list`, a `tuple` or a QuerySet. Each other result is a response validation error, for each kind of handler. Examples are a `str`, a number, a list for `-> dict`, a dict for `-> list`, and a `Struct` or a generator. A response object, such as `JSON(...)`, has no such check.
 A `-> list[UserSerializer]` route validates that the result is a list. A result such as `3` or a `dict` is a response validation error, and `None` is the empty list.
 A route with `validate_response=False` does no such check. It sends a `str` as `text/plain` and `bytes` as `application/octet-stream`.
 
