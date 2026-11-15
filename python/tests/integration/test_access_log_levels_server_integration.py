@@ -31,7 +31,7 @@ def _run(make_server_project, level: str) -> list[str]:
         settings_extra=_LOGGING.replace("{level}", level),
     )
     with project.start(startup_path="/health") as server:
-        for path in ("/health", "/gone", "/down", "/teapot"):
+        for path in ("/ok", "/gone", "/down", "/teapot"):
             server.request("GET", path)
     return project.path("access.log").read_text().splitlines()
 
@@ -39,7 +39,7 @@ def _run(make_server_project, level: str) -> list[str]:
 @pytest.mark.server_integration
 def test_access_log_levels_follow_status(make_server_project):
     lines = _run(make_server_project, "INFO")
-    assert any(line.startswith("INFO GET /health 200") for line in lines)
+    assert any(line.startswith("INFO GET /ok 200") for line in lines)
     assert any(line.startswith("WARNING GET /gone 404") for line in lines)
     assert any(line.startswith("WARNING GET /teapot 418") for line in lines)
     assert any(line.startswith("ERROR GET /down 503") for line in lines)
@@ -48,7 +48,7 @@ def test_access_log_levels_follow_status(make_server_project):
 @pytest.mark.server_integration
 def test_access_log_at_warning_keeps_only_errors(make_server_project):
     lines = _run(make_server_project, "WARNING")
-    assert not any("/health" in line for line in lines)
+    assert not any("/ok" in line for line in lines)
     assert any(line.startswith("WARNING GET /gone 404") for line in lines)
     assert any(line.startswith("ERROR GET /down 503") for line in lines)
 
@@ -57,4 +57,4 @@ def test_access_log_at_warning_keeps_only_errors(make_server_project):
 def test_access_log_at_error_keeps_server_errors(make_server_project):
     lines = _run(make_server_project, "ERROR")
     assert any(line.startswith("ERROR GET /down 503") for line in lines)
-    assert not any("/health" in line or "/gone" in line or "/teapot" in line for line in lines)
+    assert not any("/ok" in line or "/gone" in line or "/teapot" in line for line in lines)
