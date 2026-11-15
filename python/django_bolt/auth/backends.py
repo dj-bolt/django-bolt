@@ -155,7 +155,9 @@ class JWTAuthentication(BaseAuthentication):
             (which also works, for compatibility). Mutually exclusive with
             ``secret``.
         leeway: Clock-skew tolerance in seconds applied to ``exp``/``nbf``
-            validation (default: 60).
+            validation (default: 60). A ``revocation_store`` with a
+            ``leeway`` must have one that is not smaller, or the backend
+            raises ``ImproperlyConfigured``.
         token_type: Expected ``typ`` claim. When set (e.g. ``"refresh"`` for
             a token-rotation endpoint), tokens must carry exactly that
             ``typ``, and no other type claim that disagrees. When left as
@@ -278,6 +280,14 @@ class JWTAuthentication(BaseAuthentication):
                 )
         if leeway < 0:
             raise ImproperlyConfigured("JWTAuthentication leeway must be >= 0 seconds.")
+        # A store entry lives until ``exp`` plus the leeway of the store. A custom store can have no leeway.
+        store_leeway = getattr(revocation_store, "leeway", None)
+        if store_leeway is not None and store_leeway < leeway:
+            raise ImproperlyConfigured(
+                f"JWTAuthentication leeway is {leeway} seconds, but its revocation_store has a leeway of "
+                f"{store_leeway} seconds. A revoked token would be accepted again before it expires. "
+                f"Pass leeway={leeway} to the store."
+            )
         if secret == "":
             raise ImproperlyConfigured("JWTAuthentication secret must not be empty.")
         self._secret = secret
