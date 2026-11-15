@@ -2,13 +2,80 @@
 
 from __future__ import annotations
 
-import pytest
+from typing import Annotated, ClassVar
 
+import msgspec
+import pytest
+from django.core.exceptions import ImproperlyConfigured
+
+from django_bolt import BoltAPI
+from django_bolt.exceptions import RequestValidationError
+from django_bolt.param_functions import Body, Cookie, Form, Header, Query
 from django_bolt.serializers import (
     Serializer,
     SerializerView,
     computed_field,
+    field,
+    field_validator,
+    model_validator,
 )
+from django_bolt.testing import TestClient
+
+
+class ReadOnlyAddress(Serializer):
+    id: int = field(read_only=True, default=0)
+    city: str = ""
+
+
+class ReadOnlyUser(Serializer):
+    id: int = field(read_only=True, default=0)
+    name: str
+    created: str | None = None
+    tags: list[str] = field(read_only=True, default_factory=list)
+    address: ReadOnlyAddress = field(default_factory=ReadOnlyAddress)
+
+    class Config:
+        read_only = {"created"}
+
+
+class StrictConfigReadOnly(Serializer, forbid_unknown_fields=True):
+    name: str
+    id: int = 0
+    tags: list[str] = []
+
+    class Config:
+        read_only = {"id", "tags"}
+
+
+class StrictFieldReadOnly(Serializer, forbid_unknown_fields=True):
+    name: str
+    id: int = field(read_only=True, default=0)
+    tags: list[str] = field(read_only=True, default_factory=list)
+
+
+class NoDefaultBody(Serializer):
+    id: int = field(read_only=True)
+    name: str
+
+
+class ReadOnlyWithBefore(Serializer):
+    id: int = field(read_only=True, default=0)
+    name: str
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def name_to_text(cls, value):
+        return str(value)
+
+
+class ReadOnlyParams(Serializer):
+    id: int = field(read_only=True, default=0)
+    name: str = ""
+
+
+class StrictReadOnlyParams(Serializer, forbid_unknown_fields=True):
+    id: int = field(read_only=True, default=0)
+    name: str = ""
 
 
 class TestFieldFunction:
@@ -33,6 +100,206 @@ class TestFieldFunction:
         assert "id" in result
         assert "name" in result
         assert "internal_id" not in result
+
+    def test_read_only_field_ignores_the_input_value(self):
+        """Input cannot set a read_only field. The field gets its default."""
+        data = {"id": 99, "name": "n", "address": {"id": 5, "city": "c"}, "created": "x"}
+
+        loaded = ReadOnlyUser.model_validate(data)
+        assert (loaded.id, loaded.created, loaded.tags, loaded.name) == (0, None, [], "n")
+        assert loaded.address.id == 0
+        assert loaded.address.city == "c"
+
+        loaded = ReadOnlyUser.model_validate_json(msgspec.json.encode({**data, "tags": ["t"]}))
+        assert (loaded.id, loaded.created, loaded.tags, loaded.address.id) == (0, None, [], 0)
+        # Each instance gets its own default list.
+        assert loaded.tags is not ReadOnlyUser.model_validate(data).tags
+
+    def test_read_only_field_is_set_by_python_code(self):
+        """The server fills a read_only field: direct construction and validate() keep it."""
+        user = ReadOnlyUser(id=5, name="n", created="now", tags=["t"], address=ReadOnlyAddress(id=7, city="c"))
+        assert (user.id, user.created, user.tags, user.address.id) == (5, "now", ["t"], 7)
+        assert user.validate().id == 5
+        assert user.dump()["id"] == 5
+        # No state is left behind by an earlier input validation.
+        ReadOnlyUser.model_validate({"id": 99, "name": "n"})
+        assert ReadOnlyUser(id=6, name="n").id == 6
+
+    def test_read_only_field_is_an_unknown_field_when_unknown_fields_are_forbidden(self):
+        class Strict(Serializer, forbid_unknown_fields=True):
+            id: int = field(read_only=True, default=0)
+            name: str
+
+        with pytest.raises(msgspec.ValidationError, match="Object contains unknown field `id`"):
+            Strict.model_validate({"id": 99, "name": "n"})
+        with pytest.raises(msgspec.ValidationError, match="Object contains unknown field `id`"):
+            Strict.model_validate_json(b'{"id": 99, "name": "n"}')
+        assert Strict.model_validate({"name": "n"}).id == 0
+        assert Strict(id=4, name="n").id == 4
+
+    @pytest.mark.parametrize("Strict", [StrictConfigReadOnly, StrictFieldReadOnly])  # noqa: N803
+    @pytest.mark.parametrize("sent_id", [0, 5])
+    def test_a_strict_body_refuses_each_value_of_a_read_only_field(self, Strict, sent_id):  # noqa: N803
+        """Config.read_only with a plain default is the same as field(read_only=True, default=...).
+
+        An input value that is equal to the default is still an unknown field.
+        """
+        api = BoltAPI()
+
+        async def create(body):
+            return body.dump()
+
+        create.__annotations__ = {"body": Strict, "return": dict}
+        api.post("/strict")(create)
+
+        with TestClient(api) as client:
+            response = client.post("/strict", json={"name": "a", "id": sent_id})
+            assert response.status_code == 422
+            assert "unknown field `id`" in response.text
+            assert client.post("/strict", json={"name": "a", "tags": []}).status_code == 422
+            response = client.post("/strict", json={"name": "a"})
+            assert response.status_code == 200
+            assert response.json() == {"name": "a", "id": 0, "tags": []}
+
+        # Python code sets the field. Each instance gets its own default list.
+        assert Strict(name="a").dump() == {"name": "a", "id": 0, "tags": []}
+        assert Strict(name="a", id=7).dump() == {"name": "a", "id": 7, "tags": []}
+        assert Strict(name="a").tags is not Strict(name="a").tags
+        assert Strict.model_validate({"name": "a"}).id == 0
+        with pytest.raises(msgspec.ValidationError, match="unknown field `id`"):
+            Strict.model_validate({"name": "a", "id": sent_id})
+        # A subset keeps the rule, and it keeps forbid_unknown_fields.
+        subset = Strict.subset("name", "id")
+        assert subset(name="a").dump() == {"name": "a", "id": 0}
+        assert subset.model_validate({"name": "a"}).id == 0
+        with pytest.raises(msgspec.ValidationError, match="unknown field `id`"):
+            subset.model_validate({"name": "a", "id": sent_id})
+
+    def test_read_only_field_with_no_default_cannot_validate_input(self):
+        """Input has no value for the field, and there is no default to use."""
+
+        class NoDefault(Serializer):
+            id: int = field(read_only=True)
+            name: str
+
+        with pytest.raises(ImproperlyConfigured, match=r"NoDefault\.id is read_only and has no default"):
+            NoDefault.model_validate({"id": 1, "name": "n"})
+        # Python code still builds and dumps it.
+        assert NoDefault(id=1, name="n").dump() == {"id": 1, "name": "n"}
+
+    def test_read_only_field_of_a_request_body_is_ignored(self):
+        """A JSON request body cannot set a read_only field, also in a nested serializer."""
+        api = BoltAPI()
+
+        @api.post("/users")
+        async def create_user(body: ReadOnlyUser) -> dict:
+            return {"id": body.id, "created": body.created, "address_id": body.address.id, "name": body.name}
+
+        @api.post("/users/bulk")
+        async def create_users(body: Annotated[list[ReadOnlyUser], Body()]) -> list[int]:
+            return [user.id for user in body]
+
+        payload = {"id": 99, "name": "n", "created": "x", "address": {"id": 5, "city": "c"}}
+        with TestClient(api) as client:
+            response = client.post("/users", json=payload)
+            assert response.status_code == 200
+            assert response.json() == {"id": 0, "created": None, "address_id": 0, "name": "n"}
+            assert client.post("/users/bulk", json=[payload, payload]).json() == [0, 0]
+
+    def test_read_only_field_is_ignored_when_the_serializer_has_a_before_validator(self):
+        """A before validator changes the decode path of the body. That path also ignores read_only input."""
+        api = BoltAPI()
+
+        @api.post("/users")
+        async def create_user(body: ReadOnlyWithBefore) -> dict:
+            return {"id": body.id, "name": body.name}
+
+        with TestClient(api) as client:
+            response = client.post("/users", json={"id": 99, "name": 5})
+            assert response.status_code == 200
+            assert response.json() == {"id": 0, "name": "5"}
+
+        assert ReadOnlyWithBefore.model_validate({"id": 99, "name": 5}).id == 0
+        assert ReadOnlyWithBefore.model_validate_json(b'{"id": 99, "name": 5}').id == 0
+        assert ReadOnlyWithBefore(id=4, name="n").id == 4
+
+    @pytest.mark.parametrize("source", ["query", "header", "cookie", "form"])
+    def test_read_only_field_of_a_parameter_model_is_ignored(self, source):
+        """A Query(), Header(), Cookie() or Form() model follows the rule of the JSON body."""
+        marker = {"query": Query, "header": Header, "cookie": Cookie, "form": Form}[source]
+        api = BoltAPI()
+
+        # The marker is a local name, so the annotations are set as objects.
+        for path, model in (("/plain", ReadOnlyParams), ("/strict", StrictReadOnlyParams)):
+
+            async def handler(params):
+                return {"id": params.id, "name": params.name}
+
+            handler.__annotations__ = {"params": Annotated[model, marker()], "return": dict}
+            api.post(path)(handler)
+
+        def send(client, path, values):
+            if source == "cookie":
+                cookie = "; ".join(f"{key}={value}" for key, value in values.items())
+                return client.post(path, headers={"cookie": cookie})
+            keyword = {"query": "params", "header": "headers", "form": "data"}[source]
+            return client.post(path, **{keyword: values})
+
+        with TestClient(api) as client:
+            response = send(client, "/plain", {"id": "99", "name": "n"})
+            assert response.status_code == 200
+            assert response.json() == {"id": 0, "name": "n"}
+
+            # With forbid_unknown_fields=True the value is an error, as an unknown field is.
+            response = send(client, "/strict", {"id": "99", "name": "n"})
+            assert response.status_code == 422
+            assert "unknown field `id`" in response.text
+            response = send(client, "/strict", {"name": "n"})
+            assert response.status_code == 200
+            assert response.json() == {"id": 0, "name": "n"}
+
+    def test_request_body_with_a_read_only_field_and_no_default_stops_registration(self):
+        api = BoltAPI()
+        with pytest.raises(ImproperlyConfigured, match=r"NoDefaultBody\.id is read_only and has no default"):
+
+            @api.post("/users")
+            async def create_user(body: NoDefaultBody) -> dict:
+                return {}
+
+    def test_field_default_default_factory_and_exclude(self):
+        """field() gives the default of a field, and exclude=True keeps the field out of dump()."""
+
+        class Member(Serializer):
+            name: str
+            internal: str = field(exclude=True, default="x")
+            role: str = field(default="user")
+            tags: list[str] = field(default_factory=list)
+
+        first, second = Member(name="a"), Member(name="b")
+
+        assert (first.role, first.tags, first.internal) == ("user", [], "x")
+        assert first.tags is not second.tags
+        assert first.dump() == {"name": "a", "role": "user", "tags": []}
+        assert Member.dump_many([first]) == [{"name": "a", "role": "user", "tags": []}]
+
+    def test_write_only_field_is_dropped_and_the_fields_after_it_stay(self):
+        """A write-only field does not hide the fields that follow it, also in a subset."""
+
+        class Account(Serializer):
+            id: int
+            password: str = field(write_only=True)
+            token: str
+            email: str
+
+            class Config:
+                write_only = {"token"}
+
+        account = Account(id=1, password="p", token="t", email="a@example.com")
+        public = {"id": 1, "email": "a@example.com"}
+
+        assert account.dump() == public
+        assert Account.dump_many([account]) == [public]
+        assert Account.subset("id", "token", "email")(id=1, token="t", email="a@example.com").dump() == public
 
     def test_field_write_only_meta(self):
         """Test write_only fields via Meta class."""
@@ -345,6 +612,78 @@ class TestDumpMethods:
         result_filtered = user.dump(exclude_defaults=True)
         assert result_filtered == {"name": "John"}
 
+    def test_dump_exclude_defaults_with_a_mutable_default(self):
+        """An empty list or dict default is a default value, as a default_factory is."""
+
+        class Post(Serializer):
+            title: str
+            tags: list[str] = []
+            meta: dict[str, str] = {}
+            authors: list[str] = field(default_factory=list)
+
+        assert Post(title="a").dump(exclude_defaults=True) == {"title": "a"}
+        assert Post(title="a", tags=["x"], meta={"k": "v"}, authors=["me"]).dump(exclude_defaults=True) == {
+            "title": "a",
+            "tags": ["x"],
+            "meta": {"k": "v"},
+            "authors": ["me"],
+        }
+
+    @pytest.mark.parametrize(
+        ("option", "expected_tag", "expected_post"),
+        [
+            (
+                {"exclude_none": True},
+                {"name": "a", "w": 1},
+                {"t": "untitled", "size": 1},
+            ),
+            (
+                {"exclude_defaults": True},
+                {"name": "a"},
+                {"parent": None, "subtitle": None, "size": 1},
+            ),
+            (
+                {"by_alias": True},
+                {"name": "a", "note": None, "w": 1},
+                {"note": None, "t": "untitled", "parent": None, "subtitle": None, "size": 1},
+            ),
+        ],
+    )
+    def test_dump_option_applies_to_nested_serializers_dump_many_and_views(self, option, expected_tag, expected_post):
+        """Each path of dump() gives the same output for an option, at each level."""
+
+        class Tag(Serializer):
+            name: str
+            note: str | None = None
+            weight: int = field(alias="w", default=1)
+
+        class Post(Serializer):
+            note: str | None = None
+            title: str = field(alias="t", default="untitled")
+            parent: int | None
+            tag: Tag
+            tags: list[Tag]
+
+            @computed_field
+            def subtitle(self) -> str | None:
+                return None
+
+            @computed_field
+            def size(self) -> int:
+                return len(self.tags)
+
+        tag = Tag(name="a")
+        post = Post(parent=None, tag={"name": "a"}, tags=[{"name": "a"}])
+        expected = {"tag": expected_tag, "tags": [expected_tag], **expected_post}
+
+        assert tag.dump(**option) == expected_tag
+        assert Tag.dump_many([tag], **option) == [expected_tag]
+        assert post.dump(**option) == expected
+        assert Post.dump_many((item for item in [post]), **option) == [expected]
+        view = Post.exclude("unknown")
+        assert view.dump(post, **option) == expected
+        assert view.dump_many([post], **option) == [expected]
+
     def test_dump_json(self):
         """Test dump_json method."""
 
@@ -413,6 +752,44 @@ class TestSerializerView:
         # Dump respects field selection
         result = view.dump(user)
         assert result == {"id": 1, "name": "John"}
+
+
+class _ViewItem(Serializer):
+    id: int
+    name: str | None = None
+    note: str = "n"
+    nick: str = field(alias="nickName", default="x")
+
+
+class TestSerializerViewApi:
+    """SerializerView chaining and JSON output, and Serializer.validate."""
+
+    def test_only_on_a_view_narrows_it_and_keeps_exclusions(self):
+        item = _ViewItem(id=1, name="a", note="b", nick="c")
+        narrowed = _ViewItem.only("id", "name", "note").only("name", "note", "nick")
+        assert narrowed.dump(item) == {"name": "a", "note": "b"}
+        assert _ViewItem.exclude("note").only("id", "note", "name").dump(item) == {"id": 1, "name": "a"}
+
+    def test_view_dump_json_forwards_each_option(self):
+        # The alias of a field is its key in each output; by_alias changes nothing.
+        view = _ViewItem.exclude("note")
+        item = _ViewItem(id=1, nick="y")
+        assert view.dump_json(item) == b'{"id":1,"name":null,"nickName":"y"}'
+        assert view.dump_json(item, exclude_none=True) == b'{"id":1,"nickName":"y"}'
+        assert view.dump_json(item, exclude_defaults=True) == b'{"id":1,"nickName":"y"}'
+        assert view.dump_json(item, by_alias=True) == b'{"id":1,"name":null,"nickName":"y"}'
+        assert view.dump_many_json([item]) == b'[{"id":1,"name":null,"nickName":"y"}]'
+        assert view.dump_many_json([item], exclude_none=True) == b'[{"id":1,"nickName":"y"}]'
+        assert view.dump_many_json([item], exclude_defaults=True) == b'[{"id":1,"nickName":"y"}]'
+        assert view.dump_many_json([item], by_alias=True) == b'[{"id":1,"name":null,"nickName":"y"}]'
+
+    def test_validate_returns_a_new_instance_or_raises(self):
+        item = _ViewItem(id=1, name="a")
+        checked = item.validate()
+        assert checked == item
+        assert checked is not item
+        with pytest.raises(msgspec.ValidationError):
+            _ViewItem(id="not-int").validate()
 
 
 class TestComplexScenarios:
@@ -592,6 +969,24 @@ class TestSubsetMethod:
         assert user.name == "John"
         assert user.role == "user"
 
+    def test_subset_keeps_the_struct_options_of_the_parent(self):
+        """A subset has the rename, omit_defaults, forbid_unknown_fields and frozen options of its parent."""
+
+        class Account(Serializer, rename="camel", omit_defaults=True, forbid_unknown_fields=True, frozen=True):
+            user_name: str
+            display_name: str = ""
+            email_address: str = ""
+
+        AccountMini = Account.subset("user_name", "display_name")
+        mini = AccountMini.model_validate({"userName": "ada", "displayName": "Ada"})
+
+        assert mini.dump() == {"userName": "ada", "displayName": "Ada"}
+        assert msgspec.json.encode(AccountMini(user_name="ada")) == b'{"userName":"ada"}'
+        with pytest.raises(msgspec.ValidationError, match="unknown field `emailAddress`"):
+            msgspec.convert({"userName": "ada", "emailAddress": "a@example.com"}, AccountMini)
+        with pytest.raises(AttributeError):
+            mini.user_name = "bob"
+
     def test_subset_with_computed_field(self):
         """Test subset includes computed fields."""
 
@@ -612,6 +1007,92 @@ class TestSubsetMethod:
         assert result["first_name"] == "John"
         assert result["last_name"] == "Doe"
         assert result["full_name"] == "John Doe"
+
+    def test_subset_keeps_a_model_validator_whose_fields_it_has(self):
+        """A subset ran no model validator. Thus `low > high` passed for the subset and failed for the parent."""
+
+        class RangeSerializer(Serializer):
+            low: int
+            high: int
+            note: str = ""
+
+            @model_validator
+            def check_order(self):
+                if self.low > self.high:
+                    raise ValueError("low is above high")
+                return self
+
+            @model_validator
+            def check_note(self):
+                if self.note == "forbidden":
+                    raise ValueError("note is forbidden")
+                return self
+
+        Bounds = RangeSerializer.subset("low", "high", name="Bounds")
+        # This subset has no `high` field, so `check_order` cannot run.
+        LowWithNote = RangeSerializer.subset("low", "note", name="LowWithNote")
+
+        api = BoltAPI()
+
+        async def bounds(data):
+            return {"low": data.low, "high": data.high}
+
+        async def low(data):
+            return {"low": data.low, "note": data.note}
+
+        # This module has postponed annotations, and the subsets are local names.
+        bounds.__annotations__["data"] = Bounds
+        low.__annotations__["data"] = LowWithNote
+        api.post("/bounds")(bounds)
+        api.post("/low")(low)
+
+        with TestClient(api) as client:
+            assert client.post("/bounds", json={"low": 1, "high": 5}).json() == {"low": 1, "high": 5}
+            response = client.post("/bounds", json={"low": 5, "high": 1})
+            assert response.status_code == 422
+            assert "low is above high" in response.text
+
+            assert client.post("/low", json={"low": 5}).json() == {"low": 5, "note": ""}
+            response = client.post("/low", json={"low": 5, "note": "forbidden"})
+            assert response.status_code == 422
+            assert "note is forbidden" in response.text
+
+        assert [validator.__name__ for validator in Bounds.__model_validators__] == ["check_order"]
+        assert [validator.__name__ for validator in LowWithNote.__model_validators__] == ["check_note"]
+
+    def test_subset_leaves_out_a_model_validator_that_calls_a_parent_method(self):
+        """The subset does not have the methods and class variables of the parent."""
+
+        class LimitSerializer(Serializer):
+            LIMIT: ClassVar[int] = 3
+            low: int
+            name: str = ""
+
+            def _low_is_small(self):
+                return self.low <= 5
+
+            @model_validator
+            def check_low(self):
+                if not self._low_is_small():
+                    raise ValueError("low is too large")
+
+            @model_validator
+            def check_name(self):
+                if len(self.name) > self.LIMIT:
+                    raise ValueError("name is too long")
+
+            @model_validator
+            def check_sign(self):
+                if self.low < 0:
+                    raise ValueError("low is below zero")
+
+        Sub = LimitSerializer.subset("low", "name", name="LimitSub")
+
+        assert [validator.__name__ for validator in Sub.__model_validators__] == ["check_sign"]
+        # Before, the copied validators raised AttributeError for each instance.
+        assert Sub(low=9, name="a long name").low == 9
+        with pytest.raises(RequestValidationError):
+            Sub(low=-1)
 
     def test_subset_from_parent(self):
         """Test creating subset instance from parent instance."""

@@ -26,7 +26,7 @@ use bolt_core::metadata::{RateLimitKey, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::middleware::rate_limit::RateLimiters;
-use bolt_core::router::Router;
+use bolt_core::router::{Router, normalize_request_path};
 use bolt_core::state::{
     AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS, find_websocket_mount_in_slice,
 };
@@ -811,8 +811,9 @@ pub fn handle_test_websocket(
         &path
     };
 
-    // Find WebSocket route
-    let (route, path_params) = match app.websocket_router.find(normalized_path) {
+    // Find WebSocket route. Each form of a `%XX` escape matches, as on the server.
+    let route_path = normalize_request_path(normalized_path);
+    let (route, path_params) = match app.websocket_router.find(&route_path) {
         Some((route, params)) => (route, params),
         // No route matched: fall back to a mounted ASGI app, as the server does.
         None => {
@@ -1058,25 +1059,6 @@ pub fn handle_test_websocket(
 
     let client_tuple = pyo3::types::PyTuple::new(py, ["127.0.0.1", "12345"])?;
     scope_dict.set_item("client", client_tuple)?;
-
-    // Add auth context if present
-    if let Some(route_meta) = app.route_metadata.get(handler_id) {
-        let auth_ctx = if !route_meta.auth_backends.is_empty() {
-            authenticate(&header_map, &route_meta.auth_backends)
-        } else {
-            None
-        };
-
-        if let Some(ref auth) = auth_ctx {
-            let ctx_dict = pyo3::types::PyDict::new(py);
-            bolt_core::middleware::auth::populate_auth_context(
-                &ctx_dict.clone().unbind(),
-                auth,
-                py,
-            );
-            scope_dict.set_item("auth_context", ctx_dict)?;
-        }
-    }
 
     Ok((
         true,

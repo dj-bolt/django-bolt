@@ -57,6 +57,27 @@ def test_websocket_normal_path_param_completes_handshake(make_server_project):
         assert websocket.receive_text() == "connected"
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("/ws/%C3%BC", "/ws/ü"),
+        ("/ws/a%20b", "/ws/a b"),
+        ("/ws/%C3%BC%20b/x%20y", "/ws/ü b/x y"),
+        # An escape with lower-case digits is the same path.
+        ("/ws/%c3%bc", "/ws/ü"),
+        # The form with a trailing slash matches the same route, for each form of an escape.
+        ("/ws/%C3%BC/", "/ws/ü"),
+        ("/ws/%c3%bc/", "/ws/ü"),
+    ],
+)
+def test_websocket_route_path_with_an_escaped_character_completes_handshake(make_server_project, url, expected):
+    """A client sends a space or a non-ASCII character as an escape, and the route accepts."""
+    project = make_server_project(api_module=app_module("ws_route_path_escape"))
+
+    with project.start() as server, SimpleWebSocketClient(server.host, server.port, url) as websocket:
+        assert websocket.receive_text() == expected
+
+
 def test_websocket_honors_django_bolt_max_param_length_env(make_server_project):
     """The upgrade limit is driven by DJANGO_BOLT_MAX_PARAM_LENGTH, not hard-coded to 8192.
 
