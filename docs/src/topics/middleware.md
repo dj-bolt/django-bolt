@@ -313,6 +313,8 @@ api.include_router(admin_router)
 
 Passing plain middleware instances in these lists fails fast with `TypeError` (`pass class, not instance`).
 
+A dict config needs `"type": "cors"` or `"type": "rate_limit"`. A dict with no type or with another type raises `ValueError`, because no middleware reads it. `@middleware(type="cors", ...)` is the same dict as keyword arguments. Other keyword arguments of `@middleware` raise `TypeError`. Use `@cors(...)`, `@rate_limit(...)` and `@skip_middleware(...)`.
+
 In a `cors` dict, `origins` and `origin_regexes` take a `str` or a collection of `str`. Another type, or an empty pattern, stops startup with `TypeError` or `ValueError`.
 
 Router middleware is inherited parent-to-child and executes in declared order.
