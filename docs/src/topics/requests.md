@@ -199,6 +199,27 @@ async def user(user_id: UserId, page: Page = 1):
 The handler gets an `int`, and `/users/abc` gives a 422.
 A parameterized alias gets its arguments. With `type Pair[T] = list[T]`, a `Pair[int]` parameter converts as `list[int]`.
 
+### Enum and Literal
+
+An `Enum` parameter gets the member with the value from the request. A `Literal` parameter takes only its listed values:
+
+```python
+import enum
+from typing import Literal
+
+class Color(enum.Enum):
+    RED = "red"
+    BLUE = "blue"
+
+@api.get("/paint")
+async def paint(color: Color, order: Literal["asc", "desc"] = "asc"):
+    return {"color": color.name, "order": order}
+```
+
+`/paint?color=red` gives `Color.RED`. Another value, such as `/paint?color=green`, gives a 422.
+An `IntEnum` or a `Literal` of numbers converts the text to a number first.
+This applies to path, query, header, cookie and form parameters.
+
 ## Request body
 
 ### JSON body
