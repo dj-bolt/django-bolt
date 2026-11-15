@@ -1089,8 +1089,10 @@ class BoltAPI:
             handler_id = self._next_handler_id
             self._next_handler_id += 1
 
-            # Build full path with prefix
-            full_path = f"{self.prefix}{path}" if self.prefix else path
+            # Build full path with prefix. The server removes the trailing slash
+            # of a WebSocket request path before the lookup, for each
+            # trailing_slash mode. Thus the route path has no trailing slash.
+            full_path = _normalize_path(f"{self.prefix}{path}" if self.prefix else path, "strip")
 
             self._handlers[handler_id] = fn
 
@@ -3730,8 +3732,8 @@ class BoltAPI:
 
         # Copy WebSocket routes
         for ws_path, handler_id, handler in app._websocket_routes:
-            # Compute new path with mount prefix and normalize using parent's trailing_slash setting
-            new_path = _normalize_path(mount_path + ws_path, self.trailing_slash)
+            # A WebSocket route path has no trailing slash: see _websocket_decorator.
+            new_path = _normalize_path(mount_path + ws_path, "strip")
 
             new_handler_id = self._next_handler_id
             self._next_handler_id += 1
