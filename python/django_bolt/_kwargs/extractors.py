@@ -7,9 +7,10 @@ extractor functions that avoid runtime type checking.
 
 from __future__ import annotations
 
+import enum
 import inspect
 from collections.abc import Callable, Sequence
-from typing import Annotated, Any, get_args, get_origin
+from typing import Annotated, Any, Literal, get_args, get_origin
 
 import msgspec
 from django.db.models import QuerySet
@@ -72,10 +73,12 @@ def _holds_one_item(annotation: Any) -> bool:
 def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = False) -> Callable | None:
     """Build the conversion of one parameter value that Rust cannot do, or None.
 
-    Rust converts a scalar value by its type. It does not build a sequence and
-    it does not check ``msgspec.Meta`` constraints. For such a parameter, one
-    ``msgspec.convert`` builds the ``list``, ``set``, ``frozenset`` or ``tuple``
-    from the values and checks the constraints. A bad value gives a 422 that
+    Rust converts a scalar value by its type. It does not build a sequence, it
+    does not check ``msgspec.Meta`` constraints, and it does not know an
+    ``Enum`` or a ``Literal``. For such a parameter, one ``msgspec.convert``
+    builds the ``list``, ``set``, ``frozenset`` or ``tuple`` from the values,
+    checks the constraints, and gives the ``Enum`` member or the ``Literal``
+    value. A bad value gives a 422 that
     names ``loc`` and ``key``. With ``one_item``, a source that gives one value
     (a path, a header or a cookie) gives a sequence of that one item. A type
     that cannot hold one item, such as ``tuple[int, str]``, then raises
@@ -92,7 +95,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
         if isinstance(extra, msgspec.Meta)
         for name in _META_CONSTRAINTS
     )
-    if not is_sequence and not constrained:
+    is_choice = get_origin(inner) is Literal or (isinstance(inner, type) and issubclass(inner, enum.Enum))
+    if not is_sequence and not constrained and not is_choice:
         return None
     wrap = is_sequence and one_item
     if wrap and loc in _SINGLE_VALUE_SOURCES and not _holds_one_item(target):

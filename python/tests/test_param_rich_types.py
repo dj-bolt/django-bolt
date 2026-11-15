@@ -11,8 +11,9 @@ Each value arrives with its declared type, and a bad value gives a 422:
 
 # No ``from __future__ import annotations``: the tests declare the handlers
 # with local types, and the handlers must resolve them.
+import enum
 from decimal import Decimal
-from typing import Annotated, NewType
+from typing import Annotated, Literal, NewType
 from urllib.parse import parse_qsl
 
 import msgspec
@@ -397,6 +398,67 @@ def test_a_parameterized_type_alias_converts_as_the_type_it_names(generic_alias_
 def test_a_bad_parameterized_type_alias_value_is_a_422(generic_alias_client, url):
     response = generic_alias_client.get(url)
     assert response.status_code == 422, response.text
+
+
+# --- Enum and Literal ---------------------------------------------------------------
+
+
+class _Color(enum.Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class _Level(enum.IntEnum):
+    LOW = 1
+    HIGH = 2
+
+
+def test_an_enum_or_literal_parameter_converts_its_value_and_rejects_another_value():
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(color: _Color, level: _Level = _Level.LOW, mode: Literal["asc", "desc"] | None = None):
+        return {"color": color.name, "level": level.name, "mode": mode}
+
+    @api.get("/path/{color}")
+    async def path(color: _Color):
+        return {"color": color.name}
+
+    @api.get("/header")
+    async def header(x_color: Annotated[_Color, Header()], level: Annotated[_Level | None, Cookie()] = None):
+        return {"color": x_color.name, "level": level and level.name}
+
+    @api.post("/form")
+    async def form(color: Annotated[_Color, Form()]):
+        return {"color": color.name}
+
+    with TestClient(api) as client:
+        assert client.get("/query?color=red").json() == {"color": "RED", "level": "LOW", "mode": None}
+        assert client.get("/query?color=blue&level=2&mode=desc").json() == {
+            "color": "BLUE",
+            "level": "HIGH",
+            "mode": "desc",
+        }
+        assert client.get("/path/blue").json() == {"color": "BLUE"}
+        assert client.get("/header", headers={"x-color": "red"}).json() == {"color": "RED", "level": None}
+        assert client.get("/header", headers={"x-color": "red", "cookie": "level=2"}).json() == {
+            "color": "RED",
+            "level": "HIGH",
+        }
+        assert client.post("/form", data={"color": "blue"}).json() == {"color": "BLUE"}
+
+        bad = [
+            (client.get("/query?color=green"), ["query", "color"]),
+            (client.get("/query?color=red&level=3"), ["query", "level"]),
+            (client.get("/query?color=red&mode=up"), ["query", "mode"]),
+            (client.get("/path/green"), ["path", "color"]),
+            (client.get("/header", headers={"x-color": "green"}), ["header", "x-color"]),
+            (client.get("/header", headers={"x-color": "red", "cookie": "level=3"}), ["cookie", "level"]),
+            (client.post("/form", data={"color": "green"}), ["body", "color"]),
+        ]
+        for response, loc in bad:
+            assert response.status_code == 422, loc
+            assert response.json()["detail"][0]["loc"] == loc
 
 
 # --- msgspec.Meta constraints ----------------------------------------------------------
