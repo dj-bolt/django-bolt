@@ -874,6 +874,16 @@ fn write_access_log(
             return;
         }
     }
+    // A flood of 429 responses writes one line for each second on this worker.
+    // A 429 that the filter skips takes no line and is not in the count.
+    let suppressed = if status == 429 {
+        match bolt_core::access_log::rejection_line_at(start) {
+            Some(suppressed) => suppressed,
+            None => return,
+        }
+    } else {
+        0
+    };
     let msg = format!(
         "{} {} {} {:.1}ms",
         req.method().as_str(),
@@ -881,6 +891,12 @@ fn write_access_log(
         status,
         dur_ms
     );
+    // The line of a 429 counts the 429 responses before it that wrote no line.
+    let msg = if suppressed == 0 {
+        msg
+    } else {
+        format!("{msg} | suppressed: {suppressed}")
+    };
     Python::attach(|py| {
         let _ = logger.call_method1(py, level, (msg,));
     });

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import time
+
 import pytest
 
 from .apps import app_module
@@ -23,6 +26,30 @@ LOGGING = {
     },
 }
 """
+
+
+@pytest.mark.server_integration
+def test_access_log_writes_one_429_line_for_each_second_of_a_flood(make_server_project):
+    project = make_server_project(
+        api_module=app_module("access_log_rejections"),
+        settings_extra=_LOGGING,
+    )
+    with project.start(startup_path="/health") as server:
+        # The route takes one request for each second. The server has one worker.
+        statuses = [server.request("GET", "/limited").status_code for _ in range(40)]
+        time.sleep(1.2)
+        statuses += [server.request("GET", "/limited").status_code for _ in range(2)]
+    rejected = statuses.count(429)
+    assert rejected >= 38
+    assert statuses[-1] == 429
+
+    lines = [line for line in project.path("access.log").read_text().splitlines() if " 429 " in line]
+    matches = [re.fullmatch(r"WARNING GET /limited 429 \S+ms(?: \| suppressed: (\d+))?", line) for line in lines]
+    assert all(matches), lines
+    # One line for each second: the flood can cross one second, and the last 429 is in a later second.
+    assert 2 <= len(lines) <= 3, lines
+    # Each 429 with no line is in the count of a later line.
+    assert len(lines) + sum(int(match.group(1) or 0) for match in matches) == rejected
 
 
 @pytest.mark.server_integration
