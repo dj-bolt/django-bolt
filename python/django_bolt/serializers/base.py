@@ -1891,6 +1891,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             - Computed fields are included if their name is in the fields list
             - write_only fields from Meta are automatically excluded from subsets
             - The subset inherits validators for included fields
+            - The subset keeps the rename, omit_defaults, forbid_unknown_fields and frozen
+              options of the parent. It does not keep the tag
+            - Model validators are not copied. They can read a field that the subset
+              does not have
             - Always define subsets at module level, not inside view functions
         """
         fields_set = frozenset(fields)
@@ -1974,7 +1978,19 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # and reusing the parent's tag would create duplicate-tag collisions
         # in any tagged union containing both. Callers who need a tagged
         # subset can subclass with an explicit `tag=...`.
-        new_cls: type[T] = type(class_name, (Serializer,), class_dict, kw_only=True)  # type: ignore
+        # The subset keeps the wire names and the struct options of the parent.
+        struct_config = cls.__struct_config__
+        new_cls: type[T] = type(  # type: ignore
+            class_name,
+            (Serializer,),
+            class_dict,
+            kw_only=True,
+            rename={name: cls.__rename_map__[name] for name in struct_fields_to_include if name in cls.__rename_map__}
+            or None,
+            omit_defaults=struct_config.omit_defaults,
+            forbid_unknown_fields=struct_config.forbid_unknown_fields,
+            frozen=struct_config.frozen,
+        )
 
         # Add from_parent class method
         @classmethod
