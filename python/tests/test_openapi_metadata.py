@@ -7,6 +7,7 @@ from django_bolt.decorators import ActionHandler, action
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.openapi.spec import Tag
+from django_bolt.responses import Redirect
 from django_bolt.views import ViewSet
 from django_bolt.websocket import WebSocket
 
@@ -407,6 +408,48 @@ def test_websocket_summary_and_description():
     assert operation.summary == "WebSocket: Stream prices"
     assert "Sends each price change." in operation.description
     assert "Docstring summary." not in operation.description
+
+
+def test_websocket_operation_documents_the_upgrade_handshake():
+    """A WebSocket operation lists the upgrade headers and the 101, 400 and 403 responses."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/stream")
+    async def stream(websocket: WebSocket):
+        await websocket.accept()
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate().to_schema()
+    operation = schema["paths"]["/ws/stream"]["get"]
+    assert operation["operationId"] == "websocket_stream"
+    assert operation["summary"] == "WebSocket Connection"
+    headers = {p["name"]: p for p in operation["parameters"]}
+    assert set(headers) == {"Upgrade", "Connection"}
+    assert headers["Upgrade"]["in"] == "header"
+    assert headers["Upgrade"]["required"] is True
+    assert headers["Upgrade"]["schema"] == {"type": "string", "enum": ["websocket"]}
+    assert headers["Connection"]["schema"] == {"type": "string", "enum": ["Upgrade"]}
+    assert set(operation["responses"]) == {"101", "400", "403"}
+    assert set(operation["responses"]["101"]["headers"]) == {"Upgrade", "Connection"}
+
+
+def test_redirect_route_documents_the_location_header():
+    """A Redirect route shows a 307 response, or its own status code, with a Location header."""
+    api = BoltAPI()
+
+    @api.get("/temporary", response_class=Redirect)
+    async def temporary():
+        return Redirect("/new")
+
+    @api.get("/permanent", status_code=301, response_class=Redirect)
+    async def permanent():
+        return Redirect("/new")
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate().to_schema()
+    assert list(schema["paths"]["/temporary"]["get"]["responses"]) == ["307"]
+    assert list(schema["paths"]["/permanent"]["get"]["responses"]) == ["301"]
+    response = schema["paths"]["/permanent"]["get"]["responses"]["301"]
+    assert response["description"] == "Moved Permanently"
+    assert response["headers"]["Location"]["schema"] == {"type": "string"}
 
 
 def test_websocket_include_in_schema_false():
