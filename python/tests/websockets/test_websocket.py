@@ -371,6 +371,7 @@ async def test_websocket_server_close_normal(api):
             await ws.receive_text()
 
         assert exc_info.value.code == CloseCode.NORMAL
+        assert exc_info.value.reason == "done"
 
 
 @pytest.mark.asyncio
@@ -381,6 +382,18 @@ async def test_websocket_server_close_error(api):
             await ws.receive_text()
 
         assert exc_info.value.code == CloseCode.INTERNAL_ERROR
+        assert exc_info.value.reason == "something went wrong"
+
+
+@pytest.mark.asyncio
+async def test_websocket_server_close_reason_reaches_receive_bytes(api):
+    """The close reason of the handler is in the error of each receive method."""
+    async with WebSocketTestClient(api, "/ws/close-error") as ws:
+        with pytest.raises(ConnectionClosed) as exc_info:
+            await ws.receive_bytes()
+
+        assert exc_info.value.code == CloseCode.INTERNAL_ERROR
+        assert exc_info.value.reason == "something went wrong"
 
 
 # --- Type Coercion Tests ---

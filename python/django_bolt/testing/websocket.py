@@ -504,7 +504,7 @@ class WebSocketTestClient:
             elif msg_type == "websocket.close":
                 self._closed = True
                 self._close_code = msg.get("code", CloseCode.NORMAL)
-                raise ConnectionClosed(self._close_code)
+                raise ConnectionClosed(self._close_code, msg.get("reason", ""))
             elif msg_type == "websocket.accept":
                 # Skip accept messages
                 continue
@@ -526,7 +526,7 @@ class WebSocketTestClient:
             elif msg_type == "websocket.close":
                 self._closed = True
                 self._close_code = msg.get("code", CloseCode.NORMAL)
-                raise ConnectionClosed(self._close_code)
+                raise ConnectionClosed(self._close_code, msg.get("reason", ""))
             elif msg_type == "websocket.accept":
                 continue
             else:
