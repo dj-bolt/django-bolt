@@ -132,6 +132,18 @@ Use `clear_root_path=True` when the mounted Django app's URL patterns already in
   - With `clear_root_path=True`, Django sees full paths like `/admin/login/`.
 - If Django URL patterns are relative to the mount root (for example `/login/` under the mount), keep the default `clear_root_path=False`.
 
+### The admin mount of `runbolt`
+
+`runbolt` mounts the Django admin at the prefix of the admin site in your URLconf. You do not call `mount_django()` for it.
+
+An admin site in `i18n_patterns()` has one prefix for each language of `settings.LANGUAGES`, for example `/en/admin` and `/fr/admin`. `runbolt` mounts each of them. It also mounts the path with no language, `/admin`. Django's `LocaleMiddleware` redirects that path to the prefix of a language. With `prefix_default_language=False`, the default language has no prefix. Set `LANGUAGES` to the languages that you use: the default of Django has about 100 languages, and each gets a mount.
+
+A prefix with a path parameter, such as `path("<tenant>/admin/", admin.site.urls)`, is not a static path. `runbolt` cannot mount the admin there and prints a warning. To serve it, give Django each path that has no Bolt route:
+
+```python
+api.mount_django("/", clear_root_path=True)
+```
+
 ## Rules and constraints
 
 - Mount paths must be static (no dynamic segments like `/{id}`).

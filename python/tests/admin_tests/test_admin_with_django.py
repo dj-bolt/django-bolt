@@ -90,6 +90,70 @@ def test_admin_at_the_root_path_leaves_the_bolt_routes(settings, capsys):
     assert "csrfmiddlewaretoken" in response.text
 
 
+def _use_two_languages(settings, urlconf):
+    settings.ROOT_URLCONF = urlconf
+    settings.LANGUAGE_CODE = "en"
+    settings.LANGUAGES = [("en", "English"), ("fr", "French")]
+    settings.MIDDLEWARE = [
+        "django.contrib.sessions.middleware.SessionMiddleware",
+        "django.middleware.locale.LocaleMiddleware",
+        "django.middleware.common.CommonMiddleware",
+        "django.middleware.csrf.CsrfViewMiddleware",
+        "django.contrib.auth.middleware.AuthenticationMiddleware",
+        "django.contrib.messages.middleware.MessageMiddleware",
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_in_i18n_patterns_answers_for_each_language(settings):
+    """The admin answers at the prefix of each language, and Django redirects the path with no prefix."""
+    _use_two_languages(settings, "tests.admin_tests.urls_i18n")
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        english = client.get("/en/admin/login/")
+        french = client.get("/fr/admin/login/")
+        no_prefix = client.get("/admin/login/", follow_redirects=False)
+
+    assert english.status_code == 200
+    assert '<html lang="en"' in english.text
+    assert french.status_code == 200
+    assert '<html lang="fr"' in french.text
+    # LocaleMiddleware of Django redirects to the prefix of the default language.
+    assert no_prefix.status_code == 302
+    assert no_prefix.headers["location"] == "/en/admin/login/"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_in_i18n_patterns_with_no_prefix_for_the_default_language(settings):
+    """With prefix_default_language=False, the default language has no prefix."""
+    _use_two_languages(settings, "tests.admin_tests.urls_i18n_no_default_prefix")
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        english = client.get("/admin/login/")
+        french = client.get("/fr/admin/login/")
+
+    assert english.status_code == 200
+    assert '<html lang="en"' in english.text
+    assert french.status_code == 200
+    assert '<html lang="fr"' in french.text
+
+
+def test_admin_behind_a_path_parameter_prints_a_warning(settings, capsys):
+    """A prefix with a path parameter cannot be a mount. runbolt names the way to serve it."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_path_parameter"
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    err = capsys.readouterr().err
+    assert err.count("[django-bolt] Warning") == 1
+    assert "path parameter" in err
+    assert 'api.mount_django("/", clear_root_path=True)' in err
+
+
 @pytest.mark.django_db(transaction=True)
 def test_admin_login_page():
     """Test /admin/login/ returns HTML page (not empty body) via TestClient."""
