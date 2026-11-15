@@ -1136,6 +1136,36 @@ mod tests {
         assert!(matches!(exit_code, Ok(0)), "{exit_code:?}");
     }
 
+    /// The supervisor loop with a worker that fails at once, as for a port in use.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_first_start_ends_the_session_with_the_exit_code_of_the_worker() {
+        use super::supervise;
+        use std::sync::atomic::AtomicBool;
+
+        let command = ["sh", "-c", "exit 3"].map(String::from);
+        let filter = ReloadFilter::new(vec![], vec![]);
+        // The watcher stays alive while the loop polls the worker. If the loop
+        // waits for changes, the watcher stops later and the exit code is 1.
+        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(5));
+            drop(tx);
+        });
+
+        let exit_code = supervise(
+            &command,
+            &rx,
+            &filter,
+            Duration::from_millis(50),
+            Duration::from_millis(20),
+            &AtomicBool::new(false),
+            &Paint { enabled: false },
+        );
+
+        assert!(matches!(exit_code, Ok(3)), "{exit_code:?}");
+    }
+
     #[test]
     fn wait_for_child_exit_gives_the_status_of_a_child_that_exits_in_time() {
         let mut child = Command::new("sh")
