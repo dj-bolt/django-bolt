@@ -430,6 +430,18 @@ def test_ellipsis_only_dict_raises_at_registration():
             pass
 
 
+@pytest.mark.parametrize("key", [True, False])
+def test_bool_key_dict_raises_at_registration(key):
+    """A bool is not a status code. A bool key of response_model raises TypeError at registration."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match="response_model"):
+
+        @api.get("/item", response_model={key: OkSchema, 201: OkSchema})
+        async def handler():
+            return {"id": 1, "name": "x"}
+
+
 # ============================================================================
 # Edge case: non-2xx-only dict uses lowest int code as default
 # ============================================================================
