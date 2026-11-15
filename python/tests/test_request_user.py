@@ -380,6 +380,33 @@ class TestJWTUserLoading:
         # The read of request.user does not load the user, so the value is not None itself.
         assert checked_response.json() == {"is_none": False, "falsy": True, "auser_is_none": True}
 
+    @pytest.mark.parametrize("path", ["/async", "/sync"])
+    def test_the_401_of_a_user_with_no_row_names_the_scheme_of_the_route(self, path):
+        """The 401 of the read has the challenge of the route, not a fixed Bearer."""
+
+        class KeyWithUser(APIKeyAuthentication):
+            def get_user_sync(self, user_id):
+                # The key is valid, but its user has no row.
+                return None
+
+        api = BoltAPI()
+        auth = [KeyWithUser(api_keys={"key-one"})]
+
+        @api.get("/async", auth=auth, guards=[IsAuthenticated()])
+        async def read_async(request):
+            return {"user_id": request.user.id}
+
+        @api.get("/sync", auth=auth, guards=[IsAuthenticated()])
+        def read_sync(request):
+            return {"user_id": request.user.id}
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.get(path, headers={"X-API-Key": "key-one"})
+
+        assert response.status_code == 401, response.text
+        assert response.json() == {"detail": "Authentication required"}
+        assert response.headers["www-authenticate"] == "ApiKey"
+
     def test_unauthenticated_request_rejected(self, jwt_api):
         """Test that unauthenticated request is rejected by guard."""
         with TestClient(jwt_api) as client:
