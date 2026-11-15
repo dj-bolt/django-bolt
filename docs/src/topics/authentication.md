@@ -889,10 +889,10 @@ to call `is_revoked()` manually.
 !!! tip "Always pass the token's `exp`"
 
     `revoke()` accepts an `exp` keyword argument. Pass the token's own
-    `exp` claim so the revocation entry expires exactly when the token
-    would have anyway — no security gap, no wasted storage. Without
-    `exp`, the entry falls back to the store's `default_ttl` (7 days
-    by default).
+    `exp` claim. `JWTAuthentication` accepts a token until `exp + leeway`
+    (60 seconds after `exp` by default). The store keeps the entry until
+    that time. Without `exp`, the entry lives for the `default_ttl` of
+    the store (7 days by default).
 
 ### In-memory revocation (development)
 
@@ -929,6 +929,7 @@ store = DjangoCacheRevocation(
     cache_alias="default",
     key_prefix="revoked_tokens:",
     default_ttl=86400 * 7,  # 7 days — fallback when revoke() is called without `exp`
+    leeway=60,  # the `leeway` of the JWTAuthentication that reads this store
 )
 ```
 
@@ -953,7 +954,7 @@ INSTALLED_APPS = [
 ```python
 from django_bolt.auth import DjangoORMRevocation
 
-store = DjangoORMRevocation(default_ttl=86400 * 7)
+store = DjangoORMRevocation(default_ttl=86400 * 7, leeway=60)
 ```
 
 The store works with `JWTAuthViews`, including logout-all. A periodic
@@ -1041,12 +1042,35 @@ an internal module of allauth, so check them when you upgrade allauth.
 
 `revoke()` resolves the entry's lifetime in this order:
 
-1. **`exp` keyword arg** — derived as `max(0, exp - now)`. Use this whenever
-   you have the token's full claims (i.e. always, in a logout handler).
+1. **`exp` keyword arg** — derived as `max(0, exp + store.leeway - now)`. Use
+   this whenever you have the token's full claims (i.e. always, in a logout
+   handler).
 2. **`store.default_ttl`** — set on the constructor. Used when `revoke()`
    is called without `exp` (e.g. an admin action that revokes by JTI).
 3. **`_DEFAULT_TTL_SECONDS`** — module-level fallback (7 days) if neither
    of the above is supplied.
+
+### Store leeway
+
+`JWTAuthentication` accepts a token until `exp + leeway`. A revocation
+entry must live until that time. If it expires at `exp`, the backend
+accepts the revoked token again for `leeway` seconds.
+
+`DjangoCacheRevocation` and `DjangoORMRevocation` have a `leeway`
+argument for this. Its default is 60 seconds, the same as the default of
+`JWTAuthentication`. If you set a larger `leeway` on the backend, pass
+the same value to the store:
+
+```python
+from django_bolt.auth import DjangoCacheRevocation, JWTAuthentication
+
+store = DjangoCacheRevocation(leeway=120)
+jwt_auth = JWTAuthentication(leeway=120, revocation_store=store)
+```
+
+`JWTAuthentication` raises `ImproperlyConfigured` when the `leeway` of
+its store is smaller than its own. `InMemoryRevocation` keeps each entry
+until the process stops, so it has no `leeway`.
 
 ## Endpoints without authentication
 
