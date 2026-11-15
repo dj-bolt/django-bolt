@@ -465,6 +465,54 @@ class TestEmptyRouteRegistration:
             assert response.json() == {"message": "v1 root"}
 
 
+@pytest.mark.parametrize("path", ["/d", "/d/{x}"])
+def test_a_second_handler_for_the_method_and_path_of_a_route_stops_startup(path):
+    """A route does not replace an earlier route with no sign."""
+    api = BoltAPI()
+
+    @api.get(path)
+    async def first():
+        return {"handler": "first"}
+
+    @api.get(path)
+    async def second():
+        return {"handler": "second"}
+
+    with pytest.raises(ValueError, match="Failed to register route"):
+        TestClient(api)
+
+
+def test_two_mounted_apis_with_the_same_route_stop_startup():
+    api = BoltAPI()
+    for name in ("first", "second"):
+        child = BoltAPI()
+
+        @child.get("/d")
+        async def handler(name: str = name):
+            return {"handler": name}
+
+        api.mount("/m", child)
+
+    with pytest.raises(ValueError, match="GET /m/d is already registered"):
+        TestClient(api)
+
+
+def test_the_same_path_with_another_method_is_another_route():
+    api = BoltAPI()
+
+    @api.get("/d")
+    async def read():
+        return {"method": "GET"}
+
+    @api.post("/d")
+    async def write():
+        return {"method": "POST"}
+
+    with TestClient(api) as client:
+        assert client.get("/d").json() == {"method": "GET"}
+        assert client.post("/d").json() == {"method": "POST"}
+
+
 class TestTrailingSlashSetting:
     """Tests for trailing_slash parameter behavior."""
 

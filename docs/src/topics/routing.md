@@ -24,6 +24,8 @@ async def create_user():
     return {"created": True}
 ```
 
+Each method and path has one handler. A second handler for the same method and path stops startup with a `ValueError`.
+
 ## HTTP methods
 
 Django-Bolt supports all common HTTP methods:
