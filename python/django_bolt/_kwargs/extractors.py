@@ -86,8 +86,9 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     inner = unwrap_optional(base)
     # A bare `set` has no origin. msgspec reads it as set[Any].
     is_sequence = (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
-    if _holds_bytes(inner, is_sequence):
-        return _bytes_param_converter(target, loc, key, is_sequence=is_sequence, wrap=is_sequence and one_item)
+    bytes_items = _bytes_items(inner, is_sequence)
+    if bytes_items is not None:
+        return _bytes_param_converter(target, loc, key, items=bytes_items, wrap=is_sequence and one_item)
     constrained = get_origin(target) is Annotated and any(
         getattr(extra, name, None) is not None
         for extra in get_args(target)[1:]
@@ -125,18 +126,65 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
 _BYTES_TYPES = (bytes, bytearray, memoryview)
 
 
-def _holds_bytes(inner: Any, is_sequence: bool) -> bool:
-    """Return True for a bytes type, or for a sequence with one item type that is a bytes type."""
+def _bytes_items(inner: Any, is_sequence: bool) -> bool | frozenset[int] | None:
+    """Say which text values of a type become ``bytes``, or None when the type holds no bytes type.
+
+    False is a bytes type that is not a sequence. True is a sequence with one
+    item type that is a bytes type, such as ``list[bytes]``. A frozenset holds
+    the positions of the bytes items of a tuple such as ``tuple[bytes, int]``.
+    """
     if not is_sequence:
-        return inner in _BYTES_TYPES
-    item_types = [arg for arg in get_args(inner) if arg is not Ellipsis]
-    if len(item_types) != 1:
-        return False
-    item_type = item_types[0]
-    return (get_args(item_type)[0] if get_origin(item_type) is Annotated else item_type) in _BYTES_TYPES
+        return False if inner in _BYTES_TYPES else None
+    is_bytes = [
+        (get_args(arg)[0] if get_origin(arg) is Annotated else arg) in _BYTES_TYPES
+        for arg in get_args(inner)
+        if arg is not Ellipsis
+    ]
+    if len(is_bytes) == 1:
+        return True if is_bytes[0] else None
+    return frozenset(position for position, found in enumerate(is_bytes) if found) or None
 
 
-def _bytes_param_converter(target: Any, loc: str, key: str, *, is_sequence: bool, wrap: bool) -> Callable:
+def _encode_items(values: list[Any], items: bool | frozenset[int]) -> list[Any]:
+    """Encode the text items of a sequence that ``_bytes_items`` names."""
+    if items is True:
+        return [value.encode() if type(value) is str else value for value in values]
+    return [
+        value.encode() if position in items and type(value) is str else value for position, value in enumerate(values)
+    ]
+
+
+def _bytes_field_plan(struct_type: type) -> tuple[tuple[str, bool | frozenset[int]], ...]:
+    """Return the encoded name and the ``_bytes_items`` result of each field of a model that holds bytes."""
+    plan: list[tuple[str, bool | frozenset[int]]] = []
+    for field in msgspec.structs.fields(struct_type):
+        target = unwrap_optional(field.type)
+        inner = unwrap_optional(get_args(target)[0] if get_origin(target) is Annotated else target)
+        items = _bytes_items(inner, (get_origin(inner) or inner) in _SEQUENCE_ORIGINS)
+        if items is not None:
+            plan.append((getattr(field, "encode_name", field.name), items))
+    return tuple(plan)
+
+
+def _encode_bytes_fields(data: dict[str, Any], plan: tuple[tuple[str, bool | frozenset[int]], ...]) -> dict[str, Any]:
+    """Return a copy of the values of a parameter model with the text of each bytes field as UTF-8 bytes.
+
+    msgspec reads a str for a ``bytes`` type as base64. A parameter model gets
+    text from a query, a form, a header or a cookie, as a plain parameter does.
+    Thus the text is encoded before msgspec builds the model.
+    """
+    encoded = dict(data)
+    for name, items in plan:
+        value = encoded.get(name)
+        if items is False:
+            if type(value) is str:
+                encoded[name] = value.encode()
+        elif type(value) is list:
+            encoded[name] = _encode_items(value, items)
+    return encoded
+
+
+def _bytes_param_converter(target: Any, loc: str, key: str, *, items: bool | frozenset[int], wrap: bool) -> Callable:
     """Build the conversion of a text parameter to ``bytes``, or to a sequence of ``bytes``.
 
     Rust gives the value of a path segment, a query key, a header, a cookie or
@@ -161,14 +209,17 @@ def _bytes_param_converter(target: Any, loc: str, key: str, *, is_sequence: bool
             "Use list[T], set[T], tuple[T] or tuple[T, ...]."
         )
     holder = msgspec.defstruct("ParamValue", [("value", target)], array_like=True)
+    is_sequence = items is not False
+    # The other items of a tuple such as tuple[bytes, int] are text. msgspec converts them.
+    strict = type(items) is bool
 
     def convert(value: Any) -> Any:
         if type(value) is list:
-            encoded = [item.encode() for item in value] if is_sequence else value[-1].encode()
+            encoded = _encode_items(value, items) if is_sequence else value[-1].encode()
         else:
             encoded = [value.encode()] if wrap else value.encode()
         try:
-            return msgspec.convert((encoded,), holder).value
+            return msgspec.convert((encoded,), holder, strict=strict).value
         except msgspec.ValidationError as error:
             # Remove the position of the value in the holder from the error path.
             msg = str(error).replace(" - at `$[0]`", "").replace("`$[0]", "`$")
@@ -420,6 +471,7 @@ def _collect_struct_errors(
     param_type: str,
     source: str,
     has_files: bool = False,
+    inputs: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Collect validation errors for every field of a msgspec struct from the provided input mapping.
@@ -432,6 +484,7 @@ def _collect_struct_errors(
         param_type (str): The source name in a missing-field message ("query parameter", "cookie" or "form field").
         source (str): The source in `loc` ("query", "cookie" or "body").
         has_files (bool): Enable upload-file decoding hooks when True.
+        inputs (dict[str, Any] | None): The values as the request gave them, for the "input" of an error. `data` holds the UTF-8 bytes of a bytes field. The default is `data`.
 
     Returns:
         list[dict[str, Any]]: A list of error dictionaries. Each dictionary contains:
@@ -441,6 +494,8 @@ def _collect_struct_errors(
             - "input": the offending input value or None for missing fields/files.
     """
     dec_hook = _upload_file_dec_hook if has_files else None
+    if inputs is None:
+        inputs = data
     errors: list[dict[str, Any]] = []
     for field in msgspec.structs.fields(struct_type):
         encoded_name = getattr(field, "encode_name", field.name)
@@ -453,7 +508,7 @@ def _collect_struct_errors(
                         "type": "validation_error",
                         "loc": (source, encoded_name),
                         "msg": str(e),
-                        "input": data[encoded_name],
+                        "input": inputs[encoded_name],
                     }
                 )
         elif field.required:
@@ -527,6 +582,8 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
     has_upload_file_fields = any(is_upload_file_type(f.type) for f in msgspec.structs.fields(struct_type))
     # Pre-compute sequence field names — empty tuple means zero runtime overhead.
     _seq_field_names = _collect_sequence_field_names(struct_type)
+    # Empty for a model with no bytes field, so such a model has no cost for each request.
+    _bytes_fields = _bytes_field_plan(struct_type)
 
     if has_upload_file_fields:
         _upload_field_names = [f.name for f in msgspec.structs.fields(struct_type) if is_upload_file_type(f.type)]
@@ -559,10 +616,11 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
                 if value is not None and not isinstance(value, list):
                     merged[name] = [value]
 
+            values = _encode_bytes_fields(merged, _bytes_fields) if _bytes_fields else merged
             try:
-                result = msgspec.convert(merged, struct_type, strict=False, dec_hook=_upload_file_dec_hook)
+                result = msgspec.convert(values, struct_type, strict=False, dec_hook=_upload_file_dec_hook)
             except msgspec.ValidationError as e:
-                errors = _collect_struct_errors(struct_type, merged, param_type, source, has_files=True)
+                errors = _collect_struct_errors(struct_type, values, param_type, source, has_files=True, inputs=merged)
                 if errors:
                     raise RequestValidationError(errors=errors) from e
                 raise
@@ -608,10 +666,11 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
                         wrapped[name] = [value]
                 param_map = wrapped if wrapped is not None else param_map
 
+            values = _encode_bytes_fields(param_map, _bytes_fields) if _bytes_fields else param_map
             try:
-                return msgspec.convert(param_map, struct_type, strict=False)
+                return msgspec.convert(values, struct_type, strict=False)
             except msgspec.ValidationError as e:
-                errors = _collect_struct_errors(struct_type, param_map, param_type, source)
+                errors = _collect_struct_errors(struct_type, values, param_type, source, inputs=param_map)
                 if errors:
                     raise RequestValidationError(errors=errors) from e
                 raise
@@ -621,12 +680,14 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
 
 
 def _collect_header_struct_errors(
-    header_fields: tuple[tuple[str, str, Any, bool], ...], data: dict[str, Any]
+    header_fields: tuple[tuple[str, str, Any, bool], ...], data: dict[str, Any], inputs: dict[str, Any]
 ) -> list[dict[str, Any]]:
     """Return one error for each missing or invalid field of a header struct.
 
     ``header_fields`` holds the header name, the encoded name, the type and the
-    required flag of each field. ``data`` maps encoded names to header values.
+    required flag of each field. ``data`` maps encoded names to header values,
+    with the UTF-8 bytes of a bytes field. ``inputs`` holds the values as the
+    request gave them, for the ``input`` of an error.
     The ``loc`` of each error is ``("header", header name)``, as for a scalar header.
     """
     errors: list[dict[str, Any]] = []
@@ -640,7 +701,7 @@ def _collect_header_struct_errors(
                         "type": "validation_error",
                         "loc": ("header", header_name),
                         "msg": str(e),
-                        "input": data[encoded_name],
+                        "input": inputs[encoded_name],
                     }
                 )
         elif required:
@@ -685,6 +746,7 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
         header_to_encoded.append((header_name, encoded_name))
         header_fields.append((header_name, encoded_name, field.type, field.required))
     error_fields = tuple(header_fields)
+    bytes_fields = _bytes_field_plan(struct_type)
 
     def extract(headers_map: dict[str, str]) -> Any:
         converted = {}
@@ -693,10 +755,11 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
             if value is not None:
                 converted[encoded_name] = value
 
+        values = _encode_bytes_fields(converted, bytes_fields) if bytes_fields else converted
         try:
-            return msgspec.convert(converted, struct_type)
+            return msgspec.convert(values, struct_type)
         except msgspec.ValidationError as e:
-            errors = _collect_header_struct_errors(error_fields, converted)
+            errors = _collect_header_struct_errors(error_fields, values, converted)
             if errors:
                 raise RequestValidationError(errors=errors) from e
             raise

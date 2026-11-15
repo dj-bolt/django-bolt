@@ -211,10 +211,12 @@ async def echo(token: bytes):
 
 `GET /echo?token=abc` gives the handler `b"abc"`. Bolt does not decode base64.
 This rule applies to a path, query, header, cookie and form parameter.
-It also applies to `bytearray`, and to a sequence such as `list[bytes]`.
+It also applies to `bytearray`, to a sequence such as `list[bytes]`, and to a `bytes` item of a tuple such as `tuple[bytes, int]`.
 A `msgspec.Meta` constraint such as `max_length` counts the bytes.
 
-A `bytes` field of a [parameter model](#parameter-models) is different: msgspec reads its text as base64.
+A `bytes` field of a [parameter model](#parameter-models) follows the same rule. The model can be a `Query()`, `Form()`, `Header()` or `Cookie()` model.
+
+A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64.
 
 ## Request body
 
