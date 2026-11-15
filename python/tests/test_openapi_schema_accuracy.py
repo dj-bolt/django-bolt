@@ -13,12 +13,13 @@ from typing import Annotated, Any, Literal
 import msgspec
 import pytest
 from django.db import models
+from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import ComponentNameCollisionError, SchemaGenerator
 from django_bolt.param_functions import Query
-from django_bolt.serializers import Serializer
+from django_bolt.serializers import Serializer, field
 from django_bolt.serializers.types import Email, HttpsURL, PositiveInt
 from django_bolt.testing import TestClient
 
@@ -425,6 +426,29 @@ def test_documented_type_carries_examples():
     assert props["name"]["examples"] == ["alice", "bob"]
 
 
+def test_extra_json_schema_keys_in_camel_case_reach_the_schema():
+    """A JSON Schema keyword of ``Meta(extra_json_schema=...)`` keeps its camelCase name in the document."""
+
+    class Upload(msgspec.Struct):
+        payload: Annotated[
+            str,
+            msgspec.Meta(
+                extra_json_schema={
+                    "contentEncoding": "base64",
+                    "readOnly": True,
+                    "externalDocs": {"url": "https://example.com/payload"},
+                }
+            ),
+        ]
+
+    assert _get_response_component_schema(Upload)["properties"]["payload"] == {
+        "type": "string",
+        "contentEncoding": "base64",
+        "readOnly": True,
+        "externalDocs": {"url": "https://example.com/payload"},
+    }
+
+
 def test_builtin_custom_types_in_serializer_render_concrete_types():
     """The reported scenario: a Serializer using built-in Email/PositiveInt/HttpsURL.
 
@@ -462,6 +486,101 @@ def test_documented_constrained_field_matches_msgspec_schema():
     msgspec_props = msgspec.json.schema(Account)["$defs"]["Account"]["properties"]
     for field_name in ("email", "age", "site"):
         assert bolt_props[field_name]["type"] == msgspec_props[field_name]["type"]
+
+
+def test_field_options_are_in_the_serializer_schema():
+    """description, title, examples and deprecated of field() are in the property schema."""
+
+    class Maker(Serializer):
+        name: str = field(description="Name of the maker")
+
+    class Product(Serializer):
+        sku: str = field(description="Stock unit", title="SKU", examples=["AB-1", "AB-2"], deprecated=True)
+        price: float = field(default=1.5, description="Price in euro")
+        maker: Maker = field(description="Who makes it", title="Maker of the product", deprecated=True)
+        second_maker: Maker | None = field(default=None, description="Optional maker")
+        makers: list[Maker] = field(default_factory=list, description="Each maker")
+        note: Annotated[str, msgspec.Meta(description="From Meta")] = field(default="", description="From field()")
+        plain: int = 0
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.post("/products")
+    async def create_product(body: Product) -> Product:
+        pass
+
+    spec = _get_schema(api)
+    validate(spec)
+    operation = spec["paths"]["/products"]["post"]
+    ref = {"$ref": "#/components/schemas/Product"}
+    # The request body and the response use the same schema.
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == ref
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == ref
+
+    props = spec["components"]["schemas"]["Product"]["properties"]
+    assert props["sku"] == {
+        "type": "string",
+        "description": "Stock unit",
+        "title": "SKU",
+        "examples": ["AB-1", "AB-2"],
+        "deprecated": True,
+    }
+    assert props["price"] == {"type": "number", "default": 1.5, "description": "Price in euro"}
+    # A reference to a component keeps the options next to it.
+    assert props["maker"] == {
+        "allOf": [{"$ref": "#/components/schemas/Maker"}],
+        "description": "Who makes it",
+        "title": "Maker of the product",
+        "deprecated": True,
+    }
+    assert props["second_maker"]["description"] == "Optional maker"
+    assert props["second_maker"]["anyOf"][0] == {"$ref": "#/components/schemas/Maker"}
+    assert props["makers"]["description"] == "Each maker"
+    assert props["makers"]["items"] == {"$ref": "#/components/schemas/Maker"}
+    # field() wins over msgspec.Meta.
+    assert props["note"]["description"] == "From field()"
+    assert props["plain"] == {"type": "integer", "default": 0}
+    # The nested serializer has the options of its own fields.
+    assert spec["components"]["schemas"]["Maker"]["properties"]["name"] == {
+        "type": "string",
+        "description": "Name of the maker",
+    }
+    assert spec["components"]["schemas"]["Product"]["required"] == ["sku", "maker"]
+
+
+class HiddenFieldOwner(Serializer):
+    name: str
+
+
+class HiddenFieldItem(Serializer):
+    name: str
+    token: str = field(include_in_schema=False)
+    trace: str = field(include_in_schema=False, default="t")
+    owner: HiddenFieldOwner | None = field(include_in_schema=False, default=None)
+
+
+def test_field_with_include_in_schema_false_is_not_in_the_schema():
+    """The schema has no such property. The field still validates and serializes."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.post("/items")
+    async def create_item(body: HiddenFieldItem) -> HiddenFieldItem:
+        return body
+
+    spec = _get_schema(api)
+    validate(spec)
+    component = spec["components"]["schemas"]["HiddenFieldItem"]
+    assert list(component["properties"]) == ["name"]
+    assert component["required"] == ["name"]
+    # No component for a type that only a hidden field uses.
+    assert "HiddenFieldOwner" not in spec["components"]["schemas"]
+
+    with TestClient(api) as client:
+        response = client.post("/items", json={"name": "n", "token": "k", "owner": {"name": "o"}})
+        assert response.status_code == 200
+        assert response.json() == {"name": "n", "token": "k", "trace": "t", "owner": {"name": "o"}}
+        # The hidden field is still required.
+        assert client.post("/items", json={"name": "n"}).status_code == 422
 
 
 def test_documented_query_struct_field_renders_concrete_type():
@@ -600,6 +719,50 @@ def test_dict_str_optional_value_renders_anyof_with_null():
         {"type": "integer"},
         {"type": "null"},
     ]
+
+
+class MaybeItem(msgspec.Struct):
+    id: int
+
+
+def test_optional_type_keeps_its_null_arm_outside_a_struct():
+    """`T | None` as a response type, a body type or an item type says that null is valid."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/maybe")
+    async def maybe() -> int | None:
+        pass
+
+    @api.get("/maybe-item")
+    async def maybe_item() -> MaybeItem | None:
+        pass
+
+    @api.get("/maybe-in-list")
+    async def maybe_in_list() -> list[int | None]:
+        pass
+
+    @api.post("/maybe-body")
+    async def maybe_body(item: MaybeItem | None = None, page: int | None = None) -> dict[str, int | None]:
+        pass
+
+    paths = _get_schema(api)["paths"]
+
+    def response_schema(path: str, method: str = "get") -> dict:
+        return paths[path][method]["responses"]["200"]["content"]["application/json"]["schema"]
+
+    nullable_int = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+    nullable_item = {"anyOf": [{"$ref": "#/components/schemas/MaybeItem"}, {"type": "null"}]}
+    assert response_schema("/maybe") == nullable_int == msgspec.json.schema(int | None)
+    assert response_schema("/maybe-item") == nullable_item
+    assert response_schema("/maybe-in-list") == {"type": "array", "items": nullable_int}
+    assert response_schema("/maybe-body", "post") == {"type": "object", "additionalProperties": nullable_int}
+
+    # Bolt decodes the JSON body `null` to None for this parameter.
+    operation = paths["/maybe-body"]["post"]
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == nullable_item
+    # A query parameter cannot carry null: `required: false` says that it is optional.
+    (page,) = operation["parameters"]
+    assert (page["schema"], page["required"]) == ({"type": "integer"}, False)
 
 
 def test_dict_str_any_keeps_additional_properties_true():
