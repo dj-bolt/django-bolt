@@ -287,6 +287,22 @@ async def raw_body(request):
     return {"size": len(body)}
 ```
 
+### JSON object without a schema
+
+A `dict` parameter reads a JSON object that has no fixed fields. The route must be a `POST`, `PUT` or `PATCH` route:
+
+```python
+@api.post("/events")
+async def create_event(payload: dict):
+    return {"keys": sorted(payload)}
+
+@api.put("/counters")
+async def set_counters(counters: dict[str, int]):
+    return {"total": sum(counters.values())}
+```
+
+A `dict[K, V]` type validates the keys and the values. A body that is not a JSON object gets a 422. On a `GET`, `HEAD`, `DELETE` or `OPTIONS` route, a `dict` parameter is a query parameter, because the request has no body.
+
 ## Headers
 
 ### Using Annotated

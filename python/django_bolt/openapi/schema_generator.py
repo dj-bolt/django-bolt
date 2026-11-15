@@ -1059,6 +1059,12 @@ class SchemaGenerator:
                 body_param, body_type, body_required = body_field.name, body_field.annotation, body_field.is_required
 
         if not body_param or not body_type:
+            # A JSON body of another type, such as a dict.
+            plain_body = next((f for f in fields if f.source == "body"), None)
+            if plain_body is not None:
+                body_param, body_type = plain_body.name, plain_body.annotation
+
+        if not body_param or not body_type:
             # Check for form/file fields
             form_fields = [f for f in fields if f.source in ("form", "file")]
 
