@@ -59,6 +59,8 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
     int: int.__int__,
     float: float.__float__,
     bytes: bytes.__bytes__,
+    # msgspec encodes an exact bytearray as base64 text. bytes() copies a subclass.
+    bytearray: bytes,
     timedelta: lambda v: timedelta(days=v.days, seconds=v.seconds, microseconds=v.microseconds),
     # IP addresses
     IPv4Address: str,

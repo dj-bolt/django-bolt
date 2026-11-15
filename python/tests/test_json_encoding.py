@@ -39,6 +39,10 @@ class MyTimedelta(timedelta):
     pass
 
 
+class MyByteArray(bytearray):
+    pass
+
+
 # msgspec encodes the exact type itself. Only a subclass goes to DEFAULT_TYPE_ENCODERS.
 SUBCLASS_VALUES = {
     "decimal": (Decimal("1.50"), MyDecimal("1.50")),
@@ -52,6 +56,7 @@ SUBCLASS_VALUES = {
     "float": (1.5, MyFloat(1.5)),
     "float-nan": (float("nan"), MyFloat("nan")),
     "bytes": (b"ab", MyBytes(b"ab")),
+    "bytearray": (bytearray(b"ab"), MyByteArray(b"ab")),
     "timedelta": (timedelta(days=1, seconds=5, microseconds=6), MyTimedelta(days=1, seconds=5, microseconds=6)),
 }
 EXPECTED_JSON = {
@@ -66,6 +71,7 @@ EXPECTED_JSON = {
     "float": "1.5",
     "float-nan": "null",
     "bytes": '"YWI="',
+    "bytearray": '"YWI="',
     "timedelta": '"P1DT5.000006S"',
 }
 
