@@ -25,6 +25,7 @@ from ..responses import (
     Redirect,
     StreamingResponse,
 )
+from ..serializers.base import Serializer
 from ..serializers.fields import FieldConfig, _FieldMarker
 from ..typing import is_msgspec_struct, is_optional, resolve_type_alias, unwrap_optional
 from ..views import _layer
@@ -480,17 +481,33 @@ class SchemaGenerator:
         return Schema(all_of=[schema], **options)
 
     @staticmethod
-    def _field_in_schema(field: Any) -> bool:
+    def _field_configs(struct_type: Any) -> dict[str, FieldConfig]:
+        """Give the ``field()`` config of each field of a Serializer class, by field name.
+
+        The class keeps one config map for a field with a default and for a required field.
+        A struct that is not a Serializer has no config.
+        """
+        if not (isinstance(struct_type, type) and issubclass(struct_type, Serializer)):
+            return {}
+        struct_type._ensure_dump_ready()
+        return struct_type.__field_configs__
+
+    @staticmethod
+    def _field_in_schema(config: FieldConfig | None) -> bool:
         """False for a Serializer field with ``field(include_in_schema=False)``."""
-        default = field.default
-        return not isinstance(default, _FieldMarker) or default.config.include_in_schema
+        return config is None or config.include_in_schema
 
     def _msgspec_field_schema(
-        self, field: Any, *, register_component: bool = False
+        self, field: Any, config: FieldConfig | None = None, *, register_component: bool = False
     ) -> tuple[str, Schema | Reference, bool]:
-        """Build a schema and required flag for a msgspec-inspected field."""
+        """Build a schema and required flag for a msgspec-inspected field.
+
+        ``config`` is the ``field()`` config of a Serializer field, or None.
+        """
         field_name = field.encode_name
         field_schema = self._type_to_schema(field.type, register_component=register_component)
+        if config is not None:
+            field_schema = self._with_field_options(field_schema, config)
 
         default = field.default
         has_default = default is not msgspec.NODEFAULT
@@ -500,7 +517,6 @@ class SchemaGenerator:
         # the default, so field.required is False even when the marker carries
         # only config and no real default.
         if isinstance(default, _FieldMarker):
-            field_schema = self._with_field_options(field_schema, default.config)
             if default.config.has_default():
                 default = default.config.get_default()
             else:
@@ -912,10 +928,12 @@ class SchemaGenerator:
             # Handle msgspec.Struct in query parameters
             if source == "query" and is_msgspec_struct(annotation):
                 struct_info = msgspec.inspect.type_info(annotation)
+                field_configs = self._field_configs(annotation)
                 for struct_field in struct_info.fields:
-                    if not self._field_in_schema(struct_field):
+                    field_config = field_configs.get(struct_field.name)
+                    if not self._field_in_schema(field_config):
                         continue
-                    field_name, field_schema, field_required = self._msgspec_field_schema(struct_field)
+                    field_name, field_schema, field_required = self._msgspec_field_schema(struct_field, field_config)
                     parameters.append(
                         Parameter(
                             name=field_name,
@@ -1012,11 +1030,13 @@ class SchemaGenerator:
                     # UploadFile branch in _type_to_schema fires for file fields.
                     unwrapped = unwrap_optional(annotation)
                     if is_msgspec_struct(unwrapped):
+                        field_configs = self._field_configs(unwrapped)
                         for struct_field in msgspec.structs.fields(unwrapped):
-                            if not self._field_in_schema(struct_field):
+                            field_config = field_configs.get(struct_field.name)
+                            if not self._field_in_schema(field_config):
                                 continue
                             sub_name, sub_schema, sub_required = self._msgspec_field_schema(
-                                struct_field, register_component=False
+                                struct_field, field_config, register_component=False
                             )
                             properties[sub_name] = sub_schema
                             if sub_required:
@@ -1495,11 +1515,13 @@ class SchemaGenerator:
         properties = {}
         required = []
 
+        field_configs = self._field_configs(struct_type)
         for field in struct_info.fields:
-            if not self._field_in_schema(field):
+            field_config = field_configs.get(field.name)
+            if not self._field_in_schema(field_config):
                 continue
             field_name, field_schema, field_required = self._msgspec_field_schema(
-                field, register_component=register_component
+                field, field_config, register_component=register_component
             )
             properties[field_name] = field_schema
 
