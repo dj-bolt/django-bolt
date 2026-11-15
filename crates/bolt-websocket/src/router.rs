@@ -21,8 +21,8 @@ pub struct WebSocketRouter {
     dynamic_router: matchit::Router<WebSocketRoute>,
     /// Track if we have any dynamic routes
     has_dynamic_routes: bool,
-    /// Store dynamic route paths for Actix registration
-    dynamic_paths: Vec<String>,
+    /// Each route path as it was written, for Actix registration
+    paths: Vec<String>,
 }
 
 impl Default for WebSocketRouter {
@@ -37,7 +37,7 @@ impl WebSocketRouter {
             static_routes: AHashMap::new(),
             dynamic_router: matchit::Router::new(),
             has_dynamic_routes: false,
-            dynamic_paths: Vec::new(),
+            paths: Vec::new(),
         }
     }
 
@@ -55,6 +55,14 @@ impl WebSocketRouter {
             injector,
         };
 
+        // Actix matches the decoded request path, so it gets the path as it
+        // was written.
+        if !self.paths.iter().any(|known| known == path) {
+            self.paths.push(path.to_string());
+        }
+        // `find` gets the request path with its `%XX` escapes.
+        let path = &*bolt_core::router::encode_route_path(path);
+
         if !path.contains('{') {
             self.static_routes.insert(path.to_string(), route);
         } else {
@@ -66,7 +74,6 @@ impl WebSocketRouter {
                 ))
             })?;
             self.has_dynamic_routes = true;
-            self.dynamic_paths.push(path.to_string());
         }
 
         Ok(())
@@ -76,7 +83,8 @@ impl WebSocketRouter {
     ///
     /// The values are URL-decoded with the same code as for HTTP routes, so
     /// `/ws/rooms/hello%20world` gives `hello world`. The server and the test
-    /// backend both use this lookup.
+    /// backend both use this lookup. `path` is the request path in the form of
+    /// `normalize_request_path`.
     pub fn find(&self, path: &str) -> Option<(&WebSocketRoute, AHashMap<String, String>)> {
         // O(1) static route lookup first
         if let Some(route) = self.static_routes.get(path) {
@@ -103,10 +111,80 @@ impl WebSocketRouter {
         self.static_routes.is_empty() && !self.has_dynamic_routes
     }
 
-    /// Get all registered WebSocket paths for Actix route registration
+    /// Get all registered WebSocket paths for Actix route registration.
+    /// Each path is as it was written, with no escape added.
     pub fn get_all_paths(&self) -> Vec<String> {
-        let mut paths: Vec<String> = self.static_routes.keys().cloned().collect();
-        paths.extend(self.dynamic_paths.iter().cloned());
-        paths
+        self.paths.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A router with the handler id of each route at its index.
+    fn router_with(paths: &[&str]) -> WebSocketRouter {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut router = WebSocketRouter::new();
+            for (handler_id, path) in paths.iter().enumerate() {
+                router.register(path, handler_id, py.None(), None).unwrap();
+            }
+            router
+        })
+    }
+
+    #[test]
+    fn a_route_path_matches_the_escaped_request_path() {
+        let router = router_with(&["/ws/\u{fc} b", "/ws/\u{fc} b/{room}", "/ws/plain"]);
+        let found = |path: &str| {
+            router.find(path).map(|(route, params)| {
+                let mut params: Vec<(String, String)> = params.into_iter().collect();
+                params.sort();
+                (route.handler_id, route.path.clone(), params)
+            })
+        };
+        assert_eq!(
+            found("/ws/%C3%BC%20b"),
+            Some((0, "/ws/\u{fc} b".to_string(), vec![]))
+        );
+        assert_eq!(
+            found("/ws/%C3%BC%20b/x%20y"),
+            Some((
+                1,
+                "/ws/\u{fc} b/{room}".to_string(),
+                vec![("room".to_string(), "x y".to_string())]
+            ))
+        );
+        assert_eq!(
+            found("/ws/plain"),
+            Some((2, "/ws/plain".to_string(), vec![]))
+        );
+        assert_eq!(found("/ws/\u{fc} b"), None);
+    }
+
+    #[test]
+    fn a_request_path_matches_for_each_form_of_an_escape() {
+        let router = router_with(&["/ws/\u{fc}", "/ws/a:b/{room}"]);
+        let found = |path: &str| {
+            let path = bolt_core::router::normalize_request_path(path);
+            router
+                .find(&path)
+                .map(|(route, params)| (route.handler_id, params.get("room").cloned()))
+        };
+        assert_eq!(found("/ws/%c3%bc"), Some((0, None)));
+        assert_eq!(found("/ws/%C3%bC"), Some((0, None)));
+        assert_eq!(
+            found("/ws/%61%3ab/x%2fy"),
+            Some((1, Some("x/y".to_string())))
+        );
+        // An escaped `/` is data of one segment.
+        assert_eq!(found("/ws/a:b%2Fx"), None);
+    }
+
+    #[test]
+    fn actix_gets_each_route_path_one_time_as_it_was_written() {
+        let router = router_with(&["/ws/\u{fc}", "/ws/{room}/a b", "/ws/\u{fc}"]);
+        assert_eq!(router.get_all_paths(), ["/ws/\u{fc}", "/ws/{room}/a b"]);
     }
 }

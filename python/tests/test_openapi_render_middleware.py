@@ -3,6 +3,7 @@
 import sys
 
 import pytest
+import yaml
 from django.conf import settings
 from django.test import override_settings
 
@@ -14,6 +15,7 @@ from django_bolt.openapi import (
     SwaggerRenderPlugin,
     YamlRenderPlugin,
 )
+from django_bolt.openapi.spec import Components, OpenAPIFormat, OpenAPIType, Schema
 from django_bolt.testing import TestClient
 
 from .debug_toolbar_urls import toolbar_urlpatterns
@@ -44,6 +46,22 @@ def test_explicit_yaml_plugin():
             assert response.status_code == 200, response.text
             assert response.headers["content-type"] == "text/yaml; charset=utf-8"
             assert "title: YAML" in response.text
+
+
+def test_enum_value_of_a_user_schema_is_plain_text_in_json_and_yaml():
+    """``OpenAPIType`` and ``OpenAPIFormat`` members of a schema of the config go out as their values."""
+    legacy = Schema(type=OpenAPIType.STRING, format=OpenAPIFormat.DATE)
+    api = BoltAPI(
+        openapi_config=OpenAPIConfig(title="Enums", version="1", components=Components(schemas={"Legacy": legacy}))
+    )
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        as_json = client.get("/docs/openapi.json")
+        as_yaml = client.get("/docs/openapi.yaml")
+
+    assert as_json.json()["components"]["schemas"]["Legacy"] == {"type": "string", "format": "date"}
+    assert as_yaml.status_code == 200, as_yaml.text
+    assert yaml.safe_load(as_yaml.text)["components"]["schemas"]["Legacy"] == {"type": "string", "format": "date"}
 
 
 @pytest.mark.parametrize("plugin", [ScalarRenderPlugin(), SwaggerRenderPlugin()])
