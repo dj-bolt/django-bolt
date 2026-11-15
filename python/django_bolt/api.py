@@ -1116,7 +1116,8 @@ class BoltAPI:
 
             # The handshake awaits this check before the upgrade: a revoked
             # token gets 401, as on an HTTP route.
-            revocation_handlers = _revocation_handlers(route_auth_backends(ws_auth))
+            ws_auth_backends = route_auth_backends(ws_auth)
+            revocation_handlers = _revocation_handlers(ws_auth_backends)
             if revocation_handlers is not None:
                 middleware_meta = middleware_meta or {}
                 middleware_meta["websocket_revocation_check"] = functools.partial(
@@ -1125,9 +1126,10 @@ class BoltAPI:
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
-                # Store auth backend instances for user resolution
-                if ws_auth is not None:
-                    middleware_meta["_auth_backend_instances"] = ws_auth
+                # Store the auth backend instances for user resolution and for the
+                # OpenAPI schema: the explicit ones, or the defaults that Rust gets.
+                if ws_auth_backends:
+                    middleware_meta["_auth_backend_instances"] = ws_auth_backends
 
             return fn
 
