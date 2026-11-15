@@ -18,6 +18,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from .typing import REQUEST_PARAM_NAMES
+
 __all__ = [
     "DependencyNeeds",
     "HandlerAnalysis",
@@ -551,14 +553,11 @@ def _find_definition(tree: ast.AST, name: str) -> ast.FunctionDef | ast.AsyncFun
     )
 
 
-_REQUEST_PARAM_NAMES = frozenset({"request", "req"})
-
-
 def _dep_request_param_names(dep_meta: dict[str, Any]) -> set[str]:
     """Return the set of parameter names that receive the raw request object."""
     # compile_binder always sets mode, sig and fields.
     if dep_meta["mode"] == "request_only":
-        return {p.name for p in dep_meta["sig"].parameters.values() if p.name in _REQUEST_PARAM_NAMES}
+        return {p.name for p in dep_meta["sig"].parameters.values() if p.name in REQUEST_PARAM_NAMES}
     return {f.name for f in dep_meta["fields"] if f.source == "request"}
 
 

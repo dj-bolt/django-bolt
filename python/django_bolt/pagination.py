@@ -36,6 +36,7 @@ from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, Tuple
 from . import _json
 from .concurrency import run_in_orm_executor
 from .exceptions import UnloadedRelationError
+from .typing import REQUEST_PARAM_NAMES
 
 __all__ = [
     "PaginationBase",
@@ -48,7 +49,6 @@ __all__ = [
 ]
 
 T = TypeVar("T")
-_PAGINATION_UNSET = object()
 
 
 class PaginatedResponse(msgspec.Struct, Generic[T], omit_defaults=True):  # noqa: UP046 — PEP 695 params are unresolvable under PEP 563
@@ -764,7 +764,7 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     def decorator(handler: Callable) -> Callable:
         # Store original handler for introspection
         original_handler = handler
-        request_getter = _compile_request_getter(original_handler)
+        signature, request_getter, added_request_index = _compile_request_getter(original_handler)
         cached_paginator: PaginationBase | None = None
 
         @wraps(handler)
@@ -776,12 +776,9 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
                 cached_paginator.serializer_class = getattr(wrapper, "__serializer_class__", None)
 
             request = request_getter(args, kwargs)
-
-            if request is None:
-                raise ValueError(
-                    f"Pagination decorator on {handler.__name__} could not find request. "
-                    f"Args: {[type(a).__name__ for a in args]}, kwargs: {list(kwargs.keys())}"
-                )
+            if added_request_index is not None:
+                # The handler has no request parameter. Remove the argument that the signature adds.
+                args = args[:added_request_index]
 
             # PyRequest already supports .get() and __getitem__ — no per-request
             # isinstance/hasattr type sniffing (hot-path rule). Anything the
@@ -797,8 +794,8 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
 
             return paginated
 
-        # Preserve signature so framework knows to pass request
-        wrapper.__signature__ = inspect.signature(original_handler)
+        # The framework reads this signature. It has a request parameter, so the framework passes the request.
+        wrapper.__signature__ = signature
         wrapper.__name__ = original_handler.__name__
         wrapper.__doc__ = original_handler.__doc__
         wrapper.__module__ = original_handler.__module__
@@ -812,31 +809,36 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     return decorator
 
 
-def _compile_request_getter(handler: Callable) -> Callable[[tuple[Any, ...], dict[str, Any]], Any]:
-    """Compile a lightweight request extractor once per paginated handler."""
+def _compile_request_getter(
+    handler: Callable,
+) -> tuple[inspect.Signature, Callable[[tuple[Any, ...], dict[str, Any]], Any], int | None]:
+    """Find the request argument of a paginated handler one time, at decoration.
+
+    The framework gives the request to a parameter that has a name in ``REQUEST_PARAM_NAMES``.
+    It passes a positional parameter by position and each other parameter by keyword.
+    For a handler with no such parameter, the returned signature adds one after the positional parameters.
+
+    Returns:
+        The signature for the wrapper, the function that gets the request from
+        the arguments, and the index of the added parameter (None if the handler has its own).
+    """
     sig = inspect.signature(handler)
-    positional_request_index: int | None = None
+    params = list(sig.parameters.values())
+    positional_kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    request_param = next((param for param in params if param.name in REQUEST_PARAM_NAMES), None)
+    added_index: int | None = None
 
-    for index, param in enumerate(sig.parameters.values()):
-        if param.name != "request":
-            continue
+    if request_param is None:
+        added_index = sum(param.kind in positional_kinds for param in params)
+        # The default lets the parameter follow one that has a default. The framework always passes the request.
+        request_param = inspect.Parameter("request", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
+        params.insert(added_index, request_param)
+        sig = sig.replace(parameters=params)
 
-        if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-            positional_request_index = index
-        break
+    index = params.index(request_param) if request_param.kind in positional_kinds else None
+    name = request_param.name
 
     def get_request(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
-        request = kwargs.get("request", _PAGINATION_UNSET)
-        if request is not _PAGINATION_UNSET:
-            return request
+        return kwargs[name] if index is None else args[index]
 
-        if positional_request_index is not None and positional_request_index < len(args):
-            return args[positional_request_index]
-
-        for candidate in args[:2]:
-            if isinstance(candidate, dict) or hasattr(candidate, "get") or hasattr(candidate, "__getitem__"):
-                return candidate
-
-        return None
-
-    return get_request
+    return sig, get_request, added_index

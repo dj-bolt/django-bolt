@@ -25,6 +25,7 @@ from ..dependencies import (
     sync_form,
 )
 from ..typing import (
+    REQUEST_PARAM_NAMES,
     FieldDefinition,
     HandlerMetadata,
     HandlerPattern,
@@ -186,7 +187,7 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
 
     # Quick path: single parameter that looks like request
     params = list(sig.parameters.values())
-    if len(params) == 1 and params[0].name in {"request", "req"}:
+    if len(params) == 1 and params[0].name in REQUEST_PARAM_NAMES:
         meta["mode"] = "request_only"
         return meta
 
