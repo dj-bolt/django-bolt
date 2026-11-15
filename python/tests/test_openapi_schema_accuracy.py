@@ -698,6 +698,50 @@ def test_dict_str_optional_value_renders_anyof_with_null():
     ]
 
 
+class MaybeItem(msgspec.Struct):
+    id: int
+
+
+def test_optional_type_keeps_its_null_arm_outside_a_struct():
+    """`T | None` as a response type, a body type or an item type says that null is valid."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/maybe")
+    async def maybe() -> int | None:
+        pass
+
+    @api.get("/maybe-item")
+    async def maybe_item() -> MaybeItem | None:
+        pass
+
+    @api.get("/maybe-in-list")
+    async def maybe_in_list() -> list[int | None]:
+        pass
+
+    @api.post("/maybe-body")
+    async def maybe_body(item: MaybeItem | None = None, page: int | None = None) -> dict[str, int | None]:
+        pass
+
+    paths = _get_schema(api)["paths"]
+
+    def response_schema(path: str, method: str = "get") -> dict:
+        return paths[path][method]["responses"]["200"]["content"]["application/json"]["schema"]
+
+    nullable_int = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+    nullable_item = {"anyOf": [{"$ref": "#/components/schemas/MaybeItem"}, {"type": "null"}]}
+    assert response_schema("/maybe") == nullable_int == msgspec.json.schema(int | None)
+    assert response_schema("/maybe-item") == nullable_item
+    assert response_schema("/maybe-in-list") == {"type": "array", "items": nullable_int}
+    assert response_schema("/maybe-body", "post") == {"type": "object", "additionalProperties": nullable_int}
+
+    # Bolt decodes the JSON body `null` to None for this parameter.
+    operation = paths["/maybe-body"]["post"]
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == nullable_item
+    # A query parameter cannot carry null: `required: false` says that it is optional.
+    (page,) = operation["parameters"]
+    assert (page["schema"], page["required"]) == ({"type": "integer"}, False)
+
+
 def test_dict_str_any_keeps_additional_properties_true():
     """`dict[str, Any]` has no value type to describe — keep `true`, don't regress.
 

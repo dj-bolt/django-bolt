@@ -327,7 +327,7 @@ class SchemaGenerator:
 
     def _form_field_schema(self, annotation: Any, marker: Any, default: Any) -> Schema | Reference:
         """The schema of one form field, with the description and the default of its marker."""
-        schema = self._type_to_schema(annotation)
+        schema = self._type_to_schema(annotation, null_arm=False)
         if isinstance(schema, Schema) and marker and marker.description:
             schema = replace(schema, description=marker.description)
         if default not in (inspect.Parameter.empty, None):
@@ -959,7 +959,7 @@ class SchemaGenerator:
                 continue
 
             # Get schema for parameter type
-            schema = self._type_to_schema(annotation)
+            schema = self._type_to_schema(annotation, null_arm=False)
             # A path, a header or a cookie gives one value, so its array holds exactly one item.
             if param_in != "query" and isinstance(schema, Schema) and schema.type == "array":
                 schema = replace(schema, min_items=1, max_items=1)
@@ -1424,12 +1424,17 @@ class SchemaGenerator:
         # Return sorted list of Tag objects
         return list(tag_objects.values()) if tag_objects else None
 
-    def _type_to_schema(self, type_annotation: Any, register_component: bool = False) -> Schema | Reference:
+    def _type_to_schema(
+        self, type_annotation: Any, register_component: bool = False, *, null_arm: bool = True
+    ) -> Schema | Reference:
         """Convert a Python type annotation or msgspec.inspect node to an OpenAPI Schema.
 
         Args:
             type_annotation: Python type annotation or ``msgspec.inspect`` node.
             register_component: Whether to register complex types as components.
+            null_arm: False for a parameter or a form field. Such a value cannot
+                be null, and ``required: false`` says that it is optional. Thus
+                ``T | None`` gives the schema of ``T``.
 
         Returns:
             Schema or Reference object.
@@ -1446,9 +1451,11 @@ class SchemaGenerator:
             if node_handler is None:
                 return Schema(type="object")
             return node_handler(self, type_annotation, register_component)
-        return self._typing_to_schema(type_annotation, register_component)
+        return self._typing_to_schema(type_annotation, register_component, null_arm)
 
-    def _typing_to_schema(self, type_annotation: Any, register_component: bool) -> Schema | Reference:
+    def _typing_to_schema(
+        self, type_annotation: Any, register_component: bool, null_arm: bool = True
+    ) -> Schema | Reference:
         """Convert a raw ``typing`` annotation (not a msgspec.inspect node)."""
         # A NewType or a ``type`` alias documents the type it names, as msgspec decodes it.
         type_annotation = resolve_type_alias(type_annotation)
@@ -1466,11 +1473,12 @@ class SchemaGenerator:
                 )
             type_annotation = args[0]
 
-        # Optional[T] -> T (single non-None arg only; multi-arm unions like
-        # ``A | B | None`` go to _union_schema so every arm is preserved).
+        # Optional[T] -> T for a parameter (single non-None arg only; multi-arm
+        # unions like ``A | B | None`` go to _union_schema so every arm is preserved).
         # T goes through this method again, so ``Annotated[int, Meta(ge=1)] | None``
-        # shows the constraints of its value.
-        if is_optional(type_annotation):
+        # shows the constraints of its value. Each other ``T | None`` goes to
+        # _union_schema, which keeps the null arm.
+        if not null_arm and is_optional(type_annotation):
             non_none_args = [arg for arg in get_args(type_annotation) if arg is not type(None)]
             if len(non_none_args) == 1:
                 return self._typing_to_schema(non_none_args[0], register_component)
