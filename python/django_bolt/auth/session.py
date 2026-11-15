@@ -16,8 +16,10 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 
+from .. import _json
 from .._core import GuardCheck
 from ..concurrency import in_lane_mode
+from ..exceptions import HTTPException
 from ..middleware.django_adapter import DjangoMiddleware, DjangoMiddlewareStack
 from ..middleware_response import MiddlewareResponse
 from .backends import SessionAuthentication, get_default_authentication_classes
@@ -32,7 +34,10 @@ _AUTH_MIDDLEWARE = "django.contrib.auth.middleware.AuthenticationMiddleware"
 _SESSION_CLAIMS = frozenset({"sub", "is_staff", "is_superuser", "permissions"})
 _NO_PERMISSIONS: frozenset[str] = frozenset()
 
-SessionGuardCheck = Callable[[Any], Awaitable[MiddlewareResponse | None]]
+# The result is None for an allowed request. It is a response for a redirect
+# to the login page. It is an HTTPException for a 401 or a 403. The check
+# returns the exception, so the response still passes through Django's middleware.
+SessionGuardCheck = Callable[[Any], Awaitable[MiddlewareResponse | HTTPException | None]]
 
 
 def uses_session(backends: Sequence[Any]) -> bool:
@@ -129,11 +134,11 @@ def build_session_guard_check(
     for reads, attribute in (
         (reads_staff, "is_staff"),
         (reads_superuser, "is_superuser"),
-        (reads_permissions, "aget_all_permissions"),
+        (reads_permissions, "get_all_permissions"),
     ):
         if reads and not hasattr(user_model, attribute):
             raise ImproperlyConfigured(
-                f"A guard on {route} reads {attribute.removeprefix('aget_all_')} of the session user, "
+                f"A guard on {route} reads {attribute.removeprefix('get_all_')} of the session user, "
                 f"but the user model {user_model.__name__} has no {attribute}."
             )
 
@@ -161,7 +166,7 @@ def build_session_guard_check(
     # picks it for Django's ORM. Django's async auth chain takes one hop per query.
     averdict = sync_to_async(verdict, thread_sensitive=True)
 
-    async def check_session_guards(request: Any) -> MiddlewareResponse | None:
+    async def check_session_guards(request: Any) -> MiddlewareResponse | HTTPException | None:
         context = request.context
         if context is None or context["auth_backend"] != "session":
             # Rust checked the guards for a token or for no credential.
@@ -178,6 +183,10 @@ def build_session_guard_check(
         if status_code == 401 and login_url is not None:
             redirect = redirect_to_login(request.get_full_path(), login_url)
             return MiddlewareResponse(302, {"location": redirect["Location"]}, b"", "empty")
-        return MiddlewareResponse(status_code, {}, body)
+        # The API formats this error as each other 401 and 403. See _build_route_executor.
+        if status_code == 401:
+            # Rust adds the WWW-Authenticate challenge of the route.
+            return HTTPException(401, "Authentication required")
+        return HTTPException(403, _json.decode(body)["detail"])
 
     return check_session_guards

@@ -338,37 +338,25 @@ def test_cors_rejects_an_option_of_the_wrong_type_or_range(kwargs, error, match)
 
 
 @pytest.mark.parametrize(
-    ("config", "match"),
+    ("config", "error", "match"),
     [
-        ({"methods": "GET"}, "cors methods must be a collection of str, got str 'GET'"),
-        ({"headers": ["X-A", 1]}, "cors headers must be a collection of str"),
-        ({"expose_headers": "X-A"}, "cors expose_headers must be a collection of str, got str 'X-A'"),
-        ({"credentials": "yes"}, "cors credentials must be a bool, got str 'yes'"),
-        ({"max_age": "600"}, "cors max_age must be an int from 0 to 4294967295, got str '600'"),
-        ({"max_age": -1}, "cors max_age must be an int from 0 to 4294967295, got int -1"),
+        ({"methods": "GET"}, TypeError, "api cors dict methods must be a list of str, not str 'GET'"),
+        ({"headers": ["X-A", 1]}, TypeError, "api cors dict headers must hold only str, not int 1"),
+        ({"expose_headers": "X-A"}, TypeError, "api cors dict expose_headers must be a list of str, not str 'X-A'"),
+        ({"credentials": "yes"}, TypeError, "api cors dict credentials must be a bool, not str 'yes'"),
+        ({"max_age": "600"}, TypeError, "api cors dict max_age must be an int, not str '600'"),
+        ({"max_age": -1}, ValueError, "api cors dict max_age must be from 0 to 4294967295, got -1"),
     ],
 )
-def test_a_cors_config_with_an_option_of_the_wrong_type_stops_startup(config, match):
-    # A dict in the middleware of an API does not go through @cors. Rust reads it at startup.
-    api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://a.test"], **config}])
-
-    @api.get("/route")
-    async def route():
-        return {}
-
-    with pytest.raises(TypeError, match=re.escape(match)), TestClient(api, read_django_settings=False):
-        pass
+def test_a_cors_config_with_an_option_of_the_wrong_type_stops_the_registration(config, error, match):
+    # A dict in the middleware of an API gets the checks of @cors.
+    with pytest.raises(error, match=re.escape(match)):
+        BoltAPI(middleware=[{"type": "cors", "origins": ["https://a.test"], **config}])
 
 
-def test_a_cors_config_that_is_not_a_list_of_str_stops_startup():
-    api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://a.test", 1], "credentials": True}])
-
-    @api.get("/route")
-    async def route():
-        return {}
-
-    with pytest.raises(TypeError, match="origins"), TestClient(api, read_django_settings=False):
-        pass
+def test_a_cors_config_that_is_not_a_list_of_str_stops_the_registration():
+    with pytest.raises(TypeError, match="api cors dict origins must hold only str, not int"):
+        BoltAPI(middleware=[{"type": "cors", "origins": ["https://a.test", 1], "credentials": True}])
 
 
 def test_a_route_takes_one_cors_decorator():
@@ -432,15 +420,9 @@ def test_cors_rejects_an_empty_pattern(origin_regexes):
         cors(origin_regexes=origin_regexes, credentials=True)(lambda: None)
 
 
-def test_a_cors_config_with_an_empty_pattern_stops_startup():
-    api = BoltAPI(middleware=[{"type": "cors", "origin_regexes": [""], "credentials": True}])
-
-    @api.get("/route")
-    async def route():
-        return {}
-
-    with pytest.raises(ValueError, match="empty pattern"), TestClient(api, read_django_settings=False):
-        pass
+def test_a_cors_config_with_an_empty_pattern_stops_the_registration():
+    with pytest.raises(ValueError, match="api cors dict origin_regexes holds an empty pattern"):
+        BoltAPI(middleware=[{"type": "cors", "origin_regexes": [""], "credentials": True}])
 
 
 @pytest.mark.parametrize(

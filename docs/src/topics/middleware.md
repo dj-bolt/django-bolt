@@ -47,7 +47,7 @@ async def tenant_data():
 
 A pattern can match a part of the origin, so start it with `^` and end it with `$`. Patterns use the syntax of the Rust `regex` crate, which has no look-around and no back-references. An invalid pattern or an empty pattern stops startup with `ValueError`. Bolt does not reject a pattern that allows too much. A pattern such as `.*` or `^` allows every origin.
 
-The most specific `cors` config applies. A route-level `@cors` takes precedence over the router, and the router takes precedence over the API. A config with no origins and no patterns, such as a router config that sets only `credentials`, keeps the allow list of the outer config. A route takes one cors config. A second `@cors`, or a `@cors` together with `@middleware(type="cors")`, raises `ValueError`. The config stays on the function, so give each route with `@cors` its own function. `@cors` raises `ValueError` when it gets no origin and no pattern. It raises `TypeError` when an origin or a pattern is not a `str`. Give `methods` and `headers` as a list of `str`, `credentials` as a `bool`, and `max_age` as an `int` of 0 or more. Another type raises `TypeError`, and a `max_age` out of range raises `ValueError`. A `cors` dict in the `middleware` of an API or a router gets the same check when the server starts. A method name or a header name with a character that is not valid in an HTTP header, such as a line break, stops startup with `ValueError`.
+The most specific `cors` config applies. A route-level `@cors` takes precedence over the router, and the router takes precedence over the API. A config with no origins and no patterns, such as a router config that sets only `credentials`, keeps the allow list of the outer config. A route takes one cors config. A second `@cors`, or a `@cors` together with `@middleware(type="cors")`, raises `ValueError`. The config stays on the function, so give each route with `@cors` its own function. `@cors` raises `ValueError` when it gets no origin and no pattern. It raises `TypeError` when an origin or a pattern is not a `str`. Give `methods` and `headers` as a list of `str`, `credentials` as a `bool`, and `max_age` as an `int` of 0 or more. Another type raises `TypeError`, and a `max_age` out of range raises `ValueError`. A `cors` dict gets the same checks when you register it. This applies to `@middleware(type="cors", ...)` and to a dict in the `middleware` of an API or a router. Only the config of a route needs an origin or a pattern. A method name or a header name with a character that is not valid in an HTTP header, such as a line break, stops startup with `ValueError`.
 
 A WebSocket route does not use `@cors`. The WebSocket handshake checks the `Origin` header against the global settings only.
 
@@ -98,6 +98,10 @@ Parameters:
 - `rps` - Requests per second allowed
 - `burst` - Maximum burst size (allows short spikes)
 - `key` - What to count per: `"ip"` (the default), `"user"`, `"api_key"` or a request header name
+
+The most specific rate limit applies. A `@rate_limit` of the route takes precedence over a `rate_limit` dict in the `middleware` of the router, and the router takes precedence over the API. The limit of the outer level does not also apply. `@skip_middleware("rate_limit")` removes the limit of each level.
+
+A route takes one rate limit. A second `@rate_limit`, or a `@rate_limit` together with `@middleware(type="rate_limit")`, raises `ValueError`. The config stays on the function, so give each route with `@rate_limit` its own function.
 
 ### Counting per caller
 
@@ -183,7 +187,9 @@ async def health():
 
 A name selects a Rust middleware: `cors`, `rate_limit` or `compression`. A name
 also selects a Python middleware by the name or the dotted path of its class or
-function. `*` skips each Bolt middleware: the Python middleware and the Rust
+function. A name ignores the letter case. You can also give the middleware class
+itself, for example `@skip_middleware(TimingMiddleware)`. A value that is not a
+`str` or a class raises `TypeError`. `*` skips each Bolt middleware: the Python middleware and the Rust
 middleware. `*` does not skip a Django middleware. To skip a Django middleware,
 give the name of its class, for example `@skip_middleware("CsrfViewMiddleware")`.
 Thus `*` cannot remove the CSRF check of a route.
@@ -304,18 +310,46 @@ async def list_users():
 api.include_router(admin_router)
 ```
 
+### Answer without the handler
+
+A middleware can answer the request itself. Return a response and do not call `get_response`:
+
+```python
+from django_bolt.middleware import Middleware
+from django_bolt.responses import JSON
+
+
+class MaintenanceMiddleware(Middleware):
+    async def process_request(self, request):
+        if request.headers.get("x-maintenance") == "1":
+            return JSON({"detail": "maintenance"}, status_code=503, headers={"Retry-After": "60"})
+        return await self.get_response(request)
+```
+
+A middleware can return what a handler can return, for example a response object such as `JSON`, `PlainText` or `Redirect`, or a dict. Bolt serializes the value as it serializes the return of the handler of the route. Thus a dict gets the status code of the route, and a `response_model` of the route validates it. A response object with its own status code is the clear form. `raise HTTPException(...)` also stops the request.
+
+An outer middleware gets the object that the inner middleware returned. A response object has `status_code` and `headers`. A dict has none of them, so return a response object when an outer middleware changes the response.
+
+A tuple from a middleware is the internal wire tuple of Bolt, not `(status, data)`.
+
 ### Allowed middleware entries
 
-- Middleware classes (`__init__(get_response)`)
+- Middleware classes (`__init__(get_response)` and `__call__(request)`)
 - `DjangoMiddleware(...)` wrappers
 - `DjangoMiddlewareStack(...)` wrappers
 - Dict middleware configs for Rust-handled middleware (`cors`, `rate_limit`)
 
 Passing plain middleware instances in these lists fails fast with `TypeError` (`pass class, not instance`).
 
+A class with no `__call__` method, for example `int`, also raises `TypeError`. Bolt calls the instance with the request.
+
+A dict config needs `"type": "cors"` or `"type": "rate_limit"`. A dict with no type or with another type raises `ValueError`, because no middleware reads it. `@middleware(type="cors", ...)` is the same dict as keyword arguments. A dict config gets the checks of `@cors(...)` or `@rate_limit(...)`, so a value that the decorator refuses raises the same error. Other keyword arguments of `@middleware` raise `TypeError`. Use `@cors(...)`, `@rate_limit(...)` and `@skip_middleware(...)`.
+
 In a `cors` dict, `origins` and `origin_regexes` take a `str` or a collection of `str`. Another type, or an empty pattern, stops startup with `TypeError` or `ValueError`.
 
 Router middleware is inherited parent-to-child and executes in declared order.
+
+A nested router also takes `auth`, `guards` and `tags` from its parent router. A value that the child router or the route sets wins. The nearest parent that sets a value gives it.
 
 ## Django middleware integration
 
@@ -393,6 +427,8 @@ api = BoltAPI(
 
 Each wrapper runs the `process_view` hook of its middleware before the handler. The hook gets the route handler as the view, so view decorators such as `@csrf_exempt` and `@login_not_required` work.
 
+Bolt runs three hooks of a Django middleware: `process_request`, `process_view` and `process_response`. It does not run `process_exception` or `process_template_response`. A handler exception goes to the Bolt error handlers, and `process_exception` does not see it. See [Error Handling](error-handling.md).
+
 A list of wrappers runs the hooks in a different order from Django. Each wrapper runs its `process_request` and then its `process_view`, before the next wrapper starts. Django runs all `process_request` hooks first, and then all `process_view` hooks. If the order of the hooks is important, use `django_middleware=[...]` or `DjangoMiddlewareStack`. They use the order of Django.
 
 ### Using DjangoMiddlewareStack
@@ -414,6 +450,8 @@ api = BoltAPI(
     ]
 )
 ```
+
+An entry of the list can also be the dotted path of a class, as for `DjangoMiddleware`.
 
 ### Accessing Django request attributes
 
@@ -539,6 +577,8 @@ Python middleware execution order is explicit and strict:
 3. Route middleware (`@middleware(...)` / function-style `@middleware`)
 4. Handler
 
+One `@middleware(A, B)` runs `A` first and then `B`. When a route has more than one `@middleware` decorator, the decorator nearest to the function runs first. Thus `@middleware(A)` above `@middleware(B)` runs `B` first and then `A`.
+
 For responses, the order is reversed.
 
 `BoltAPI(django_middleware=...)` puts the Django middleware before the entries of `middleware=[...]`. A `DjangoMiddleware` or `DjangoMiddlewareStack` in `middleware=[...]` runs at its position in the list.
@@ -546,6 +586,8 @@ For responses, the order is reversed.
 A Python middleware before the Django middleware runs before any Django hook, as in Django's `MIDDLEWARE` order. It does not run on the lane of the request. It does not see the thread-local state of the Django middleware, for example the tenant of django-tenants. If it loads `request.user`, it loads the user without that state, and the handler then gets the same user. Put a middleware that reads the user after the Django middleware.
 
 Rust-handled middleware configs (for example `@cors` and `@rate_limit`) are still compiled from metadata and executed in Rust.
+
+Python middleware and Django middleware run only for a request that matches a route. Rust answers a request that matches no route, for example with a 404, and no middleware sees it. This is different from Django, where each middleware in `MIDDLEWARE` also sees a request that gets a 404. Thus a logging middleware does not record these requests, and a tenant middleware does not set a tenant for them. The access log of Bolt also has no line for them, so record them at the proxy in front of Bolt.
 
 ## Performance
 
