@@ -7,6 +7,7 @@ extractor functions that avoid runtime type checking.
 
 from __future__ import annotations
 
+import datetime
 import enum
 import inspect
 from collections.abc import Callable, Sequence
@@ -75,10 +76,10 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
 
     Rust converts a scalar value by its type. It does not build a sequence, it
     does not check ``msgspec.Meta`` constraints, and it does not know an
-    ``Enum`` or a ``Literal``. For such a parameter, one ``msgspec.convert``
-    builds the ``list``, ``set``, ``frozenset`` or ``tuple`` from the values,
-    checks the constraints, and gives the ``Enum`` member or the ``Literal``
-    value. A bad value gives a 422 that
+    ``Enum``, a ``Literal`` or a ``timedelta``. For such a parameter, one
+    ``msgspec.convert`` builds the ``list``, ``set``, ``frozenset`` or ``tuple``
+    from the values, checks the constraints, and gives the ``Enum`` member, the
+    ``Literal`` value or the ``timedelta``. A bad value gives a 422 that
     names ``loc`` and ``key``. With ``one_item``, a source that gives one value
     (a path, a header or a cookie) gives a sequence of that one item. A type
     that cannot hold one item, such as ``tuple[int, str]``, then raises
@@ -96,7 +97,9 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
         for name in _META_CONSTRAINTS
     )
     is_choice = get_origin(inner) is Literal or (isinstance(inner, type) and issubclass(inner, enum.Enum))
-    if not is_sequence and not constrained and not is_choice:
+    # Rust has no conversion for a duration. msgspec reads the ISO 8601 form, such as PT5S.
+    is_duration = inner is datetime.timedelta
+    if not is_sequence and not constrained and not is_choice and not is_duration:
         return None
     wrap = is_sequence and one_item
     if wrap and loc in _SINGLE_VALUE_SOURCES and not _holds_one_item(target):

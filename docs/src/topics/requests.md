@@ -220,6 +220,21 @@ async def paint(color: Color, order: Literal["asc", "desc"] = "asc"):
 An `IntEnum` or a `Literal` of numbers converts the text to a number first.
 This applies to path, query, header, cookie and form parameters.
 
+### Durations
+
+A `datetime.timedelta` parameter takes an ISO 8601 duration, such as `PT5S` or `P1DT2H`. It also takes a number of seconds, such as `90`:
+
+```python
+import datetime
+
+@api.get("/wait")
+async def wait(timeout: datetime.timedelta):
+    return {"seconds": timeout.total_seconds()}
+```
+
+`/wait?timeout=PT5S` gives `timedelta(seconds=5)`. Text that is not a duration gives a 422.
+This applies to path, query, header, cookie and form parameters.
+
 ## Request body
 
 ### JSON body
