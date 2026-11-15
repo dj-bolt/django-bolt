@@ -98,8 +98,11 @@ class Router:
             parent._children.append(self)
 
     def _add(self, method: str, path: str, handler: Callable, **meta: Any) -> None:
-        """Add a route to the router."""
-        full = (self.prefix + path) if self.prefix else path
+        """Add a route to the router.
+
+        The path stays relative. `get_all_routes` adds the prefix, so a prefix
+        that `include_router` changes later applies to each route.
+        """
         # Merge router-level defaults into meta
         if self.tags and "tags" not in meta:
             meta["tags"] = self.tags
@@ -108,7 +111,7 @@ class Router:
         if self.guards is not None and "guards" not in meta:
             meta["guards"] = self.guards
         meta["_owner_router"] = self
-        self._routes.append((method, full, handler, meta))
+        self._routes.append((method, path, handler, meta))
 
     def get(self, path: str, **kwargs: Any):
         """Register a GET route."""
@@ -224,13 +227,12 @@ class Router:
             route_meta = dict(meta)
             owner_router = route_meta.pop("_owner_router", self)
             route_meta["_router_middleware"] = owner_router.get_middleware_chain()
-            routes.append((method, path, handler, route_meta))
+            routes.append((method, self.prefix + path, handler, route_meta))
 
         for child in self._children:
             # Prepend parent prefix to child routes
             for method, path, handler, meta in child.get_all_routes():
-                full_path = self.prefix + path if self.prefix else path
-                routes.append((method, full_path, handler, meta))
+                routes.append((method, self.prefix + path, handler, meta))
         return routes
 
     def get_middleware_chain(self) -> list["MiddlewareType"]:

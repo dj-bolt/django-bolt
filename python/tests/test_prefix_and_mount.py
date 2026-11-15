@@ -10,7 +10,7 @@ import asyncio
 
 import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Router
 from django_bolt.middleware import Middleware
 from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
 from django_bolt.testing import TestClient
@@ -647,3 +647,26 @@ def test_a_mounted_api_runs_its_own_python_middleware(handler_is_async):
 
     assert (child_response.json(), child_response.headers.get("x-api")) == ({"from": "child"}, "child")
     assert (plain_response.json(), plain_response.headers.get("x-api")) == ({"from": "plain"}, None)
+
+
+def test_include_router_prefix_applies_to_routes_added_before_and_after():
+    """The prefix of Router.include_router applies to each route of the child, whenever it was added."""
+    parent = Router(prefix="/v1")
+    child = Router(prefix="/users")
+
+    @child.get("/early")
+    async def early():
+        return {"route": "early"}
+
+    parent.include_router(child, prefix="/extra")
+
+    @child.get("/late")
+    async def late():
+        return {"route": "late"}
+
+    api = BoltAPI()
+    api.include_router(parent)
+
+    with TestClient(api) as client:
+        assert client.get("/v1/extra/users/early").json() == {"route": "early"}
+        assert client.get("/v1/extra/users/late").json() == {"route": "late"}
