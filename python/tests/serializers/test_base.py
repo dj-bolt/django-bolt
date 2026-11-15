@@ -544,6 +544,78 @@ class TestSerializerInheritance:
         admin = AdminSerializer(username="alice", email="alice@example.com", is_admin=True)
         assert admin.is_admin is True
 
+    def test_a_subclass_replaces_a_validator_of_the_same_name(self):
+        """The definition of the subclass runs alone, at the position of the parent definition."""
+        calls: list[str] = []
+
+        class Parent(Serializer):
+            v: int
+
+            @field_validator("v")
+            @classmethod
+            def first(cls, value):
+                calls.append("parent.first")
+                return value
+
+            @field_validator("v")
+            @classmethod
+            def check(cls, value):
+                calls.append("parent.check")
+                return value
+
+            @field_validator("v")
+            @classmethod
+            def last(cls, value):
+                calls.append("parent.last")
+                return value
+
+            @model_validator
+            def whole(self):
+                calls.append("parent.whole")
+
+        class Child(Parent):
+            @field_validator("v")
+            @classmethod
+            def other_name(cls, value):
+                calls.append("child.other_name")
+                return value
+
+            @field_validator("v")
+            @classmethod
+            def check(cls, value):
+                calls.append("child.check")
+                return value
+
+            @model_validator
+            def whole(self):
+                calls.append("child.whole")
+
+        class GrandChild(Child):
+            pass
+
+        class NoValidator(Parent):
+            def check(self):
+                return "an ordinary method"
+
+            whole = None
+
+        Child(v=1)
+        assert calls == ["parent.first", "child.check", "parent.last", "child.other_name", "child.whole"]
+
+        calls.clear()
+        GrandChild(v=1)
+        assert calls == ["parent.first", "child.check", "parent.last", "child.other_name", "child.whole"]
+
+        # The parent keeps its own definitions.
+        calls.clear()
+        Parent(v=1)
+        assert calls == ["parent.first", "parent.check", "parent.last", "parent.whole"]
+
+        # A definition with no decorator replaces the validator: no validator of that name runs.
+        calls.clear()
+        NoValidator(v=1)
+        assert calls == ["parent.first", "parent.last"]
+
 
 class TestConfigClass:
     """Test Config class configuration."""
