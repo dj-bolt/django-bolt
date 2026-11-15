@@ -1179,7 +1179,7 @@ async fn route_request(
                 AuthGuardResult::Deferred(ctx) => Some(ctx),
                 AuthGuardResult::Unauthorized => {
                     // CORS headers will be added by CorsMiddleware
-                    return responses::error_401();
+                    return responses::error_401_challenge(route_meta.www_authenticate.as_ref());
                 }
                 AuthGuardResult::Forbidden(denial) => {
                     // CORS headers will be added by CorsMiddleware
@@ -1664,7 +1664,7 @@ async fn route_request(
         }
     });
 
-    match dispatch_result {
+    let mut response = match dispatch_result {
         Ok(DispatchOutcome::Ready(response)) => response,
         // Sync dispatch completed but body needs async post-processing (stream/file).
         // Already parsed — no duplicate GIL acquire or wire re-parse.
@@ -1714,7 +1714,14 @@ async fn route_request(
         Err(e) => Python::attach(|py| {
             handle_python_error(py, e, req.path(), req.method().as_str(), state.debug)
         }),
-    }
+    };
+
+    // A 401 from Python gets the challenge of the route, as a 401 from Rust.
+    responses::add_challenge(
+        &mut response,
+        route_metadata.and_then(|m| m.www_authenticate.as_ref()),
+    );
+    response
 }
 
 #[cfg(test)]
