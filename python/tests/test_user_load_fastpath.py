@@ -143,6 +143,15 @@ def test_invalid_pk_returns_none():
     assert load_user_by_pk_sync(User, "not-a-pk") is None
 
 
+@pytest.mark.parametrize("pk", ["9223372036854775808", "110169484474386276334"])
+def test_pk_too_large_for_the_database_returns_none(pk):
+    """A numeric token subject can be larger than a database integer. An OIDC `sub` of 21 digits is one."""
+    # The compiled statement. The ORM raises DoesNotExist for this value.
+    assert load_user_by_pk_sync(User, pk) is None
+    # A custom manager makes the loader use the ORM.
+    assert load_user_by_pk_sync(FilteredAccount, pk) is None
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _filtered_account_table(django_db_setup, django_db_blocker):
     """Create the FilteredAccount table (test models are not in migrations)."""
