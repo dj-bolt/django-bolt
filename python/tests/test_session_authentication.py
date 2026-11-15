@@ -16,6 +16,7 @@ from django.test import override_settings
 from django_bolt import BoltAPI, CurrentUser, Request, Router
 from django_bolt.auth import (
     AllowAny,
+    APIKeyAuthentication,
     IsAuthenticated,
     JWTAuthentication,
     Requires,
@@ -24,6 +25,8 @@ from django_bolt.auth import (
 )
 from django_bolt.auth.session import auth_without_session
 from django_bolt.concurrency import in_lane_mode
+from django_bolt.error_handlers import problem_details
+from django_bolt.exceptions import HTTPException
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.testing import TestClient, WebSocketTestClient
@@ -105,6 +108,94 @@ def test_requires_is_staff_checks_the_django_user():
         _login(staff_client, "session_staff")
         assert member.get("/staff").status_code == 403
         assert staff_client.get("/staff").status_code == 200
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("error_formatter", [None, problem_details], ids=["default", "problem-details"])
+def test_a_session_rejection_is_the_same_response_as_a_rejection_in_rust(error_formatter):
+    """Python rejects a request with a session cookie. A client gets the response that Rust sends."""
+    api = BoltAPI(error_formatter=error_formatter)
+    _add_login(api)
+
+    @api.get("/me", auth=[SessionAuthentication()], guards=[IsAuthenticated()])
+    async def me():
+        return {"ok": True}
+
+    # Rust checks the guards of a token request, and Python those of a session request.
+    @api.get(
+        "/staff",
+        auth=[JWTAuthentication(), SessionAuthentication()],
+        guards=[Requires("is_staff", True, message="Staff only")],
+    )
+    async def staff():
+        return {"ok": True}
+
+    user = User.objects.create_user(username="session_member", password="pw-for-tests")
+    with TestClient(api) as client:
+        rust_401 = client.get("/me")
+        python_401 = client.get("/me", headers={"cookie": "sessionid=not-a-session"})
+        token = create_jwt_for_user(user)
+        rust_403 = client.get("/staff", headers={"authorization": f"Bearer {token}"})
+        _login(client, "session_member")
+        python_403 = client.get("/staff")
+
+    def seen(response):
+        return (
+            response.status_code,
+            response.headers["content-type"],
+            response.json(),
+            response.headers.get("www-authenticate"),
+        )
+
+    assert seen(python_401) == seen(rust_401)
+    assert seen(python_403) == seen(rust_403)
+    if error_formatter is None:
+        assert seen(python_401) == (401, "application/json", {"detail": "Authentication required"}, "ApiKey")
+        assert seen(python_403) == (403, "application/json", {"detail": "Staff only"}, None)
+    else:
+        assert python_401.headers["content-type"] == "application/problem+json"
+        assert python_403.json()["detail"] == "Staff only"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_401_names_the_scheme_of_each_backend_of_the_route():
+    """RFC 9110 section 15.5.2: the challenge of a 401 applies to the route."""
+    api = BoltAPI()
+    key = APIKeyAuthentication(api_keys={"key-one"})
+
+    @api.get("/key", auth=[key], guards=[IsAuthenticated()])
+    async def by_key():
+        return {"ok": True}
+
+    @api.get("/session", auth=[SessionAuthentication()], guards=[IsAuthenticated()])
+    async def by_session():
+        return {"ok": True}
+
+    @api.get("/jwt-cookie", auth=[JWTAuthentication(cookie="token")], guards=[IsAuthenticated()])
+    async def by_jwt_cookie():
+        return {"ok": True}
+
+    @api.get("/both", auth=[JWTAuthentication(), key], guards=[IsAuthenticated()])
+    async def by_both(own: bool = False):
+        # A 401 from Python, without and with a challenge of the handler.
+        raise HTTPException(401, "No access", headers={"WWW-Authenticate": 'Bearer realm="api"'} if own else None)
+
+    with TestClient(api) as client:
+
+        def challenge(path, detail="Authentication required", **headers):
+            response = client.get(path, headers=headers)
+            assert (response.status_code, response.json()) == (401, {"detail": detail})
+            return response.headers.get_list("www-authenticate")
+
+        # Rust rejects a request with no credential.
+        assert challenge("/key") == ["ApiKey"]
+        assert challenge("/session") == ["ApiKey"]
+        assert challenge("/jwt-cookie") == ["ApiKey"]
+        assert challenge("/both") == ["Bearer, ApiKey"]
+        # Python rejects a session cookie with no user, and the handler raises a 401.
+        assert challenge("/session", cookie="sessionid=not-a-session") == ["ApiKey"]
+        assert challenge("/both", "No access", **{"x-api-key": "key-one"}) == ["Bearer, ApiKey"]
+        assert challenge("/both?own=true", "No access", **{"x-api-key": "key-one"}) == ['Bearer realm="api"']
 
 
 @pytest.mark.django_db(transaction=True)

@@ -1039,7 +1039,7 @@ async fn route_request<const ACCESS_LOG: bool>(
                 AuthGuardResult::Deferred(ctx) => Some(ctx),
                 AuthGuardResult::Unauthorized => {
                     // CORS headers will be added by CorsMiddleware
-                    return responses::error_401();
+                    return responses::error_401_challenge(route_meta.www_authenticate.as_ref());
                 }
                 AuthGuardResult::Forbidden(denial) => {
                     // CORS headers will be added by CorsMiddleware
@@ -1568,6 +1568,13 @@ async fn route_request<const ACCESS_LOG: bool>(
             handle_python_error(py, e, req.path(), req.method().as_str(), state.debug)
         }),
     };
+
+    // A 401 from Python gets the challenge of the route, as a 401 from Rust.
+    let mut response = response;
+    responses::add_challenge(
+        &mut response,
+        route_metadata.and_then(|m| m.www_authenticate.as_ref()),
+    );
 
     if ACCESS_LOG {
         let status = response.status().as_u16();
