@@ -135,8 +135,8 @@ pub fn install(py: Python<'_>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_record, level_filter, record_passes};
-    use log::{Level, LevelFilter};
+    use super::{LOGGER, format_record, level_filter, record_passes};
+    use log::{Level, LevelFilter, Log, Metadata};
 
     #[test]
     fn other_crates_log_only_warnings_and_errors() {
@@ -162,6 +162,19 @@ mod tests {
             "bolt_core::lane",
             LevelFilter::Warn
         ));
+    }
+
+    /// `log_enabled!` asks the backend. No other test sets the level.
+    #[test]
+    fn the_backend_is_enabled_only_for_a_record_that_gets_a_line() {
+        log::set_max_level(LevelFilter::Info);
+        let enabled = |level, target| {
+            let metadata = Metadata::builder().level(level).target(target).build();
+            LOGGER.enabled(&metadata)
+        };
+        assert!(enabled(Level::Info, "bolt_core::lane"));
+        assert!(!enabled(Level::Debug, "bolt_core::lane"));
+        assert!(!enabled(Level::Info, "actix_server::builder"));
     }
 
     #[test]

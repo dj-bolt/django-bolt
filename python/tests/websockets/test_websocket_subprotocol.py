@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from django_bolt import BoltAPI, WebSocket
@@ -114,6 +116,26 @@ async def test_receive_before_accept_gives_connect_event():
 
     async with WebSocketTestClient(api, "/ws/connect-first") as ws:
         assert await ws.receive_text() == "websocket.connect"
+
+
+@pytest.mark.asyncio
+async def test_second_receive_before_accept_waits():
+    """Only the first receive before accept gives the connect event."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/connect-twice")
+    async def connect_twice(websocket: WebSocket):
+        first = await websocket.receive()
+        try:
+            await asyncio.wait_for(websocket.receive(), timeout=0.05)
+            second = "a second message"
+        except TimeoutError:
+            second = "waits"
+        await websocket.accept()
+        await websocket.send_text(f"{first['type']},{second}")
+
+    async with WebSocketTestClient(api, "/ws/connect-twice") as ws:
+        assert await ws.receive_text() == "websocket.connect,waits"
 
 
 def _mounted_api() -> BoltAPI:

@@ -27,7 +27,8 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 
-use bolt_core::metadata::{parse_auth_backend, parse_guard};
+use actix_web::http::header::HeaderValue;
+use bolt_core::metadata::{parse_auth_backend, parse_challenge, parse_guard};
 use bolt_core::middleware::auth::{AuthBackend, AuthContext};
 use bolt_core::permissions::{Guard, GuardSet};
 use bolt_core::state::AppState;
@@ -73,6 +74,8 @@ pub struct McpMount {
     pub path: String,
     /// Tier-1 auth, enforced in Rust before rmcp sees the request.
     pub auth_backends: Vec<AuthBackend>,
+    /// The `WWW-Authenticate` value of a Tier-1 401. None for no backend.
+    pub auth_challenge: Option<HeaderValue>,
     pub guards: GuardSet,
     pub oauth: Option<McpOAuth>,
     pub service: McpService,
@@ -142,6 +145,7 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
             auth_backends.push(backend);
         }
     }
+    let auth_challenge = parse_challenge(mount_def, "auth_challenge")?;
     let guards = match mount_def.get_item("guards")? {
         Some(list) if !list.is_none() => {
             let dicts: Vec<HashMap<String, Py<PyAny>>> = list
@@ -218,6 +222,7 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
     Ok(McpMount {
         path,
         auth_backends,
+        auth_challenge,
         guards,
         oauth,
         service,

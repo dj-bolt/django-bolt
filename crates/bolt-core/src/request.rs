@@ -87,6 +87,17 @@ pub struct PyRequest {
 }
 
 impl PyRequest {
+    /// The scheme of the request: "http" or "https". A request with no
+    /// resolved scheme is "http", because Bolt does not end TLS.
+    #[inline]
+    fn resolved_scheme(&self) -> &'static str {
+        if self.conn_scheme.is_empty() {
+            "http"
+        } else {
+            self.conn_scheme
+        }
+    }
+
     #[inline]
     fn dict_or_empty<'py>(value: &Option<Py<PyDict>>, py: Python<'py>) -> Py<PyDict> {
         match value {
@@ -321,6 +332,10 @@ impl PyRequest {
         meta.set_item("SERVER_NAME", server_name)?;
         meta.set_item("SERVER_PORT", server_port.to_string())?;
         meta.set_item("SERVER_PROTOCOL", "HTTP/1.1")?;
+        // The scheme of the connection or of a trusted proxy, under the WSGI
+        // key. The Django request of a Django middleware reads it, as
+        // `WSGIRequest` does. `SECURE_PROXY_SSL_HEADER` applies on top of it.
+        meta.set_item("wsgi.url_scheme", self.resolved_scheme())?;
 
         // REMOTE_ADDR comes from `middleware::client_ip::resolve`.
         let remote_addr = self
@@ -437,11 +452,7 @@ impl PyRequest {
     /// applies.
     #[pyo3(signature = (location=None))]
     fn build_absolute_uri(&self, py: Python<'_>, location: Option<&str>) -> PyResult<String> {
-        let scheme = if self.conn_scheme.is_empty() {
-            "http"
-        } else {
-            self.conn_scheme
-        };
+        let scheme = self.resolved_scheme();
         py.import("django_bolt._absolute_uri")?
             .getattr("build_absolute_uri")?
             .call1((
