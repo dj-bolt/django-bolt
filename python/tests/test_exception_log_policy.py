@@ -235,6 +235,30 @@ def test_an_error_while_bolt_builds_the_error_response_is_logged(server_errors):
     assert [message.split(":")[:2] for message in server_errors()] == [["Exception in GET /unencodable", " TypeError"]]
 
 
+@pytest.mark.parametrize("path", ["/async", "/sync"])
+def test_a_response_that_rust_cannot_build_is_a_500_with_the_cause_only_in_the_log(settings, capfd, path):
+    """A status of 70000 is not valid. Rust finds it, so Python logs no exception."""
+    settings.DEBUG = False
+    api = BoltAPI()
+
+    @api.get("/async")
+    async def async_route():
+        await asyncio.sleep(0)
+        return JSON({"ok": True}, status_code=70000)
+
+    @api.get("/sync")
+    def sync_route():
+        return JSON({"ok": True}, status_code=70000)
+
+    with TestClient(api) as client:
+        response = client.get(path)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+    cause = f"GET {path}: cannot build the response of the handler: OverflowError"
+    assert cause in capfd.readouterr().err
+
+
 def test_an_error_while_bolt_builds_an_http_exception_response_is_logged(server_errors):
     api = BoltAPI()
 
