@@ -43,7 +43,8 @@ _check_before_call = False
 # The aliases whose DATABASES entry sets OPTIONS["pool"]. A pooled connection
 # goes back to its pool when the thread that holds it has no more work: a
 # worker of a Bolt executor when its queue is empty, a lane at the end of its
-# request, and another thread at the end of its outermost guarded call. A
+# request, a worker thread at the end of a sync request that ran on it, and
+# another thread at the end of its outermost guarded call. A
 # thread that kept it would hold a pool slot while it is idle, and idle threads
 # and lanes can outnumber max_size. The pool checks its own connections, so the
 # check before a call leaves these aliases out.
@@ -356,6 +357,21 @@ def _call_guarded_pooled[T](
             except Exception:
                 # A raise here would replace the result or the error of the call.
                 logger.exception("Could not give the pooled database connections of a thread back after a call")
+
+
+def release_pooled_connections_after_sync_dispatch() -> None:
+    """Give the pooled connections of a worker thread back after a sync request that ran on it.
+
+    A sync handler with no blocking call in its own source runs on the worker
+    thread that accepted the request. A helper of the handler can still query.
+    The worker thread would then keep the pooled connection while it is idle.
+
+    A raise here would replace the response of the request, so Bolt logs the error.
+    """
+    try:
+        release_pooled_connections()
+    except Exception:
+        logger.exception("Could not give the pooled database connections of a worker thread back after a sync request")
 
 
 class _ReleasePooledConnectionsWhenIdle:
