@@ -218,6 +218,14 @@ async def create_user(user: CreateUser):
     return {"username": user.username}
 ```
 
+A list of structs reads a JSON array:
+
+```python
+@api.post("/users/bulk")
+async def create_users(users: list[CreateUser]):
+    return {"count": len(users)}
+```
+
 ### Raw body access
 
 Access the raw body bytes:

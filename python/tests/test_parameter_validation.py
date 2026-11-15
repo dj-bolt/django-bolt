@@ -9,6 +9,7 @@ import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.params import Body, Param, Query
+from django_bolt.testing import TestClient
 
 
 class UserCreate(msgspec.Struct):
@@ -111,6 +112,24 @@ def test_post_with_struct_inferred_as_body():
 
     user_field = next(f for f in meta["fields"] if f.name == "user")
     assert user_field.source == "body"
+
+
+def test_post_with_struct_list_inferred_as_body():
+    """A list of msgspec.Struct with no marker is the JSON body, as one Struct is."""
+    api = BoltAPI()
+
+    @api.post("/users/bulk")
+    async def create_users(users: list[UserCreate]):
+        return {"names": [user.name for user in users]}
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/users/bulk",
+            json=[{"name": "Ann", "email": "ann@example.com"}, {"name": "Bob", "email": "bob@example.com"}],
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"names": ["Ann", "Bob"]}
 
 
 def test_path_params_inferred_correctly():
