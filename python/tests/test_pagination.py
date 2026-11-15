@@ -215,6 +215,65 @@ def test_page_number_pagination_empty_results(db):
 
 
 @pytest.mark.django_db(transaction=True)
+def test_pagination_page_or_offset_beyond_the_data(db):
+    """A page or an offset after the last row gives an empty page. A very large number is not a server error."""
+    for number in range(7):
+        Article.objects.create(title=f"Article {number}", content="content", author="author")
+    api = BoltAPI()
+
+    @api.get("/none/page")
+    @paginate(PageNumberPagination)
+    async def page_of_no_rows(request):
+        return Article.objects.filter(author="nobody")
+
+    @api.get("/none-list/page")
+    @paginate(PageNumberPagination)
+    async def page_of_empty_list(request):
+        return []
+
+    @api.get("/all/offset")
+    @paginate(LimitOffsetPagination)
+    async def offset_of_rows(request):
+        return Article.objects.all()
+
+    @api.get("/all-list/offset")
+    @paginate(LimitOffsetPagination)
+    async def offset_of_list(request):
+        return [{"id": number} for number in range(7)]
+
+    with TestClient(api) as client:
+        # With no rows, each page number is page 1. There is no page before it.
+        for path in ("/none/page", "/none-list/page"):
+            first_page = client.get(path).json()
+            assert first_page == {
+                "items": [],
+                "total": 0,
+                "has_next": False,
+                "has_previous": False,
+                "page": 1,
+                "page_size": 100,
+                "total_pages": 0,
+            }
+            assert client.get(f"{path}?page=3").json() == first_page
+            # The row offset of this page does not fit the integer of the database.
+            assert client.get(f"{path}?page={2**64}").json() == first_page
+
+        # An offset after the last row gives no items. The response shows the offset of the request.
+        for path in ("/all/offset", "/all-list/offset"):
+            for offset in (100, 2**63):
+                response = client.get(f"{path}?limit=2&offset={offset}")
+                assert response.status_code == 200, response.text
+                assert response.json() == {
+                    "items": [],
+                    "total": 7,
+                    "has_next": False,
+                    "has_previous": True,
+                    "limit": 2,
+                    "offset": offset,
+                }
+
+
+@pytest.mark.django_db(transaction=True)
 def test_page_number_pagination_with_filtering(sample_articles):
     """Test pagination with queryset filtering"""
     api = BoltAPI()
