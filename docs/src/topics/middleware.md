@@ -304,6 +304,28 @@ async def list_users():
 api.include_router(admin_router)
 ```
 
+### Answer without the handler
+
+A middleware can answer the request itself. Return a response and do not call `get_response`:
+
+```python
+from django_bolt.middleware import Middleware
+from django_bolt.responses import JSON
+
+
+class MaintenanceMiddleware(Middleware):
+    async def process_request(self, request):
+        if request.headers.get("x-maintenance") == "1":
+            return JSON({"detail": "maintenance"}, status_code=503, headers={"Retry-After": "60"})
+        return await self.get_response(request)
+```
+
+A middleware can return what a handler can return, for example a response object such as `JSON`, `PlainText` or `Redirect`, or a dict. Bolt serializes the value as it serializes the return of the handler of the route. Thus a dict gets the status code of the route, and a `response_model` of the route validates it. A response object with its own status code is the clear form. `raise HTTPException(...)` also stops the request.
+
+An outer middleware gets the object that the inner middleware returned. A response object has `status_code` and `headers`. A dict has none of them, so return a response object when an outer middleware changes the response.
+
+A tuple from a middleware is the internal wire tuple of Bolt, not `(status, data)`.
+
 ### Allowed middleware entries
 
 - Middleware classes (`__init__(get_response)`)

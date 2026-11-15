@@ -176,7 +176,8 @@ class MiddlewareProtocol(Protocol):
 
     The middleware can:
     - Modify the request before passing it on
-    - Short-circuit by returning a response directly
+    - Short-circuit by returning a response directly: a response object such
+      as JSON, or another value that a handler can return
     - Modify the response after the handler executes
     - Add data to request.state for downstream handlers
     """
@@ -277,7 +278,9 @@ class BaseMiddleware(ABC):
         """
         Process the request. Override this in subclasses.
 
-        Call self.get_response(request) to continue the chain.
+        Call self.get_response(request) to continue the chain. To answer
+        without the handler, return a response object such as JSON, or another
+        value that a handler can return.
 
         Args:
             request: The incoming request
@@ -318,7 +321,9 @@ class Middleware(ABC):
         """
         Process the request.
 
-        Call self.get_response(request) to continue the chain.
+        Call self.get_response(request) to continue the chain. To answer
+        without the handler, return a response object such as JSON, or another
+        value that a handler can return.
 
         Args:
             request: The incoming request object

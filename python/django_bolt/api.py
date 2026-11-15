@@ -3313,10 +3313,9 @@ class BoltAPI:
             return middleware_response.to_tuple()
         if isinstance(middleware_response, tuple):
             return MiddlewareResponse.from_tuple(middleware_response).to_tuple()
-        raise TypeError(
-            f"Middleware chain returned unsupported response type: {type(middleware_response).__name__}. "
-            "Expected MiddlewareResponse or ResponseWireV1 tuple."
-        )
+        # A middleware answered with what a handler can return, for example a
+        # response object or a dict. The serializer of the route handles it.
+        return await serialize_response(middleware_response, meta)
 
     async def _check_revocation(
         self,

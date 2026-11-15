@@ -1473,11 +1473,37 @@ class WireTupleMiddleware(Middleware):
         return (418, 0, 0, b'{"teapot":true}')
 
 
-class StrMiddleware(Middleware):
-    """Answer with a type that is not a response."""
+class ForbidWithJson(Middleware):
+    """Answer with a response object, without the handler."""
 
     async def process_request(self, request):
-        return "not a response"
+        response = JSON({"detail": "forbidden"}, status_code=403, headers={"X-Reason": "blocked"})
+        response.set_cookie("seen", "1")
+        return response
+
+
+class DictAnswer(Middleware):
+    """Answer with a dict, as a handler can."""
+
+    async def process_request(self, request):
+        return {"from": "middleware"}
+
+
+class TextAnswer(Middleware):
+    """Answer with a PlainText response."""
+
+    async def process_request(self, request):
+        return PlainText("stop", status_code=429)
+
+
+class MarkResponse(Middleware):
+    """Change the response of the inner middleware."""
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.status_code = 401
+        response.headers["X-Outer"] = "changed"
+        return response
 
 
 def test_a_middleware_can_answer_with_a_wire_tuple():
@@ -1494,20 +1520,59 @@ def test_a_middleware_can_answer_with_a_wire_tuple():
     assert response.headers["content-type"] == "application/json"
 
 
-def test_a_middleware_answer_of_another_type_is_a_500_that_names_the_type():
-    api = BoltAPI(middleware=[StrMiddleware])
+def test_a_middleware_can_answer_with_a_response_object():
+    api = BoltAPI(middleware=[ForbidWithJson])
 
     @api.get("/tea")
     async def tea():
         return {"handler": True}
 
-    with override_settings(DEBUG=True), TestClient(api) as client:
+    with TestClient(api) as client:
         response = client.get("/tea")
 
-    assert response.status_code == 500
-    assert (
-        "Middleware chain returned unsupported response type: str. Expected MiddlewareResponse or ResponseWireV1 tuple."
-    ) in response.text
+    assert (response.status_code, response.json()) == (403, {"detail": "forbidden"})
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["x-reason"] == "blocked"
+    assert response.cookies["seen"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("answer", "status", "content_type", "body"),
+    [
+        (DictAnswer, 201, "application/json", b'{"from":"middleware"}'),
+        (TextAnswer, 429, "text/plain; charset=utf-8", b"stop"),
+    ],
+)
+def test_a_middleware_can_answer_with_what_a_handler_can_return(answer, status, content_type, body):
+    api = BoltAPI()
+
+    # A dict gets the status of the route, as a dict from the handler does.
+    @api.post("/tea", status_code=201)
+    @middleware(answer)
+    async def tea():
+        return {"handler": True}
+
+    with TestClient(api) as client:
+        response = client.post("/tea")
+
+    assert (response.status_code, response.content) == (status, body)
+    assert response.headers["content-type"] == content_type
+
+
+def test_an_outer_middleware_changes_the_response_object_of_an_inner_middleware():
+    api = BoltAPI(middleware=[MarkResponse, ForbidWithJson])
+
+    @api.get("/tea")
+    async def tea():
+        return {"handler": True}
+
+    with TestClient(api) as client:
+        response = client.get("/tea")
+
+    assert (response.status_code, response.json()) == (401, {"detail": "forbidden"})
+    assert response.headers["x-outer"] == "changed"
+    assert response.headers["x-reason"] == "blocked"
+    assert response.cookies["seen"] == "1"
 
 
 class HeaderMapping(Middleware):
