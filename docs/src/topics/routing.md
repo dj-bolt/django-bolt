@@ -39,6 +39,19 @@ Django-Bolt supports all common HTTP methods:
 | `@api.options()` | OPTIONS | Get allowed methods |
 | `@api.query()` | QUERY | Read using a request body |
 
+A request with a method that the path has no route for gets `405 Method Not Allowed`. The `Allow` header lists the methods of the path. A path with no route gets 404.
+
+```python
+@api.get("/reports")
+async def list_reports():
+    return []
+
+# POST /reports  → 405, Allow: GET, OPTIONS
+# POST /missing  → 404
+```
+
+Bolt adds no HEAD route for a GET route. Thus `HEAD /reports` also gets 405. Add `@api.head()` to serve HEAD.
+
 Example with all methods:
 
 ```python

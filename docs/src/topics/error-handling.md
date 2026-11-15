@@ -324,7 +324,7 @@ For validation errors:
 An error formatter changes the body of each error response that the framework makes. One function formats the errors from all layers:
 
 - The Rust core:
-  - 401 and 403 from guards, and 404 for no route.
+  - 401 and 403 from guards, 404 for no route, and 405 for a route path with no route for the method.
   - 413, and 400 for bad headers.
   - 422 from path, query, header, cookie and form values.
   - 429 from rate limits.
@@ -396,6 +396,7 @@ api = BoltAPI(error_formatter=format_error)
 | `not_authenticated` | 401 | A guard, or an `HTTPException(401)` |
 | `forbidden` | 403 | A guard, the CSRF origin check of Bolt, `PermissionDenied`, a `FileResponse` outside `BOLT_ALLOWED_FILE_PATHS` or an `HTTPException(403)` |
 | `not_found` | 404 | No route, Django's `Http404` (also from `get_object_or_404`), a `FileResponse` or a `File` whose path names no regular file, or an `HTTPException(404)` |
+| `method_not_allowed` | 405 | A path that has routes, but none for the method of the request, or an `HTTPException(405)` |
 | `payload_too_large` | 413 | A body over `BOLT_MAX_UPLOAD_SIZE` |
 | `validation` | 422 | A value that fails validation, in Rust or in Python |
 | `rate_limited` | 429 | A rate limit |
