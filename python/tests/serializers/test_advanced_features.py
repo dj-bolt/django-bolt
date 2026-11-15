@@ -8,6 +8,7 @@ from django_bolt.serializers import (
     Serializer,
     SerializerView,
     computed_field,
+    field,
 )
 
 
@@ -344,6 +345,23 @@ class TestDumpMethods:
         # With exclude_defaults - default values are excluded
         result_filtered = user.dump(exclude_defaults=True)
         assert result_filtered == {"name": "John"}
+
+    def test_dump_exclude_defaults_with_a_mutable_default(self):
+        """An empty list or dict default is a default value, as a default_factory is."""
+
+        class Post(Serializer):
+            title: str
+            tags: list[str] = []
+            meta: dict[str, str] = {}
+            authors: list[str] = field(default_factory=list)
+
+        assert Post(title="a").dump(exclude_defaults=True) == {"title": "a"}
+        assert Post(title="a", tags=["x"], meta={"k": "v"}, authors=["me"]).dump(exclude_defaults=True) == {
+            "title": "a",
+            "tags": ["x"],
+            "meta": {"k": "v"},
+            "authors": ["me"],
+        }
 
     def test_dump_json(self):
         """Test dump_json method."""
