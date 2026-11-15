@@ -581,6 +581,8 @@ A Python middleware before the Django middleware runs before any Django hook, as
 
 Rust-handled middleware configs (for example `@cors` and `@rate_limit`) are still compiled from metadata and executed in Rust.
 
+Python middleware and Django middleware run only for a request that matches a route. Rust answers a request that matches no route, for example with a 404, and no middleware sees it. This is different from Django, where each middleware in `MIDDLEWARE` also sees a request that gets a 404. Thus a logging middleware does not record these requests, and a tenant middleware does not set a tenant for them. The access log of Bolt also has no line for them, so record them at the proxy in front of Bolt.
+
 ## Performance
 
 Django-Bolt's middleware runs in Rust where possible:
