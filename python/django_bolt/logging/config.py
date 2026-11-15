@@ -14,7 +14,7 @@ import contextlib
 import importlib
 import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from logging.handlers import QueueHandler, QueueListener
 from queue import Full, Queue
@@ -87,10 +87,12 @@ class LoggingConfig:
     # Custom exception logging handler
     exception_logging_handler: Callable | None = None
 
-    # Skip logging for specific paths (e.g., health checks)
+    # The access log of runbolt writes no line for a request with one of these
+    # paths (e.g., health checks). The match is exact, on the complete request path.
     skip_paths: set[str] = field(default_factory=lambda: {"/health", "/ready", "/metrics"})
 
-    # Skip logging for specific status codes
+    # The access log of runbolt writes no line for a response with one of these
+    # status codes.
     skip_status_codes: set[int] = field(default_factory=set)
 
     # The access log of runbolt writes this part of the 1xx to 3xx responses
@@ -138,13 +140,43 @@ def _checked_min_duration_ms(value: object, name: str) -> float:
     return float(value)
 
 
-def access_log_filter_meta(config: LoggingConfig) -> dict[str, float]:
+def _checked_skip_paths(value: object) -> tuple[str, ...]:
+    """Return ``value`` as the sorted request paths that write no access-log line."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise ValueError(f"LoggingConfig.skip_paths must be a set of paths, got {value!r}")
+    paths = tuple(value)
+    for path in paths:
+        if not isinstance(path, str):
+            raise ValueError(f"LoggingConfig.skip_paths must hold only str paths, got {path!r}")
+    return tuple(sorted(paths))
+
+
+def _checked_skip_status_codes(value: object) -> tuple[int, ...]:
+    """Return ``value`` as the sorted status codes that write no access-log line."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise ValueError(f"LoggingConfig.skip_status_codes must be a set of status codes, got {value!r}")
+    codes = tuple(value)
+    for code in codes:
+        if isinstance(code, bool) or not isinstance(code, int) or not 100 <= code <= 599:
+            raise ValueError(
+                f"LoggingConfig.skip_status_codes must hold only status codes from 100 to 599, got {code!r}"
+            )
+    return tuple(sorted(codes))
+
+
+def access_log_filter_meta(config: LoggingConfig) -> dict[str, float | tuple[str, ...] | tuple[int, ...]]:
     """Return the route metadata keys for the access-log filter of ``config``.
 
     Rust reads the keys one time, at startup. A key is absent when its option
     sets no limit. A value out of range raises ``ValueError``.
     """
-    meta: dict[str, float] = {}
+    meta: dict[str, float | tuple[str, ...] | tuple[int, ...]] = {}
+    skip_paths = _checked_skip_paths(config.skip_paths)
+    if skip_paths:
+        meta["access_log_skip_paths"] = skip_paths
+    skip_status_codes = _checked_skip_status_codes(config.skip_status_codes)
+    if skip_status_codes:
+        meta["access_log_skip_status_codes"] = skip_status_codes
     if config.sample_rate is not None:
         sample_rate = _checked_sample_rate(config.sample_rate, "LoggingConfig.sample_rate")
         if sample_rate < 1.0:

@@ -1,8 +1,10 @@
-//! The access-log filter of a route: sampling and the slow-request threshold.
+//! The access-log filter of a route: sampling, the slow-request threshold, and
+//! the paths and status codes that write no line.
 //!
-//! Python gives the two values of `LoggingConfig` at route registration. The
+//! Python gives the values of `LoggingConfig` at route registration. The
 //! request path reads them from the route metadata, with no Python call.
 
+use ahash::AHashSet;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -14,10 +16,15 @@ use std::hash::{BuildHasher, Hasher};
 const SAMPLE_RATE_KEY: &str = "access_log_sample_rate";
 /// Route metadata key of `LoggingConfig.min_duration_ms`.
 const MIN_DURATION_KEY: &str = "access_log_min_duration_ms";
+/// Route metadata key of `LoggingConfig.skip_paths`.
+const SKIP_PATHS_KEY: &str = "access_log_skip_paths";
+/// Route metadata key of `LoggingConfig.skip_status_codes`.
+const SKIP_STATUS_CODES_KEY: &str = "access_log_skip_status_codes";
 
-/// Which 1xx to 3xx responses of a route write an access-log line.
-/// A 4xx or a 5xx response always writes its line.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// Which responses of a route write an access-log line.
+/// The sample rate and the threshold apply to a 1xx to 3xx response only.
+/// A skipped path or status code writes no line for each status class.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccessLogFilter {
     /// The part of the 1xx to 3xx responses that write a line, from 0.0 to 1.0.
     sample_rate: Option<f64>,
@@ -25,6 +32,10 @@ pub struct AccessLogFilter {
     min_duration_ms: Option<f64>,
     /// `false` when the two values set no limit. The request path then makes one check.
     has_limit: bool,
+    /// A request with one of these paths writes no line. The match is exact.
+    skip_paths: AHashSet<String>,
+    /// A response with one of these status codes writes no line.
+    skip_status_codes: Vec<u16>,
 }
 
 impl AccessLogFilter {
@@ -33,7 +44,20 @@ impl AccessLogFilter {
             sample_rate,
             min_duration_ms,
             has_limit: sample_rate.is_some() || min_duration_ms.is_some(),
+            skip_paths: AHashSet::new(),
+            skip_status_codes: Vec::new(),
         }
+    }
+
+    /// Add the request paths and the status codes that write no line.
+    pub fn with_skips(
+        mut self,
+        paths: impl IntoIterator<Item = String>,
+        status_codes: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        self.skip_paths = paths.into_iter().collect();
+        self.skip_status_codes = status_codes.into_iter().collect();
+        self
     }
 
     /// Read the filter from the metadata dict of a route. A missing key or
@@ -57,7 +81,23 @@ impl AccessLogFilter {
                 "{MIN_DURATION_KEY} must be 0 or more"
             )));
         }
-        Ok(Self::new(sample_rate, min_duration_ms))
+        let skip_paths = match py_meta.get_item(SKIP_PATHS_KEY)? {
+            Some(value) if !value.is_none() => value.extract::<Vec<String>>()?,
+            _ => Vec::new(),
+        };
+        let skip_status_codes = match py_meta.get_item(SKIP_STATUS_CODES_KEY)? {
+            Some(value) if !value.is_none() => value.extract::<Vec<u16>>()?,
+            _ => Vec::new(),
+        };
+        Ok(Self::new(sample_rate, min_duration_ms).with_skips(skip_paths, skip_status_codes))
+    }
+
+    /// `true` when the config of the route skips this request path or this
+    /// status code. With no skip value, the cost is two length checks.
+    #[inline]
+    pub fn skips(&self, path: &str, status: u16) -> bool {
+        self.skip_status_codes.contains(&status)
+            || (!self.skip_paths.is_empty() && self.skip_paths.contains(path))
     }
 
     /// `true` when the response writes its access-log line.
@@ -168,6 +208,34 @@ mod tests {
     }
 
     #[test]
+    fn a_skipped_path_matches_the_complete_request_path() {
+        let filter = AccessLogFilter::default().with_skips(["/health".to_string()], []);
+        assert!(filter.skips("/health", 200));
+        // A skipped path writes no line for an error.
+        assert!(filter.skips("/health", 503));
+        for path in ["/health/", "/healthy", "/api/health", "/", ""] {
+            assert!(!filter.skips(path, 200), "path {path}");
+        }
+    }
+
+    #[test]
+    fn a_skipped_status_code_applies_to_each_path() {
+        let filter = AccessLogFilter::default().with_skips([], [204, 404]);
+        assert!(filter.skips("/items", 204));
+        assert!(filter.skips("/gone", 404));
+        for status in [200, 205, 304, 403, 500] {
+            assert!(!filter.skips("/items", status), "status {status}");
+        }
+    }
+
+    #[test]
+    fn a_filter_with_no_skip_value_skips_nothing() {
+        let filter = AccessLogFilter::new(Some(0.0), Some(250.0));
+        assert!(!filter.skips("/health", 200));
+        assert!(!filter.skips("", 0));
+    }
+
+    #[test]
     fn the_generator_gives_an_even_spread_in_the_unit_range() {
         let total = 100_000;
         let mut below = 0;
@@ -198,6 +266,21 @@ mod tests {
                 AccessLogFilter::from_python(&meta).unwrap(),
                 AccessLogFilter::new(Some(0.05), Some(250.0))
             );
+
+            meta.set_item("access_log_skip_paths", ("/health", "/ready"))
+                .unwrap();
+            meta.set_item("access_log_skip_status_codes", (204, 304))
+                .unwrap();
+            assert_eq!(
+                AccessLogFilter::from_python(&meta).unwrap(),
+                AccessLogFilter::new(Some(0.05), Some(250.0))
+                    .with_skips(["/ready".to_string(), "/health".to_string()], [204, 304])
+            );
+            // A status code that is not a number from 0 to 65535 is an error.
+            meta.set_item("access_log_skip_status_codes", (-1,))
+                .unwrap();
+            assert!(AccessLogFilter::from_python(&meta).is_err());
+            meta.del_item("access_log_skip_status_codes").unwrap();
 
             meta.set_item("access_log_sample_rate", 1.5).unwrap();
             assert!(AccessLogFilter::from_python(&meta).is_err());

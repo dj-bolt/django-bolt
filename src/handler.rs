@@ -18,7 +18,6 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
 use bolt_asgi::asgi_http;
-use bolt_core::access_log::AccessLogFilter;
 use bolt_core::error::{self, handle_python_error};
 use bolt_core::form_parsing::{
     DEFAULT_MAX_FIELDS, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT, ERROR_TYPE_PAYLOAD_TOO_LARGE,
@@ -776,20 +775,20 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     };
     let kept_req = req.clone();
     let kept_state = state.clone();
-    let mut access_log_filter = None;
-    let mut response = route_request(req, payload, state, &mut access_log_filter).await;
+    let mut access_log_route = None;
+    let mut response = route_request(req, payload, state, &mut access_log_route).await;
     if kept_state.error_renderer.is_some() && response.status().as_u16() >= 400 {
         response = crate::error_formatter::format_error_response(response, &kept_req, &kept_state);
     }
     if let Some(start) = access_log_start
-        && let Some(filter) = access_log_filter
+        && let Some(handler_id) = access_log_route
     {
         write_access_log(
             &kept_state,
             &kept_req,
             response.status().as_u16(),
             start,
-            filter,
+            handler_id,
         );
     }
     response
@@ -809,14 +808,15 @@ fn access_log_level(status: u16) -> (u8, &'static str) {
 }
 
 /// Write the access-log line of one response to the `django.server` logger.
-/// `filter` holds the sample rate and the slow-request threshold of the route.
-/// A 4xx or a 5xx always passes it.
+/// The filter of the route `handler_id` holds the skipped paths and status
+/// codes, the sample rate and the slow-request threshold. A 4xx or a 5xx always
+/// passes the last two. A route with no metadata has no filter.
 fn write_access_log(
     state: &AppState,
     req: &HttpRequest,
     status: u16,
     start: std::time::Instant,
-    filter: AccessLogFilter,
+    handler_id: usize,
 ) {
     let (bit, level) = access_log_level(status);
     if state.access_log_levels & bit == 0 {
@@ -826,8 +826,11 @@ fn write_access_log(
         return;
     };
     let dur_ms = start.elapsed().as_secs_f64() * 1000.0;
-    if !filter.keeps(status, dur_ms) {
-        return;
+    if let Some(meta) = state.route_metadata.get(handler_id) {
+        let filter = &meta.access_log_filter;
+        if filter.skips(req.path(), status) || !filter.keeps(status, dur_ms) {
+            return;
+        }
     }
     let msg = format!(
         "{} {} {} {:.1}ms",
@@ -841,15 +844,6 @@ fn write_access_log(
     });
 }
 
-/// The access-log filter of the route `handler_id`. A route with no metadata has no limit.
-#[inline]
-fn route_access_log_filter(state: &AppState, handler_id: usize) -> AccessLogFilter {
-    state
-        .route_metadata
-        .get(handler_id)
-        .map_or_else(AccessLogFilter::default, |meta| meta.access_log_filter)
-}
-
 /// The error formatter does not change the responses of an MCP or an ASGI mount.
 /// Some of their errors come from shared builders, so remove the `ErrorInfo` here.
 #[inline]
@@ -860,16 +854,17 @@ fn without_error_info(mut response: HttpResponse, state: &AppState) -> HttpRespo
     response
 }
 
-/// Route one request. `access_log_filter` becomes `Some` when the response is
-/// for a Bolt route: each response after the route match, the redirect to the
-/// other slash form of a route path, and the automatic OPTIONS answer.
-/// `handle_request` writes the access-log line for these, if the filter keeps
-/// it. A native route, a mount and a path with no route leave it `None`.
+/// Route one request. `access_log_route` becomes the handler id of the route
+/// when the response is for a Bolt route: each response after the route match,
+/// the redirect to the other slash form of a route path, and the automatic
+/// OPTIONS answer. `handle_request` writes the access-log line for these, if
+/// the filter of that route keeps it. A native route, a mount and a path with
+/// no route leave it `None`.
 async fn route_request(
     req: HttpRequest,
     mut payload: web::Payload,
     state: web::Data<Arc<AppState>>,
-    access_log_filter: &mut Option<AccessLogFilter>,
+    access_log_route: &mut Option<usize>,
 ) -> HttpResponse {
     // Keep as &str - no allocation, only clone on error paths
     let method = req.method().as_str();
@@ -901,8 +896,7 @@ async fn route_request(
                 // Try alternate path - if it matches, send 308 redirect
                 if let Some(alternate) = router.find(method, &alternate_path) {
                     // The line of the redirect has the filter of the route at the other form.
-                    *access_log_filter =
-                        Some(route_access_log_filter(&state, alternate.handler_id()));
+                    *access_log_route = Some(alternate.handler_id());
                     let query = req.query_string();
                     let location = if query.is_empty() {
                         alternate_path
@@ -922,13 +916,9 @@ async fn route_request(
                     let allow_header = available_methods.join(", ");
                     // CORS headers will be added by CorsMiddleware
                     // The line of this answer has the filter of the first route of the path.
-                    *access_log_filter = Some(
-                        router
-                            .find(&available_methods[0], path)
-                            .map_or_else(AccessLogFilter::default, |found| {
-                                route_access_log_filter(&state, found.handler_id())
-                            }),
-                    );
+                    *access_log_route = router
+                        .find(&available_methods[0], path)
+                        .map(|found| found.handler_id());
                     return HttpResponse::NoContent()
                         .insert_header(("Allow", allow_header))
                         .insert_header(("Content-Type", "application/json"))
@@ -1003,8 +993,7 @@ async fn route_request(
     // Get parsed route metadata (Rust-native) by reference.
     // NOTE: Fetch metadata EARLY so we can use optimization flags to skip unnecessary parsing.
     let route_metadata = state.route_metadata.get(handler_id);
-    *access_log_filter =
-        Some(route_metadata.map_or_else(AccessLogFilter::default, |meta| meta.access_log_filter));
+    *access_log_route = Some(handler_id);
 
     // OPTIMIZATION: Extract the execution plan bitfield once (Copy u16).
     // All subsequent flag reads are direct bit-tests, avoiding repeated Option::map closures.
