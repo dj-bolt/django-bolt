@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.exceptions import RequestValidationError
 from django_bolt.serializers import (
     Serializer,
     SerializerView,
@@ -667,6 +670,40 @@ class TestSubsetMethod:
 
         assert [validator.__name__ for validator in Bounds.__model_validators__] == ["check_order"]
         assert [validator.__name__ for validator in LowWithNote.__model_validators__] == ["check_note"]
+
+    def test_subset_leaves_out_a_model_validator_that_calls_a_parent_method(self):
+        """The subset does not have the methods and class variables of the parent."""
+
+        class LimitSerializer(Serializer):
+            LIMIT: ClassVar[int] = 3
+            low: int
+            name: str = ""
+
+            def _low_is_small(self):
+                return self.low <= 5
+
+            @model_validator
+            def check_low(self):
+                if not self._low_is_small():
+                    raise ValueError("low is too large")
+
+            @model_validator
+            def check_name(self):
+                if len(self.name) > self.LIMIT:
+                    raise ValueError("name is too long")
+
+            @model_validator
+            def check_sign(self):
+                if self.low < 0:
+                    raise ValueError("low is below zero")
+
+        Sub = LimitSerializer.subset("low", "name", name="LimitSub")
+
+        assert [validator.__name__ for validator in Sub.__model_validators__] == ["check_sign"]
+        # Before, the copied validators raised AttributeError for each instance.
+        assert Sub(low=9, name="a long name").low == 9
+        with pytest.raises(RequestValidationError):
+            Sub(low=-1)
 
     def test_subset_from_parent(self):
         """Test creating subset instance from parent instance."""

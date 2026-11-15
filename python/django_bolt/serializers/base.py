@@ -1909,7 +1909,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             - The subset inherits validators for included fields
             - The subset inherits a model validator when it has each field that the
               validator names (``self.low``). A model validator that names a field
-              outside the subset does not run for the subset
+              outside the subset does not run for the subset. The same applies to
+              a method or a class variable of the parent that is not in the subset
             - Always define subsets at module level, not inside view functions
         """
         fields_set = frozenset(fields)
@@ -1989,11 +1990,17 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             class_dict["Config"] = Config
 
         # Copy each model validator that the subset can run. A validator that
-        # names a parent field outside the subset reads an attribute that the
-        # subset does not have, so it stays out.
-        missing_fields = frozenset(cls.__struct_fields__) - fields_set
+        # names a parent attribute outside the subset reads an attribute that
+        # the subset does not have, so it stays out. Such an attribute is a
+        # field, a method or a class variable of the parent.
         for validator in cls.__model_validators__:
-            if not (_names_in_code(validator) & missing_fields):
+            if not any(
+                hasattr(cls, name)
+                and name not in fields_set
+                and name not in class_dict
+                and not hasattr(Serializer, name)
+                for name in _names_in_code(validator)
+            ):
                 class_dict[validator.__name__] = validator
 
         # Create the new Serializer subclass. We intentionally do NOT inherit
