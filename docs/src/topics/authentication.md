@@ -25,7 +25,7 @@ async def profile(request):
 
 This endpoint:
 
-1. Expects a JWT token in the `Authorization` header: `Bearer <token>`
+1. Expects a JWT token in the `Authorization` header: `Bearer <token>`. The scheme name has no case, so `bearer <token>` also works.
 2. Validates the token signature and expiration
 3. Rejects the request with 401 if the token is invalid
 4. Populates `request.context` with token claims
