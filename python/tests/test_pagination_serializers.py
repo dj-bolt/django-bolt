@@ -12,7 +12,14 @@ import builtins
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI, CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
+from django_bolt import (
+    BoltAPI,
+    CursorPagination,
+    LimitOffsetPagination,
+    PageNumberPagination,
+    PaginatedResponse,
+    paginate,
+)
 from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
 from django_bolt.views import ViewSet
@@ -177,6 +184,12 @@ def test_paginate_with_bolt_serializer_uses_dump_many(sample_articles):
         all_ids = page1_ids | page2_ids | page3_ids
         assert len(all_ids) == 25
 
+        # A page of one item uses the serializer too
+        one_item = client.get("/articles?page_size=1")
+        assert one_item.status_code == 200
+        assert one_item.json()["page_size"] == 1
+        assert [set(item) for item in one_item.json()["items"]] == [{"id", "title", "author"}]
+
 
 @pytest.mark.django_db(transaction=True)
 def test_paginate_with_bolt_serializer_detail_fields(sample_articles):
@@ -288,6 +301,31 @@ def test_paginate_with_nested_serializer_uses_afrom_model(sample_blog_posts):
 
 
 @pytest.mark.django_db(transaction=True)
+def test_paginate_list_of_models_loads_the_relations_of_a_nested_serializer(sample_blog_posts):
+    """A list of model instances has no loading plan. The page loads the relation of each item."""
+    api = BoltAPI()
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 2
+
+    @api.get("/posts", response_model=list[BlogPostListSerializer])
+    @paginate(SmallPagePagination)
+    async def list_posts(request):
+        return [post async for post in BlogPost.objects.order_by("id")]
+
+    with TestClient(api) as client:
+        response = client.get("/posts?page=2")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 5
+    assert [(item["title"], item["author"]["name"]) for item in data["items"]] == [
+        ("Post 3", "Author 3"),
+        ("Post 4", "Author 4"),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
 def test_paginate_preloads_relations_instead_of_per_item_async_loading(sample_blog_posts, monkeypatch):
     """A page of nested-FK items is served from the serializer's loading plan.
 
@@ -368,15 +406,19 @@ def test_paginate_with_msgspec_struct(sample_articles):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_paginate_without_serializer_uses_fallback(sample_articles):
-    """Test that @paginate falls back to _model_to_dict when no serializer is provided."""
+@pytest.mark.parametrize("response_model", [None, list[dict]])
+def test_paginate_without_serializer_uses_fallback(sample_articles, response_model):
+    """Test that @paginate falls back to _model_to_dict when no serializer is provided.
+
+    An item type that is not a serializer, such as dict, gives the same fallback.
+    """
     api = BoltAPI()
 
     class SmallPagePagination(PageNumberPagination):
         page_size = 10
 
-    # No response_model or return type annotation
-    @api.get("/articles")
+    # No response_model or return type annotation, or one without a serializer
+    @api.get("/articles", response_model=response_model)
     @paginate(SmallPagePagination)
     async def list_articles(request):
         return Article.objects.all()
@@ -547,14 +589,18 @@ def test_paginate_with_empty_queryset_and_serializer(db):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_paginate_with_filtered_queryset_and_serializer(sample_articles):
-    """Test pagination with filtered queryset and serializer."""
+@pytest.mark.parametrize("response_model", [list[ArticleListSerializer], PaginatedResponse[ArticleListSerializer]])
+def test_paginate_with_filtered_queryset_and_serializer(sample_articles, response_model):
+    """Test pagination with filtered queryset and serializer.
+
+    The response model can be the list of items or the envelope of the page.
+    """
     api = BoltAPI()
 
     class SmallPagePagination(PageNumberPagination):
         page_size = 10
 
-    @api.get("/articles", response_model=list[ArticleListSerializer])
+    @api.get("/articles", response_model=response_model)
     @paginate(SmallPagePagination)
     async def list_articles(request, is_published: bool = None):
         qs = Article.objects.all()
@@ -573,7 +619,7 @@ def test_paginate_with_filtered_queryset_and_serializer(sample_articles):
 
         # Verify serializer still applied
         first_item = data["items"][0]
-        assert "content" not in first_item
+        assert set(first_item) == {"id", "title", "author"}
 
 
 @pytest.mark.django_db(transaction=True)
@@ -589,7 +635,7 @@ def test_paginate_with_values_queryset_uses_fallback(sample_articles):
     async def list_articles(request):
         # values() returns dicts, not model instances
         # The serializer won't be able to use from_model(), so it falls back
-        return Article.objects.values("id", "title", "author")
+        return Article.objects.values("id", "title", "author", "content")
 
     with TestClient(api) as client:
         response = client.get("/articles?page=1")
@@ -598,11 +644,9 @@ def test_paginate_with_values_queryset_uses_fallback(sample_articles):
         data = response.json()
         assert len(data["items"]) == 10
 
-        # values() returns dicts, so all fields from values() will be present
+        # values() returns dicts. The page keeps only the fields of the serializer.
         first_item = data["items"][0]
-        assert "id" in first_item
-        assert "title" in first_item
-        assert "author" in first_item
+        assert set(first_item) == {"id", "title", "author"}
 
 
 # ============================================================================

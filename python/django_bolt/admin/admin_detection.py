@@ -9,7 +9,7 @@ import sys
 
 from django.conf import settings
 from django.contrib.sessions.middleware import SessionMiddleware
-from django.urls import get_resolver
+from django.urls import NoReverseMatch, get_script_prefix, reverse
 from django.utils.module_loading import import_string
 
 logger = logging.getLogger(__name__)
@@ -58,55 +58,32 @@ def is_admin_installed() -> bool:
 
 def detect_admin_url_prefix() -> str | None:
     """
-    Detect the URL prefix for Django admin by parsing urlpatterns.
+    Find the URL prefix of the Django admin site.
+
+    Django resolves the admin index through the URL resolver tree. Thus the
+    prefix is correct for a regex pattern, a nested ``include()`` and an
+    ``AdminSite`` with its own name.
 
     Returns:
-        Admin URL prefix (e.g., 'admin' or 'dashboard') or None if not found
+        The prefix with no slash at its ends, for example ``"admin"`` or
+        ``"portal/staff"``. ``""`` when the admin site is at the root path.
+        ``"admin"`` when the URLconf has no admin site that Django can
+        reverse. ``None`` when the admin is not installed.
     """
     if not is_admin_installed():
         return None
 
+    urlconf = getattr(settings, "ROOT_URLCONF", None)
+    if not urlconf:
+        return "admin"
+
     try:
-        # Get root URL resolver
-        resolver = get_resolver(getattr(settings, "ROOT_URLCONF", None))
+        index_url = reverse("admin:index", urlconf=urlconf)
+    except NoReverseMatch:
+        return "admin"
 
-        # Search for admin patterns
-        for url_pattern in resolver.url_patterns:
-            # Check if this is admin.site.urls
-            if hasattr(url_pattern, "app_name") and url_pattern.app_name == "admin":
-                # Extract the pattern prefix
-                pattern_str = str(url_pattern.pattern)
-                # Remove trailing slash and special regex chars
-                prefix = pattern_str.rstrip("/^$")
-                return prefix if prefix else "admin"
-
-            # Also check URLResolver with admin urlconf
-            if hasattr(url_pattern, "urlconf_name"):
-                urlconf = url_pattern.urlconf_name
-                # Check if urlconf module contains admin.site
-                if hasattr(urlconf, "__name__") and "admin" in str(urlconf.__name__):
-                    pattern_str = str(url_pattern.pattern)
-                    prefix = pattern_str.rstrip("/^$")
-                    return prefix if prefix else "admin"
-
-                # Check if urlconf is a list containing admin patterns
-                if isinstance(urlconf, (list, tuple)):
-                    for sub_pattern in urlconf:
-                        if (
-                            hasattr(sub_pattern, "callback")
-                            and hasattr(sub_pattern.callback, "__module__")
-                            and "admin" in sub_pattern.callback.__module__
-                        ):
-                            pattern_str = str(url_pattern.pattern)
-                            prefix = pattern_str.rstrip("/^$")
-                            return prefix if prefix else "admin"
-
-    except Exception as e:
-        # If detection fails, log warning and return default
-        print(f"[django-bolt] Warning: Could not auto-detect admin URL prefix: {e}", file=sys.stderr)
-
-    # Default fallback
-    return "admin"
+    # reverse() puts the script prefix (FORCE_SCRIPT_NAME) first. A mount path does not have it.
+    return index_url.removeprefix(get_script_prefix()).strip("/")
 
 
 def get_admin_route_patterns() -> list[tuple[str, list[str]]]:

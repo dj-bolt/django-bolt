@@ -235,6 +235,25 @@ async def wait(timeout: datetime.timedelta):
 `/wait?timeout=PT5S` gives `timedelta(seconds=5)`. Text that is not a duration gives a 422.
 This applies to path, query, header, cookie and form parameters.
 
+### bytes parameters
+
+A `bytes` parameter gets the UTF-8 bytes of the text value:
+
+```python
+@api.get("/echo")
+async def echo(token: bytes):
+    return {"length": len(token)}
+```
+
+`GET /echo?token=abc` gives the handler `b"abc"`. Bolt does not decode base64.
+This rule applies to a path, query, header, cookie and form parameter.
+It also applies to `bytearray`, to a sequence such as `list[bytes]`, and to a `bytes` item of a tuple such as `tuple[bytes, int]`.
+A `msgspec.Meta` constraint such as `max_length` counts the bytes.
+
+A `bytes` field of a [parameter model](#parameter-models) follows the same rule. The model can be a `Query()`, `Form()`, `Header()` or `Cookie()` model.
+
+A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64.
+
 ### Types that Bolt cannot convert
 
 A path, query, header, cookie or form parameter gets text from the request.
@@ -264,6 +283,24 @@ class CreateUser(msgspec.Struct):
 async def create_user(user: CreateUser):
     return {"username": user.username}
 ```
+
+A list of structs reads a JSON array:
+
+```python
+@api.post("/users/bulk")
+async def create_users(users: list[CreateUser]):
+    return {"count": len(users)}
+```
+
+A request with no body gives a 422. To make the body optional, give the parameter a default:
+
+```python
+@api.post("/search")
+async def search(filters: CreateUser | None = None):
+    return {"filtered": filters is not None}
+```
+
+A request with no body then gives the default. A body that is present must be valid JSON of the type.
 
 ### Raw body access
 
@@ -482,6 +519,8 @@ async def login(
     return {"username": username}
 ```
 
+A repeated field keeps its last value, as a repeated query key does. Declare a `list`, `set`, `frozenset` or `tuple` to take each value.
+
 A URL-encoded body can have 1000 fields or fewer. Django has the same default limit, `DATA_UPLOAD_MAX_NUMBER_FIELDS`. A repeated key counts once for each field. A body with more fields gets 422 with the error type `too_many_fields`. A multipart body can have 100 parts or fewer.
 
 ### Multipart forms
@@ -577,6 +616,8 @@ async def secure_endpoint(headers: Annotated[AuthHeaders, Header()]):
 
 Request: `GET /secure` with headers `X-Api-Key: secret123`
 
+A `list`, `set`, `frozenset` or `tuple` field gets a sequence of one item, the value of the header. Bolt does not split the value at a comma.
+
 ### Cookie models
 
 Group cookies:
@@ -591,6 +632,37 @@ class SessionCookies(msgspec.Struct):
 async def get_preferences(cookies: Annotated[SessionCookies, Cookie()]):
     return {"theme": cookies.theme, "language": cookies.language}
 ```
+
+### Optional models
+
+Give the parameter a default to make the model optional:
+
+```python
+@api.get("/items/search")
+async def search_items(params: Annotated[FilterParams | None, Query()] = None):
+    return {"filtered": params is not None}
+```
+
+A request with none of the keys of the model gives the default.
+A request with one of the keys validates the model, so a missing required field gives a 422.
+This applies to `Query()`, `Header()`, `Cookie()` and `Form()` models.
+
+### Unknown keys
+
+A parameter model ignores a key that it does not declare. To reject such a key, set `forbid_unknown_fields=True`:
+
+```python
+class StrictFilters(msgspec.Struct, forbid_unknown_fields=True):
+    page: int = 1
+
+@api.get("/strict")
+async def strict(filters: Annotated[StrictFilters, Query()], limit: int = 10):
+    return {"page": filters.page, "limit": limit}
+```
+
+`/strict?page=2&limit=5` passes, because `limit` is a parameter of the handler.
+`/strict?page=2&other=1` gives a 422 with the type `unknown_field` and the `loc` `["query", "other"]`.
+The keys of a dependency are not parameters of the handler, so the model rejects them.
 
 ### Benefits of parameter models
 
@@ -734,6 +806,22 @@ async def upload_multiple(
         "filenames": [f.filename for f in files],
     }
 ```
+
+### File content as bytes
+
+Use `bytes` when the handler needs only the content of the file. Use `list[bytes]` for the content of each file:
+
+```python
+@api.post("/checksum")
+async def checksum(data: Annotated[bytes, File(max_size=FileSize.MB_5)]):
+    return {"size": len(data)}
+
+@api.post("/checksums")
+async def checksums(parts: Annotated[list[bytes], File(max_files=5)]):
+    return {"sizes": [len(part) for part in parts]}
+```
+
+Bolt reads the complete file into memory for a `bytes` parameter. Set `max_size`. Use `UploadFile` for a large file, or when you need the filename or the content type.
 
 ### Saving to Django FileField / ImageField
 

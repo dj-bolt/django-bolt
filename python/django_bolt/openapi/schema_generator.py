@@ -25,7 +25,8 @@ from ..responses import (
     Redirect,
     StreamingResponse,
 )
-from ..serializers.fields import _FieldMarker
+from ..serializers.base import Serializer
+from ..serializers.fields import FieldConfig, _FieldMarker
 from ..typing import is_msgspec_struct, is_optional, resolve_type_alias, unwrap_optional
 from ..views import _layer
 from .spec import (
@@ -59,7 +60,7 @@ class OpenAPIStrictError(ValueError):
     annotation / ``response_model``) and components that needed the
     ``module.qualname`` fallback because two types share a short name. An
     ``error_formatter`` without ``error_schema`` is an offender when a route
-    has a 422 response.
+    has a 422, 401 or 403 response.
     """
 
 
@@ -75,6 +76,11 @@ _RESPONSE_CLASS_MEDIA: tuple[tuple[type, str, Schema], ...] = (
 )
 
 
+# The response of a handler that returns a plain ``str`` or plain ``bytes``.
+_STR_MEDIA: tuple[str, Schema] = ("text/plain", Schema(type="string"))
+_BYTES_MEDIA: tuple[str, Schema] = ("application/octet-stream", Schema(type="string", format="binary"))
+
+
 def _response_class_media(response_class: type | None) -> tuple[str, Schema] | None:
     if response_class is None:
         return None
@@ -82,6 +88,13 @@ def _response_class_media(response_class: type | None) -> tuple[str, Schema] | N
         if issubclass(response_class, cls):
             return media_type, schema
     return None
+
+
+def _is_response_class(annotation: Any) -> bool:
+    """True for a response class that the generator documents with its own media type or as a redirect."""
+    return isinstance(annotation, type) and (
+        issubclass(annotation, Redirect) or _response_class_media(annotation) is not None
+    )
 
 
 def _struct_origin(annotation: Any) -> type | None:
@@ -123,15 +136,39 @@ class ComponentNameCollisionError(ValueError):
         )
 
 
-# Mapping from auth backend scheme_name to OpenAPI security scheme identifier
-_SCHEME_NAME_MAP: dict[str, str] = {
-    "jwt": "BearerAuth",
-    "api_key": "ApiKeyAuth",
-    "session": "SessionAuth",
-}
+def _backend_security_scheme(backend: Any) -> tuple[str, SecurityScheme] | None:
+    """The OpenAPI security scheme of an auth backend, with its name in the document.
+
+    The scheme follows the place where Bolt reads the credential. The result
+    is None for a backend that Bolt does not know.
+    """
+    kind = backend.scheme_name
+    if kind == "jwt":
+        if backend.cookie:
+            # Bolt reads the token only from this cookie.
+            return "JWTCookieAuth", SecurityScheme(
+                type="apiKey", name=backend.cookie, security_scheme_in="cookie", description="A JWT"
+            )
+        if backend.header.lower() != "authorization":
+            # The "bearer" scheme is for the Authorization header only.
+            return "JWTHeaderAuth", SecurityScheme(
+                type="apiKey", name=backend.header, security_scheme_in="header", description="A JWT"
+            )
+        return "BearerAuth", SecurityScheme(type="http", scheme="bearer", bearer_format="JWT")
+    if kind == "api_key":
+        return "ApiKeyAuth", SecurityScheme(type="apiKey", name=backend.header, security_scheme_in="header")
+    if kind == "session":
+        return "SessionAuth", SecurityScheme(
+            type="apiKey", name=django_settings.SESSION_COOKIE_NAME, security_scheme_in="cookie"
+        )
+    return None
 
 
 _PATH_PARAM_RE = re.compile(r"{([^{}]+)}")
+
+# The sources of a route field that Bolt validates. A value that fails gives a 422.
+_PARAMETER_SOURCES = frozenset({"path", "query", "header", "cookie"})
+_FORM_SOURCES = frozenset({"form", "file"})
 
 
 def _extract_path_param_names(path: str) -> list[str]:
@@ -315,11 +352,22 @@ class SchemaGenerator:
 
     def _form_field_schema(self, annotation: Any, marker: Any, default: Any) -> Schema | Reference:
         """The schema of one form field, with the description and the default of its marker."""
-        schema = self._type_to_schema(annotation)
+        schema = self._type_to_schema(annotation, null_arm=False)
         if isinstance(schema, Schema) and marker and marker.description:
             schema = replace(schema, description=marker.description)
         if default not in (inspect.Parameter.empty, None):
             schema = self._with_default(schema, default)
+        return schema
+
+    @classmethod
+    def _file_part_schema(cls, schema: Schema | Reference) -> Schema | Reference:
+        """The schema of a file part. A file part holds the raw bytes, not base64 text."""
+        if not isinstance(schema, Schema):
+            return schema
+        if schema.content_encoding == "base64":
+            return replace(schema, content_encoding=None, format="binary")
+        if schema.type == "array" and schema.items is not None:
+            return replace(schema, items=cls._file_part_schema(schema.items))
         return schema
 
     @staticmethod
@@ -462,12 +510,51 @@ class SchemaGenerator:
                 setattr(schema, attr, value)
         return schema
 
+    def _with_field_options(self, schema: Schema | Reference, config: FieldConfig) -> Schema | Reference:
+        """Add ``description``, ``title``, ``examples`` and ``deprecated`` of ``field()`` to a property schema.
+
+        A component reference keeps the options next to it, in an ``allOf`` wrapper.
+        """
+        options = self._schema_kwargs(
+            description=config.description,
+            title=config.title,
+            examples=config.examples,
+            deprecated=config.deprecated or None,
+        )
+        if not options:
+            return schema
+        if isinstance(schema, Schema):
+            return replace(schema, **options)
+        return Schema(all_of=[schema], **options)
+
+    @staticmethod
+    def _field_configs(struct_type: Any) -> dict[str, FieldConfig]:
+        """Give the ``field()`` config of each field of a Serializer class, by field name.
+
+        The class keeps one config map for a field with a default and for a required field.
+        A struct that is not a Serializer has no config.
+        """
+        if not (isinstance(struct_type, type) and issubclass(struct_type, Serializer)):
+            return {}
+        struct_type._ensure_dump_ready()
+        return struct_type.__field_configs__
+
+    @staticmethod
+    def _field_in_schema(config: FieldConfig | None) -> bool:
+        """False for a Serializer field with ``field(include_in_schema=False)``."""
+        return config is None or config.include_in_schema
+
     def _msgspec_field_schema(
-        self, field: Any, *, register_component: bool = False
+        self, field: Any, config: FieldConfig | None = None, *, register_component: bool = False
     ) -> tuple[str, Schema | Reference, bool]:
-        """Build a schema and required flag for a msgspec-inspected field."""
+        """Build a schema and required flag for a msgspec-inspected field.
+
+        ``config`` is the ``field()`` config of a Serializer field, or None.
+        """
         field_name = field.encode_name
         field_schema = self._type_to_schema(field.type, register_component=register_component)
+        if config is not None:
+            field_schema = self._with_field_options(field_schema, config)
 
         default = field.default
         has_default = default is not msgspec.NODEFAULT
@@ -504,6 +591,18 @@ class SchemaGenerator:
 
         return field_name, field_schema, field_required
 
+    def _is_excluded(self, path: str) -> bool:
+        """True for a route below the docs path or below an ``exclude_paths`` entry.
+
+        An entry matches whole path segments. ``/admin`` matches ``/admin`` and
+        ``/admin/users``. It does not match ``/administrators``.
+        """
+        for prefix in (self.config.path, *self.config.exclude_paths):
+            prefix = prefix.rstrip("/")
+            if path == prefix or path.startswith(prefix + "/"):
+                return True
+        return False
+
     def generate(self) -> OpenAPI:
         """Generate complete OpenAPI schema.
 
@@ -512,9 +611,10 @@ class SchemaGenerator:
         """
         openapi = self.config.to_openapi_schema()
 
-        # Track auth schemes seen during _extract_security calls
-        self._seen_schemes: set[str] = set()
-        self._api_key_header: str | None = None
+        # The security schemes of the auth backends, filled by _extract_security calls.
+        # The schemes of the config come first: a name of the user keeps its scheme.
+        self._user_security_schemes = dict(openapi.components.security_schemes or {})
+        self._security_schemes: dict[str, SecurityScheme] = {}
 
         # Generate path items from routes and collect tags
         paths: dict[str, PathItem] = {}
@@ -528,20 +628,14 @@ class SchemaGenerator:
         # 3.1.0 for maximum downstream tooling compatibility.
         has_query_operation = False
 
+        # An operationId must be unique in the document. The id of a route is
+        # method + function name, so two routes can share one.
+        self._operation_ids: set[str] = set()
+
         # Process HTTP routes
         for method, path, handler_id, handler in self.api._routes:
-            # Skip OpenAPI docs routes (always excluded)
-            if path.startswith(self.config.path):
-                continue
-
-            # Skip paths based on exclude_paths configuration
-            should_exclude = False
-            for exclude_prefix in self.config.exclude_paths:
-                if path.startswith(exclude_prefix):
-                    should_exclude = True
-                    break
-
-            if should_exclude:
+            # Skip the OpenAPI docs routes (always excluded) and the exclude_paths configuration
+            if self._is_excluded(path):
                 continue
 
             # Get handler metadata
@@ -562,6 +656,7 @@ class SchemaGenerator:
             )
 
             # Collect tags from operation
+            operation.operation_id = self._unique_operation_id(operation.operation_id)
             if operation.tags:
                 collected_tags.update(operation.tags)
 
@@ -573,18 +668,8 @@ class SchemaGenerator:
 
         # Process WebSocket routes
         for ws_path, handler_id, handler in self.api._websocket_routes:
-            # Skip OpenAPI docs routes (always excluded)
-            if ws_path.startswith(self.config.path):
-                continue
-
-            # Skip paths based on exclude_paths configuration
-            should_exclude = False
-            for exclude_prefix in self.config.exclude_paths:
-                if ws_path.startswith(exclude_prefix):
-                    should_exclude = True
-                    break
-
-            if should_exclude:
+            # Skip the OpenAPI docs routes (always excluded) and the exclude_paths configuration
+            if self._is_excluded(ws_path):
                 continue
 
             # Get handler metadata
@@ -604,6 +689,7 @@ class SchemaGenerator:
             )
 
             # Collect tags from operation
+            operation.operation_id = self._unique_operation_id(operation.operation_id)
             if operation.tags:
                 collected_tags.update(operation.tags)
 
@@ -651,12 +737,22 @@ class SchemaGenerator:
                 formatter = self.api._error_formatter
                 name = getattr(formatter, "__name__", type(formatter).__name__)
                 problems.append(
-                    f"the error_formatter {name} has no error_schema, so the 422 responses have no body "
+                    f"the error_formatter {name} has no error_schema, so the error responses have no body "
                     "schema (decorate the formatter with error_schema)"
                 )
             raise OpenAPIStrictError("OpenAPI strict mode: " + "; ".join(problems))
 
         return openapi
+
+    def _unique_operation_id(self, operation_id: str) -> str:
+        """Return operation_id, or operation_id with a numeric suffix when it is taken."""
+        candidate = operation_id
+        number = 1
+        while candidate in self._operation_ids:
+            number += 1
+            candidate = f"{operation_id}_{number}"
+        self._operation_ids.add(candidate)
+        return candidate
 
     def _create_operation(
         self,
@@ -694,6 +790,8 @@ class SchemaGenerator:
 
         # Extract security requirements
         security = self._extract_security(handler_id)
+        if self.config.include_error_responses:
+            self._add_auth_error_responses(responses, handler_id)
 
         # Prefer explicit tags over auto-extracted tags
         tags = meta.get("openapi_tags")
@@ -710,6 +808,7 @@ class SchemaGenerator:
             security=security,
             tags=tags,
             operation_id=f"{method.lower()}_{handler.__name__}",
+            deprecated=bool(meta.get("openapi_deprecated")),
         )
 
         return operation
@@ -888,8 +987,12 @@ class SchemaGenerator:
             # Handle msgspec.Struct in query parameters
             if source == "query" and is_msgspec_struct(annotation):
                 struct_info = msgspec.inspect.type_info(annotation)
+                field_configs = self._field_configs(annotation)
                 for struct_field in struct_info.fields:
-                    field_name, field_schema, field_required = self._msgspec_field_schema(struct_field)
+                    field_config = field_configs.get(struct_field.name)
+                    if not self._field_in_schema(field_config):
+                        continue
+                    field_name, field_schema, field_required = self._msgspec_field_schema(struct_field, field_config)
                     parameters.append(
                         Parameter(
                             name=field_name,
@@ -902,10 +1005,11 @@ class SchemaGenerator:
                 continue
 
             # Get schema for parameter type
-            schema = self._type_to_schema(annotation)
+            schema = self._type_to_schema(annotation, null_arm=False)
             # A path, a header or a cookie gives one value, so its array holds exactly one item.
             if param_in != "query" and isinstance(schema, Schema) and schema.type == "array":
-                schema = replace(schema, min_items=1, max_items=1)
+                # An empty default must stay valid for the schema, so it sets no minimum.
+                schema = replace(schema, min_items=None if default == [] else 1, max_items=1)
             if default not in (inspect.Parameter.empty, None):
                 schema = replace(schema, default=default)
 
@@ -965,6 +1069,19 @@ class SchemaGenerator:
             if dependency_body is not None:
                 body_param, body_type = dependency_body.name, dependency_body.annotation
 
+        body_required = True
+        if not body_param or not body_type:
+            # A JSON body that is not a struct, such as a list of structs with Body().
+            body_field = next((f for f in fields if f.source == "body"), None)
+            if body_field is not None:
+                body_param, body_type, body_required = body_field.name, body_field.annotation, body_field.is_required
+
+        if not body_param or not body_type:
+            # A JSON body of another type, such as a dict.
+            plain_body = next((f for f in fields if f.source == "body"), None)
+            if plain_body is not None:
+                body_param, body_type = plain_body.name, plain_body.annotation
+
         if not body_param or not body_type:
             # A JSON body of another type, such as a dict.
             plain_body = next((f for f in fields if f.source == "body"), None)
@@ -992,16 +1109,23 @@ class SchemaGenerator:
                     # UploadFile branch in _type_to_schema fires for file fields.
                     unwrapped = unwrap_optional(annotation)
                     if is_msgspec_struct(unwrapped):
+                        field_configs = self._field_configs(unwrapped)
                         for struct_field in msgspec.structs.fields(unwrapped):
+                            field_config = field_configs.get(struct_field.name)
+                            if not self._field_in_schema(field_config):
+                                continue
                             sub_name, sub_schema, sub_required = self._msgspec_field_schema(
-                                struct_field, register_component=False
+                                struct_field, field_config, register_component=False
                             )
                             properties[sub_name] = sub_schema
                             if sub_required:
                                 required.append(sub_name)
                         continue
 
-                    properties[name] = self._form_field_schema(annotation, field.param, default)
+                    field_schema = self._form_field_schema(annotation, field.param, default)
+                    if field.source == "file":
+                        field_schema = self._file_part_schema(field_schema)
+                    properties[name] = field_schema
                     if default == inspect.Parameter.empty and not is_optional(annotation):
                         required.append(name)
 
@@ -1011,14 +1135,12 @@ class SchemaGenerator:
                     required=required or None,
                 )
 
-                return RequestBody(
-                    description="Form data",
-                    content={
-                        "multipart/form-data": OpenAPIMediaType(schema=schema),
-                        "application/x-www-form-urlencoded": OpenAPIMediaType(schema=schema),
-                    },
-                    required=bool(required),
-                )
+                content = {"multipart/form-data": OpenAPIMediaType(schema=schema)}
+                # A urlencoded body cannot hold a file.
+                if not meta.get("has_file_uploads"):
+                    content["application/x-www-form-urlencoded"] = OpenAPIMediaType(schema=schema)
+
+                return RequestBody(description="Form data", content=content, required=bool(required))
 
             return None
 
@@ -1030,8 +1152,43 @@ class SchemaGenerator:
             content={
                 "application/json": OpenAPIMediaType(schema=schema),
             },
-            required=True,
+            required=body_required,
         )
+
+    def _response_type_content(self, response_type: Any) -> dict[str, OpenAPIMediaType]:
+        """Return the content of a response type, by the media type of each result.
+
+        Bolt sends a ``str`` result as text/plain and a ``bytes`` result as
+        application/octet-stream. Each other result is JSON. Thus ``str | None``
+        has a text/plain string and an application/json null.
+        """
+        arms = get_args(response_type) if get_origin(response_type) in (Union, UnionType) else (response_type,)
+        json_arms = [arm for arm in arms if arm not in (str, bytes, bytearray)]
+        if len(json_arms) == len(arms):
+            schema = self._type_to_schema(response_type, register_component=True)
+            examples = _build_union_examples(response_type)
+            return {"application/json": OpenAPIMediaType(schema=schema, examples=examples)}
+
+        content: dict[str, OpenAPIMediaType] = {}
+        if str in arms:
+            content[_STR_MEDIA[0]] = OpenAPIMediaType(schema=_STR_MEDIA[1])
+        if bytes in arms or bytearray in arms:
+            content[_BYTES_MEDIA[0]] = OpenAPIMediaType(schema=_BYTES_MEDIA[1])
+        if not json_arms:
+            return content
+        # The JSON results: the type with no str arm and no bytes arm.
+        json_type = json_arms[0]
+        for arm in json_arms[1:]:
+            json_type = json_type | arm
+        if len(json_arms) == 2 and type(None) in json_arms:
+            # A None result is the JSON null, so T | None keeps its null arm.
+            value_type = json_arms[0] if json_arms[1] is type(None) else json_arms[1]
+            value_schema = self._type_to_schema(value_type, register_component=True)
+            schema = self._union_schema([value_schema], has_none=True, tagged=False)
+        else:
+            schema = self._type_to_schema(json_type, register_component=True)
+        content["application/json"] = OpenAPIMediaType(schema=schema, examples=_build_union_examples(json_type))
+        return content
 
     def _extract_responses(
         self, meta: dict[str, Any], handler_id: int, *, method: str = "", path: str = ""
@@ -1056,15 +1213,9 @@ class SchemaGenerator:
                 if resp_type is None:
                     responses[str(code)] = OpenAPIResponse(description=desc)
                 else:
-                    schema = self._type_to_schema(resp_type, register_component=True)
                     responses[str(code)] = OpenAPIResponse(
                         description=desc,
-                        content={
-                            "application/json": OpenAPIMediaType(
-                                schema=schema,
-                                examples=_build_union_examples(resp_type),
-                            )
-                        },
+                        content=self._response_type_content(resp_type),
                     )
             # Ellipsis catch-all → OpenAPI "default" response
             if ... in response_map:
@@ -1072,15 +1223,9 @@ class SchemaGenerator:
                 if ellipsis_type is None:
                     responses["default"] = OpenAPIResponse(description="Default response")
                 else:
-                    schema = self._type_to_schema(ellipsis_type, register_component=True)
                     responses["default"] = OpenAPIResponse(
                         description="Default response",
-                        content={
-                            "application/json": OpenAPIMediaType(
-                                schema=schema,
-                                examples=_build_union_examples(ellipsis_type),
-                            )
-                        },
+                        content=self._response_type_content(ellipsis_type),
                     )
             # fall through to error response logic below
         else:
@@ -1090,8 +1235,16 @@ class SchemaGenerator:
             default_status = meta.get("default_status_code", 200)
 
             response_class = meta.get("response_class")
+            if _is_response_class(response_type):
+                # ``-> StreamingResponse`` names the response class. It is not the type of a JSON body.
+                response_class = response_class or response_type
+                response_type = None
             has_type = bool(response_type) and response_type != inspect._empty
             media = _response_class_media(response_class)
+            if response_class is None and (response_type is str or response_type is bytes):
+                # Bolt sends a str as text and bytes as they are. Neither is a JSON body.
+                media = _STR_MEDIA if response_type is str else _BYTES_MEDIA
+                has_type = False
 
             if response_class is not None and issubclass(response_class, Redirect):
                 # A redirect has no body; the default 200 is meaningless here.
@@ -1109,16 +1262,9 @@ class SchemaGenerator:
                     content={media_type: OpenAPIMediaType(schema=body_schema)},
                 )
             elif has_type:
-                schema = self._type_to_schema(response_type, register_component=True)
-
                 responses[str(default_status)] = OpenAPIResponse(
                     description="Successful response",
-                    content={
-                        "application/json": OpenAPIMediaType(
-                            schema=schema,
-                            examples=_build_union_examples(response_type),
-                        ),
-                    },
+                    content=self._response_type_content(response_type),
                 )
             else:
                 # Opaque JSON: nothing to type. Recorded for strict mode.
@@ -1132,14 +1278,15 @@ class SchemaGenerator:
 
         # Add common error responses if enabled in config
         if self.config.include_error_responses:
-            # Check if request body is present (for 422 validation errors)
-            has_request_body = meta.get("body_struct_param") or any(
-                f.source in ("body", "form", "file") for f in self._route_fields(meta)
-            )
+            # Bolt validates each parameter and the request body, so each of them can give a 422.
+            sources = {f.source for f in self._route_fields(meta)}
+            has_parameters = not sources.isdisjoint(_PARAMETER_SOURCES)
+            has_form = not sources.isdisjoint(_FORM_SOURCES)
+            has_request_body = bool(meta.get("body_struct_param")) or has_form or "body" in sources
 
-            if has_request_body:
+            if has_request_body or has_parameters:
                 # 422 Unprocessable Entity - validation errors
-                content = self._validation_error_content()
+                content = self._validation_error_content(text_detail=has_parameters or has_form)
                 declared = responses.get("422")
                 if declared is None:
                     responses["422"] = OpenAPIResponse(
@@ -1171,10 +1318,12 @@ class SchemaGenerator:
                 merged[media_type] = replace(existing, schema=Schema(any_of=[existing.schema, media.schema]))
         return merged or None
 
-    def _validation_error_content(self) -> dict[str, OpenAPIMediaType] | None:
+    def _validation_error_content(self, *, text_detail: bool = False) -> dict[str, OpenAPIMediaType] | None:
         """The content of a 422 response, as the error formatter of the API sends it.
 
-        Without a formatter, the body is the default ``{"detail": [...]}``. A
+        Without a formatter, the body is the default ``{"detail": [...]}``. With
+        ``text_detail``, the detail can also be a text: Bolt sends a text for a
+        parameter of the wrong type and for a missing parameter or form field. A
         formatter can declare its body with ``error_schema``. For a formatter
         with no declaration, the result is None. Bolt cannot know the media type
         or the shape of its body. A generated client parses the body that a
@@ -1182,7 +1331,12 @@ class SchemaGenerator:
         """
         formatter = self.api._error_formatter
         if formatter is None:
-            return {"application/json": OpenAPIMediaType(schema=self._get_validation_error_schema())}
+            schema = self._get_validation_error_schema()
+            if text_detail:
+                errors = schema.properties["detail"]
+                text = Schema(type="string", description="Validation error message")
+                schema = replace(schema, properties={"detail": Schema(any_of=[errors, text])})
+            return {"application/json": OpenAPIMediaType(schema=schema)}
         declared = getattr(formatter, "__bolt_error_schema__", None)
         if declared is None:
             self._untyped_errors = True
@@ -1240,52 +1394,38 @@ class SchemaGenerator:
         )
 
     def _register_security_schemes(self, openapi: OpenAPI) -> None:
-        """Auto-register SecurityScheme definitions from auth backends collected during generation.
+        """Put the security schemes of the auth backends into the components.
 
-        Uses backend info accumulated by _extract_security calls to register
-        the corresponding SecurityScheme in components.security_schemes,
-        preserving any user-defined schemes.
+        ``_extract_security`` collects the schemes. A scheme of the config
+        with the same name stays as the user wrote it.
         """
-        if not self._seen_schemes:
+        if not self._security_schemes:
             return
+        openapi.components.security_schemes = {**self._user_security_schemes, **self._security_schemes}
 
-        existing = openapi.components.security_schemes or {}
-        needs_jwt = "jwt" in self._seen_schemes and "BearerAuth" not in existing
-        needs_api_key = "api_key" in self._seen_schemes and "ApiKeyAuth" not in existing
-        needs_session = "session" in self._seen_schemes and "SessionAuth" not in existing
+    def _security_scheme_name(self, name: str, scheme: SecurityScheme) -> str:
+        """Return the name of ``scheme`` in the document, and record the scheme.
 
-        if not needs_jwt and not needs_api_key and not needs_session:
-            return
-
-        schemes = dict(existing)
-
-        if needs_jwt:
-            schemes["BearerAuth"] = SecurityScheme(
-                type="http",
-                scheme="bearer",
-                bearer_format="JWT",
-            )
-
-        if needs_api_key:
-            schemes["ApiKeyAuth"] = SecurityScheme(
-                type="apiKey",
-                name=self._api_key_header,
-                security_scheme_in="header",
-            )
-
-        if needs_session:
-            schemes["SessionAuth"] = SecurityScheme(
-                type="apiKey",
-                name=django_settings.SESSION_COOKIE_NAME,
-                security_scheme_in="cookie",
-            )
-
-        openapi.components.security_schemes = schemes
+        Two backends of one kind can read from different places, for example
+        two API key headers. Each place gets its own scheme: the second one
+        has the name with the suffix ``2``.
+        """
+        if name in self._user_security_schemes:
+            return name
+        candidate = name
+        number = 1
+        while self._security_schemes.get(candidate, scheme) != scheme:
+            number += 1
+            candidate = f"{name}{number}"
+        self._security_schemes[candidate] = scheme
+        return candidate
 
     def _extract_security(self, handler_id: int) -> list[dict[str, list[str]]] | None:
         """Extract security requirements from handler middleware.
 
-        Also accumulates seen scheme types for _register_security_schemes.
+        The list has one entry for each backend of the route. A request needs
+        only one of them. The call also records the scheme of each backend
+        for ``_register_security_schemes``.
 
         Args:
             handler_id: Handler ID.
@@ -1301,15 +1441,106 @@ class SchemaGenerator:
 
         security: list[dict[str, list[str]]] = []
         for backend in auth_config:
-            scheme = backend.scheme_name
-            openapi_name = _SCHEME_NAME_MAP.get(scheme)
-            if openapi_name:
-                security.append({openapi_name: []})
-                self._seen_schemes.add(scheme)
-                if scheme == "api_key" and self._api_key_header is None:
-                    self._api_key_header = backend.header
+            named_scheme = _backend_security_scheme(backend)
+            if named_scheme is None:
+                continue
+            requirement = {self._security_scheme_name(*named_scheme): []}
+            if requirement not in security:
+                security.append(requirement)
 
         return security or None
+
+    def _add_auth_error_responses(self, responses: dict[str, OpenAPIResponse], handler_id: int) -> None:
+        """Add the 401 and the 403 that the auth backends and the guards of a route can send.
+
+        A route with no auth backend gets none. The guards run in order, and
+        ``AllowAny`` stops them, as in Rust. ``IsAuthenticated`` and
+        ``Requires`` reject a request with no user: 401. ``Requires`` can deny
+        a user: 403. A session backend with ``login_url`` redirects a request
+        with no user to the login page: 302 in place of the 401.
+        """
+        middleware_meta = self.api._handler_middleware.get(handler_id, {})
+        backends = middleware_meta.get("_auth_backend_instances")
+        if not backends:
+            return
+
+        needs_user = can_deny = False
+        for guard in middleware_meta.get("guards", ()):
+            if guard["type"] == "allow_any":
+                break
+            needs_user = True
+            can_deny = can_deny or guard["type"] == "requires"
+        if not needs_user:
+            return
+
+        # Rust takes the first session backend of the route.
+        session = next((backend for backend in backends if backend.scheme_name == "session"), None)
+        if session is not None and session.login_url is not None:
+            responses.setdefault(
+                "302",
+                OpenAPIResponse(
+                    description="Found - Redirect to the login page",
+                    headers={"Location": OpenAPIHeader(schema=Schema(type="string"))},
+                ),
+            )
+        else:
+            challenge = OpenAPIHeader(
+                schema=Schema(type="string"), description="The authentication challenge of the route"
+            )
+            self._add_error_response(
+                responses,
+                "401",
+                "Unauthorized - The request has no valid credential",
+                headers={"WWW-Authenticate": challenge},
+            )
+        if can_deny:
+            self._add_error_response(responses, "403", "Forbidden - A guard of the route denies the user")
+
+    def _add_error_response(
+        self,
+        responses: dict[str, OpenAPIResponse],
+        status: str,
+        description: str,
+        *,
+        headers: dict[str, OpenAPIHeader] | None = None,
+    ) -> None:
+        """Add an error response of the Rust core, with the error body of the API.
+
+        A response that the route declares for this status keeps its
+        description. Its content shows the two bodies.
+        """
+        content = self._error_content()
+        declared = responses.get(status)
+        if declared is None:
+            responses[status] = OpenAPIResponse(description=description, headers=headers, content=content)
+            return
+        responses[status] = replace(
+            declared,
+            headers={**(headers or {}), **(declared.headers or {})} or None,
+            content=self._merge_content(declared.content, content),
+        )
+
+    def _error_content(self) -> dict[str, OpenAPIMediaType] | None:
+        """The content of an error response with no field errors, such as a 401 or a 403.
+
+        Without a formatter, the body is ``{"detail": "<message>"}``. A
+        formatter gives the body that it declares with ``error_schema``, or no
+        content when it declares none.
+        """
+        formatter = self.api._error_formatter
+        if formatter is None:
+            schema = Schema(
+                type="object",
+                properties={"detail": Schema(type="string", description="Error message")},
+                required=["detail"],
+            )
+            return {"application/json": OpenAPIMediaType(schema=schema)}
+        declared = getattr(formatter, "__bolt_error_schema__", None)
+        if declared is None:
+            self._untyped_errors = True
+            return None
+        schema = self._type_to_schema(declared.schema, register_component=True)
+        return {declared.media_type: OpenAPIMediaType(schema=schema)}
 
     def _extract_tags(self, handler: Any) -> list[str] | None:
         """Extract tags for grouping operations.
@@ -1362,12 +1593,17 @@ class SchemaGenerator:
         # Return sorted list of Tag objects
         return list(tag_objects.values()) if tag_objects else None
 
-    def _type_to_schema(self, type_annotation: Any, register_component: bool = False) -> Schema | Reference:
+    def _type_to_schema(
+        self, type_annotation: Any, register_component: bool = False, *, null_arm: bool = True
+    ) -> Schema | Reference:
         """Convert a Python type annotation or msgspec.inspect node to an OpenAPI Schema.
 
         Args:
             type_annotation: Python type annotation or ``msgspec.inspect`` node.
             register_component: Whether to register complex types as components.
+            null_arm: False for a parameter or a form field. Such a value cannot
+                be null, and ``required: false`` says that it is optional. Thus
+                ``T | None`` gives the schema of ``T``.
 
         Returns:
             Schema or Reference object.
@@ -1384,9 +1620,11 @@ class SchemaGenerator:
             if node_handler is None:
                 return Schema(type="object")
             return node_handler(self, type_annotation, register_component)
-        return self._typing_to_schema(type_annotation, register_component)
+        return self._typing_to_schema(type_annotation, register_component, null_arm)
 
-    def _typing_to_schema(self, type_annotation: Any, register_component: bool) -> Schema | Reference:
+    def _typing_to_schema(
+        self, type_annotation: Any, register_component: bool, null_arm: bool = True
+    ) -> Schema | Reference:
         """Convert a raw ``typing`` annotation (not a msgspec.inspect node)."""
         # A NewType or a ``type`` alias documents the type it names, as msgspec decodes it.
         type_annotation = resolve_type_alias(type_annotation)
@@ -1404,11 +1642,12 @@ class SchemaGenerator:
                 )
             type_annotation = args[0]
 
-        # Optional[T] -> T (single non-None arg only; multi-arm unions like
-        # ``A | B | None`` go to _union_schema so every arm is preserved).
+        # Optional[T] -> T for a parameter (single non-None arg only; multi-arm
+        # unions like ``A | B | None`` go to _union_schema so every arm is preserved).
         # T goes through this method again, so ``Annotated[int, Meta(ge=1)] | None``
-        # shows the constraints of its value.
-        if is_optional(type_annotation):
+        # shows the constraints of its value. Each other ``T | None`` goes to
+        # _union_schema, which keeps the null arm.
+        if not null_arm and is_optional(type_annotation):
             non_none_args = [arg for arg in get_args(type_annotation) if arg is not type(None)]
             if len(non_none_args) == 1:
                 return self._typing_to_schema(non_none_args[0], register_component)
@@ -1473,9 +1712,13 @@ class SchemaGenerator:
         properties = {}
         required = []
 
+        field_configs = self._field_configs(struct_type)
         for field in struct_info.fields:
+            field_config = field_configs.get(field.name)
+            if not self._field_in_schema(field_config):
+                continue
             field_name, field_schema, field_required = self._msgspec_field_schema(
-                field, register_component=register_component
+                field, field_config, register_component=register_component
             )
             properties[field_name] = field_schema
 
@@ -1729,9 +1972,10 @@ _MSGSPEC_NODE_HANDLERS: dict[str, Callable[[SchemaGenerator, Any, bool], Schema 
     "FloatType": lambda gen, node, _r: gen._numeric_type_schema(node, "number"),
     "StrType": _node_str,
     "BoolType": lambda _g, _n, _r: Schema(type="boolean"),
-    "BytesType": lambda _g, _n, _r: Schema(type="string", format="binary"),
-    "ByteArrayType": lambda _g, _n, _r: Schema(type="string", format="binary"),
-    "MemoryViewType": lambda _g, _n, _r: Schema(type="string", format="binary"),
+    # msgspec writes and reads bytes in JSON as base64 text.
+    "BytesType": lambda _g, _n, _r: Schema(type="string", content_encoding="base64"),
+    "ByteArrayType": lambda _g, _n, _r: Schema(type="string", content_encoding="base64"),
+    "MemoryViewType": lambda _g, _n, _r: Schema(type="string", content_encoding="base64"),
     # Any value: an empty schema. msgspec.Raw holds JSON of any type.
     "AnyType": lambda _g, _n, _r: Schema(),
     "RawType": lambda _g, _n, _r: Schema(),
@@ -1823,7 +2067,7 @@ _PRIMITIVE_SCHEMAS: dict[Any, dict[str, str]] = {
     int: {"type": "integer"},
     float: {"type": "number"},
     bool: {"type": "boolean"},
-    bytes: {"type": "string", "format": "binary"},
+    bytes: {"type": "string", "content_encoding": "base64"},
     Any: {},
     msgspec.Raw: {},
     type(None): {"type": "null"},
