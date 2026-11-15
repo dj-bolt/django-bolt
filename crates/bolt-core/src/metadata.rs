@@ -11,6 +11,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::access_log::AccessLogFilter;
 use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
     ApiKeys, AuthBackend, AuthContext, Claims, JwtKeySource, RefreshingJwks, StaticKey,
@@ -576,6 +577,9 @@ pub struct RouteMetadata {
     /// callable that takes the auth context and returns True for a revoked
     /// token. The handshake awaits it before the upgrade.
     pub websocket_revocation_check: Option<Arc<Py<PyAny>>>,
+    /// Sampling and the slow-request threshold of the access log, from the
+    /// `LoggingConfig` of the API of the route.
+    pub access_log_filter: AccessLogFilter,
 }
 
 /// Read a byte size of the route metadata, or the default when the key is missing.
@@ -871,6 +875,8 @@ impl RouteMetadata {
         // Default success status. Python route registration sets it.
         let default_status_code = required_status_code(py_meta, "default_status_code")?;
 
+        let access_log_filter = AccessLogFilter::from_python(py_meta)?;
+
         Ok(RouteMetadata {
             auth_backends,
             guards,
@@ -894,6 +900,7 @@ impl RouteMetadata {
             plan,
             default_status_code,
             websocket_revocation_check,
+            access_log_filter,
         })
     }
 }

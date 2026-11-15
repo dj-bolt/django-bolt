@@ -1580,14 +1580,18 @@ async fn route_request<const ACCESS_LOG: bool>(
         };
         if state.access_log_levels & bit != 0 {
             let dur_ms = access_log_start.unwrap().elapsed().as_secs_f64() * 1000.0;
-            let msg = format!("{} {} {} {:.1}ms", method, path, status, dur_ms);
-            Python::attach(|py| {
-                let _ = state
-                    .access_logger
-                    .as_ref()
-                    .unwrap()
-                    .call_method1(py, level, (msg,));
-            });
+            // Sampling and the slow-request threshold of the route. A 4xx or a
+            // 5xx always passes.
+            if route_metadata.is_none_or(|meta| meta.access_log_filter.keeps(status, dur_ms)) {
+                let msg = format!("{} {} {} {:.1}ms", method, path, status, dur_ms);
+                Python::attach(|py| {
+                    let _ = state
+                        .access_logger
+                        .as_ref()
+                        .unwrap()
+                        .call_method1(py, level, (msg,));
+                });
+            }
         }
     }
 
