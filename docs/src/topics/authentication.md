@@ -661,7 +661,7 @@ Django does the session work:
 1. Bolt adds Django's `SessionMiddleware` and `AuthenticationMiddleware` to each route that uses the backend. When the middleware of the API, router or route already has both, Bolt adds nothing. When it has only one of them, startup fails, because a second `SessionMiddleware` would load and save the session again.
 2. Rust rejects a request with no session cookie with 401. No Python runs.
 3. For a request with the cookie, Django loads the session and the user.
-4. Bolt checks the guards of the route against `request.user`, before the handler.
+4. Bolt checks the guards of the route against `request.user`, before the handler. A rejection is the same 401 or 403 as for a token. It has the `WWW-Authenticate` header of a 401, and the `error_formatter` of the API formats it.
 
 A guard can read `is_staff`, `is_superuser` and `permissions` of the Django user. `Requires("permissions", "app.perm")` uses the permissions of the user and of its groups. A `Requires` on another claim rejects a session request with 403. A `none_of` guard on another claim is an error at startup, because it would let every session user in. Startup also fails when a guard reads a field that your user model does not have.
 
