@@ -237,6 +237,42 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
     return execute
 
 
+def _check_wrapper_takes_handler_arguments(fn: Callable) -> None:
+    """Refuse a decorated handler whose wrapper cannot take the arguments of the handler.
+
+    Bolt reads the parameters of the wrapped function and calls the wrapper with them.
+    A Django view decorator such as ``@csrf_exempt`` gives a wrapper with a
+    ``(request, *args, **kwargs)`` signature. Each call of that wrapper fails
+    when the handler takes no positional argument.
+    """
+    if not hasattr(fn, "__wrapped__"):
+        return
+    try:
+        wrapper_sig = inspect.signature(fn, follow_wrapped=False)
+    except ValueError:
+        # The wrapper is an object with no signature of its own. There is nothing to compare.
+        return
+    handler_sig = inspect.signature(fn)
+    positional = 0
+    keywords: dict[str, None] = {}
+    for param in handler_sig.parameters.values():
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            return
+        if param.kind is inspect.Parameter.KEYWORD_ONLY:
+            keywords[param.name] = None
+        else:
+            positional += 1
+    try:
+        wrapper_sig.bind(*(None,) * positional, **keywords)
+    except TypeError as exc:
+        raise TypeError(
+            f"Handler {fn.__name__}{handler_sig} has a decorator with a wrapper that takes {wrapper_sig}. "
+            f"Bolt calls the wrapper with the arguments of the handler, and that call fails: {exc}. "
+            f"For a Django view decorator such as @csrf_exempt, the handler must take `request` "
+            f"as its first parameter."
+        ) from exc
+
+
 def _route_handler(fn: Any) -> Callable:
     """Return the callable that a route registers for `fn`.
 
@@ -1867,6 +1903,8 @@ class BoltAPI:
         _router_middleware: list[Any] | None = None,
     ):
         def decorator(fn: Callable):
+            _check_wrapper_takes_handler_arguments(fn)
+
             # Detect if handler is async or sync
             is_async = inspect.iscoroutinefunction(fn)
 

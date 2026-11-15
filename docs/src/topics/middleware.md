@@ -427,7 +427,7 @@ api = BoltAPI(
 
 Each wrapper runs the `process_view` hook of its middleware before the handler. The hook gets the route handler as the view, so view decorators such as `@csrf_exempt` and `@login_not_required` work.
 
-Put a view decorator below the route decorator. The route decorator registers the function that it gets. A view decorator above it marks a function that Bolt did not register. Thus it has no effect, and Bolt gives no error. The wrapper of `@csrf_exempt` passes `request` to the handler, so the handler must have a `request` parameter.
+Put a view decorator below the route decorator. The route decorator registers the function that it gets. A view decorator above it marks a function that Bolt did not register. Thus it has no effect, and Bolt gives no error. The wrapper of `@csrf_exempt` passes `request` to the handler, so the handler must take `request` as its first parameter. Bolt raises a `TypeError` at registration when the handler has no parameter for it.
 
 ```python
 @api.post("/webhook")   # First: the route decorator
