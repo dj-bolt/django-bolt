@@ -124,6 +124,29 @@ def test_views_use_the_given_key_algorithm_and_prefix():
         assert client.post("/api/auth-X/logout", headers=NO_CSRF_ORIGIN).status_code == 200
 
 
+@pytest.mark.parametrize(
+    ("prefix", "path"),
+    [("/", "/"), ("", "/"), ("/auth", "/auth"), ("/api/auth/", "/api/auth")],
+)
+def test_refresh_cookie_path_is_the_prefix_of_the_routes(prefix, path):
+    """The refresh cookie has the path of the routes. Routes at the root give the path ``/``."""
+    api = _views_api(prefix=prefix, secure_cookies=False)
+
+    def refresh_cookie_path(response) -> str:
+        cookie = next(c for c in response.headers.get_list("set-cookie") if c.startswith("refresh_token="))
+        return next(a for a in cookie.split("; ") if a.startswith("Path"))
+
+    with TestClient(api) as client:
+        login = client.post(f"{path.rstrip('/')}/login", json=LOGIN)
+        assert login.status_code == 200
+        assert refresh_cookie_path(login) == f"Path={path}"
+
+        logout = client.post(f"{path.rstrip('/')}/logout", headers=NO_CSRF_ORIGIN)
+        assert logout.status_code == 200, logout.text
+        # The cookie that clears the refresh cookie has the same path, or the browser keeps the cookie.
+        assert refresh_cookie_path(logout) == f"Path={path}"
+
+
 def test_refresh_cookie_without_a_jti_is_rejected():
     """A refresh token that cannot be revoked must not reach the lifecycle routes."""
     now = int(time.time())

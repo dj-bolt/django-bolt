@@ -52,6 +52,8 @@ class JWTAuthViews:
         self.algorithm = algorithm
         self.kid = kid
         self.prefix = prefix.rstrip("/")
+        # The path of the refresh cookie. Routes at the root have an empty prefix.
+        self._refresh_path = self.prefix or "/"
         self.access_cookie = access_cookie
         self.refresh_cookie = refresh_cookie
         self.secure_cookies = secure_cookies
@@ -62,7 +64,7 @@ class JWTAuthViews:
 
     def _clear_cookies(self, response: JSON) -> JSON:
         response.delete_cookie(self.access_cookie, path="/")
-        response.delete_cookie(self.refresh_cookie, path=self.prefix)
+        response.delete_cookie(self.refresh_cookie, path=self._refresh_path)
         return response
 
     async def _require_live_refresh(self, request: Any) -> dict[str, Any]:
@@ -110,7 +112,7 @@ class JWTAuthViews:
                 pair,
                 access_cookie=self.access_cookie,
                 refresh_cookie=self.refresh_cookie,
-                refresh_path=self.prefix,
+                refresh_path=self._refresh_path,
                 secure=self.secure_cookies,
             )
 
@@ -137,7 +139,7 @@ class JWTAuthViews:
                 pair,
                 access_cookie=self.access_cookie,
                 refresh_cookie=self.refresh_cookie,
-                refresh_path=self.prefix,
+                refresh_path=self._refresh_path,
                 secure=self.secure_cookies,
             )
 
