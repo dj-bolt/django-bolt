@@ -5,7 +5,7 @@ Provides hierarchical routing with middleware inheritance.
 Routes defined on a router inherit the router's middleware, auth, and guards.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING, Any, Optional
 
 from .middleware.middleware import normalize_middleware_specs
@@ -82,7 +82,10 @@ class Router:
             middleware: Router-level middleware (inherits from parent)
             auth: Default authentication backends (can be overridden per-route)
             guards: Default guards/permissions (can be overridden per-route)
-            parent: Parent router for nested routers
+            parent: Parent router for nested routers. The routes of this
+                router get the prefix and the middleware of the parent.
+                `api.include_router()` registers them one time, if it gets
+                this router, the parent, or the two.
         """
         self.prefix = prefix.rstrip("/")
         self.tags = tags or []
@@ -210,15 +213,20 @@ class Router:
         """
         # Update the child router's parent relationship
         router._parent = self
-        self._children.append(router)
+        # A router made with `parent=self` is already a child. Do not add it again.
+        if router not in self._children:
+            self._children.append(router)
 
         # Combine prefixes
         if prefix:
             router.prefix = prefix.rstrip("/") + router.prefix
 
-    def get_all_routes(self) -> list[tuple[str, str, Callable, dict[str, Any]]]:
+    def get_all_routes(self, skip: Collection["Router"] = ()) -> list[tuple[str, str, Callable, dict[str, Any]]]:
         """
         Get all routes including from child routers.
+
+        Args:
+            skip: Child routers to leave out, with their own children.
 
         Returns list of (method, path, handler, meta) tuples.
         """
@@ -230,10 +238,25 @@ class Router:
             routes.append((method, self.prefix + path, handler, route_meta))
 
         for child in self._children:
+            if child in skip:
+                continue
             # Prepend parent prefix to child routes
-            for method, path, handler, meta in child.get_all_routes():
+            for method, path, handler, meta in child.get_all_routes(skip):
                 routes.append((method, self.prefix + path, handler, meta))
         return routes
+
+    def parent_prefix(self) -> str:
+        """The prefixes of the parent routers, from the root to the direct parent."""
+        parent = self._parent
+        return parent.parent_prefix() + parent.prefix if parent else ""
+
+    def child_routers(self) -> list["Router"]:
+        """Each router below this one: its children, and their children."""
+        routers = []
+        for child in self._children:
+            routers.append(child)
+            routers.extend(child.child_routers())
+        return routers
 
     def get_middleware_chain(self) -> list["MiddlewareType"]:
         """

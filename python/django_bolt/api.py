@@ -656,6 +656,8 @@ class BoltAPI:
         # Django admin configuration (controlled by --no-admin flag)
         self._admin_routes_registered = False
         self._asgi_mounts: list[tuple[str, Callable[..., Any]]] = []
+        # Routers with a parent that include_router() registered, for each prefix of the call.
+        self._included_child_routers: dict[str, set[Router]] = {}
         # MCP mount definitions (dicts consumed by _core.register_mcp_mounts).
         # Populated by bolt_mcp.mount_mcp; empty for APIs without MCP.
         self._mcp_mounts: list[dict[str, Any]] = []
@@ -3827,6 +3829,10 @@ class BoltAPI:
             api.include_router(users_router, prefix="/api/v1")
             # Results in: GET /api/v1/users, GET /api/v1/users/{user_id}
 
+        A router with a parent (`Router(parent=...)` or `Router.include_router`)
+        registers one time for each `prefix`, with the prefixes of its parents.
+        A call with the router and a call with its parent give the same route.
+
         Args:
             router: Router instance containing routes to include
             prefix: Additional URL prefix to prepend (combined with router's prefix)
@@ -3837,14 +3843,26 @@ class BoltAPI:
                 f"Use mount() for BoltAPI sub-applications."
             )
 
+        # A router with a parent registers one time for each prefix, with the
+        # prefixes of its parents. It is the same route if this call includes
+        # the router or its parent, and the order of the calls has no effect.
+        prefix = prefix.rstrip("/")
+        included = self._included_child_routers.setdefault(prefix, set())
+        if router in included:
+            return
+
         # Get all routes from router (including nested routers)
-        all_routes = router.get_all_routes()
+        all_routes = router.get_all_routes(skip=included)
+        included.update(router.child_routers())
+        if router._parent is not None:
+            included.add(router)
+            prefix += router.parent_prefix()
 
         for method, route_path, handler, meta in all_routes:
             route_meta = dict(meta)
 
             # Compute full path with optional prefix
-            full_path = prefix.rstrip("/") + route_path if prefix else route_path
+            full_path = prefix + route_path
 
             # Extract route-specific overrides from meta
             route_auth = route_meta.pop("auth", None)

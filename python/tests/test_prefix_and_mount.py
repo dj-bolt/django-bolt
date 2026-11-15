@@ -592,6 +592,58 @@ class TestTrailingSlashSetting:
             assert "/" in registered_paths, f"Root '/' should be unchanged in '{mode}' mode"
 
 
+@pytest.mark.parametrize(
+    "order",
+    [("parent",), ("child",), ("parent", "child"), ("child", "parent"), ("nest", "parent", "child")],
+    ids=lambda order: "+".join(order),
+)
+def test_a_router_with_a_parent_registers_one_time_with_the_prefix_of_its_parent(order):
+    """The order of the include calls does not change the routes of the child."""
+    parent = Router(prefix="/v1")
+    child = Router(prefix="/users", parent=parent)
+
+    @parent.get("/status")
+    async def status():
+        return {"route": "status"}
+
+    @child.get("/me")
+    async def me():
+        return {"route": "me"}
+
+    api = BoltAPI()
+    for name in order:
+        if name == "nest":
+            # The child is already a child of this parent.
+            parent.include_router(child)
+        else:
+            api.include_router(parent if name == "parent" else child)
+
+    paths = sorted(path for _method, path, _id, handler in api._routes if handler in (status, me))
+    assert paths == (["/v1/users/me"] if order == ("child",) else ["/v1/status", "/v1/users/me"])
+    with TestClient(api) as client:
+        assert client.get("/v1/users/me").json() == {"route": "me"}
+        assert client.get("/users/me").status_code == 404
+
+
+def test_a_router_included_with_two_prefixes_registers_two_times():
+    parent = Router(prefix="/v1")
+    child = Router(prefix="/users", parent=parent)
+
+    @child.get("/me")
+    async def me():
+        return {"route": "me"}
+
+    api = BoltAPI()
+    api.include_router(parent, prefix="/a")
+    api.include_router(parent, prefix="/b")
+    api.include_router(child, prefix="/b")
+
+    with TestClient(api) as client:
+        assert client.get("/a/v1/users/me").json() == {"route": "me"}
+        assert client.get("/b/v1/users/me").json() == {"route": "me"}
+    assert sum(handler is me for *_route, handler in api._routes) == 2
+
+
 class TagMiddleware(Middleware):
     """Add the header ``x-api`` with the name of the API that runs the middleware."""
 
