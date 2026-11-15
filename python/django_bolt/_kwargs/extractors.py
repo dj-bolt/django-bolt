@@ -658,7 +658,8 @@ def create_file_extractor(
     Create a pre-compiled extractor for file uploads with UploadFile support.
 
     Supports both the new UploadFile type and legacy dict annotations for
-    backward compatibility.
+    backward compatibility. A ``bytes`` parameter gets the content of the
+    file, and ``list[bytes]`` gets the content of each file.
 
     Note: File validation (max_size, min_size, allowed_types, max_files) is now
     handled in Rust at parse time. This function only creates UploadFile objects
@@ -666,7 +667,7 @@ def create_file_extractor(
 
     Args:
         name: Parameter name
-        annotation: Type annotation (UploadFile, list[UploadFile], dict, list[dict])
+        annotation: Type annotation (UploadFile, list[UploadFile], bytes, list[bytes], dict, list[dict])
         default: Default value
         alias: Alternative field name
         max_size: Maximum file size in bytes (validated in Rust)
@@ -691,6 +692,40 @@ def create_file_extractor(
     # Check if we should create UploadFile instances
     # Use is_upload_file_type helper which handles all cases including Optional
     expects_upload_file = is_upload_file_type(annotation)
+
+    item_type = (get_args(unwrapped) or (Any,))[0] if expects_list else unwrapped
+    if item_type is bytes:
+        # The handler gets the content, not the file dict from Rust.
+        default_value = None if default is inspect.Parameter.empty else default
+
+        def read_content(file_info: dict[str, Any]) -> bytes:
+            content = file_info["content"]
+            if content is None:
+                # Rust wrote a large file to disk. It deletes the file after the request.
+                with open(file_info["temp_path"], "rb") as spooled:
+                    return spooled.read()
+            return content
+
+        def extract_bytes(files_map: dict[str, Any]) -> Any:
+            try:
+                file_info = files_map[key]
+            except KeyError:
+                if optional:
+                    return default_value
+                raise RequestValidationError(
+                    errors=[
+                        {"type": "file_missing", "loc": ("body", key), "msg": "Missing required file", "input": None}
+                    ]
+                ) from None
+            # Rust gives one dict for one file, and a list of dicts for more files.
+            if expects_list:
+                if isinstance(file_info, list):
+                    return [read_content(item) for item in file_info]
+                return [read_content(file_info)]
+            # As for UploadFile: a parameter for one file gets the first file.
+            return read_content(file_info[0] if isinstance(file_info, list) else file_info)
+
+        return extract_bytes
 
     if optional:
         default_value = None if default is inspect.Parameter.empty else default
@@ -717,7 +752,7 @@ def create_file_extractor(
                     files_map["_upload_files"].append(upload)
                     return [upload] if expects_list else upload
             else:
-                # Legacy behavior for dict/bytes annotations
+                # Legacy behavior for dict annotations
                 if expects_list and not isinstance(file_info, list):
                     return [file_info]
                 return file_info
@@ -756,7 +791,7 @@ def create_file_extractor(
                     files_map["_upload_files"].append(upload)
                     return [upload] if expects_list else upload
             else:
-                # Legacy behavior for dict/bytes annotations
+                # Legacy behavior for dict annotations
                 if expects_list and not isinstance(file_info, list):
                     return [file_info]
                 return file_info
