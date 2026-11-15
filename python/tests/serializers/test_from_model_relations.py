@@ -269,6 +269,37 @@ async def test_afrom_model_loads_multiple_unloaded_relations_concurrently(monkey
     assert set(seen_relations) == {"author", "comments"}
 
 
+class CommentWithPostAndAuthorSerializer(Serializer):
+    id: int
+    post: BlogPostWithAuthorAndCommentsSerializer
+
+
+class AuthorWithPostCommentsSerializer(Serializer):
+    id: int
+    posts: list[BlogPostWithCommentsSerializer]
+
+
+@pytest.mark.django_db
+def test_from_model_max_depth_is_the_deepest_nested_level_that_it_accepts():
+    author = Author.objects.create(name="Alice", email="alice@example.com")
+    post = BlogPost.objects.create(title="Post", content="Body", author=author)
+    comment = Comment.objects.create(post=post, author=author, text="Nice")
+    loaded_comment = (
+        Comment.objects.select_related("post__author").prefetch_related("post__comments").get(pk=comment.pk)
+    )
+    loaded_author = Author.objects.prefetch_related("posts__comments").get(pk=author.pk)
+
+    # The comment and the author are level 0. Their deepest nested serializer is level 2.
+    assert CommentWithPostAndAuthorSerializer.from_model(loaded_comment, max_depth=2).post.author.name == "Alice"
+    assert AuthorWithPostCommentsSerializer.from_model(loaded_author, max_depth=2).posts[0].comments[0].text == "Nice"
+    assert CommentWithPostAndAuthorSerializer.from_model(loaded_comment).post.comments[0].id == comment.pk
+
+    with pytest.raises(ValueError, match=r"Maximum recursion depth \(1\) exceeded"):
+        CommentWithPostAndAuthorSerializer.from_model(loaded_comment, max_depth=1)
+    with pytest.raises(ValueError, match=r"Maximum recursion depth \(1\) exceeded"):
+        AuthorWithPostCommentsSerializer.from_model(loaded_author, max_depth=1)
+
+
 @pytest.mark.django_db
 def test_from_model_unloaded_source_path_uses_default_without_querying():
     user = User.objects.create(
@@ -411,3 +442,17 @@ def test_async_serializer_route_loads_a_relation_of_a_model_in_a_returned_struct
         resp = client.get("/holder")
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"user": {"id": user.pk, "profile": profile.pk}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_serializer_view_afrom_model_forwards_to_serializer():
+    author = await Author.objects.acreate(name="Alice", email="alice@example.com")
+
+    view = AuthorWithPlainPostsSerializer.only("id", "name")
+    serializer = await view.afrom_model(author)
+
+    assert isinstance(serializer, AuthorWithPlainPostsSerializer)
+    assert view.dump(serializer) == {"id": author.id, "name": "Alice"}
+    with pytest.raises(ValueError, match="Maximum recursion depth"):
+        await view.afrom_model(author, max_depth=-1)

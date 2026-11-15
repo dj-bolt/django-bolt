@@ -25,12 +25,10 @@ from ipaddress import (
     IPv6Network,
 )
 from pathlib import Path, PurePath
-from typing import Any, TypeVar
+from typing import Any
 from uuid import UUID
 
 import msgspec
-
-T = TypeVar("T")
 
 # Default type encoders for non-JSON-native types
 # Maps type -> encoder function
@@ -45,12 +43,15 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
     # Paths
     Path: str,
     PurePath: str,
-    # Dates/Times -> ISO format
-    datetime: lambda v: v.isoformat(),
+    # msgspec encodes an exact datetime, time or Decimal itself. Only a
+    # subclass comes here. Return the exact type, and msgspec encodes it as
+    # it encodes the base type: "Z" for UTC, a string for a Decimal.
+    datetime: lambda v: datetime(
+        v.year, v.month, v.day, v.hour, v.minute, v.second, v.microsecond, v.tzinfo, fold=v.fold
+    ),
     date: lambda v: v.isoformat(),
-    time: lambda v: v.isoformat(),
-    # Decimals -> int or float
-    Decimal: lambda v: int(v) if v.as_tuple().exponent >= 0 else float(v),
+    time: lambda v: time(v.hour, v.minute, v.second, v.microsecond, v.tzinfo, fold=v.fold),
+    Decimal: Decimal,
     # IP addresses
     IPv4Address: str,
     IPv4Interface: str,
@@ -125,33 +126,4 @@ def decode(value: bytes | str) -> Any:
     return _DECODER.decode(value)
 
 
-def decode_typed[T](
-    value: bytes | str,
-    target_type: type[T],
-    strict: bool = True,
-) -> T:
-    """Decode JSON with type validation and coercion.
-
-    Args:
-        value: JSON bytes or string
-        target_type: Expected type (e.g., msgspec.Struct subclass)
-        strict: If False, enables lenient type coercion (e.g., "123" -> 123)
-
-    Returns:
-        Decoded and validated object of target_type
-
-    Raises:
-        msgspec.DecodeError: If decoding or validation fails
-        msgspec.ValidationError: If type validation fails
-
-    Examples:
-        >>> class User(msgspec.Struct):
-        ...     id: int
-        ...     name: str
-        >>> decode_typed(b'{"id": 1, "name": "Alice"}', User)
-        User(id=1, name='Alice')
-    """
-    return msgspec.json.decode(value, type=target_type, strict=strict)
-
-
-__all__ = ["encode", "decode", "decode_typed", "DEFAULT_TYPE_ENCODERS", "default_serializer"]
+__all__ = ["encode", "decode", "DEFAULT_TYPE_ENCODERS", "default_serializer"]

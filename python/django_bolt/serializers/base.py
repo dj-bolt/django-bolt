@@ -37,6 +37,7 @@ from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
 
 from django_bolt import _json
+from django_bolt._serializer_before import PLAN_NOT_BUILT, RAW_VALIDATED, before_plan, run_before_validators
 from django_bolt.error_handlers import msgspec_validation_error_to_dict
 from django_bolt.exceptions import (
     RequestValidationError,
@@ -331,7 +332,27 @@ class _SerializerMeta(_STRUCT_META):
     def __new__(mcs, name: str, bases: tuple, namespace: dict, **kwargs):
         # Force kw_only=True for all Serializer subclasses
         kwargs.setdefault("kw_only", True)
+
+        # field() with no default is not a default value. Take the marker out of
+        # the class body, so msgspec reports a missing value as it does for a
+        # plain required field. The config stays on the class.
+        required_field_configs = {
+            field_name: value.config
+            for field_name, value in namespace.items()
+            if isinstance(value, _FieldMarker) and not value.config.has_default()
+        }
+        for field_name in required_field_configs:
+            del namespace[field_name]
         cls = cast(Any, super().__new__(mcs, name, bases, namespace, **kwargs))
+
+        # A subclass keeps the config of its parents. A field that the subclass
+        # declares again with a default uses that default, not the old config.
+        defaults = dict(_iter_field_defaults(cls))
+        inherited = getattr(cls, "__required_field_configs__", {})
+        cls.__required_field_configs__ = {
+            **{field_name: config for field_name, config in inherited.items() if field_name not in defaults},
+            **required_field_configs,
+        }
 
         # Build rename map (e.g., {"user_name": "userName"} for rename="camel").
         # Done here because __struct_fields__ isn't available in __init_subclass__.
@@ -392,8 +413,16 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     # Class attributes for validators (populated by __init_subclass__)
     __field_validators__: ClassVar[dict[str, list[Any]]] = {}
     __model_validators__: ClassVar[list[Any]] = []
-    # Pre-computed tuple of (field_name, validators_tuple) for faster iteration
+    # Pre-computed tuple of (field_name, validators_tuple) for faster iteration.
+    # It has the validators with mode="after". __field_validators__ has each mode, in definition order.
     __field_validators_tuple__: ClassVar[tuple[tuple[str, tuple[Any, ...]], ...]] = ()
+    # Validators with mode="before", in the order that they run.
+    __before_field_validators__: ClassVar[tuple[tuple[str, tuple[Any, ...]], ...]] = ()
+    __before_model_validators__: ClassVar[tuple[Any, ...]] = ()
+    # How model_validate() runs the before validators of this class and of its
+    # nested serializers: PLAN_NOT_BUILT until the first input, then the plan,
+    # or None for a class that keeps the direct msgspec decode.
+    __before_plan__: ClassVar[Any] = None
     _computed_dump_specs: ClassVar[tuple[_ComputedDumpSpec, ...]] = ()
 
     # Cached type hints and metadata (populated by __init_subclass__)
@@ -409,6 +438,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __write_only_fields__: ClassVar[frozenset[str]] = frozenset()
     __source_mapping__: ClassVar[dict[str, str]] = {}  # API field name -> source attribute
     __field_sets__: ClassVar[dict[str, list[str]]] = {}  # Named field sets for use() method
+
+    # Config of each field that has field() with no default (set by the metaclass)
+    __required_field_configs__: ClassVar[dict[str, FieldConfig]] = {}
 
     # _FieldMarker default resolution (populated by __init_subclass__)
     __field_marker_defaults__: ClassVar[dict[str, Any]] = {}  # field_name -> actual default value
@@ -469,8 +501,19 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         # Pre-compute validators as tuple for faster iteration (no dict overhead)
         cls.__field_validators_tuple__ = tuple(
-            (field_name, tuple(validators)) for field_name, validators in cls.__field_validators__.items()
+            (field_name, tuple(validators))
+            for field_name, validators in collect_field_validators(cls, mode="after").items()
         )
+        cls.__before_field_validators__ = tuple(
+            (field_name, tuple(validators))
+            for field_name, validators in collect_field_validators(cls, mode="before").items()
+        )
+        cls.__before_model_validators__ = tuple(collect_model_validators(cls, mode="before"))
+        cls.__before_plan__ = PLAN_NOT_BUILT
+        # Only a class with a before validator gets the slower validation step.
+        # Each other class keeps _run_field_validators() as it is.
+        if cls.__before_field_validators__ or cls.__before_model_validators__:
+            cls._run_field_validators = Serializer._run_before_then_field_validators
 
         cls.__default_values_map__ = None
         # A subclass must rebuild its own specs even when the parent already
@@ -492,7 +535,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Set fast-path flags to control which validation runs
         cls.__has_nested_or_literal__ = bool(cls.__nested_fields__ or cls.__literal_fields__)
         cls.__has_field_validators__ = bool(cls.__field_validators__)
-        cls.__has_model_validators__ = bool(cls.__model_validators__)
+        cls.__has_model_validators__ = bool(cls.__model_validators__ or cls.__before_model_validators__)
         cls.__has_computed_fields__ = bool(cls.__computed_fields__)
 
         # Skip all validation if there's nothing to validate
@@ -533,6 +576,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Check Config class for read_only/write_only sets (renamed from Meta to avoid conflict with msgspec.Meta)
         meta = getattr(cls, "Config", None)
         if meta:
+            # Nothing ran Config.validators. Reject it: a class that sets it looks validated and is not.
+            if hasattr(meta, "validators"):
+                raise TypeError(
+                    f"{cls.__name__}.Config.validators is not an option. "
+                    f"Declare each validator with @field_validator or @model_validator."
+                )
             meta_read_only = getattr(meta, "read_only", set())
             meta_write_only = getattr(meta, "write_only", set())
             meta_field_sets = getattr(meta, "field_sets", {})
@@ -638,10 +687,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         Validators are executed in order:
         1. Fix _FieldMarker defaults (only if field() is used)
-        2. Field validators with mode='before'
-        3. Field validators with mode='after'
-        4. Model validators with mode='before'
+        2. Model validators with mode='before'
+        3. Field validators with mode='before'
+        4. Field validators with mode='after'
         5. Model validators with mode='after'
+
+        Steps 2 and 3 run here only for an instance that Python code builds.
+        For input (a request body, model_validate(), model_validate_json()),
+        they run on the raw data before msgspec builds the instance.
         """
         cls = self.__class__
 
@@ -692,14 +745,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # Check if the current value is a _FieldMarker (meaning the user
             # didn't provide a value and msgspec used the marker as default)
             if isinstance(current_value, _FieldMarker):
-                config = current_value.config
-                if config.has_default():
-                    # Replace with actual default from the _FieldMarker config
-                    _setattr(self, field_name, config.get_default())
-                else:
-                    # field() was used without a default, and user didn't provide value
-                    # This shouldn't normally happen since msgspec requires the field
-                    raise MsgspecValidationError(f"Field '{field_name}' is required but was not provided")
+                # Replace with actual default from the _FieldMarker config. A field()
+                # with no default is a required field of the struct, not a marker.
+                _setattr(self, field_name, current_value.config.get_default())
 
     @classmethod
     def _lazy_collect_field_configs(cls) -> None:
@@ -729,6 +777,17 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 if config.source:
                     source_mapping[field_name] = config.source
 
+        for field_name, config in cls.__required_field_configs__.items():
+            field_configs[field_name] = config
+            if config.read_only:
+                read_only.add(field_name)
+            if config.write_only:
+                write_only.add(field_name)
+            if config.source:
+                source_mapping[field_name] = config.source
+
+        has_field_markers = bool(field_marker_fields)
+
         # Merge with existing configs from Meta class
         cls.__field_configs__.update(field_configs)
         cls.__read_only_fields__ = cls.__read_only_fields__ | frozenset(read_only)
@@ -748,7 +807,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         )
 
         # Update the has_field_markers flag based on actual _FieldMarker defaults found
-        cls.__has_field_markers__ = bool(field_configs)
+        cls.__has_field_markers__ = has_field_markers
 
         # Build rename map if deferred from _SerializerMeta.__new__ (forward reference)
         if not cls.__has_rename__ and not cls.__rename_map__:
@@ -818,14 +877,61 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                     _setattr(self, field_name, current_value)
 
                 except (ValueError, TypeError) as e:
-                    # Collect error instead of raising immediately
+                    # Collect error instead of raising immediately. The loc has the
+                    # wire name of the field, as a msgspec error has.
                     errors.append(
                         {
-                            "loc": ["body", field_name],
+                            "loc": ["body", _class.__rename_map__.get(field_name, field_name)],
                             "msg": str(e),
                             "type": "value_error",
                         }
                     )
+
+        return errors
+
+    def _run_before_then_field_validators(self) -> list[dict]:
+        """_run_field_validators() of a class that has a validator with mode="before"."""
+        if not RAW_VALIDATED.get():
+            # Python code built this instance. No raw input went through the plan.
+            errors = self._run_before_validators()
+            if errors:
+                return errors
+        return Serializer._run_field_validators(self)
+
+    def _run_before_validators(self) -> list[dict]:
+        """
+        Run the before validators on an instance that Python code built.
+
+        msgspec does no type conversion for such an instance, so the validators
+        get the values of the fields. A model validator gets them as a dict with
+        the input names of the fields, and Bolt sets the fields from its result.
+        """
+        cls = self.__class__
+        errors: list[dict] = []
+        _setattr = msgspec_structs.force_setattr
+
+        if cls.__before_model_validators__:
+            rename_map = cls.__rename_map__
+            input_names = [(name, rename_map.get(name, name)) for name in cls.__struct_fields__]
+            data: Any = {input_name: getattr(self, name) for name, input_name in input_names}
+            try:
+                for validator in cls.__before_model_validators__:
+                    data = validator(cls, data)
+            except (ValueError, TypeError) as e:
+                return [{"loc": ["body"], "msg": str(e), "type": "value_error"}]
+            if isinstance(data, dict):
+                for name, input_name in input_names:
+                    if input_name in data:
+                        _setattr(self, name, data[input_name])
+
+        for field_name, validators in cls.__before_field_validators__:
+            try:
+                value = getattr(self, field_name)
+                for validator in validators:
+                    value = validator(cls, value)
+                _setattr(self, field_name, value)
+            except (ValueError, TypeError) as e:
+                errors.append({"loc": ["body", field_name], "msg": str(e), "type": "value_error"})
 
         return errors
 
@@ -844,6 +950,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         # Cache force_setattr for nested field validation (optimization #2)
         _setattr = msgspec_structs.force_setattr
+        # The loc of an error has the wire name of the field, as a msgspec error has.
+        rename_map = self.__class__.__rename_map__
 
         # Validate nested fields (no hasattr needed - msgspec struct fields always exist)
         for field_name, nested_config in self.__nested_fields__.items():
@@ -857,7 +965,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             except (ValueError, TypeError) as e:
                 errors.append(
                     {
-                        "loc": ["body", field_name],
+                        "loc": ["body", rename_map.get(field_name, field_name)],
                         "msg": str(e),
                         "type": "value_error",
                     }
@@ -869,7 +977,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if current_value not in allowed_values:
                 errors.append(
                     {
-                        "loc": ["body", field_name],
+                        "loc": ["body", rename_map.get(field_name, field_name)],
                         "msg": f"invalid value {current_value!r}. Expected one of: {', '.join(repr(v) for v in allowed_values)}",
                         "type": "value_error",
                     }
@@ -927,6 +1035,33 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Convert to dict and back through msgspec to trigger full validation
         data = msgspec.structs.asdict(self)
         return msgspec.convert(data, type=self.__class__)
+
+    @classmethod
+    def _get_before_plan(cls) -> Any:
+        """The plan for the before validators of this class and its nested serializers. Built one time."""
+        plan = cls.__before_plan__
+        if plan is PLAN_NOT_BUILT:
+            plan = cls.__before_plan__ = before_plan(cls)
+        return plan
+
+    @classmethod
+    def _validate_json_with_before(cls: type[T], plan: Any, json_data: str | bytes) -> T:
+        """model_validate_json() of a class with a before validator: builtins, the plan, then convert."""
+        data = run_before_validators(plan, msgspec.json.decode(json_data))
+        token = RAW_VALIDATED.set(True)
+        try:
+            # str_keys: the keys of a JSON object are strings.
+            return msgspec.convert(data, type=cls, str_keys=True)
+        except MsgspecValidationError as e:
+            if isinstance(e.__cause__, RequestValidationError):
+                raise e.__cause__ from e
+            if isinstance(data, dict):
+                errors = cls._collect_msgspec_errors(data)
+                if errors:
+                    raise RequestValidationError(errors=errors) from e
+            raise
+        finally:
+            RAW_VALIDATED.reset(token)
 
     @classmethod
     def _collect_msgspec_errors(cls: type[T], data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1018,9 +1153,24 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # author.name == 'John' (stripped)
             # author.email == 'john@example.com' (lowercased)
         """
+        if cls.__before_plan__ is not None and not RAW_VALIDATED.get():
+            plan = cls._get_before_plan()
+            if plan is not None:
+                data = run_before_validators(plan, data)
+                token = RAW_VALIDATED.set(True)
+                try:
+                    return cls.model_validate(data)
+                finally:
+                    RAW_VALIDATED.reset(token)
+
         try:
             return msgspec.convert(data, type=cls)
         except MsgspecValidationError as e:
+            # msgspec wraps the RequestValidationError of our validators. Raise it
+            # with its error list, as model_validate_json() does.
+            if isinstance(e.__cause__, RequestValidationError):
+                raise e.__cause__ from e
+
             # Collect all errors by validating field-by-field (Litestar approach)
             if isinstance(data, dict):
                 errors = cls._collect_msgspec_errors(data)
@@ -1052,6 +1202,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # author.name == 'John' (stripped)
             # author.email == 'john@example.com' (lowercased)
         """
+        if cls.__before_plan__ is not None and not RAW_VALIDATED.get():
+            plan = cls._get_before_plan()
+            if plan is not None:
+                return cls._validate_json_with_before(plan, json_data)
+
         try:
             return msgspec.json.decode(json_data, type=cls)
         except MsgspecValidationError as e:
@@ -1733,7 +1888,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         Convert serializer to a dictionary.
 
         Args:
-            exclude_unset: If True, exclude fields with default values
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
 
         Returns:
             Dictionary representation of the serializer
@@ -1744,7 +1899,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         """
         result = {}
         for field_name in self.__struct_fields__:
-            result[field_name] = getattr(self, field_name)
+            value = getattr(self, field_name)
+            if exclude_unset and value is msgspec.UNSET:
+                continue
+            result[field_name] = value
         return result
 
     def to_model(self, model_class: type[Model]) -> Model:
@@ -1754,6 +1912,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         Args:
             model_class: The Django model class to instantiate
 
+        The instance does not get the value of a ``read_only`` field.
+
         Returns:
             An unsaved model instance
 
@@ -1762,14 +1922,16 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             user = user_data.to_model(User)
             await user.asave()
         """
-        return model_class(**self.to_dict())
+        read_only = self.__read_only_fields__
+        return model_class(**{name: value for name, value in self.to_dict().items() if name not in read_only})
 
     def update_instance(self: T, instance: Model) -> Model:
         """
         Update a Django model instance with values from this serializer.
 
         Only updates fields that are present in the serializer. When omit_defaults=True,
-        only updates fields that differ from their default values.
+        only updates fields that differ from their default values. Does not update
+        a ``read_only`` field.
 
         Args:
             instance: The model instance to update
@@ -1789,7 +1951,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Get field defaults if omit_defaults is enabled
         default_values = dict(_iter_field_defaults(type(self))) if omit_defaults else {}
 
+        read_only = self.__read_only_fields__
+
         for field_name in self.__struct_fields__:
+            if field_name in read_only:
+                continue
+
             value = getattr(self, field_name)
 
             # Skip fields that are at their default value if omit_defaults is True
@@ -1814,9 +1981,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         read_only: set[str] = set()
         """Field names that should only be returned, not accepted on input"""
-
-        validators: dict[str, list[Any]] = {}
-        """Additional validators to apply to fields"""
 
         field_sets: dict[str, list[str]] = {}
         """
@@ -1883,6 +2047,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             - Computed fields are included if their name is in the fields list
             - write_only fields from Meta are automatically excluded from subsets
             - The subset inherits validators for included fields
+            - The subset keeps the rename, omit_defaults, forbid_unknown_fields and frozen
+              options of the parent. It does not keep the tag
+            - Model validators are not copied. They can read a field that the subset
+              does not have
             - Always define subsets at module level, not inside view functions
         """
         fields_set = frozenset(fields)
@@ -1925,10 +2093,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if field_idx >= 0:
                 parent_default_map[parent_fields[field_idx]] = default_val
 
-        # Set defaults on the new class for fields that have them
+        # Set defaults on the new class for fields that have them. A field with
+        # field() and no default keeps its config.
+        required_field_configs = cls.__required_field_configs__
         for field_name in struct_fields_to_include:
             if field_name in parent_default_map:
                 class_dict[field_name] = parent_default_map[field_name]
+            elif field_name in required_field_configs:
+                class_dict[field_name] = _FieldMarker(config=required_field_configs[field_name])
 
         # Copy computed field methods that are in the fields list
         computed_to_include: list[str] = []
@@ -1941,8 +2113,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Copy field validators for included fields
         for field_name, validators in cls.__field_validators__.items():
             if field_name in fields_set:
-                for validator in validators:
-                    class_dict[f"_validator_{field_name}"] = validator
+                for index, validator in enumerate(validators):
+                    class_dict[f"_validator_{field_name}_{index}"] = validator
 
         # Copy Config with adjusted field_sets (only include subsets of our fields)
         parent_meta = getattr(cls, "Config", None)
@@ -1966,7 +2138,19 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # and reusing the parent's tag would create duplicate-tag collisions
         # in any tagged union containing both. Callers who need a tagged
         # subset can subclass with an explicit `tag=...`.
-        new_cls: type[T] = type(class_name, (Serializer,), class_dict, kw_only=True)  # type: ignore
+        # The subset keeps the wire names and the struct options of the parent.
+        struct_config = cls.__struct_config__
+        new_cls: type[T] = type(  # type: ignore
+            class_name,
+            (Serializer,),
+            class_dict,
+            kw_only=True,
+            rename={name: cls.__rename_map__[name] for name in struct_fields_to_include if name in cls.__rename_map__}
+            or None,
+            omit_defaults=struct_config.omit_defaults,
+            forbid_unknown_fields=struct_config.forbid_unknown_fields,
+            frozen=struct_config.frozen,
+        )
 
         # Add from_parent class method
         @classmethod
@@ -2149,7 +2333,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         Args:
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys (not yet implemented)
 
@@ -2167,10 +2351,15 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
             if cls.__orm_state_check_fields__:
                 self._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
-            # to_builtins handles rename and tag injection natively; asdict is
-            # cheaper when neither applies, so keep the split for the common case.
-            if cls.__has_rename__ or cls.__tag_value__ is not None:
-                return msgspec.to_builtins(self)
+            # asdict is cheapest when the keys are the field names. For a rename,
+            # pair the encoded names with the values. The values stay as they are,
+            # as on the slow path.
+            if cls.__tag_value__ is not None:
+                result = {cls.__tag_field__: cls.__tag_value__}
+                result.update(zip(cls.__struct_encode_fields__, msgspec_structs.astuple(self), strict=True))
+                return result
+            if cls.__has_rename__:
+                return dict(zip(cls.__struct_encode_fields__, msgspec_structs.astuple(self), strict=True))
             return msgspec_structs.asdict(self)
 
         # SLOW PATH: Need special handling.
@@ -2223,6 +2412,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
             # Skip None values if exclude_none
             if exclude_none and value is None:
+                continue
+
+            if exclude_unset and value is msgspec.UNSET:
                 continue
 
             if exclude_defaults and spec.default_value is not _MISSING and value == spec.default_value:
@@ -2302,7 +2494,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         Args:
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 
@@ -2333,7 +2525,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         Args:
             instances: Iterable of serializer instances to dump
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 
@@ -2352,9 +2544,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if cls.__orm_state_check_fields__:
                 for instance in instances_list:
                     instance._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
-            if cls.__has_rename__ or cls.__tag_value__ is not None:
-                _to_builtins = msgspec.to_builtins
-                return [_to_builtins(instance) for instance in instances_list]
+            _astuple = msgspec_structs.astuple
+            if cls.__tag_value__ is not None:
+                keys = (cls.__tag_field__, *cls.__struct_encode_fields__)
+                tag = cls.__tag_value__
+                return [dict(zip(keys, (tag, *_astuple(instance)), strict=True)) for instance in instances_list]
+            if cls.__has_rename__:
+                keys = cls.__struct_encode_fields__
+                return [dict(zip(keys, _astuple(instance), strict=True)) for instance in instances_list]
             _asdict = msgspec_structs.asdict
             return [_asdict(instance) for instance in instances_list]
 
@@ -2389,7 +2586,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         Args:
             instances: Iterable of serializer instances to dump
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 
@@ -2504,7 +2701,7 @@ class SerializerView(Iterable[T]):
         Args:
             instance: Serializer instance to dump
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 
@@ -2537,7 +2734,7 @@ class SerializerView(Iterable[T]):
         Args:
             instances: Iterable of serializer instances
             exclude_none: If True, exclude fields with None values
-            exclude_unset: If True, exclude fields that weren't explicitly set
+            exclude_unset: If True, exclude fields that hold msgspec.UNSET
             exclude_defaults: If True, exclude fields with their default values
             by_alias: If True, use field aliases as keys
 
