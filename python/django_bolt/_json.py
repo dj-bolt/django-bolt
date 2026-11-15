@@ -13,7 +13,7 @@ Inspired by Litestar's serialization approach.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
 from ipaddress import (
@@ -52,6 +52,12 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
     date: lambda v: v.isoformat(),
     time: lambda v: time(v.hour, v.minute, v.second, v.microsecond, v.tzinfo, fold=v.fold),
     Decimal: Decimal,
+    # The same rule for a subclass of int, float, bytes or timedelta.
+    # The base descriptor returns the exact type for each of the first three.
+    int: int.__int__,
+    float: float.__float__,
+    bytes: bytes.__bytes__,
+    timedelta: lambda v: timedelta(days=v.days, seconds=v.seconds, microseconds=v.microseconds),
     # IP addresses
     IPv4Address: str,
     IPv4Interface: str,
