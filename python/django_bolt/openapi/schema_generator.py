@@ -1070,7 +1070,8 @@ class SchemaGenerator:
                     if not self._field_in_schema(field_config):
                         continue
                     field_name, field_schema, field_required = self._msgspec_field_schema(struct_field, field_config)
-                    field_schema = self._text_value_schema(field_schema)
+                    # Remove the null arm first, so that the array rule below sees the array of `list | None`.
+                    field_schema = self._model_field_schema(self._text_value_schema(field_schema))
                     if source == "header":
                         # Bolt reads the x_request_id field from the x-request-id header.
                         field_name = field_name.lower().replace("_", "-")
@@ -1084,7 +1085,7 @@ class SchemaGenerator:
                             name=field_name,
                             param_in=param_in,
                             required=field_required,
-                            schema=self._model_field_schema(field_schema),
+                            schema=field_schema,
                             description=f"Parameter {field_name}",
                         )
                     )
