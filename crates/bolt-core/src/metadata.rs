@@ -702,8 +702,10 @@ impl RouteMetadata {
                         cors_config = Some(config);
                     }
 
-                    // Parse rate_limit config separately for fast access
-                    if type_str == "rate_limit" && rate_limit_config.is_none() {
+                    // Parse rate_limit config separately for fast access. As for
+                    // CORS, the last (most specific) config wins: the limit of
+                    // the route replaces the limit of the router and of the API.
+                    if type_str == "rate_limit" {
                         rate_limit_config = Some(parse_rate_limit_config(&mw_dict, py)?);
                     }
                 }
@@ -2482,6 +2484,33 @@ mod tests {
     }
 
     #[test]
+    fn the_last_rate_limit_config_replaces_the_outer_one() {
+        let meta = route(
+            "'middleware': [{'type': 'rate_limit', 'rps': 100, 'key': 'X-Tenant'}, \
+             {'type': 'cors', 'origins': ['https://a.test']}, \
+             {'type': 'rate_limit', 'rps': 5, 'burst': 7}]",
+        );
+        let limit = meta.rate_limit_config.unwrap();
+        assert_eq!((limit.rps, limit.burst), (5, 7));
+        // No value comes from the outer config.
+        assert_eq!(limit.key, RateLimitKey::Ip);
+    }
+
+    #[test]
+    fn each_rate_limit_config_of_a_route_is_checked() {
+        for list in [
+            "{'type': 'rate_limit', 'rps': 0}, {'type': 'rate_limit', 'rps': 5}",
+            "{'type': 'rate_limit', 'rps': 5}, {'type': 'rate_limit', 'rps': 0}",
+        ] {
+            let result = parse_route(&format!("'middleware': [{list}]"));
+            assert_eq!(
+                error_of(result),
+                "TypeError: rate_limit rps must be an int of 1 or more, got int 0"
+            );
+        }
+    }
+
+    #[test]
     fn the_last_cors_config_replaces_the_outer_one() {
         let meta = route(
             "'middleware': [{'type': 'cors', 'origins': ['https://a.test'], 'max_age': 10}, \
@@ -2586,14 +2615,6 @@ mod tests {
         assert_eq!((limit.rps, limit.burst), (5, 9));
         assert_eq!(limit.key, RateLimitKey::Header("x-key".to_string()));
         assert_eq!(readings(meta.plan), only(8));
-    }
-
-    #[test]
-    fn the_first_rate_limit_wins() {
-        let meta = route(
-            "'middleware': [{'type': 'rate_limit', 'rps': 5}, {'type': 'rate_limit', 'rps': 50}]",
-        );
-        assert_eq!(meta.rate_limit_config.unwrap().rps, 5);
     }
 
     #[test]

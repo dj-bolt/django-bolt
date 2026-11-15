@@ -1418,6 +1418,49 @@ def test_a_route_rate_limit_limits_a_router_route_with_no_api_limit():
     assert 429 in statuses[1:], statuses
 
 
+_STRICT = {"type": "rate_limit", "rps": 1, "burst": 1}
+_LOOSE = {"type": "rate_limit", "rps": 1000}
+
+
+@pytest.mark.parametrize(
+    ("api_limit", "router_limit", "route_limit", "limited"),
+    [
+        (_LOOSE, None, rate_limit(rps=1, burst=1), True),
+        (_STRICT, None, rate_limit(rps=1000), False),
+        (_LOOSE, _STRICT, None, True),
+        (_STRICT, _LOOSE, None, False),
+        (_STRICT, _STRICT, rate_limit(rps=1000), False),
+        (_LOOSE, _LOOSE, rate_limit(rps=1, burst=1), True),
+        (_STRICT, _STRICT, skip_middleware("rate_limit"), False),
+    ],
+    ids=[
+        "route-over-api",
+        "loose-route-over-api",
+        "router-over-api",
+        "loose-router-over-api",
+        "loose-route-over-router",
+        "route-over-router",
+        "skip-over-all",
+    ],
+)
+def test_the_most_specific_rate_limit_applies(api_limit, router_limit, route_limit, limited):
+    """The order is route, router, API. Before, the API limit won over each other limit."""
+    api = BoltAPI(middleware=[api_limit])
+    router = Router(prefix="/router", middleware=[router_limit] if router_limit else None)
+
+    async def items():
+        return {"ok": True}
+
+    router.get("/items")(route_limit(items) if route_limit else items)
+    api.include_router(router)
+
+    with TestClient(api) as client:
+        statuses = [client.get("/router/items").status_code for _ in range(4)]
+
+    assert statuses[0] == 200
+    assert (429 in statuses[1:]) is limited, statuses
+
+
 class WireTupleMiddleware(Middleware):
     """Answer with a ResponseWireV1 tuple, without the handler."""
 
