@@ -69,12 +69,15 @@ class JWTAuthViews:
         """Reject a refresh token that ``/refresh`` also rejects.
 
         A used, revoked or old-version token must not end the sessions of live tokens.
+        The refresh route cannot rotate a token with no family, so this token gets the same 401.
         """
         claims = request["context"]["auth_claims"]
+        # The Rust layer gives ``fam`` as a str and ``ver`` as an int, or leaves the claim out.
         fam = claims.get("fam")
         if (
-            await self.store.is_revoked(claims["jti"])
-            or (fam is not None and await self.store.is_family_revoked(fam))
+            not fam
+            or await self.store.is_revoked(claims["jti"])
+            or await self.store.is_family_revoked(fam)
             or claims.get("ver", 0) != await self.store.get_user_version(request["context"]["user_id"])
         ):
             raise HTTPException(status_code=401, detail="Invalid token")
