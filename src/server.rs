@@ -246,16 +246,12 @@ impl ServerConfig {
             } else {
                 origins
             };
-            Some(CorsConfig::from_django_settings(
+            Some(CorsConfig {
+                origin_set: origins.iter().cloned().collect(),
                 origins,
-                vec![],
-                allow_all,
-                false,
-                None,
-                None,
-                None,
-                None,
-            ))
+                allow_all_origins: allow_all,
+                ..Default::default()
+            })
         };
     }
 }
@@ -456,16 +452,21 @@ fn read_cors_and_file_scopes(
                 cors_origins = vec!["*".to_string()];
             }
 
-            Some(CorsConfig::from_django_settings(
-                cors_origins,
-                origin_regex_patterns.clone(),
-                allow_all,
-                credentials,
-                methods,
-                headers,
-                expose_headers,
-                max_age,
-            ))
+            // A pattern or a name that Rust cannot use stops startup. The
+            // error names the setting and the value.
+            Some(
+                CorsConfig::from_django_settings(
+                    cors_origins,
+                    origin_regex_patterns.clone(),
+                    allow_all,
+                    credentials,
+                    methods,
+                    headers,
+                    expose_headers,
+                    max_age,
+                )
+                .map_err(|message| improperly_configured(py, format!("{message}.")))?,
+            )
         } else {
             None
         };
