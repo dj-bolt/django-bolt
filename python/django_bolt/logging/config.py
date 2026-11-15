@@ -14,10 +14,12 @@ import contextlib
 import importlib
 import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from logging.handlers import QueueHandler, QueueListener
 from queue import Full, Queue
+
+from django.core.exceptions import ImproperlyConfigured
 
 try:
     from django.conf import settings
@@ -85,19 +87,21 @@ class LoggingConfig:
     # Custom exception logging handler
     exception_logging_handler: Callable | None = None
 
-    # Skip logging for specific paths (e.g., health checks)
+    # The access log of runbolt writes no line for a request with one of these
+    # paths (e.g., health checks). The match is exact, on the complete request path.
     skip_paths: set[str] = field(default_factory=lambda: {"/health", "/ready", "/metrics"})
 
-    # Skip logging for specific status codes
+    # The access log of runbolt writes no line for a response with one of these
+    # status codes.
     skip_status_codes: set[int] = field(default_factory=set)
 
-    # Optional sampling of logs (0.0-1.0). When set, successful responses (2xx/3xx)
-    # will only be logged with this probability. Errors (4xx/5xx) are not sampled.
+    # The access log of runbolt writes this part of the 1xx to 3xx responses
+    # (0.0 to 1.0). None writes each of them. A 4xx or a 5xx is not sampled.
     sample_rate: float | None = None
 
-    # Only log successful responses slower than this threshold (milliseconds).
-    # Errors (4xx/5xx) are not subject to the slow-only threshold.
-    min_duration_ms: int | None = None
+    # The access log of runbolt writes a 1xx to 3xx response only when it took
+    # this many milliseconds or more. A 4xx or a 5xx always writes its line.
+    min_duration_ms: float | None = None
 
     def get_logger(self) -> logging.Logger:
         """Get the configured logger.
@@ -122,54 +126,92 @@ class LoggingConfig:
         return not (status_code and status_code in self.skip_status_codes)
 
 
+def _checked_sample_rate(value: object, name: str) -> float:
+    """Return ``value`` as a sample rate, a number from 0.0 to 1.0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be a number from 0.0 to 1.0, got {value!r}")
+    return float(value)
+
+
+def _checked_min_duration_ms(value: object, name: str) -> float:
+    """Return ``value`` as a duration in milliseconds, a number of 0 or more."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value >= 0:
+        raise ValueError(f"{name} must be a number of 0 or more, got {value!r}")
+    return float(value)
+
+
+def _checked_skip_paths(value: object) -> tuple[str, ...]:
+    """Return ``value`` as the sorted request paths that write no access-log line."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise ValueError(f"LoggingConfig.skip_paths must be a set of paths, got {value!r}")
+    paths = tuple(value)
+    for path in paths:
+        if not isinstance(path, str):
+            raise ValueError(f"LoggingConfig.skip_paths must hold only str paths, got {path!r}")
+    return tuple(sorted(paths))
+
+
+def _checked_skip_status_codes(value: object) -> tuple[int, ...]:
+    """Return ``value`` as the sorted status codes that write no access-log line."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise ValueError(f"LoggingConfig.skip_status_codes must be a set of status codes, got {value!r}")
+    codes = tuple(value)
+    for code in codes:
+        if isinstance(code, bool) or not isinstance(code, int) or not 100 <= code <= 599:
+            raise ValueError(
+                f"LoggingConfig.skip_status_codes must hold only status codes from 100 to 599, got {code!r}"
+            )
+    return tuple(sorted(codes))
+
+
+def access_log_filter_meta(config: LoggingConfig) -> dict[str, float | tuple[str, ...] | tuple[int, ...]]:
+    """Return the route metadata keys for the access-log filter of ``config``.
+
+    Rust reads the keys one time, at startup. A key is absent when its option
+    sets no limit. A value out of range raises ``ValueError``.
+    """
+    meta: dict[str, float | tuple[str, ...] | tuple[int, ...]] = {}
+    skip_paths = _checked_skip_paths(config.skip_paths)
+    if skip_paths:
+        meta["access_log_skip_paths"] = skip_paths
+    skip_status_codes = _checked_skip_status_codes(config.skip_status_codes)
+    if skip_status_codes:
+        meta["access_log_skip_status_codes"] = skip_status_codes
+    if config.sample_rate is not None:
+        sample_rate = _checked_sample_rate(config.sample_rate, "LoggingConfig.sample_rate")
+        if sample_rate < 1.0:
+            meta["access_log_sample_rate"] = sample_rate
+    if config.min_duration_ms is not None:
+        min_duration_ms = _checked_min_duration_ms(config.min_duration_ms, "LoggingConfig.min_duration_ms")
+        if min_duration_ms > 0.0:
+            meta["access_log_min_duration_ms"] = min_duration_ms
+    return meta
+
+
 def get_default_logging_config() -> LoggingConfig:
     """Get default logging configuration.
 
-    Uses Django's DEBUG setting to determine log level.
+    The settings ``DJANGO_BOLT_LOG_SAMPLE`` and ``DJANGO_BOLT_LOG_SLOW_MS`` give
+    ``sample_rate`` and ``min_duration_ms``. A value out of range raises
+    ``ImproperlyConfigured``.
     """
     log_level = "INFO"
-    debug = False
-    settings_level = None
     settings_sample = None
     settings_slow_ms = None
+    if settings is not None and settings.configured:
+        settings_sample = getattr(settings, "DJANGO_BOLT_LOG_SAMPLE", None)
+        settings_slow_ms = getattr(settings, "DJANGO_BOLT_LOG_SLOW_MS", None)
+        log_level = "DEBUG" if settings.DEBUG else "WARNING"
+
     try:
-        if settings is not None and settings.configured:
-            debug = settings.DEBUG
-            # Optional overrides from Django settings
-            settings_level = getattr(settings, "DJANGO_BOLT_LOG_LEVEL", None)
-            settings_sample = getattr(settings, "DJANGO_BOLT_LOG_SAMPLE", None)
-            settings_slow_ms = getattr(settings, "DJANGO_BOLT_LOG_SLOW_MS", None)
-            # Default base level by DEBUG
-            log_level = "DEBUG" if debug else "WARNING"
-    except (AttributeError, Exception) as e:
-        # Django not available or not configured, use default
-        logging.getLogger(__name__).debug(
-            "Failed to read Django settings for logging configuration. Using default log level. Error: %s", e
+        sample_rate = (
+            None if settings_sample is None else _checked_sample_rate(settings_sample, "DJANGO_BOLT_LOG_SAMPLE")
         )
-
-    # Choose log level: Django settings override > default determined by DEBUG
-    if settings_level:
-        log_level = str(settings_level).upper()
-
-    sample_rate: float | None = None
-    if settings_sample is not None:
-        try:
-            sr = float(settings_sample)
-            if 0.0 <= sr <= 1.0:
-                sample_rate = sr
-        except Exception:
-            sample_rate = None
-
-    min_duration_ms: int | None = None
-    if settings_slow_ms is not None:
-        try:
-            min_duration_ms = max(0, int(settings_slow_ms))
-        except Exception:
-            min_duration_ms = None
-    else:
-        # Default to slow-only logging in production
-        if not debug:
-            min_duration_ms = 250
+        min_duration_ms = (
+            None if settings_slow_ms is None else _checked_min_duration_ms(settings_slow_ms, "DJANGO_BOLT_LOG_SLOW_MS")
+        )
+    except ValueError as error:
+        raise ImproperlyConfigured(str(error)) from error
 
     return LoggingConfig(
         log_level=log_level,
@@ -363,7 +405,9 @@ def setup_django_logging(force: bool = False) -> None:
             # App-level logging config remains source of truth; use base_level if unset
             current_level = logger.level or logging.getLevelName(base_level)
             logger.setLevel(current_level)
-            logger.propagate = logger_name == "django"
+            # Each of these loggers has the queue handler. A record that also
+            # went to the root logger would print two times.
+            logger.propagate = False
 
         _LOGGING_CONFIGURED = True
 

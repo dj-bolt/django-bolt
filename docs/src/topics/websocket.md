@@ -96,6 +96,23 @@ async for data in websocket.iter_json():
     print(f"Received: {data}")
 ```
 
+### A frame of a different type
+
+`receive_text()` reads only a text frame, and `receive_bytes()` reads only a
+binary frame. A frame of the other type raises `WebSocketException` with code
+1003 (unsupported data). The reason names the frame, for example
+`receive_text() got a binary frame`. The connection stays open, and the next
+call reads the next frame. `receive_json()` and the iterators raise the same
+error. To read each frame type, use `receive()`:
+
+```python
+message = await websocket.receive()
+if "text" in message:
+    print(f"Text: {message['text']}")
+else:
+    print(f"Binary: {len(message['bytes'])} bytes")
+```
+
 ## Path parameters
 
 WebSocket routes support path parameters:
@@ -126,6 +143,10 @@ async def connect(websocket: WebSocket, token: str | None = None):
     # ...
 ```
 
+This `close()` runs before `accept()`, so it refuses the handshake with `403`.
+The client does not get the close code. To send a close code, call `accept()`
+first. See [Refuse the handshake](#refuse-the-handshake).
+
 When a query key repeats, the parameter gets the last value, as for HTTP
 routes.
 
@@ -154,12 +175,22 @@ raises `ValueError` with the same text.
 
 ### From the server
 
+When the handler returns after `accept()` with no `close()`, Bolt closes the
+connection with code 1000. When the handler raises, Bolt closes it with code
+1011 and the reason `Internal error`. To send a different code or a reason,
+call `close()`:
+
 ```python
 await websocket.close()
 
 # With custom close code and reason
 await websocket.close(code=1000, reason="Normal closure")
 ```
+
+A close frame holds a code and a reason of at most 123 bytes of UTF-8 (RFC 6455).
+Use a code from 1000 to 4999, but not 1005, 1006 or 1015. `close()` raises
+`ValueError` for a code or a reason that makes an invalid close frame. The
+connection stays open, and `WebSocketTestClient` raises the same error.
 
 ### Refuse the handshake
 
@@ -221,7 +252,7 @@ Access close codes:
 ```python
 from django_bolt import CloseCode
 
-await websocket.close(code=CloseCode.NORMAL_CLOSURE)
+await websocket.close(code=CloseCode.NORMAL)
 ```
 
 ## Subprotocols
@@ -293,6 +324,23 @@ async with websockets.connect(
 ) as ws:
     print(await ws.recv())
 ```
+
+In a test, send the same header. `WebSocketTestClient` has no option that
+replaces the credential, so the test runs the authentication and the guards of
+the server:
+
+```python
+from django_bolt.testing import WebSocketTestClient
+
+async with WebSocketTestClient(
+    api,
+    "/ws/protected",
+    headers={"Authorization": f"Bearer {token}"},
+) as ws:
+    assert await ws.receive_text() == "Welcome"
+```
+
+A connection that the authentication or a guard refuses raises `PermissionError`.
 
 ### Revoked tokens
 
@@ -385,13 +433,37 @@ A route without `include_in_schema` uses the value of its `BoltAPI`, as an HTTP 
 Use the `WebSocketTestClient`:
 
 ```python
-from django_bolt.testing import TestClient
+import pytest
 
-with TestClient(api) as client:
-    with client.websocket_connect("/ws/echo") as ws:
-        ws.send_text("Hello")
-        response = ws.receive_text()
+from django_bolt.testing import WebSocketTestClient
+
+
+@pytest.mark.asyncio
+async def test_echo():
+    async with WebSocketTestClient(api, "/ws/echo") as ws:
+        await ws.send_text("Hello")
+        response = await ws.receive_text()
         assert response == "Echo: Hello"
+```
+
+`WebSocketTestClient` is an async client. Each connection is one `async with` block.
+`TestClient` is for HTTP requests and has no WebSocket method.
+
+When the handler closes the connection, the receive methods raise `ConnectionClosed`.
+Its `code` attribute has the close code:
+
+```python
+from django_bolt.testing import ConnectionClosed, WebSocketTestClient
+
+@api.websocket("/ws/once")
+async def once(websocket: WebSocket):
+    await websocket.accept()
+    await websocket.close(code=4001)
+
+async with WebSocketTestClient(api, "/ws/once") as ws:
+    with pytest.raises(ConnectionClosed) as closed:
+        await ws.receive_text()
+assert closed.value.code == 4001
 ```
 
 `WebSocketTestClient` waits for the handshake decision of the handler, as the
@@ -407,6 +479,13 @@ assert rejected.value.status_code == 403
 ```
 
 An error in the handler before `accept()` fails the `async with` with that error.
+
+When the `async with` block ends, the client disconnects. The handler gets the
+disconnect and runs to its end, as on the server. Thus a test can check what
+the handler does after the client leaves. An error of the handler after the
+disconnect fails the `async with`. A `WebSocketDisconnect` that the handler
+does not catch is not an error. The client cancels a handler that still runs
+after 1 second.
 
 ## Real-time patterns
 
