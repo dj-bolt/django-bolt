@@ -228,6 +228,34 @@ def test_openapi_root_path_serves_ui_directly():
         assert "swagger" in html.lower(), "Response should contain Swagger UI"
 
 
+@pytest.mark.parametrize(
+    ("path", "marker"),
+    [
+        ("/docs", "swagger"),
+        ("/docs/redoc", "redoc"),
+        ("/docs/scalar", "scalar"),
+        ("/docs/rapidoc", "rapi-doc"),
+        ("/docs/stoplight", "elements-api"),
+    ],
+)
+def test_default_api_serves_each_docs_page_at_its_documented_path(path, marker):
+    """With no ``openapi_config``, each docs UI is at the path that the docs name."""
+    api = BoltAPI()
+
+    @api.get("/items")
+    async def items():
+        return []
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get(path)
+
+    assert response.status_code == 200, response.text
+    assert "text/html" in response.headers["content-type"]
+    assert marker in response.text.lower()
+
+
 def test_openapi_renders_serializer_with_field_marker_default():
     """Regression: serializer field() used as default must not leak the
     internal _FieldMarker (which carries a bare object() sentinel for

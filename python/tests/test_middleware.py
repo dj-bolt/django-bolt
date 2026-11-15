@@ -521,7 +521,7 @@ class TestMiddlewareOrderingAndExecution:
 
         @middleware
         async def function_mw(request, call_next):
-            events.append("function:before")
+            events.append(f"function:before:{request.method} {request.path}")
             response = await call_next(request)
             response.headers["X-Function-Middleware"] = "true"
             events.append("function:after")
@@ -531,8 +531,8 @@ class TestMiddlewareOrderingAndExecution:
 
         @api.get("/fn")
         @function_mw
-        async def fn_handler():
-            events.append("handler")
+        async def fn_handler(request):
+            events.append(f"handler:{request.path}")
             return {"ok": True}
 
         with TestClient(api, use_http_layer=True) as client:
@@ -541,7 +541,8 @@ class TestMiddlewareOrderingAndExecution:
             assert response.headers.get("X-Function-Middleware") == "true"
             assert response.json() == {"ok": True}
 
-        assert events == ["function:before", "handler", "function:after"]
+        # The middleware and the handler behind it get the request.
+        assert events == ["function:before:GET /fn", "handler:/fn", "function:after"]
 
 
 class TestMiddlewareMetadata:
