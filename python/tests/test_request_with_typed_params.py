@@ -9,10 +9,18 @@ request object.
 
 from __future__ import annotations
 
+from typing import Annotated
+
+import msgspec
 import pytest
 
 from django_bolt import BoltAPI
+from django_bolt.params import Cookie, Header
 from django_bolt.testing import TestClient
+
+
+class _Item(msgspec.Struct):
+    name: str
 
 
 # Function scope: each test registers its routes, so a mutation tool sees
@@ -80,6 +88,18 @@ def api():
             "item_id": item_id,
             "cookies": dict(request.cookies),
         }
+
+    # Handler with request + typed body, header and cookie parameters. The
+    # handler does not read the request, so the analysis finds no request part.
+    @api.post("/items/typed")
+    async def create_with_unread_request(
+        request,
+        item: _Item,
+        token: Annotated[str, Header(alias="x-task-token")],
+        theme: Annotated[str, Cookie()],
+        page: int = 1,
+    ):
+        return {"name": item.name, "token": token, "theme": theme, "page": page}
 
     # Control: request-only handler — should always work
     @api.get("/headers-only")
@@ -184,6 +204,19 @@ class TestRequestCookiesWithTypedParams:
         assert data["item_id"] == "abc"
         assert data["cookies"].get("session") == "abc123"
         assert data["cookies"].get("theme") == "dark"
+
+
+class TestTypedParamsWithUnreadRequest:
+    """The typed parameters get their values when the handler has a request parameter that it does not read."""
+
+    def test_typed_params_with_unread_request(self, client):
+        response = client.post(
+            "/items/typed?page=3",
+            json={"name": "bolt"},
+            headers={"X-Task-Token": "secret-token", "Cookie": "theme=dark"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"name": "bolt", "token": "secret-token", "theme": "dark", "page": 3}
 
 
 class TestAllComponentsWithMixedParams:
