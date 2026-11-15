@@ -108,6 +108,50 @@ def test_bare_dict_default():
         assert response.json() == {"id": 1, "name": "Test"}
 
 
+def test_bare_return_with_no_success_code_in_the_map_answers_200():
+    """A map of error types only does not make an error status the default status of the route."""
+    api = BoltAPI()
+
+    @api.get("/text", response_model={404: ErrorSchema, ...: str})
+    async def text():
+        return "hello"
+
+    @api.get("/errors-only", response_model={400: ErrorSchema, 500: ErrorSchema})
+    def errors_only():
+        return {"id": 1}
+
+    @api.get("/missing", response_model={400: ErrorSchema, 404: ErrorSchema})
+    async def missing():
+        return 404, {"detail": "Not found"}
+
+    @api.post("/created", response_model={400: ErrorSchema}, status_code=201)
+    async def created():
+        return {"id": 1}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.get("/text")
+        assert response.status_code == 200
+        assert response.text == "hello"
+
+        response = client.get("/errors-only")
+        assert response.status_code == 200
+        assert response.json() == {"id": 1}
+
+        # A tuple still selects the status and its schema.
+        response = client.get("/missing")
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Not found"}
+
+        # status_code= of the decorator is the default status.
+        assert client.post("/created").status_code == 201
+
+        # The document lists the statuses of the map. It does not invent a 200 schema.
+        paths = client.get("/docs/openapi.json").json()["paths"]
+        assert set(paths["/errors-only"]["get"]["responses"]) >= {"400", "500"}
+
+
 # ============================================================================
 # 5. 204 None — empty body
 # ============================================================================

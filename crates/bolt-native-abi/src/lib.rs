@@ -462,12 +462,12 @@ mod tests {
             size: core::mem::size_of::<Request>(),
             method: Slice::from_bytes(b"POST"),
             path: Slice::from_bytes(b"/a/42"),
-            query: Slice::EMPTY,
+            query: Slice::from_bytes(b"page=2"),
             headers: headers.as_ptr(),
             n_headers: headers.len(),
             path_params: params.as_ptr(),
             n_path_params: params.len(),
-            client_addr: Slice::EMPTY,
+            client_addr: Slice::from_bytes(b"203.0.113.9"),
             scheme: Slice::from_bytes(b"https"),
             body: Slice::from_bytes(b"ping"),
         }
@@ -507,6 +507,10 @@ mod tests {
         assert_eq!(req.header(b"x-other"), None);
         assert_eq!(req.path_param(b"id"), Some(&b"42"[..]));
         assert_eq!(req.scheme(), b"https");
+        assert_eq!(req.method(), b"POST");
+        assert_eq!(req.path(), b"/a/42");
+        assert_eq!(req.query(), b"page=2");
+        assert_eq!(req.client_addr(), b"203.0.113.9");
     }
 
     handler!(static ECHO = c"echo", |req: RequestRef<'_>, responder: Responder| {
