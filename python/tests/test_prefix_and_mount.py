@@ -716,6 +716,12 @@ class TestTrailingSlashSetting:
         assert "/with-slash/" in registered_paths, f"'keep' should preserve slash, got: {registered_paths}"
         assert "/no-slash" in registered_paths, f"'keep' should preserve no slash, got: {registered_paths}"
 
+    @pytest.mark.parametrize("value", ["bogus", "Strip", "", None, True])
+    def test_trailing_slash_refuses_an_unknown_mode(self, value):
+        """An unknown mode behaved as "keep", with no error."""
+        with pytest.raises(ValueError, match='trailing_slash must be "strip", "append" or "keep"'):
+            BoltAPI(trailing_slash=value)
+
     def test_trailing_slash_with_prefix_strip(self):
         """Strip mode with prefix normalizes combined path."""
         api = BoltAPI(prefix="/api", trailing_slash="strip")

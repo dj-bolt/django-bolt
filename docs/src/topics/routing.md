@@ -340,6 +340,8 @@ You can control this behavior with the `trailing_slash` parameter:
 | `"append"` | Add trailing slashes | `/users` → `/users/` |
 | `"keep"` | No normalization | `/users/` → `/users/` |
 
+Another value raises `ValueError` when you make the `BoltAPI`.
+
 ### Runtime redirect behavior
 
 When a request URL doesn't exactly match a registered route, Django-Bolt checks if the alternate path (with or without trailing slash) exists. If it does, a **308 Permanent Redirect** is returned to the canonical URL:
