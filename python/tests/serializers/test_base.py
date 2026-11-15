@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import msgspec
 import pytest
 
 from django_bolt.exceptions import RequestValidationError
@@ -44,6 +45,20 @@ class TestSerializerBasics:
         data = user.to_dict()
 
         assert data == {"username": "charlie", "email": "charlie@example.com"}
+
+    def test_exclude_unset_leaves_out_the_fields_that_hold_unset(self):
+        """A field with the default msgspec.UNSET is unset until the caller or the input gives it a value."""
+
+        class UserPatch(Serializer):
+            username: str | msgspec.UnsetType = msgspec.UNSET
+            email: str | None | msgspec.UnsetType = msgspec.UNSET
+
+        patch = msgspec.json.decode(b'{"email": null}', type=UserPatch)
+
+        assert patch.dump(exclude_unset=True) == {"email": None}
+        assert patch.to_dict(exclude_unset=True) == {"email": None}
+        assert patch.dump_json(exclude_unset=True) == b'{"email":null}'
+        assert UserPatch.dump_many([patch], exclude_unset=True) == [{"email": None}]
 
 
 class TestFieldValidators:
