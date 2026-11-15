@@ -336,7 +336,27 @@ class _SerializerMeta(_STRUCT_META):
     def __new__(mcs, name: str, bases: tuple, namespace: dict, **kwargs):
         # Force kw_only=True for all Serializer subclasses
         kwargs.setdefault("kw_only", True)
+
+        # field() with no default is not a default value. Take the marker out of
+        # the class body, so msgspec reports a missing value as it does for a
+        # plain required field. The config stays on the class.
+        required_field_configs = {
+            field_name: value.config
+            for field_name, value in namespace.items()
+            if isinstance(value, _FieldMarker) and not value.config.has_default()
+        }
+        for field_name in required_field_configs:
+            del namespace[field_name]
         cls = cast(Any, super().__new__(mcs, name, bases, namespace, **kwargs))
+
+        # A subclass keeps the config of its parents. A field that the subclass
+        # declares again with a default uses that default, not the old config.
+        defaults = dict(_iter_field_defaults(cls))
+        inherited = getattr(cls, "__required_field_configs__", {})
+        cls.__required_field_configs__ = {
+            **{field_name: config for field_name, config in inherited.items() if field_name not in defaults},
+            **required_field_configs,
+        }
 
         # Build rename map (e.g., {"user_name": "userName"} for rename="camel").
         # Done here because __struct_fields__ isn't available in __init_subclass__.
@@ -414,6 +434,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __write_only_fields__: ClassVar[frozenset[str]] = frozenset()
     __source_mapping__: ClassVar[dict[str, str]] = {}  # API field name -> source attribute
     __field_sets__: ClassVar[dict[str, list[str]]] = {}  # Named field sets for use() method
+
+    # Config of each field that has field() with no default (set by the metaclass)
+    __required_field_configs__: ClassVar[dict[str, FieldConfig]] = {}
 
     # _FieldMarker default resolution (populated by __init_subclass__)
     __field_marker_defaults__: ClassVar[dict[str, Any]] = {}  # field_name -> actual default value
@@ -697,14 +720,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # Check if the current value is a _FieldMarker (meaning the user
             # didn't provide a value and msgspec used the marker as default)
             if isinstance(current_value, _FieldMarker):
-                config = current_value.config
-                if config.has_default():
-                    # Replace with actual default from the _FieldMarker config
-                    _setattr(self, field_name, config.get_default())
-                else:
-                    # field() was used without a default, and user didn't provide value
-                    # This shouldn't normally happen since msgspec requires the field
-                    raise MsgspecValidationError(f"Field '{field_name}' is required but was not provided")
+                # Replace with actual default from the _FieldMarker config. A field()
+                # with no default is a required field of the struct, not a marker.
+                _setattr(self, field_name, current_value.config.get_default())
 
     @classmethod
     def _lazy_collect_field_configs(cls) -> None:
@@ -734,6 +752,17 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                 if config.source:
                     source_mapping[field_name] = config.source
 
+        for field_name, config in cls.__required_field_configs__.items():
+            field_configs[field_name] = config
+            if config.read_only:
+                read_only.add(field_name)
+            if config.write_only:
+                write_only.add(field_name)
+            if config.source:
+                source_mapping[field_name] = config.source
+
+        has_field_markers = bool(field_marker_fields)
+
         # Merge with existing configs from Meta class
         cls.__field_configs__.update(field_configs)
         cls.__read_only_fields__ = cls.__read_only_fields__ | frozenset(read_only)
@@ -753,7 +782,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         )
 
         # Update the has_field_markers flag based on actual _FieldMarker defaults found
-        cls.__has_field_markers__ = bool(field_configs)
+        cls.__has_field_markers__ = has_field_markers
 
         # Build rename map if deferred from _SerializerMeta.__new__ (forward reference)
         if not cls.__has_rename__ and not cls.__rename_map__:
@@ -1933,10 +1962,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if field_idx >= 0:
                 parent_default_map[parent_fields[field_idx]] = default_val
 
-        # Set defaults on the new class for fields that have them
+        # Set defaults on the new class for fields that have them. A field with
+        # field() and no default keeps its config.
+        required_field_configs = cls.__required_field_configs__
         for field_name in struct_fields_to_include:
             if field_name in parent_default_map:
                 class_dict[field_name] = parent_default_map[field_name]
+            elif field_name in required_field_configs:
+                class_dict[field_name] = _FieldMarker(config=required_field_configs[field_name])
 
         # Copy computed field methods that are in the fields list
         computed_to_include: list[str] = []
