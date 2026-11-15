@@ -411,7 +411,11 @@ fn build_scope(
 
     let request_path = req.path();
     let subpath = mounted_subpath(request_path, &mount.prefix);
-    scope.set_item("path", &subpath)?;
+    // ASGI: `path` is percent-decoded and `raw_path` keeps the request bytes,
+    // as in the WebSocket scope. Django matches its URL patterns with `path`.
+    let path =
+        String::from_utf8_lossy(&urlencoding::decode_binary(subpath.as_bytes())).into_owned();
+    scope.set_item("path", path)?;
     scope.set_item("raw_path", PyBytes::new(py, subpath.as_bytes()))?;
     scope.set_item(
         "query_string",
