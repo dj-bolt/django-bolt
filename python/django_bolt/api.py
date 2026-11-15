@@ -1116,7 +1116,7 @@ class BoltAPI:
 
             # The handshake awaits this check before the upgrade: a revoked
             # token gets 401, as on an HTTP route.
-            ws_auth_backends = route_auth_backends(ws_auth)
+            ws_auth_backends = route_auth_backends(ws_auth, guards)
             revocation_handlers = _revocation_handlers(ws_auth_backends)
             if revocation_handlers is not None:
                 middleware_meta = middleware_meta or {}

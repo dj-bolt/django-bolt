@@ -412,6 +412,29 @@ def test_websocket_security_with_default_authentication_classes(settings):
     assert schema.paths["/ws/stream"].get.security == [{"BearerAuth": []}]
 
 
+def test_websocket_security_of_a_guarded_route_with_no_auth_backend():
+    """A guarded WebSocket route with no backend documents the JWT default, as an HTTP route does."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/stream", guards=[IsAuthenticated()])
+    async def stream(websocket: WebSocket):
+        await websocket.accept()
+
+    @api.websocket("/ws/open")
+    async def open_stream(websocket: WebSocket):
+        await websocket.accept()
+
+    @api.get("/items", guards=[IsAuthenticated()])
+    async def items():
+        return []
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
+    assert schema.paths["/items"].get.security == [{"BearerAuth": []}]
+    assert schema.paths["/ws/stream"].get.security == [{"BearerAuth": []}]
+    # A route with no guard gets no default backend.
+    assert schema.paths["/ws/open"].get.security is None
+
+
 def test_websocket_summary_and_description():
     """Explicit summary and description on a WebSocket route replace the docstring."""
     api = BoltAPI()
