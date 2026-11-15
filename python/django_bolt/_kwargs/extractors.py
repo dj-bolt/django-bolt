@@ -14,7 +14,7 @@ from typing import Annotated, Any, get_args, get_origin
 import msgspec
 from django.db.models import QuerySet
 
-from .._serializer_input import ignore_read_only_input
+from .._serializer_input import ignore_read_only_input, read_only_input_extractor
 from ..concurrency import run_in_orm_executor
 from ..datastructures import UploadFile
 from ..exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
@@ -444,6 +444,7 @@ def _collect_sequence_field_names(struct_type: type) -> tuple[str, ...]:
     return tuple(names)
 
 
+@read_only_input_extractor
 def _create_param_struct_extractor(struct_type: type, default: Any, param_type: str) -> Callable:
     """
     Create an extractor that builds and validates a msgspec Struct/Serializer from parameter data.
@@ -596,6 +597,7 @@ def _collect_header_struct_errors(
     return errors
 
 
+@read_only_input_extractor
 def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable:
     """Create an extractor that builds a Struct/Serializer from HTTP headers.
 

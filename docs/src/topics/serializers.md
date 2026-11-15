@@ -592,7 +592,7 @@ user.dump()
 # {'id': 5, 'name': 'alice'}
 ```
 
-Input is a JSON request body, `model_validate()` and `model_validate_json()`. The rule also applies to a nested serializer in that input. `from_model()` and direct construction set the field.
+Input is a JSON request body, `model_validate()` and `model_validate_json()`. A serializer that is a `Query()`, `Header()`, `Cookie()` or `Form()` model is input too. The rule also applies to a nested serializer in that input. `from_model()` and direct construction set the field.
 
 - Bolt ignores the input value. With `forbid_unknown_fields=True` on the serializer, the input value is an error, as an unknown field is.
 - A read-only field must have a default. Without one, route registration and `model_validate()` raise `ImproperlyConfigured`. A serializer that is only a response needs no default.
