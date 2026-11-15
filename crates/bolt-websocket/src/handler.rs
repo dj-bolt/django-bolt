@@ -492,6 +492,19 @@ fn create_receive_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<
     Ok(Py::new(py, receive_fn)?.into_any())
 }
 
+/// The longest close reason, in bytes of UTF-8.
+///
+/// RFC 6455 5.5 limits the payload of a control frame to 125 bytes. The close
+/// code takes 2 of them.
+const MAX_CLOSE_REASON_BYTES: usize = 123;
+
+/// Whether an endpoint can send this code in a close frame.
+///
+/// RFC 6455 7.4.1: 1005, 1006 and 1015 are never in a close frame.
+fn is_close_frame_code(code: u16) -> bool {
+    (1000..=4999).contains(&code) && !matches!(code, 1005 | 1006 | 1015)
+}
+
 /// Create Python send function that sends to actor
 fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<PyAny>> {
     #[pyclass]
@@ -585,16 +598,32 @@ fn create_send_fn(py: Python<'_>, state: Arc<WsConnectionState>) -> PyResult<Py<
                     }
                 }
                 "websocket.close" => {
-                    let code: u16 = message
-                        .get_item("code")?
-                        .map(|v| v.extract())
-                        .transpose()?
-                        .unwrap_or(1000);
+                    // Refuse a close that makes an invalid close frame (RFC 6455).
+                    let code = match message.get_item("code")? {
+                        None => 1000,
+                        Some(value) => value
+                            .extract::<u16>()
+                            .ok()
+                            .filter(|code| is_close_frame_code(*code))
+                            .ok_or_else(|| {
+                                pyo3::exceptions::PyValueError::new_err(format!(
+                                    "WebSocket close code {} is not valid: use 1000 to 4999, but not 1005, 1006 or 1015",
+                                    value
+                                ))
+                            })?,
+                    };
                     let reason: String = message
                         .get_item("reason")?
                         .map(|v| v.extract())
                         .transpose()?
                         .unwrap_or_default();
+                    if reason.len() > MAX_CLOSE_REASON_BYTES {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "WebSocket close reason is {} bytes: the limit is {} bytes of UTF-8",
+                            reason.len(),
+                            MAX_CLOSE_REASON_BYTES
+                        )));
+                    }
                     let actor = state.actor_addr.get().cloned();
                     if actor.is_none() {
                         // Close before accept refuses the upgrade with 403, as in uvicorn.
@@ -924,7 +953,9 @@ fn refusal(status: StatusCode) -> HttpResponse {
 /// Run the Python handler on this thread's WorkerLoop.
 ///
 /// The handler decides the handshake. If it ends without a decision, the
-/// upgrade gets 403 on return and 500 on error, as in uvicorn.
+/// upgrade gets 403 on return and 500 on error, as in uvicorn. If it ends
+/// after accept with no close, the connection gets a close frame: 1000 on
+/// return and 1011 on error.
 fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsTarget) {
     actix_web::rt::spawn(async move {
         // Wrap the entire handler execution in catch_unwind to handle panics
@@ -1000,14 +1031,18 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
                 Err(e) => Some(e),
             };
             match error {
-                None => ws_state.refuse(StatusCode::FORBIDDEN),
+                None => {
+                    ws_state.refuse(StatusCode::FORBIDDEN);
+                    // A handler that returns with no close ends the connection.
+                    close_accepted(&ws_state, 1000, "").await;
+                }
                 Some(e) => {
                     // A client that left is not an error of the handler.
                     if !is_client_gone(&e) {
                         eprintln!("[django-bolt] WebSocket handler error: {}", e);
                     }
                     ws_state.refuse(StatusCode::INTERNAL_SERVER_ERROR);
-                    close_with_error(&ws_state, "Internal error").await;
+                    close_accepted(&ws_state, 1011, "Internal error").await;
                 }
             }
         })
@@ -1017,17 +1052,20 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
         if result.is_err() {
             eprintln!("[django-bolt] WebSocket handler task panicked - closing connection");
             ws_state.refuse(StatusCode::INTERNAL_SERVER_ERROR);
-            close_with_error(&ws_state, "Internal server error").await;
+            close_accepted(&ws_state, 1011, "Internal server error").await;
         }
     });
 }
 
-/// Close an accepted connection with 1011. The actor stop releases the slot.
-async fn close_with_error(ws_state: &WsConnectionState, reason: &str) {
+/// Close an accepted connection when the handler ends. The actor stop releases the slot.
+///
+/// The actor of a connection that the handler or the client closed has
+/// stopped. The send then fails, and the client gets no second close frame.
+async fn close_accepted(ws_state: &WsConnectionState, code: u16, reason: &str) {
     if let Some(addr) = ws_state.actor_addr.get() {
         let _ = addr
             .send(SendToClient(WsMessage::Close {
-                code: 1011,
+                code,
                 reason: reason.to_string(),
             }))
             .await;
@@ -1036,7 +1074,17 @@ async fn close_with_error(ws_state: &WsConnectionState, reason: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::requested_subprotocols;
+    use super::{is_close_frame_code, requested_subprotocols};
+
+    #[test]
+    fn close_frame_codes_are_1000_to_4999_without_the_reserved_three() {
+        for code in [1000, 1001, 1004, 1007, 1011, 1014, 1016, 3000, 4999] {
+            assert!(is_close_frame_code(code), "{code}");
+        }
+        for code in [0, 999, 1005, 1006, 1015, 5000, u16::MAX] {
+            assert!(!is_close_frame_code(code), "{code}");
+        }
+    }
 
     #[test]
     fn requested_subprotocols_splits_trims_and_keeps_order() {
