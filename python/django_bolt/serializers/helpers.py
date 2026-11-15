@@ -117,7 +117,7 @@ def create_serializer_set(
 
     Generates:
     - Create: Accepts input for creating new instances
-    - Update: Accepts partial input for updating instances
+    - Update: Accepts input for updating instances. Each field of `update_fields` is required
     - Public: Returns public representation
 
     Args:
