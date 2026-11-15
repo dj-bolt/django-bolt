@@ -16,9 +16,11 @@ import pytest
 from django.conf import settings  # noqa: PLC0415
 from django.contrib.auth import get_user_model
 from django.db import InterfaceError, OperationalError
+from django.test import override_settings
 
-from django_bolt import BoltAPI
+from django_bolt import APIView, BoltAPI, Router, ViewSet, WebSocket, action
 from django_bolt.auth import (
+    AllowAny,
     IsAuthenticated,
     JWTAuthentication,
     create_jwt_for_user,
@@ -27,7 +29,10 @@ from django_bolt.auth import (
     get_current_user,
 )
 from django_bolt.auth.backends import revocation_takes_claims
+from django_bolt.openapi import OpenAPIConfig
+from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.params import Depends
+from django_bolt.testing import TestClient, WebSocketTestClient
 
 # Mark all tests to use Django DB
 pytestmark = pytest.mark.django_db
@@ -127,6 +132,18 @@ def test_create_jwt_with_extra_claims():
     # Clean up
     user.delete()
     print("✓ JWT with extra claims works correctly")
+
+
+@pytest.mark.parametrize("name", ["sub", "exp", "iat", "is_staff", "is_superuser"])
+def test_create_jwt_refuses_an_extra_claim_that_replaces_a_standard_claim(name):
+    """An extra claim cannot replace the identity, the lifetime or the privilege flags."""
+    with pytest.raises(ValueError, match="^extra_claims must not contain") as raised:
+        create_jwt_for_user(_plain_user(), secret="secret", extra_claims={name: 1, "jti": "token-1"})
+
+    assert str(raised.value) == (
+        f"extra_claims must not contain the standard claims ['{name}']. "
+        "create_jwt_for_user() sets them from the user and from expires_in."
+    )
 
 
 def test_jwt_authentication_with_django_user():
@@ -341,6 +358,113 @@ def test_jwt_uses_django_secret_key():
     # Should use Django's SECRET_KEY
     assert auth.secret == settings.SECRET_KEY
     print("✓ JWT uses Django SECRET_KEY by default")
+
+
+def test_a_guarded_route_with_no_auth_backend_uses_jwt():
+    """A guard that needs a user, with no ``auth`` and no setting: the route gets ``JWTAuthentication()``."""
+    api = BoltAPI()
+
+    @api.get("/guarded", guards=[IsAuthenticated()])
+    async def guarded(request):
+        return {"user_id": request.context["user_id"]}
+
+    @api.get("/open")
+    async def open_route():
+        return {"ok": True}
+
+    # Rust stops at AllowAny, so no guard of this route needs a user.
+    @api.get("/allow-any", guards=[AllowAny(), IsAuthenticated()])
+    async def allow_any():
+        return {"ok": True}
+
+    # An explicit empty list keeps its meaning: no backend.
+    @api.get("/no-backend", auth=[], guards=[IsAuthenticated()])
+    async def no_backend():
+        return {"ok": True}
+
+    with override_settings(BOLT_AUTHENTICATION_CLASSES=[]):
+
+        @api.get("/no-default-backend", guards=[IsAuthenticated()])
+        async def no_default_backend():
+            return {"ok": True}
+
+    user = _plain_user()
+    bearer = {"authorization": f"Bearer {create_jwt_for_user(user)}"}
+    other_key = {"authorization": f"Bearer {create_jwt_for_user(user, secret='not-the-secret-key-of-the-project')}"}
+    with TestClient(api) as client:
+        valid = client.get("/guarded", headers=bearer)
+        assert (valid.status_code, valid.json()) == (200, {"user_id": "7"})
+        assert client.get("/guarded").status_code == 401
+        assert client.get("/guarded", headers=other_key).status_code == 401
+        assert client.get("/open").status_code == 200
+        assert client.get("/allow-any").status_code == 200
+        assert client.get("/no-backend", headers=bearer).status_code == 401
+        assert client.get("/no-default-backend", headers=bearer).status_code == 401
+
+    # Each reader sees the same backends: the OpenAPI document shows them.
+    paths = SchemaGenerator(api, OpenAPIConfig(title="Test", version="1")).generate().to_schema()["paths"]
+    assert paths["/guarded"]["get"]["security"] == [{"BearerAuth": []}]
+    for path in ("/open", "/allow-any", "/no-backend", "/no-default-backend"):
+        assert "security" not in paths[path]["get"], path
+
+
+@pytest.mark.asyncio
+async def test_the_jwt_default_applies_for_each_source_of_the_guards():
+    """The guards of a router, a class, an action, the settings and a WebSocket route give the same default."""
+    api = BoltAPI()
+    router = Router(prefix="/router", guards=[IsAuthenticated()])
+
+    @router.get("/items")
+    async def router_items():
+        return {"ok": True}
+
+    api.include_router(router)
+
+    @api.view("/view")
+    class GuardedView(APIView):
+        guards = [IsAuthenticated()]
+
+        async def get(self, request):
+            return {"ok": True}
+
+    @api.viewset("/viewset")
+    class GuardedViewSet(ViewSet):
+        guards = [IsAuthenticated]
+
+        async def list(self, request):
+            return []
+
+        @action(methods=["GET"], detail=False)
+        async def extra(self, request):
+            return {"ok": True}
+
+        @action(methods=["GET"], detail=False, guards=[AllowAny()])
+        async def public(self, request):
+            return {"ok": True}
+
+    with override_settings(BOLT_DEFAULT_PERMISSION_CLASSES=[IsAuthenticated()]):
+
+        @api.get("/default-guards")
+        async def default_guards():
+            return {"ok": True}
+
+    @api.websocket("/ws", guards=[IsAuthenticated()])
+    async def ws(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    bearer = {"authorization": f"Bearer {create_jwt_for_user(_plain_user())}"}
+    with TestClient(api) as client:
+        for path in ("/router/items", "/view", "/viewset", "/viewset/extra", "/default-guards"):
+            assert client.get(path).status_code == 401, path
+            assert client.get(path, headers=bearer).status_code == 200, path
+        assert client.get("/viewset/public").status_code == 200
+
+    async with WebSocketTestClient(api, "/ws", headers=bearer) as websocket:
+        assert await websocket.receive_text() == "connected"
+    with pytest.raises(PermissionError, match="Authentication required"):
+        async with WebSocketTestClient(api, "/ws"):
+            pass
 
 
 def test_jwt_custom_secret_overrides():

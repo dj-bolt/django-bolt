@@ -190,6 +190,52 @@ def test_viewset_async_action_auth_override(api, view_class):
         assert response.json()["status"] == "apikey"
 
 
+def test_viewset_decorator_arguments_apply_to_action_routes(api):
+    """`@api.viewset(..., auth=, guards=, status_code=, tags=)` covers the `@action` routes."""
+
+    @api.viewset(
+        "/dec",
+        auth=[APIKeyAuthentication(api_keys={"k1"})],
+        guards=[IsAuthenticated()],
+        status_code=202,
+        validate_response=False,
+        tags=["decorated"],
+    )
+    class DecoratedViewSet(ViewSet):
+        async def list(self, request):
+            return [1]
+
+        @action(methods=["GET"], detail=False)
+        async def extra(self, request) -> dict[str, int]:
+            # Not a dict of int: the decorator disables the validation.
+            return {"extra": "text"}
+
+        @action(methods=["GET"], detail=False, auth=[], guards=[AllowAny()], status_code=200, tags=["own"])
+        async def public(self, request):
+            return {"public": True}
+
+    api._register_openapi_routes()
+    key = {"X-API-Key": "k1"}
+    with TestClient(api, use_http_layer=True) as client:
+        assert client.get("/dec").status_code == 401
+        assert client.get("/dec", headers=key).status_code == 202
+
+        # The action route has the auth, the guards and the status code of the decorator.
+        assert client.get("/dec/extra").status_code == 401
+        response = client.get("/dec/extra", headers=key)
+        assert response.status_code == 202
+        assert response.json() == {"extra": "text"}
+
+        # An action keeps the values that it sets.
+        response = client.get("/dec/public")
+        assert response.status_code == 200
+        assert response.json() == {"public": True}
+
+        paths = client.get("/docs/openapi.json").json()["paths"]
+        assert paths["/dec/extra"]["get"]["tags"] == ["decorated"]
+        assert paths["/dec/public"]["get"]["tags"] == ["own"]
+
+
 @pytest.mark.parametrize("view_class", [ViewSet, ModelViewSet])
 @pytest.mark.django_db(transaction=True)
 def test_viewset_sync_action_auth_override(api, view_class):
