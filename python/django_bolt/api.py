@@ -3335,7 +3335,9 @@ class BoltAPI:
             # pragma: no mutate end
         revoked = await handler(jti, claims) if takes_claims else await handler(jti)
         if revoked:
-            raise HTTPException(status_code=401, detail="Token has been revoked")
+            raise HTTPException(
+                status_code=401, detail="Token has been revoked", headers={"WWW-Authenticate": "Bearer"}
+            )
 
     async def _websocket_token_revoked(
         self,
