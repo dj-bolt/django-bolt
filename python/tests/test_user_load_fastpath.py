@@ -67,6 +67,30 @@ class UuidAccount(models.Model):
         app_label = "django_bolt"
 
 
+class ConverterArgumentsField(models.CharField):
+    """Field with a database converter that reads all its arguments."""
+
+    def from_db_value(self, value, expression, connection):
+        return f"{connection.alias}.{expression.target.column}={value}"
+
+
+class SnapshotAccount(models.Model):
+    """User-model stand-in that keeps the loaded values, as the Django documentation of ``from_db`` shows."""
+
+    username = models.CharField(max_length=100)
+    origin = ConverterArgumentsField(max_length=100)
+
+    class Meta:
+        app_label = "django_bolt"
+
+    @classmethod
+    def from_db(cls, db, field_names, values, **kwargs):
+        # Django 6.1 adds the keyword argument ``fetch_mode``.
+        instance = super().from_db(db, field_names, values, **kwargs)
+        instance._loaded_values = dict(zip(field_names, values, strict=True))
+        return instance
+
+
 def test_loads_a_user_with_a_uuid_primary_key():
     """The pk of a token is a string. The loader converts it for the database column type."""
     account = UuidAccount.objects.create(username="uuid_account")
@@ -125,7 +149,7 @@ def _filtered_account_table(django_db_setup, django_db_blocker):
     from django.db import connection  # noqa: PLC0415
 
     with django_db_blocker.unblock():
-        for model in (FilteredAccount, UuidAccount):
+        for model in (FilteredAccount, UuidAccount, SnapshotAccount):
             if model._meta.db_table not in connection.introspection.table_names():
                 with connection.schema_editor() as schema_editor:
                     schema_editor.create_model(model)
@@ -151,6 +175,18 @@ def test_custom_manager_dynamic_filter_is_not_frozen():
         assert load_user_by_pk_sync(FilteredAccount, str(active.pk)) is None
     finally:
         _VISIBLE_STATUS["value"] = "active"
+
+
+def test_model_with_custom_loading_gets_the_same_values_as_from_the_orm():
+    """``from_db`` gets the field names. A field converter gets the expression and the connection."""
+    account = SnapshotAccount.objects.create(username="snapshot", origin="eu")
+    orm_account = SnapshotAccount.objects.get(pk=account.pk)
+
+    loaded = load_user_by_pk_sync(SnapshotAccount, str(account.pk))
+
+    assert loaded is not None
+    assert loaded._loaded_values == {"id": account.pk, "username": "snapshot", "origin": "default.origin=eu"}
+    assert loaded._loaded_values == orm_account._loaded_values
 
 
 def test_default_user_model_takes_compiled_path():
