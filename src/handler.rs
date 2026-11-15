@@ -18,7 +18,7 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
 use bolt_asgi::asgi_http;
-use bolt_core::access_log::{AccessLogFilter, rejection_line_at};
+use bolt_core::access_log::AccessLogFilter;
 use bolt_core::error::{self, handle_python_error};
 use bolt_core::form_parsing::{
     DEFAULT_MAX_FIELDS, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT, ERROR_TYPE_PAYLOAD_TOO_LARGE,
@@ -824,7 +824,7 @@ fn write_access_log(
     }
     // A flood of 429 responses writes one line for each second on this worker.
     let suppressed = if status == 429 {
-        match rejection_line_at(start) {
+        match bolt_core::access_log::rejection_line_at(start) {
             Some(suppressed) => suppressed,
             None => return,
         }
