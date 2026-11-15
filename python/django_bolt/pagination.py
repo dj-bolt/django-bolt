@@ -430,9 +430,9 @@ class PageNumberPagination(PaginationBase):
         # Calculate total pages
         total_pages = (total + page_size - 1) // page_size if total > 0 else 0
 
-        # Validate page number
-        if page_number > total_pages and total_pages > 0:
-            page_number = total_pages
+        # A page after the last page is the last page. With no rows, it is page 1.
+        if page_number > total_pages:
+            page_number = max(total_pages, 1)
 
         # Calculate offset
         offset = (page_number - 1) * page_size
@@ -526,8 +526,12 @@ class LimitOffsetPagination(PaginationBase):
         # Get total count
         total = await self._get_queryset_count(queryset)
 
-        # Slice queryset and get raw items
-        raw_items = await self._evaluate_queryset_slice(queryset[offset : offset + limit])
+        # An offset at or after the end selects no row, so it needs no query.
+        # The database also refuses an offset that does not fit its integer type.
+        if offset >= total:
+            raw_items = []
+        else:
+            raw_items = await self._evaluate_queryset_slice(queryset[offset : offset + limit])
 
         # Serialize items using efficient batch serialization
         items = await self._serialize_items(raw_items)

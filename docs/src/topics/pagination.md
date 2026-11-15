@@ -30,19 +30,22 @@ Response:
 
 ```json
 {
-  "count": 150,
+  "items": [...],
+  "total": 150,
+  "has_next": true,
+  "has_previous": false,
   "page": 1,
   "page_size": 20,
   "total_pages": 8,
-  "has_next": true,
-  "has_previous": false,
-  "next_page": 2,
-  "previous_page": null,
-  "items": [...]
+  "next_page": 2
 }
 ```
 
+The response leaves out a field that has no value. The first page has no `previous_page`. The last page has no `next_page`.
+
 Query: `/articles?page=2&page_size=10`
+
+A page number after the last page gives the last page. With no rows, each page number gives page 1.
 
 ## LimitOffset Pagination
 
@@ -59,7 +62,7 @@ async def list_articles(request):
 
 Query: `/articles?limit=10&offset=20`
 
-Response includes `limit`, `offset`, `total`, `has_next`, `has_previous`.
+Response includes `items`, `total`, `has_next`, `has_previous`, `limit`, `offset`. An offset at or after the last row gives no items.
 
 ## Cursor Pagination
 
