@@ -943,15 +943,11 @@ def _to_django_request(request: Request) -> HttpRequest:
     # time, ensuring Rust always parses and passes cookies to Python
     django_request.COOKIES = request.raw_cookies
 
-    # Query params - only create mutable QueryDict if we have params
-    if request.query:
-        django_request.GET = QueryDict(mutable=True)
-        for key, value in request.query.items():
-            # A sequence parameter holds the list of the values of its repeated key.
-            if isinstance(value, list):
-                django_request.GET.setlist(key, value)
-            else:
-                django_request.GET[key] = value
+    # Query params. Django parses the encoded query string, so a repeated key
+    # keeps all its values. Rust gives one value for a key that the handler does not declare as a list.
+    query_string = django_request.META["QUERY_STRING"]
+    if query_string:
+        django_request.GET = QueryDict(query_string, mutable=True)
     else:
         django_request.GET = _get_empty_querydict()  # Reuse singleton (no allocation)
 
