@@ -723,6 +723,17 @@ def test_a_missing_form_field_takes_its_default_or_none(form_field_client):
     assert form_field_client.post("/limited-optional", data={"count": "2"}).json() == {"value": 2, "type": "int"}
 
 
+def test_a_repeated_form_field_that_is_not_a_sequence_keeps_its_last_value(form_field_client):
+    for url, name in [("/required", "name"), ("/default", "nick"), ("/optional", "alt")]:
+        response = form_field_client.post(url, data={name: ["a", "b"]})
+        assert response.json() == {"value": "b", "type": "str"}, url
+    for url in ["/limited", "/limited-default", "/limited-optional"]:
+        response = form_field_client.post(url, data={"count": ["3", "4"]})
+        assert response.json() == {"value": 4, "type": "int"}, url
+    # The constraint applies to the value that the handler gets.
+    assert form_field_client.post("/limited", data={"count": ["3", "0"]}).status_code == 422
+
+
 def test_a_form_field_outside_its_constraint_names_the_field(form_field_client):
     response = form_field_client.post("/limited", data={"count": "0"})
     assert response.status_code == 422

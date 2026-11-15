@@ -79,7 +79,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     names ``loc`` and ``key``. With ``one_item``, a source that gives one value
     (a path, a header or a cookie) gives a sequence of that one item. A type
     that cannot hold one item, such as ``tuple[int, str]``, then raises
-    ``TypeError`` here, when the route registers.
+    ``TypeError`` here, when the route registers. A form field (``loc`` is
+    ``body``) that is not a sequence keeps the last value of a repeated key.
     """
     target = unwrap_optional(annotation)
     base = get_args(target)[0] if get_origin(target) is Annotated else target
@@ -95,6 +96,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     if not is_sequence and not constrained:
         return None
     wrap = is_sequence and one_item
+    # Rust gives each value of a repeated form key as a list.
+    take_last = loc == "body" and not is_sequence
     if wrap and loc in _SINGLE_VALUE_SOURCES and not _holds_one_item(target):
         raise TypeError(
             f"The {loc} parameter {key!r} gets one value, but its type {target!r} cannot hold one item. "
@@ -107,6 +110,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     def convert(value: Any) -> Any:
         if wrap and not isinstance(value, list):
             value = [value]
+        elif take_last and type(value) is list:
+            value = value[-1]
         try:
             return msgspec.convert((value,), holder, strict=False).value
         except msgspec.ValidationError as error:
@@ -310,6 +315,9 @@ def create_form_extractor(name: str, annotation: Any, default: Any, alias: str |
     fields from the form data and constructs the struct instance.
 
     Note: Rust pre-converts values to typed Python objects (int, float, bool, str).
+    Rust gives each value of a repeated key as a list. A field that is not a
+    sequence keeps the last value, as a query parameter does. An ``Any`` field
+    gets the list.
     """
     # Check if annotation is a Struct/Serializer type
     unwrapped = unwrap_optional(annotation)
@@ -326,16 +334,29 @@ def create_form_extractor(name: str, annotation: Any, default: Any, alias: str |
     if optional:
         default_value = None if default is inspect.Parameter.empty else default
 
-        def extract(form_map: dict[str, Any]) -> Any:
+        def extract_all(form_map: dict[str, Any]) -> Any:
             return form_map.get(key, default_value)
-    else:
 
         def extract(form_map: dict[str, Any]) -> Any:
+            if key not in form_map:
+                return default_value
+            value = form_map[key]
+            return value[-1] if type(value) is list else value
+    else:
+
+        def extract_all(form_map: dict[str, Any]) -> Any:
             if key not in form_map:
                 raise HTTPException(status_code=422, detail=f"Missing required form field: {key}")
             return form_map[key]
 
-    return extract
+        def extract(form_map: dict[str, Any]) -> Any:
+            try:
+                value = form_map[key]
+            except KeyError:
+                raise HTTPException(status_code=422, detail=f"Missing required form field: {key}") from None
+            return value[-1] if type(value) is list else value
+
+    return extract_all if unwrapped is Any else extract
 
 
 def _upload_file_dec_hook(typ: type, obj: Any) -> Any:

@@ -414,6 +414,8 @@ async def login(
     return {"username": username}
 ```
 
+A repeated field keeps its last value, as a repeated query key does. Declare a `list`, `set`, `frozenset` or `tuple` to take each value.
+
 A URL-encoded body can have 1000 fields or fewer. Django has the same default limit, `DATA_UPLOAD_MAX_NUMBER_FIELDS`. A repeated key counts once for each field. A body with more fields gets 422 with the error type `too_many_fields`. A multipart body can have 100 parts or fewer.
 
 ### Multipart forms
