@@ -393,6 +393,17 @@ def _refuse_mount_path_arguments(path: str, app: BoltAPI) -> None:
                 )
 
 
+def _refuse_repeated_path_params(path: str) -> None:
+    """Refuse a path that has one parameter name two times: the router keeps one value for each name."""
+    seen: set[str] = set()
+    for name in _PATH_PARAM_NAME.findall(path):
+        if name in seen:
+            raise ValueError(
+                f"The path {path!r} has the parameter {name!r} two times. Give each parameter of a path its own name."
+            )
+        seen.add(name)
+
+
 def _validate_mcp_mount_conflicts(
     routes: list[tuple[Any, ...]],
     asgi_mounts: list[tuple[str, Any]],
@@ -1173,6 +1184,7 @@ class BoltAPI:
             # of a WebSocket request path before the lookup, for each
             # trailing_slash mode. Thus the route path has no trailing slash.
             full_path = _normalize_path(f"{self.prefix}{_leading_slash(path)}", "strip")
+            _refuse_repeated_path_params(full_path)
 
             self._handlers[handler_id] = fn
 
@@ -1858,6 +1870,7 @@ class BoltAPI:
 
             # Normalize trailing slash based on setting
             full_path = _normalize_path(full_path, self.trailing_slash)
+            _refuse_repeated_path_params(full_path)
 
             self._routes.append((method, full_path, handler_id, fn))
             self._handlers[handler_id] = fn
@@ -3746,6 +3759,7 @@ class BoltAPI:
         path = _leading_slash(path) or "/"
         full_path = _normalize_path(f"{self.prefix}{path}" if self.prefix else path, self.trailing_slash)
         _refuse_typed_native_path_params(full_path)
+        _refuse_repeated_path_params(full_path)
         # Check the capsule now, so a bad capsule stops startup before runbolt
         # starts its worker processes.
         _core.check_native_capsule(capsule)
@@ -3841,6 +3855,12 @@ class BoltAPI:
                 raise ValueError(f"An MCP server is already mounted at {child_definition['path']!r} on this API")
             existing_mcp_paths.add(child_definition["path"])
             child_mcp_mounts.append(child_definition)
+
+        # Check each combined path before this API changes.
+        mounted_paths = [route_path for _method, route_path, *_rest in app._routes + app._native_routes]
+        mounted_paths.extend(ws_path for ws_path, _handler_id, _handler in app._websocket_routes)
+        for mounted_path in mounted_paths:
+            _refuse_repeated_path_params(mount_path + mounted_path)
 
         # Copy routes from sub-app to this app with path prefix
         for method, route_path, handler_id, handler in app._routes:
