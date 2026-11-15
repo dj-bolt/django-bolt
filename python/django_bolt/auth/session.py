@@ -137,11 +137,11 @@ def build_session_guard_check(
     for reads, attribute in (
         (reads_staff, "is_staff"),
         (reads_superuser, "is_superuser"),
-        (reads_permissions, "aget_all_permissions"),
+        (reads_permissions, "get_all_permissions"),
     ):
         if reads and not hasattr(user_model, attribute):
             raise ImproperlyConfigured(
-                f"A guard on {route} reads {attribute.removeprefix('aget_all_')} of the session user, "
+                f"A guard on {route} reads {attribute.removeprefix('get_all_')} of the session user, "
                 f"but the user model {user_model.__name__} has no {attribute}."
             )
 
