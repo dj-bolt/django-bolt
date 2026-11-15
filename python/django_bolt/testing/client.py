@@ -10,6 +10,7 @@ This version uses async-native Rust testing infrastructure which provides:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import threading
 import warnings
@@ -600,45 +601,37 @@ class TestClient(httpx.Client):
         Yields:
             Chunks of response content
         """
+        # A chunk can end inside a multi-byte character. The decoder keeps the part for the next chunk.
+        decoder = codecs.getincrementaldecoder("utf-8")() if decode_unicode else None
         pos = 0
         while pos < len(content):
             chunk = content[pos : pos + chunk_size]
             pos += chunk_size
 
-            if decode_unicode:
-                yield chunk.decode("utf-8")
-            else:
+            if decoder is None:
                 yield chunk
+            else:
+                text = decoder.decode(chunk, final=pos >= len(content))
+                if text:
+                    yield text
 
     @staticmethod
-    def _iter_response_lines(content: bytes, decode_unicode: bool = True) -> Iterator[str]:
+    def _iter_response_lines(content: bytes, decode_unicode: bool = True) -> Iterator[str | bytes]:
         """Iterate over response content line by line.
 
         Args:
             content: Full response content
-            decode_unicode: If True, decode bytes to string (default True)
+            decode_unicode: If True, decode each line to a string (default True). Otherwise give bytes.
 
         Yields:
             Lines from the response
         """
-        buffer = b"" if not decode_unicode else ""
-
-        for chunk in TestClient._iter_response_content(content, chunk_size=8192, decode_unicode=decode_unicode):
-            if chunk:
-                buffer += chunk
-
-                # Split on newlines
-                lines = buffer.split(b"\n") if isinstance(buffer, bytes) else buffer.split("\n")
-
-                # Yield all complete lines, keep incomplete line in buffer
-                for line in lines[:-1]:
-                    yield line if isinstance(line, str) else line.decode("utf-8")
-
-                buffer = lines[-1]
-
-        # Yield any remaining data in buffer
-        if buffer:
-            yield buffer if isinstance(buffer, str) else buffer.decode("utf-8")
+        # Split the bytes, then decode each line. A chunk border can fall inside a character.
+        lines = content.split(b"\n")
+        if not lines[-1]:
+            lines.pop()
+        for line in lines:
+            yield line.decode("utf-8") if decode_unicode else line
 
 
 class AsyncTestClient(httpx.AsyncClient):
