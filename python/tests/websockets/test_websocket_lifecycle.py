@@ -101,8 +101,10 @@ async def test_close_of_the_handler_is_the_only_close():
         with pytest.raises(ConnectionClosed) as closed:
             await ws.receive_text()
         assert closed.value.code == 4001
-        with pytest.raises(TimeoutError):
+        # No second close message is in the queue. A closed client with an empty queue raises at once.
+        with pytest.raises(ConnectionClosed) as again:
             await ws.receive(timeout=0.05)
+        assert again.value.code == 4001
 
 
 @pytest.mark.asyncio
