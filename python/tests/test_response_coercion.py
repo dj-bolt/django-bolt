@@ -463,6 +463,37 @@ def test_other_generic_type_is_validated(client):
     assert message.startswith("Response validation failed: Expected `int`, got `str`")
 
 
+@pytest.mark.parametrize("is_async", [True, False], ids=["async", "sync"])
+@pytest.mark.parametrize(
+    ("value", "got"), [({"a": 1}, "object"), ([1], "array"), (3, "int"), (Item(id=1), "Item")], ids=repr
+)
+def test_none_response_type_rejects_a_result_that_is_not_none(settings, value, got, is_async):
+    settings.DEBUG = True
+    api = BoltAPI()
+    _scalar_route(api, "/bad", value, is_async=is_async, **{"return": None})
+    api.get("/unvalidated", validate_response=False, response_model=type(None))(lambda: value)
+
+    with TestClient(api) as none_client:
+        assert f"Expected `null`, got `{got}`" in _validation_message(none_client.get("/bad"))
+        # A route with no validation sends the result as before.
+        assert none_client.get("/unvalidated").status_code == 200
+
+
+@pytest.mark.parametrize("is_async", [True, False], ids=["async", "sync"])
+def test_none_response_type_does_not_validate_a_response_object(is_async):
+    """A response object has its own body. A -> None handler can return one."""
+    api = BoltAPI()
+    _scalar_route(api, "/json", JSON({"deleted": True}), is_async=is_async, **{"return": None})
+    _scalar_route(api, "/response", Response({"deleted": True}), is_async=is_async, **{"return": None})
+    _scalar_route(api, "/none", None, is_async=is_async, **{"return": None})
+
+    with TestClient(api) as none_client:
+        assert none_client.get("/json").json() == {"deleted": True}
+        assert none_client.get("/response").json() == {"deleted": True}
+        response = none_client.get("/none")
+        assert (response.status_code, response.content) == (200, b"null")
+
+
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("path", ["/articles/async", "/articles/sync"])
 def test_queryset_in_json_loads_the_declared_fields(client, path):
