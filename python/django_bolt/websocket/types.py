@@ -9,8 +9,8 @@ from urllib.parse import parse_qs
 
 import msgspec
 
-from .close_codes import CloseCode
-from .exceptions import WebSocketDisconnect
+from .close_codes import CloseCode, check_close_frame
+from .exceptions import WebSocketDisconnect, WebSocketException
 from .state import WebSocketState
 
 if TYPE_CHECKING:
@@ -153,14 +153,30 @@ class WebSocket:
         return await self.receive()
 
     async def receive_text(self) -> str:
-        """Receive a text message."""
+        """
+        Receive a text message.
+
+        A binary frame raises ``WebSocketException`` with code 1003. The
+        connection stays open. Use ``receive()`` to read each frame type.
+        """
         message = await self._receive_data()
-        return message.get("text", "")
+        text = message.get("text")
+        if text is None:
+            raise WebSocketException(CloseCode.UNSUPPORTED_DATA, "receive_text() got a binary frame")
+        return text
 
     async def receive_bytes(self) -> bytes:
-        """Receive a binary message."""
+        """
+        Receive a binary message.
+
+        A text frame raises ``WebSocketException`` with code 1003. The
+        connection stays open. Use ``receive()`` to read each frame type.
+        """
         message = await self._receive_data()
-        return message.get("bytes", b"")
+        data = message.get("bytes")
+        if data is None:
+            raise WebSocketException(CloseCode.UNSUPPORTED_DATA, "receive_bytes() got a text frame")
+        return data
 
     async def receive_json(self, mode: str = "text") -> Any:
         """
@@ -220,11 +236,17 @@ class WebSocket:
         Close the WebSocket connection.
 
         Args:
-            code: WebSocket close code (default: 1000 Normal Closure)
-            reason: Human-readable close reason
+            code: WebSocket close code (default: 1000 Normal Closure). Use
+                1000 to 1003, 1007 to 1014 or 3000 to 4999.
+            reason: Human-readable close reason, at most 123 bytes of UTF-8
+
+        Raises:
+            ValueError: The code or the reason makes an invalid close frame
+                (RFC 6455). The connection stays open.
         """
         if self._state is WebSocketState.DISCONNECTED:
             return
+        check_close_frame(code, reason)
 
         # Close before accept refuses the handshake with 403.
         self._state = WebSocketState.DISCONNECTED
@@ -239,7 +261,7 @@ class WebSocket:
             )
 
     async def iter_text(self):
-        """Async iterator for text messages."""
+        """Async iterator for text messages. A binary frame raises, as in ``receive_text()``."""
         try:
             while True:
                 yield await self.receive_text()
@@ -247,7 +269,7 @@ class WebSocket:
             return
 
     async def iter_bytes(self):
-        """Async iterator for binary messages."""
+        """Async iterator for binary messages. A text frame raises, as in ``receive_bytes()``."""
         try:
             while True:
                 yield await self.receive_bytes()

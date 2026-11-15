@@ -15,6 +15,7 @@ from django_bolt.serializers import (
     SerializerView,
     computed_field,
     field,
+    field_validator,
 )
 from django_bolt.testing import TestClient
 
@@ -53,6 +54,16 @@ class StrictFieldReadOnly(Serializer, forbid_unknown_fields=True):
 class NoDefaultBody(Serializer):
     id: int = field(read_only=True)
     name: str
+
+
+class ReadOnlyWithBefore(Serializer):
+    id: int = field(read_only=True, default=0)
+    name: str
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def name_to_text(cls, value):
+        return str(value)
 
 
 class TestFieldFunction:
@@ -145,10 +156,12 @@ class TestFieldFunction:
         assert Strict.model_validate({"name": "a"}).id == 0
         with pytest.raises(msgspec.ValidationError, match="unknown field `id`"):
             Strict.model_validate({"name": "a", "id": sent_id})
-        # A subset keeps the rule.
+        # A subset keeps the rule, and it keeps forbid_unknown_fields.
         subset = Strict.subset("name", "id")
         assert subset(name="a").dump() == {"name": "a", "id": 0}
-        assert subset.model_validate({"name": "a", "id": 9}).id == 0
+        assert subset.model_validate({"name": "a"}).id == 0
+        with pytest.raises(msgspec.ValidationError, match="unknown field `id`"):
+            subset.model_validate({"name": "a", "id": sent_id})
 
     def test_read_only_field_with_no_default_cannot_validate_input(self):
         """Input has no value for the field, and there is no default to use."""
@@ -181,6 +194,23 @@ class TestFieldFunction:
             assert response.json() == {"id": 0, "created": None, "address_id": 0, "name": "n"}
             assert client.post("/users/bulk", json=[payload, payload]).json() == [0, 0]
 
+    def test_read_only_field_is_ignored_when_the_serializer_has_a_before_validator(self):
+        """A before validator changes the decode path of the body. That path also ignores read_only input."""
+        api = BoltAPI()
+
+        @api.post("/users")
+        async def create_user(body: ReadOnlyWithBefore) -> dict:
+            return {"id": body.id, "name": body.name}
+
+        with TestClient(api) as client:
+            response = client.post("/users", json={"id": 99, "name": 5})
+            assert response.status_code == 200
+            assert response.json() == {"id": 0, "name": "5"}
+
+        assert ReadOnlyWithBefore.model_validate({"id": 99, "name": 5}).id == 0
+        assert ReadOnlyWithBefore.model_validate_json(b'{"id": 99, "name": 5}').id == 0
+        assert ReadOnlyWithBefore(id=4, name="n").id == 4
+
     def test_request_body_with_a_read_only_field_and_no_default_stops_registration(self):
         api = BoltAPI()
         with pytest.raises(ImproperlyConfigured, match=r"NoDefaultBody\.id is read_only and has no default"):
@@ -188,6 +218,41 @@ class TestFieldFunction:
             @api.post("/users")
             async def create_user(body: NoDefaultBody) -> dict:
                 return {}
+
+    def test_field_default_default_factory_and_exclude(self):
+        """field() gives the default of a field, and exclude=True keeps the field out of dump()."""
+
+        class Member(Serializer):
+            name: str
+            internal: str = field(exclude=True, default="x")
+            role: str = field(default="user")
+            tags: list[str] = field(default_factory=list)
+
+        first, second = Member(name="a"), Member(name="b")
+
+        assert (first.role, first.tags, first.internal) == ("user", [], "x")
+        assert first.tags is not second.tags
+        assert first.dump() == {"name": "a", "role": "user", "tags": []}
+        assert Member.dump_many([first]) == [{"name": "a", "role": "user", "tags": []}]
+
+    def test_write_only_field_is_dropped_and_the_fields_after_it_stay(self):
+        """A write-only field does not hide the fields that follow it, also in a subset."""
+
+        class Account(Serializer):
+            id: int
+            password: str = field(write_only=True)
+            token: str
+            email: str
+
+            class Config:
+                write_only = {"token"}
+
+        account = Account(id=1, password="p", token="t", email="a@example.com")
+        public = {"id": 1, "email": "a@example.com"}
+
+        assert account.dump() == public
+        assert Account.dump_many([account]) == [public]
+        assert Account.subset("id", "token", "email")(id=1, token="t", email="a@example.com").dump() == public
 
     def test_field_write_only_meta(self):
         """Test write_only fields via Meta class."""
@@ -500,6 +565,78 @@ class TestDumpMethods:
         result_filtered = user.dump(exclude_defaults=True)
         assert result_filtered == {"name": "John"}
 
+    def test_dump_exclude_defaults_with_a_mutable_default(self):
+        """An empty list or dict default is a default value, as a default_factory is."""
+
+        class Post(Serializer):
+            title: str
+            tags: list[str] = []
+            meta: dict[str, str] = {}
+            authors: list[str] = field(default_factory=list)
+
+        assert Post(title="a").dump(exclude_defaults=True) == {"title": "a"}
+        assert Post(title="a", tags=["x"], meta={"k": "v"}, authors=["me"]).dump(exclude_defaults=True) == {
+            "title": "a",
+            "tags": ["x"],
+            "meta": {"k": "v"},
+            "authors": ["me"],
+        }
+
+    @pytest.mark.parametrize(
+        ("option", "expected_tag", "expected_post"),
+        [
+            (
+                {"exclude_none": True},
+                {"name": "a", "w": 1},
+                {"t": "untitled", "size": 1},
+            ),
+            (
+                {"exclude_defaults": True},
+                {"name": "a"},
+                {"parent": None, "subtitle": None, "size": 1},
+            ),
+            (
+                {"by_alias": True},
+                {"name": "a", "note": None, "w": 1},
+                {"note": None, "t": "untitled", "parent": None, "subtitle": None, "size": 1},
+            ),
+        ],
+    )
+    def test_dump_option_applies_to_nested_serializers_dump_many_and_views(self, option, expected_tag, expected_post):
+        """Each path of dump() gives the same output for an option, at each level."""
+
+        class Tag(Serializer):
+            name: str
+            note: str | None = None
+            weight: int = field(alias="w", default=1)
+
+        class Post(Serializer):
+            note: str | None = None
+            title: str = field(alias="t", default="untitled")
+            parent: int | None
+            tag: Tag
+            tags: list[Tag]
+
+            @computed_field
+            def subtitle(self) -> str | None:
+                return None
+
+            @computed_field
+            def size(self) -> int:
+                return len(self.tags)
+
+        tag = Tag(name="a")
+        post = Post(parent=None, tag={"name": "a"}, tags=[{"name": "a"}])
+        expected = {"tag": expected_tag, "tags": [expected_tag], **expected_post}
+
+        assert tag.dump(**option) == expected_tag
+        assert Tag.dump_many([tag], **option) == [expected_tag]
+        assert post.dump(**option) == expected
+        assert Post.dump_many((item for item in [post]), **option) == [expected]
+        view = Post.exclude("unknown")
+        assert view.dump(post, **option) == expected
+        assert view.dump_many([post], **option) == [expected]
+
     def test_dump_json(self):
         """Test dump_json method."""
 
@@ -568,6 +705,44 @@ class TestSerializerView:
         # Dump respects field selection
         result = view.dump(user)
         assert result == {"id": 1, "name": "John"}
+
+
+class _ViewItem(Serializer):
+    id: int
+    name: str | None = None
+    note: str = "n"
+    nick: str = field(alias="nickName", default="x")
+
+
+class TestSerializerViewApi:
+    """SerializerView chaining and JSON output, and Serializer.validate."""
+
+    def test_only_on_a_view_narrows_it_and_keeps_exclusions(self):
+        item = _ViewItem(id=1, name="a", note="b", nick="c")
+        narrowed = _ViewItem.only("id", "name", "note").only("name", "note", "nick")
+        assert narrowed.dump(item) == {"name": "a", "note": "b"}
+        assert _ViewItem.exclude("note").only("id", "note", "name").dump(item) == {"id": 1, "name": "a"}
+
+    def test_view_dump_json_forwards_each_option(self):
+        # The alias of a field is its key in each output; by_alias changes nothing.
+        view = _ViewItem.exclude("note")
+        item = _ViewItem(id=1, nick="y")
+        assert view.dump_json(item) == b'{"id":1,"name":null,"nickName":"y"}'
+        assert view.dump_json(item, exclude_none=True) == b'{"id":1,"nickName":"y"}'
+        assert view.dump_json(item, exclude_defaults=True) == b'{"id":1,"nickName":"y"}'
+        assert view.dump_json(item, by_alias=True) == b'{"id":1,"name":null,"nickName":"y"}'
+        assert view.dump_many_json([item]) == b'[{"id":1,"name":null,"nickName":"y"}]'
+        assert view.dump_many_json([item], exclude_none=True) == b'[{"id":1,"nickName":"y"}]'
+        assert view.dump_many_json([item], exclude_defaults=True) == b'[{"id":1,"nickName":"y"}]'
+        assert view.dump_many_json([item], by_alias=True) == b'[{"id":1,"name":null,"nickName":"y"}]'
+
+    def test_validate_returns_a_new_instance_or_raises(self):
+        item = _ViewItem(id=1, name="a")
+        checked = item.validate()
+        assert checked == item
+        assert checked is not item
+        with pytest.raises(msgspec.ValidationError):
+            _ViewItem(id="not-int").validate()
 
 
 class TestComplexScenarios:
@@ -746,6 +921,24 @@ class TestSubsetMethod:
         assert user.id == 1
         assert user.name == "John"
         assert user.role == "user"
+
+    def test_subset_keeps_the_struct_options_of_the_parent(self):
+        """A subset has the rename, omit_defaults, forbid_unknown_fields and frozen options of its parent."""
+
+        class Account(Serializer, rename="camel", omit_defaults=True, forbid_unknown_fields=True, frozen=True):
+            user_name: str
+            display_name: str = ""
+            email_address: str = ""
+
+        AccountMini = Account.subset("user_name", "display_name")
+        mini = AccountMini.model_validate({"userName": "ada", "displayName": "Ada"})
+
+        assert mini.dump() == {"userName": "ada", "displayName": "Ada"}
+        assert msgspec.json.encode(AccountMini(user_name="ada")) == b'{"userName":"ada"}'
+        with pytest.raises(msgspec.ValidationError, match="unknown field `emailAddress`"):
+            msgspec.convert({"userName": "ada", "emailAddress": "a@example.com"}, AccountMini)
+        with pytest.raises(AttributeError):
+            mini.user_name = "bob"
 
     def test_subset_with_computed_field(self):
         """Test subset includes computed fields."""

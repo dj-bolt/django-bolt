@@ -23,10 +23,13 @@ constraints. This is msgspec's design - Meta constraints are for parsing.
 """
 
 from datetime import datetime
-from typing import Annotated
+from decimal import Decimal
+from typing import Annotated, Any
 
 import pytest
+from django.db import models
 
+from django_bolt import BoltAPI
 from django_bolt.exceptions import RequestValidationError
 from django_bolt.serializers import (
     URL,
@@ -48,9 +51,29 @@ from django_bolt.serializers.types import (
     Percentage,
     Username,
 )
+from django_bolt.testing import TestClient
 
 # Import test models
-from tests.test_models import Article, Author, BlogPost, Comment, Tag, User, UserProfile  # noqa: PLC0415
+from tests.test_models import (  # noqa: PLC0415
+    Article,
+    Author,
+    BlogPost,
+    Comment,
+    Tag,
+    User,
+    UserProfile,
+)
+
+
+class Invoice(models.Model):
+    """A model with DecimalField columns. The tests do not save it, so it needs no table."""
+
+    total = models.DecimalField(max_digits=20, decimal_places=2)
+    discount = models.DecimalField(max_digits=6, decimal_places=2, null=True)
+
+    class Meta:
+        app_label = "django_bolt"
+
 
 # =============================================================================
 # Serializers for testing
@@ -379,6 +402,38 @@ class TestToModelWithDjango:
         # Should not have display_name attribute (it's computed)
         assert not hasattr(author, "display_name") or author.display_name != serializer.display_name()
 
+    @pytest.mark.django_db
+    def test_to_model_sets_a_foreign_key_from_the_primary_key(self):
+        """`create_serializer` gives a ForeignKey the type `int`. The model takes that value as `author_id`."""
+        PostCreate = create_serializer(BlogPost, fields=["title", "content", "author"], serializer_name="PostCreate")
+        author = Author.objects.create(name="Ana", email="ana@example.com")
+
+        post = PostCreate.model_validate({"title": "T", "content": "C", "author": author.pk}).to_model(BlogPost)
+        post.save()
+
+        assert BlogPost.objects.get(pk=post.pk).author == author
+        # The round trip gives the primary key again.
+        assert PostCreate.from_model(post).author == author.pk
+
+        # A hand-written serializer can pass the model instance, as before.
+        class PostWithInstance(Serializer):
+            title: str
+            content: str
+            author: Any
+
+        assert PostWithInstance(title="T", content="C", author=author).to_model(BlogPost).author is author
+
+    def test_to_model_sets_a_one_to_one_field_and_a_none_value(self):
+        ProfileIn = create_serializer(UserProfile, fields=["bio", "user"], serializer_name="ProfileIn")
+
+        assert ProfileIn.model_validate({"bio": "b", "user": 7}).to_model(UserProfile).user_id == 7
+
+        class PostDraft(Serializer):
+            title: str
+            author: int | None = None
+
+        assert PostDraft(title="T").to_model(BlogPost).author_id is None
+
 
 class TestUpdateInstanceWithDjango:
     """Test updating Django model instances with Serializers."""
@@ -407,6 +462,19 @@ class TestUpdateInstanceWithDjango:
         original = Author.objects.get(id=author.id)
         assert original.name == "Original Name"
 
+    def test_update_instance_with_omit_defaults_keeps_the_fields_at_their_default(self):
+        """With omit_defaults=True, update_instance() sets only the fields that are not at their default."""
+
+        class AuthorPatch(Serializer, omit_defaults=True):
+            name: str = ""
+            email: str = ""
+            bio: str = ""
+
+        author = Author(name="Original", email="original@example.com", bio="Old bio")
+
+        assert AuthorPatch(email="new@example.com").update_instance(author) is author
+        assert (author.name, author.email, author.bio) == ("Original", "new@example.com", "Old bio")
+
     @pytest.mark.django_db
     def test_update_instance_and_save(self):
         """Test updating and saving model instance."""
@@ -427,6 +495,19 @@ class TestUpdateInstanceWithDjango:
         # Verify saved
         refreshed = Author.objects.get(id=author.id)
         assert refreshed.name == "Updated"
+
+    @pytest.mark.django_db
+    def test_update_instance_sets_a_foreign_key_from_the_primary_key(self):
+        PostUpdate = create_serializer(BlogPost, fields=["title", "author"], serializer_name="PostUpdate")
+        first = Author.objects.create(name="Ana", email="ana@example.com")
+        second = Author.objects.create(name="Ben", email="ben@example.com")
+        post = BlogPost.objects.create(title="T", content="C", author=first)
+
+        PostUpdate.model_validate({"title": "New", "author": second.pk}).update_instance(post).save()
+
+        post.refresh_from_db()
+        assert post.title == "New"
+        assert post.author == second
 
 
 class TestFieldValidatorsWithDjango:
@@ -734,6 +815,29 @@ class TestSubsetWithDjango:
 
         assert mini.username == "uppercase"
         assert mini.email == "upper@example.com"
+
+    def test_subset_keeps_each_validator_of_a_field(self):
+        """A subset runs all the validators of a field, as the parent does."""
+
+        class Account(Serializer):
+            id: int
+            name: str
+
+            @field_validator("name")
+            def strip_name(cls, value):
+                return value.strip()
+
+            @field_validator("name")
+            def reject_empty_name(cls, value):
+                if not value:
+                    raise ValueError("Name is empty")
+                return value
+
+        AccountMini = Account.subset("name")
+
+        assert AccountMini(name="  ada  ").name == Account(id=1, name="  ada  ").name == "ada"
+        with pytest.raises(RequestValidationError, match="Name is empty"):
+            AccountMini(name="   ")
 
     @pytest.mark.django_db
     def test_subset_with_computed_field(self):
@@ -1091,6 +1195,42 @@ class TestCreateSerializerHelpersWithDjango:
         assert "email" in UserSerializer.__annotations__
         assert "is_active" in UserSerializer.__annotations__
 
+    def test_create_serializer_keeps_the_precision_of_a_decimal_field(self):
+        """A DecimalField was `float`. Thus 0.1 + 0.2 was not 0.3, and a long value lost digits."""
+        InvoiceSerializer = create_serializer(Invoice, fields=["total", "discount"])
+        api = BoltAPI()
+
+        @api.post("/invoices")
+        async def create_invoice(data: InvoiceSerializer) -> InvoiceSerializer:
+            invoice = data.to_model(Invoice)
+            assert type(invoice.total) is Decimal
+            return InvoiceSerializer.from_model(invoice)
+
+        with TestClient(api) as client:
+            # The JSON text of a decimal, as Django REST Framework sends it.
+            response = client.post("/invoices", json={"total": "12345678901234567.89", "discount": None})
+            assert response.status_code == 200, response.text
+            assert response.json() == {"total": "12345678901234567.89", "discount": None}
+            # A JSON number is a valid input too.
+            response = client.post("/invoices", content=b'{"total": 0.10, "discount": 2.5}')
+            assert response.json() == {"total": "0.10", "discount": "2.5"}
+            assert client.post("/invoices", json={"total": "abc", "discount": None}).status_code == 422
+
+    def test_create_serializer_keeps_the_order_of_the_fields(self):
+        """The fields have the order of the `fields` argument, or the order of the model."""
+        names = ["updated_at", "email", "id", "is_staff", "username", "created_at", "is_active"]
+
+        assert create_serializer(User, fields=names).__struct_fields__ == tuple(names)
+        assert create_serializer(User, exclude=["password_hash"]).__struct_fields__ == (
+            "id",
+            "username",
+            "email",
+            "is_active",
+            "is_staff",
+            "created_at",
+            "updated_at",
+        )
+
     @pytest.mark.django_db
     def test_create_serializer_config_applies_end_to_end(self):
         """Test create_serializer uses Config metadata for model mapping and dump behavior."""
@@ -1119,6 +1259,34 @@ class TestCreateSerializerHelpersWithDjango:
         assert dumped["email"] == "helper@example.com"
         assert "created_at" in dumped
         assert "password_hash" not in dumped
+
+    def test_create_serializer_selects_the_fields_and_the_set_passes_its_options(self):
+        """exclude, an unknown name and a many-to-many field drop out. Each serializer of the set gets its options."""
+        PostSerializer = create_serializer(BlogPost, fields=["title", "tags", "author", "unknown"], exclude=["title"])
+        TagSerializer = create_serializer(Tag, exclude=["description"])
+
+        assert (PostSerializer.__name__, set(PostSerializer.__struct_fields__)) == ("BlogPostSerializer", {"author"})
+        assert set(TagSerializer.__struct_fields__) == {"id", "name"}
+
+        UserCreate, UserUpdate, UserPublic = create_serializer_set(
+            User,
+            create_fields=["username", "password_hash"],
+            update_fields=["email", "password_hash"],
+            public_fields=["id", "username"],
+            write_only={"password_hash"},
+            read_only={"id"},
+        )
+
+        assert [cls.__name__ for cls in (UserCreate, UserUpdate, UserPublic)] == [
+            "UserCreate",
+            "UserUpdate",
+            "UserPublic",
+        ]
+        assert set(UserPublic.__struct_fields__) == {"id", "username"}
+        assert UserCreate(username="u", password_hash="h").dump() == {"username": "u"}
+        assert UserUpdate(email="u@example.com", password_hash="h").dump() == {"email": "u@example.com"}
+        assert UserPublic.__read_only_fields__ == frozenset({"id"})
+        assert UserCreate.__read_only_fields__ == frozenset()
 
     @pytest.mark.django_db
     def test_create_serializer_set_with_django(self):
@@ -1875,7 +2043,7 @@ class TestComprehensiveSerializer:
             "id",
             "name",
             "sku",
-            "description",
+            "desc",  # The alias of `description` is its key in the output.
             "price",
             "quantity",
             "discount_percent",
