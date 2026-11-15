@@ -551,6 +551,8 @@ class BoltAPI:
                 Rust or from Python. ``None`` keeps the ``{"detail": ...}`` body.
                 Use ``django_bolt.error_handlers.problem_details`` for RFC 9457.
         """
+        if trailing_slash not in ("strip", "append", "keep"):
+            raise ValueError(f'trailing_slash must be "strip", "append" or "keep", not {trailing_slash!r}')
         if error_formatter is not None:
             if not callable(error_formatter):
                 raise TypeError(f"error_formatter must be callable, not {type(error_formatter).__name__}")
