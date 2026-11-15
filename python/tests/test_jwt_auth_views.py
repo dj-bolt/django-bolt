@@ -107,6 +107,29 @@ def test_cookies_are_secure_unless_the_project_turns_it_off(secure_cookies):
         assert "HttpOnly" in attributes
 
 
+@pytest.mark.parametrize(
+    ("prefix", "path"),
+    [("/", "/"), ("", "/"), ("/auth", "/auth"), ("/api/auth/", "/api/auth")],
+)
+def test_refresh_cookie_path_is_the_prefix_of_the_routes(prefix, path):
+    """The refresh cookie has the path of the routes. Routes at the root give the path ``/``."""
+    api = _views_api(prefix=prefix, secure_cookies=False)
+
+    def refresh_cookie_path(response) -> str:
+        cookie = next(c for c in response.headers.get_list("set-cookie") if c.startswith("refresh_token="))
+        return next(a for a in cookie.split("; ") if a.startswith("Path"))
+
+    with TestClient(api) as client:
+        login = client.post(f"{path.rstrip('/')}/login", json=LOGIN)
+        assert login.status_code == 200
+        assert refresh_cookie_path(login) == f"Path={path}"
+
+        logout = client.post(f"{path.rstrip('/')}/logout", headers=NO_CSRF_ORIGIN)
+        assert logout.status_code == 200, logout.text
+        # The cookie that clears the refresh cookie has the same path, or the browser keeps the cookie.
+        assert refresh_cookie_path(logout) == f"Path={path}"
+
+
 def test_views_use_the_given_key_algorithm_and_prefix():
     """Login signs with the secret, algorithm and ``kid`` of the views. The refresh route accepts these tokens."""
     api = _views_api(algorithm="HS512", kid="key-1", prefix="/api/auth-X/", secure_cookies=False)
