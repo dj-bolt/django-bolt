@@ -7,6 +7,7 @@ from typing import Any
 
 import msgspec
 from django.contrib.auth import aauthenticate
+from django.core.exceptions import ImproperlyConfigured
 
 from django_bolt.exceptions import HTTPException
 from django_bolt.responses import JSON
@@ -32,6 +33,19 @@ class JWTAuthViews:
     Applications with different credential requirements can replace
     ``credential_validator`` while retaining consistent cookie, rotation,
     revocation, error, and OpenAPI behavior.
+
+    Args:
+        secret: The key that signs the tokens. The default is Django's
+            ``SECRET_KEY``. With an asymmetric ``algorithm``, this is the PEM
+            private key.
+        algorithm: The JWT algorithm (default ``HS256``).
+        public_key: The PEM public key that verifies the tokens of an
+            asymmetric ``algorithm``. ``secret`` is then the private key that
+            signs them. Do not set it with an HMAC algorithm (``HS*``).
+        kid: An optional key identifier for the header of each token.
+
+    Raises:
+        ImproperlyConfigured: The keys do not match ``algorithm``.
     """
 
     def __init__(
@@ -40,6 +54,7 @@ class JWTAuthViews:
         store: Any,
         secret: str | None = None,
         algorithm: str = "HS256",
+        public_key: str | None = None,
         kid: str | None = None,
         prefix: str = "/auth",
         access_cookie: str = "access_token",
@@ -47,9 +62,22 @@ class JWTAuthViews:
         secure_cookies: bool = True,
         credential_validator: CredentialValidator | None = None,
     ) -> None:
+        if algorithm.startswith("HS"):
+            if public_key is not None:
+                raise ImproperlyConfigured(
+                    "JWTAuthViews accepts 'public_key' only with an asymmetric algorithm. "
+                    f"{algorithm!r} signs and verifies with 'secret'. "
+                    "Remove 'public_key', or set 'algorithm' to an asymmetric algorithm such as 'RS256'."
+                )
+        elif secret is None or public_key is None:
+            raise ImproperlyConfigured(
+                f"JWTAuthViews with the asymmetric algorithm {algorithm!r} requires 'secret' and 'public_key'. "
+                "Pass the PEM private key as 'secret' and the PEM public key as 'public_key'."
+            )
         self.store = store
         self.secret = secret
         self.algorithm = algorithm
+        self.public_key = public_key
         self.kid = kid
         self.prefix = prefix.rstrip("/")
         self.access_cookie = access_cookie
@@ -82,8 +110,10 @@ class JWTAuthViews:
 
     def register(self, api: Any) -> None:
         """Attach the four lifecycle routes to a :class:`BoltAPI`."""
+        # JWTAuthentication accepts one key: the public key of an asymmetric algorithm, or the HMAC secret.
+        verification_key = {"secret": self.secret} if self.public_key is None else {"public_key": self.public_key}
         refresh_auth = JWTAuthentication(
-            secret=self.secret,
+            **verification_key,
             algorithms=[self.algorithm],
             cookie=self.refresh_cookie,
             token_type="refresh",

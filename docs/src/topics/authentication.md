@@ -395,6 +395,35 @@ flows.
 `/auth/logout` and `/auth/logout-all` accept only a refresh token that
 `/auth/refresh` also accepts. A used, revoked or old-version token gets a 401.
 
+The views sign with `HS256` and Django's `SECRET_KEY` by default. For an
+asymmetric algorithm, pass the PEM private key as `secret` and the PEM public
+key as `public_key`. The views sign with the private key and verify the refresh
+token with the public key:
+
+```python
+from pathlib import Path
+
+from django_bolt.auth import InMemoryRevocation, JWTAuthentication, JWTAuthViews
+
+PUBLIC_KEY = Path("jwt-public.pem").read_text()
+
+auth_views = JWTAuthViews(
+    store=InMemoryRevocation(),
+    algorithm="RS256",
+    secret=Path("jwt-private.pem").read_text(),
+    public_key=PUBLIC_KEY,
+    kid="signing-key-2026-07",
+)
+auth_views.register(api)
+
+# Other routes, and other services, need only the public key.
+access_auth = JWTAuthentication(public_key=PUBLIC_KEY, algorithms=["RS256"], cookie="access_token")
+```
+
+An asymmetric algorithm with no `secret` or no `public_key` raises
+`ImproperlyConfigured` at startup. So does a `public_key` with an `HS*`
+algorithm.
+
 ### Issuing a pair
 
 Call `create_token_pair()` once the user has proved who they are — by
