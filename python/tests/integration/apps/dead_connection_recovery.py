@@ -17,6 +17,9 @@ since server projects start with an unmigrated database. ``SECRET`` and
 ``/me-inline`` is ``/me`` with no await, so Bolt dispatches it synchronously
 on the worker thread.
 
+``/me-async-loader`` loads the user with ``await request.auser()``. Its backend
+overrides ``get_user`` and calls the ``get_user`` of ``JWTAuthentication``.
+
 ``/echo`` sends a token through a query and returns what the database sent
 back, with the process that served it. Two processes that share a socket read
 each other's results, so a token that comes back wrong shows the sharing.
@@ -121,6 +124,17 @@ async def me_inline(request):
     # No await: Bolt runs this handler on the worker thread with no event
     # loop step, and the lazy user load blocks the loop of that thread.
     return {"username": request.user.username}
+
+
+class _AsyncLoader(JWTAuthentication):
+    async def get_user(self, user_id, auth_context):
+        return await super().get_user(user_id, auth_context)
+
+
+@api.get("/me-async-loader", auth=[_AsyncLoader(secret=SECRET)], guards=[IsAuthenticated()])
+async def me_async_loader(request):
+    user = await request.auser()
+    return {"username": user.username}
 
 
 @api.get("/orm-threads")

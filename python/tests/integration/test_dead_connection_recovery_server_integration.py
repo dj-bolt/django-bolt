@@ -157,6 +157,31 @@ def test_health_checks_replace_the_dead_connection_before_the_query(make_server_
         assert server.get("/me", headers=headers).status_code == 200
 
 
+def test_the_async_user_loader_of_jwt_recovers_after_postgres_closes_the_connection(
+    make_server_project, postgres_database
+):
+    """``JWTAuthentication.get_user`` is the async loader that a backend with its own ``get_user`` can call.
+
+    Its query must run where Bolt drops a dead connection. Before, the query
+    ran on a thread with no such check. Each request on that thread then
+    failed until the process restarted.
+    """
+    server, application_name = start_server(make_server_project, postgres_database)
+    with server:
+        headers = seed_and_authenticate(server)
+        before = server.get("/me-async-loader", headers=headers)
+        assert before.status_code == 200, before.text
+        assert before.json() == {"username": USERNAME}
+
+        killed = terminate_backends(postgres_database, application_name)
+        assert killed >= 1, "the server kept no connection open between requests"
+
+        statuses = [server.get("/me-async-loader", headers=headers).status_code for _ in range(5)]
+        assert 200 in statuses[:2], f"no recovery within two requests: {statuses}"
+        assert statuses[2:] == [200, 200, 200], f"recovery did not hold: {statuses}"
+        assert server.get("/me-async-loader", headers=headers).json() == {"username": USERNAME}
+
+
 # The pool keeps more connections than the threads hold, so the kill also
 # ends idle connections of the pool.
 POOL = """
