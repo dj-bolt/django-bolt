@@ -406,7 +406,8 @@ The root `BoltAPI` resolves `None` to `True`.
 ## Non-JSON responses
 
 `response_class` sets the media type in the documentation. The default is
-`application/json`:
+`application/json`. A return annotation with one of these classes, for example
+`-> StreamingResponse`, has the same effect:
 
 | `response_class` | Media type | Schema |
 |---|---|---|
