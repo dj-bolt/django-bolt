@@ -557,9 +557,34 @@ fn run_dev_reloader_inner(
         ));
     }
 
+    supervise(
+        &command,
+        &rx,
+        &filter,
+        debounce,
+        recv_timeout,
+        &shutdown,
+        &paint,
+    )
+}
+
+/// The supervisor loop. Start the worker, start a new one after each change,
+/// and return the exit code of the session.
+///
+/// `rx` gives the events of the file watcher. `shutdown` is the flag that the
+/// signal handler sets.
+fn supervise(
+    command: &[String],
+    rx: &Receiver<notify::Result<Event>>,
+    filter: &ReloadFilter,
+    debounce: Duration,
+    recv_timeout: Duration,
+    shutdown: &AtomicBool,
+    paint: &Paint,
+) -> PyResult<i32> {
     let mut reload_count = 0u64;
     // None while the worker is dead and the supervisor waits for a change.
-    let mut worker = Some(spawn_worker(&command, reload_count)?);
+    let mut worker = Some(spawn_worker(command, reload_count)?);
     // The last watcher error logged, so a repeated error is logged once.
     let mut last_watch_error: Option<String> = None;
 
@@ -594,7 +619,7 @@ fn run_dev_reloader_inner(
             )));
         }
 
-        match recv_change(&rx, &filter, debounce, recv_timeout) {
+        match recv_change(rx, filter, debounce, recv_timeout) {
             Ok(Some(changed_path)) => {
                 // After a reload, a watcher error that comes back is news again.
                 last_watch_error = None;
@@ -605,7 +630,7 @@ fn run_dev_reloader_inner(
                 ));
                 reload_count += 1;
                 stop_worker(&mut worker, WORKER_STOP_TIMEOUT_RELOAD)?;
-                worker = Some(spawn_worker(&command, reload_count)?);
+                worker = Some(spawn_worker(command, reload_count)?);
             }
             Ok(None) => {}
             Err(_) if shutdown.load(Ordering::SeqCst) => {
@@ -1062,6 +1087,53 @@ mod tests {
 
         assert_eq!(changed, Ok(Some(PathBuf::from("/tmp/project/views.py"))));
         drop(tx);
+    }
+
+    /// The supervisor loop with a channel in place of the file watcher, and a
+    /// `sleep` worker.
+    #[cfg(unix)]
+    #[test]
+    fn a_watcher_error_ends_the_session_only_for_a_stopped_watcher_or_a_shutdown() {
+        use super::supervise;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let command = ["sleep", "30"].map(String::from);
+        let filter = ReloadFilter::new(vec![], vec![]);
+        let paint = Paint { enabled: false };
+        let run = |rx: &mpsc::Receiver<notify::Result<Event>>, shutdown: &AtomicBool| {
+            supervise(
+                &command,
+                rx,
+                &filter,
+                Duration::from_millis(50),
+                Duration::from_millis(200),
+                shutdown,
+                &paint,
+            )
+        };
+
+        // No shutdown: a notify error does not end the session. Then the
+        // watcher stops, and the session ends with the exit code 1.
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(notify::Error::generic("inotify watch limit")))
+            .unwrap();
+        drop(tx);
+        let exit_code = run(&rx, &AtomicBool::new(false));
+        assert!(matches!(exit_code, Ok(1)), "{exit_code:?}");
+
+        // A shutdown arrives while the loop waits for the watcher, and the
+        // watcher stops with it. This is a clean stop: the exit code is 0.
+        let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+        let shutdown = &AtomicBool::new(false);
+        let exit_code = thread::scope(|scope| {
+            scope.spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                shutdown.store(true, Ordering::SeqCst);
+                drop(tx);
+            });
+            run(&rx, shutdown)
+        });
+        assert!(matches!(exit_code, Ok(0)), "{exit_code:?}");
     }
 
     #[test]
