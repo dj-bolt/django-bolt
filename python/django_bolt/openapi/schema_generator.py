@@ -329,6 +329,17 @@ class SchemaGenerator:
             schema = self._with_default(schema, default)
         return schema
 
+    @classmethod
+    def _file_part_schema(cls, schema: Schema | Reference) -> Schema | Reference:
+        """The schema of a file part. A file part holds the raw bytes, not base64 text."""
+        if not isinstance(schema, Schema):
+            return schema
+        if schema.content_encoding == "base64":
+            return replace(schema, content_encoding=None, format="binary")
+        if schema.type == "array" and schema.items is not None:
+            return replace(schema, items=cls._file_part_schema(schema.items))
+        return schema
+
     @staticmethod
     def _enum_values_schema(values: list[Any] | tuple[Any, ...]) -> Schema:
         """Infer the narrowest enum schema that fits the provided values."""
@@ -1046,7 +1057,10 @@ class SchemaGenerator:
                                 required.append(sub_name)
                         continue
 
-                    properties[name] = self._form_field_schema(annotation, field.param, default)
+                    field_schema = self._form_field_schema(annotation, field.param, default)
+                    if field.source == "file":
+                        field_schema = self._file_part_schema(field_schema)
+                    properties[name] = field_schema
                     if default == inspect.Parameter.empty and not is_optional(annotation):
                         required.append(name)
 
@@ -1780,9 +1794,10 @@ _MSGSPEC_NODE_HANDLERS: dict[str, Callable[[SchemaGenerator, Any, bool], Schema 
     "FloatType": lambda gen, node, _r: gen._numeric_type_schema(node, "number"),
     "StrType": _node_str,
     "BoolType": lambda _g, _n, _r: Schema(type="boolean"),
-    "BytesType": lambda _g, _n, _r: Schema(type="string", format="binary"),
-    "ByteArrayType": lambda _g, _n, _r: Schema(type="string", format="binary"),
-    "MemoryViewType": lambda _g, _n, _r: Schema(type="string", format="binary"),
+    # msgspec writes and reads bytes in JSON as base64 text.
+    "BytesType": lambda _g, _n, _r: Schema(type="string", content_encoding="base64"),
+    "ByteArrayType": lambda _g, _n, _r: Schema(type="string", content_encoding="base64"),
+    "MemoryViewType": lambda _g, _n, _r: Schema(type="string", content_encoding="base64"),
     # Any value: an empty schema. msgspec.Raw holds JSON of any type.
     "AnyType": lambda _g, _n, _r: Schema(),
     "RawType": lambda _g, _n, _r: Schema(),
@@ -1874,7 +1889,7 @@ _PRIMITIVE_SCHEMAS: dict[Any, dict[str, str]] = {
     int: {"type": "integer"},
     float: {"type": "number"},
     bool: {"type": "boolean"},
-    bytes: {"type": "string", "format": "binary"},
+    bytes: {"type": "string", "content_encoding": "base64"},
     Any: {},
     msgspec.Raw: {},
     type(None): {"type": "null"},
