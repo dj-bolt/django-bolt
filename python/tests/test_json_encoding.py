@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 
 import msgspec
@@ -23,6 +23,22 @@ class MyTime(time):
     pass
 
 
+class MyInt(int):
+    pass
+
+
+class MyFloat(float):
+    pass
+
+
+class MyBytes(bytes):
+    pass
+
+
+class MyTimedelta(timedelta):
+    pass
+
+
 # msgspec encodes the exact type itself. Only a subclass goes to DEFAULT_TYPE_ENCODERS.
 SUBCLASS_VALUES = {
     "decimal": (Decimal("1.50"), MyDecimal("1.50")),
@@ -31,6 +47,12 @@ SUBCLASS_VALUES = {
     "decimal-infinity": (Decimal("-Infinity"), MyDecimal("-Infinity")),
     "datetime-utc": (datetime(2020, 1, 2, 3, 4, 5, 6, tzinfo=UTC), MyDateTime(2020, 1, 2, 3, 4, 5, 6, tzinfo=UTC)),
     "time-utc": (time(3, 4, 5, tzinfo=UTC), MyTime(3, 4, 5, tzinfo=UTC)),
+    "int": (7, MyInt(7)),
+    "int-big": (2**63, MyInt(2**63)),
+    "float": (1.5, MyFloat(1.5)),
+    "float-nan": (float("nan"), MyFloat("nan")),
+    "bytes": (b"ab", MyBytes(b"ab")),
+    "timedelta": (timedelta(days=1, seconds=5, microseconds=6), MyTimedelta(days=1, seconds=5, microseconds=6)),
 }
 EXPECTED_JSON = {
     "decimal": '"1.50"',
@@ -39,6 +61,12 @@ EXPECTED_JSON = {
     "decimal-infinity": '"-Infinity"',
     "datetime-utc": '"2020-01-02T03:04:05.000006Z"',
     "time-utc": '"03:04:05Z"',
+    "int": "7",
+    "int-big": "9223372036854775808",
+    "float": "1.5",
+    "float-nan": "null",
+    "bytes": '"YWI="',
+    "timedelta": '"P1DT5.000006S"',
 }
 
 
