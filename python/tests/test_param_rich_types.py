@@ -413,6 +413,117 @@ def test_a_bytes_parameter_checks_its_constraints_on_the_bytes(bytes_client):
     assert bytes_client.get("/query").status_code == 422
 
 
+class BytesModel(msgspec.Struct):
+    b: bytes
+    items: list[bytes] = []
+    short: Annotated[bytes, msgspec.Meta(max_length=3)] = b""
+    maybe: bytes | None = None
+    n: int = 0
+
+
+class BytesHeaders(msgspec.Struct):
+    x_b: bytes
+    x_n: int = 0
+
+
+@pytest.fixture
+def bytes_model_client():
+    api = BoltAPI()
+
+    def show(model):
+        return {
+            "b": _show_bytes(model.b),
+            "items": _show_bytes(model.items),
+            "short": _show_bytes(model.short),
+            "maybe": _show_bytes(model.maybe),
+            "n": model.n,
+        }
+
+    @api.get("/query")
+    async def query(model: Annotated[BytesModel, Query()]):
+        return show(model)
+
+    @api.post("/form")
+    async def form(model: Annotated[BytesModel, Form()]):
+        return show(model)
+
+    @api.get("/cookie")
+    async def cookie(model: Annotated[BytesModel, Cookie()]):
+        return show(model)
+
+    @api.get("/header")
+    async def header(model: Annotated[BytesHeaders, Header()]):
+        return {"x_b": _show_bytes(model.x_b), "x_n": model.x_n}
+
+    @api.post("/json")
+    async def json_body(model: BytesModel):
+        return show(model)
+
+    @api.get("/tuple")
+    async def as_tuple(pair: tuple[bytes, int]):
+        return _show_bytes(pair[0]) | {"n": pair[1]}
+
+    return TestClient(api)
+
+
+def test_a_bytes_field_of_a_parameter_model_gets_the_utf8_bytes_of_the_text(bytes_model_client):
+    """A parameter model reads a ``bytes`` field as a plain ``bytes`` parameter does, with no base64 decoding."""
+    empty = {"type": "bytes", "hex": ""}
+    # "YWJj" is base64 for "abc". The field gets the four characters.
+    expected = {
+        "b": _utf8("YWJj"),
+        "items": {"type": "list", "items": [_utf8("x"), _utf8("YWJj")]},
+        "short": _utf8("\u00e9a"),
+        "maybe": _utf8("abc"),
+        "n": 7,
+    }
+
+    response = bytes_model_client.get("/query?b=YWJj&items=x&items=YWJj&short=%C3%A9a&maybe=abc&n=7")
+    assert response.json() == expected
+    response = bytes_model_client.post(
+        "/form", data={"b": "YWJj", "items": ["x", "YWJj"], "short": "\u00e9a", "maybe": "abc", "n": "7"}
+    )
+    assert response.json() == expected
+
+    # Text that is not base64 is a value, not an error.
+    one = {"b": _utf8("a b!"), "items": {"type": "list", "items": []}, "short": empty, "maybe": {"type": "NoneType"}}
+    assert bytes_model_client.get("/query", params={"b": "a b!"}).json() == one | {"n": 0}
+    assert bytes_model_client.post("/form", data={"b": "a b!"}).json() == one | {"n": 0}
+    assert bytes_model_client.get("/cookie", headers={"cookie": "b=YWJj; n=2"}).json() == one | {
+        "b": _utf8("YWJj"),
+        "n": 2,
+    }
+    assert bytes_model_client.get("/header", headers={"x-b": "YWJj", "x-n": "3"}).json() == {
+        "x_b": _utf8("YWJj"),
+        "x_n": 3,
+    }
+
+
+def test_a_bytes_field_of_a_parameter_model_checks_its_constraints_on_the_bytes(bytes_model_client):
+    response = bytes_model_client.get("/query?b=abc&short=YWJj")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == [
+        {
+            "type": "validation_error",
+            "loc": ["query", "short"],
+            "msg": "Expected `bytes` of length <= 3",
+            "input": "YWJj",
+        }
+    ]
+
+
+def test_a_bytes_item_of_a_tuple_parameter_gets_the_utf8_bytes_of_the_text(bytes_model_client):
+    assert bytes_model_client.get("/tuple?pair=YWJj&pair=3").json() == _utf8("YWJj") | {"n": 3}
+
+
+def test_a_bytes_field_of_a_json_body_is_base64(bytes_model_client):
+    """JSON has no bytes type. msgspec reads and writes ``bytes`` in JSON as base64 text."""
+    response = bytes_model_client.post("/json", json={"b": "YWJj"})
+
+    assert response.json()["b"] == _utf8("abc")
+
+
 # --- NewType and type aliases ----------------------------------------------------------
 
 
