@@ -38,7 +38,7 @@ python manage.py runbolt --processes 4 \
 | --- | --- |
 | `--max-rss <MiB>` | Recycle a worker once its resident set size exceeds this many MiB (checked about once per second). Set it well above your baseline per-worker RSS. `0` disables (default). |
 | `--workers-lifetime <seconds>` | Recycle each worker after this much uptime. `0` disables (default). |
-| `--respawn-failed-workers` | Fork a replacement when a worker exits unexpectedly (crash, OOM kill) instead of letting the fleet shrink. |
+| `--respawn-failed-workers` | Fork a replacement when a worker exits unexpectedly (crash, OOM kill) after it started to serve. Without the option, the fleet shrinks. A worker that cannot start (port in use, import error) is not replaced: `runbolt` stops all workers and exits with status 1. |
 | `--workers-kill-timeout <seconds>` | How long a worker gets to shut down gracefully (default: 30). After this time, the server closes the connections that are still open, and the supervisor sends SIGKILL to a worker that still runs. |
 
 `--max-rss`, `--workers-lifetime` and `--respawn-failed-workers` each enable the supervising parent process, even with `--processes 1`. `--workers-kill-timeout` does not. With one process and no supervisor, it sets only the graceful-shutdown window of the server.

@@ -8,6 +8,7 @@ use pyo3::types::PyDict;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::handler::handle_request;
@@ -673,6 +674,19 @@ pub fn register_middleware_metadata(
     Ok(())
 }
 
+/// True after this process bound its listener. The kernel accepts
+/// connections on the port from that moment.
+static SERVER_LISTENING: AtomicBool = AtomicBool::new(false);
+
+/// Tell if `start_server` bound its listener in this process.
+///
+/// A `runbolt` worker reads this when it stops with an error. The value
+/// separates a worker that did not start from a worker that failed later.
+#[pyfunction]
+pub fn server_listening() -> bool {
+    SERVER_LISTENING.load(Ordering::Relaxed)
+}
+
 #[pyfunction]
 #[pyo3(signature = (dispatch, host, port, compression_config=None, error_renderer=None))]
 pub fn start_server(
@@ -732,6 +746,7 @@ pub fn start_server(
     // failed first start, so it waits for changes and does not exit.
     let listener = bind_listener(&host, port, use_reuse_port, backlog)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Server error: {}", e)))?;
+    SERVER_LISTENING.store(true, Ordering::Relaxed);
 
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.max_blocking_threads(blocking_threads);

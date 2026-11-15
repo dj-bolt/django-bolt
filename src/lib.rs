@@ -59,7 +59,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     use crate::dev_reload::run_dev_reloader;
     use crate::server::{
         register_asgi_mounts, register_middleware_metadata, register_routes,
-        register_websocket_routes, start_server,
+        register_websocket_routes, server_listening, start_server,
     };
     use crate::testing::{
         TestRateLimiters, close_test_worker_connections, create_test_app, destroy_test_app,
@@ -84,6 +84,7 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bolt_mcp::register_mcp_mounts, m)?)?;
     m.add_function(wrap_pyfunction!(register_middleware_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(start_server, m)?)?;
+    m.add_function(wrap_pyfunction!(server_listening, m)?)?;
     m.add_function(wrap_pyfunction!(run_dev_reloader, m)?)?;
 
     // Test infrastructure functions (async-native, uses Actix test utilities)

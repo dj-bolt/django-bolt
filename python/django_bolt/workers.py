@@ -9,7 +9,9 @@ symptoms instead:
 - ``max_rss_bytes``: recycle a worker once its resident set size exceeds a
   threshold (the primary defense against slow memory leaks).
 - ``lifetime_seconds``: recycle workers after a wall-clock lifetime.
-- ``respawn_failed``: replace workers that exit unexpectedly.
+- ``respawn_failed``: replace workers that exit unexpectedly. A worker that
+  exits with ``WORKER_BOOT_ERROR`` did not start to serve. A replacement
+  fails the same way, so the supervisor stops all workers instead.
 
 Recycling is *graceful and spawn-first*: a replacement worker is forked and
 binds the same port via SO_REUSEPORT *before* the old worker receives
@@ -39,6 +41,10 @@ MIB = 1024 * 1024
 
 DEFAULT_KILL_TIMEOUT = 30.0
 DEFAULT_CHECK_INTERVAL = 1.0
+
+# Exit status of a worker that stopped before it listened on the port.
+# gunicorn uses the same value for "Worker failed to boot".
+WORKER_BOOT_ERROR = 3
 
 
 def get_rss_bytes(pid: int) -> int | None:
@@ -124,6 +130,8 @@ class WorkerSupervisor:
         self._force_kill = False
         # Set when a worker exits with an error and is not replaced.
         self._unreplaced_failure = False
+        # Set when a worker did not start and ``respawn_failed`` is on.
+        self._boot_failure = False
         # Interruptible sleep: request_shutdown() wakes the loop immediately
         # instead of waiting out the current check interval.
         self._wakeup = threading.Event()
@@ -147,6 +155,7 @@ class WorkerSupervisor:
         Returns:
             The exit status for the parent: 1 when the workers ended without a
             shutdown request and at least one of them exited with an error,
+            and 1 when ``respawn_failed`` is on and a worker did not start,
             else 0. A process manager then sees the failure, for example
             ``Restart=on-failure`` in systemd.
         """
@@ -161,6 +170,8 @@ class WorkerSupervisor:
             self._shutdown_requested = True
             self._supervise()
             raise
+        if self._boot_failure:
+            return 1
         if self._unreplaced_failure and not self._shutdown_requested:
             self._log("Every worker has exited and at least one failed; stopping with exit status 1")
             return 1
@@ -231,7 +242,16 @@ class WorkerSupervisor:
             return
 
         exit_code = os.waitstatus_to_exitcode(status)
-        if self.respawn_failed:
+        if self.respawn_failed and exit_code == WORKER_BOOT_ERROR:
+            # The worker did not listen on the port. A replacement fails the
+            # same way, so the supervisor stops the other workers and reports it.
+            self._boot_failure = True
+            self._shutdown_requested = True
+            self._log(
+                f"Worker {pid} (slot {worker.slot}) failed to start (code {exit_code}). "
+                f"A new worker fails the same way; stopping with exit status 1"
+            )
+        elif self.respawn_failed:
             self._log(f"Worker {pid} (slot {worker.slot}) exited unexpectedly (code {exit_code}); respawning")
             self._spawn_slot(worker.slot)
         else:

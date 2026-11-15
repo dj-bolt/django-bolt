@@ -33,7 +33,7 @@ from django_bolt.api import (
 from django_bolt.concurrency import close_connections_and_pools
 from django_bolt.middleware.compression import compression_setting
 from django_bolt.middleware.middleware import refuse_unread_route_config
-from django_bolt.workers import MIB, WorkerSupervisor
+from django_bolt.workers import MIB, WORKER_BOOT_ERROR, WorkerSupervisor
 
 try:
     from django_bolt.logging.config import setup_django_logging
@@ -653,7 +653,11 @@ class Command(BaseCommand):
         parser.add_argument(
             "--respawn-failed-workers",
             action="store_true",
-            help="Respawn workers that exit unexpectedly instead of letting the fleet shrink",
+            help=(
+                "Respawn workers that exit unexpectedly after they started to serve, "
+                "instead of letting the fleet shrink. A worker that cannot start "
+                "(port in use, import error) stops runbolt with exit status 1"
+            ),
         )
         parser.add_argument(
             "--workers-kill-timeout",
@@ -749,7 +753,8 @@ class Command(BaseCommand):
         recycles them on --max-rss / --workers-lifetime limits (spawn-first,
         graceful drain), respawns crashed workers when
         --respawn-failed-workers is set, and coordinates graceful shutdown
-        on SIGTERM/SIGINT.
+        on SIGTERM/SIGINT. With --respawn-failed-workers, a worker that did
+        not start to serve stops runbolt with exit status 1.
         """
         if not hasattr(os, "fork"):
             raise CommandError(
@@ -789,7 +794,10 @@ class Command(BaseCommand):
                 self.start_single_process(options, process_id=slot)
             except BaseException:
                 traceback.print_exc()
-                exit_code = 1
+                # The exit status tells the supervisor if this worker listened
+                # on the port before the error. It does not replace a worker
+                # that did not start.
+                exit_code = 1 if _core.server_listening() else WORKER_BOOT_ERROR
             finally:
                 os._exit(exit_code)
             return 0  # unreachable: os._exit never returns
