@@ -1,0 +1,2067 @@
+{
+ "589": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "595": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "605": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`format_sse_event` frames bytes data with a line break** - `format_sse_event(data_bytes=b\"a\\nb\")` with no other field gave `data: a\\nb`. The second line had no `data:` prefix, so a client dropped it. `data_str` and bytes data with an `event`, `id` or `retry` gave one `data:` line for each line. Now bytes data alone does the same. The SSE framing of a yielded object does not change: its JSON bytes have no line break."
+   }
+  ]
+ },
+ "606": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A revoked token stays revoked until `JWTAuthentication` stops accepting it** - `JWTAuthentication` accepts a token until `exp + leeway`, 60 seconds after `exp` by default. `DjangoCacheRevocation` and `DjangoORMRevocation` kept a revocation entry only until `exp`. So the backend accepted a logged-out token again for the last `leeway` seconds. A token after its `exp` but inside the leeway could not be revoked at all. Now the two stores have a `leeway` argument, 60 seconds by default, and keep an entry until `exp + leeway`. If you set a larger `leeway` on `JWTAuthentication`, pass the same value to the store. `JWTAuthentication` raises `ImproperlyConfigured` when the `leeway` of its `revocation_store` is smaller than its own. A store with no `leeway` attribute, such as `InMemoryRevocation` or a store of your own, is not checked."
+   }
+  ]
+ },
+ "607": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The logout routes reject a refresh token with no family** - `/auth/refresh` of `JWTAuthViews` rejects a refresh token with no `fam` claim. The logout routes did not check this claim. Thus `/auth/logout` gave a 500 for such a token, and `/auth/logout-all` logged out each session of the user. Now the two routes answer 401 for this token, as `/auth/refresh` does."
+   }
+  ]
+ },
+ "613": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`@paginate` finds the request of each handler** - `@paginate` looked only for a parameter with the name `request`. A handler with no request parameter gave a 500 response to each request, although the docstrings show that form. A handler with the request under the name `req` after another parameter also gave a 500 response, because `@paginate` took the other argument as the request. Now `@paginate` uses the rule of the framework: the request parameter has the name `request` or `req`. For a handler with no request parameter, `@paginate` adds one to the signature that the framework reads. It does not pass that argument to the handler."
+   }
+  ]
+ },
+ "617": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`CursorPagination` names the QuerySet that it needs** - A handler with `@paginate(CursorPagination)` that returned a list got a 500 with `AttributeError: 'list' object has no attribute 'model'`. The `paginate` docstring said that each scheme accepts a list. A cursor is a filter on the database, so `CursorPagination` cannot use a list. Now it raises `TypeError` with the reason, and the message names `PageNumberPagination` and `LimitOffsetPagination` for a list. The docstrings and the pagination page say this."
+   }
+  ]
+ },
+ "619": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A write-only field stays out of the dump of a serializer in a `dict`, `tuple` or `set` field** - `dump()` dumped a nested serializer only for a field of the type `Child`, `Child | None` or `list[Child]`. For a field such as `dict[str, Child]` or `tuple[Child, ...]`, the output kept the `Child` instances. The JSON encoder then wrote each field of them, also a `write_only` field such as a password, and wrote no computed field. Thus a route with such a response type sent the write-only fields to the client. Now `dump()` dumps each serializer in a container field, at any depth."
+   }
+  ]
+ },
+ "621": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`max_page_size` limits the default page size** - A pagination class that set only `max_page_size` kept the default `page_size` of 100. Thus `class P(PageNumberPagination): max_page_size = 2` gave a page of 100 rows, and `LimitOffsetPagination` gave `limit: 100`. `CursorPagination` had the same problem. The limit applied only to a size from the query string. Now the default size is the smaller of `page_size` and `max_page_size`."
+   }
+  ]
+ },
+ "622": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A Django middleware can answer with a streaming or a file response** - Django middleware that returned a `StreamingHttpResponse` or a `FileResponse` gave a 500 response. The bridge read `response.content`, and a streaming response has none. Now the bridge sends the chunks of `streaming_content`, sync or async, and closes the Django response at the end. It drops the `Content-Length` header, because the stream has no known length."
+   }
+  ]
+ },
+ "624": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An `Enum` or `Literal` parameter converts and validates its value** - A path, query, header, cookie or form parameter with an `Enum` or `Literal` type got the text from the request, and Bolt accepted each value. Thus a handler that read `.name` or `.value` raised an error, although the OpenAPI schema showed the allowed values. Now the handler gets the `Enum` member or the `Literal` value. Another value gives a 422 that names the parameter. A `list[Enum]` parameter and a field of a parameter model converted before this change."
+   }
+  ]
+ },
+ "625": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A paginated handler can return a `range` or other sequence** - With `PageNumberPagination` or `LimitOffsetPagination`, a handler that returned `range(7)` or a `collections.UserList` got a 500 with `TypeError: range.count() takes exactly one argument (0 given)`. The paginator called `count()` to get the total, and the `count(value)` of a sequence counts one value. Now the total of a sequence is its `len()`. A list and a tuple had no problem."
+   }
+  ]
+ },
+ "627": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`request.GET` in Django middleware keeps every value of a repeated key** - The bridge built `request.GET` from the query dict of Bolt. That dict holds one value for a key, unless the handler declares the parameter as a list. Thus `?tag=a&tag=b` gave `request.GET.getlist(\"tag\")` equal to `[\"b\"]` for a handler with no `tag` parameter. Now the bridge parses the encoded query string, as Django does. Django also raises a 400 response for a query string with more than `DATA_UPLOAD_MAX_NUMBER_FIELDS` parameters."
+   }
+  ]
+ },
+ "632": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`iter_lines()` and `iter_content()` of the test client read multi-byte text** - A streamed test response read its body in chunks of 8192 bytes for `iter_lines()`, or `chunk_size` bytes for `iter_content(decode_unicode=True)`, and decoded each chunk alone. A chunk that ended inside a UTF-8 character raised `UnicodeDecodeError`. Now `iter_lines()` splits the bytes first, and `iter_content()` uses an incremental decoder. `iter_lines(decode_unicode=False)` now gives `bytes` lines. Before, it gave `str` lines."
+   }
+  ]
+ },
+ "633": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`CursorPagination` orders by a ForeignKey or by a deferred field** - With `ordering = \"author\"` on a model whose `author` is a ForeignKey, a page with a next page got a 500. To make the cursor, the paginator read the related object. That ran a query on the event loop (`SynchronousOnlyOperation`), or, with `select_related`, gave an object that JSON cannot hold (`TypeError: Unsupported type`). A queryset that deferred the ordering field (`defer()`, `only()`) got the same `SynchronousOnlyOperation`. Now the cursor of a ForeignKey holds the key, and the paginator loads a deferred field on the ORM executor. If the related model has `Meta.ordering`, Django does not order the ForeignKey name by the key. Then the paginator raises `ValueError`, and the message gives the key name to use, for example `author_id`."
+   }
+  ]
+ },
+ "636": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `list[Struct]` parameter with no marker reads the JSON body** - Bolt read a parameter such as `users: list[CreateUser]` from the query string. A query string cannot hold a list of structs, so each request got 422 with `Missing required query parameter`. Now a list, tuple or set of `msgspec.Struct` or dataclass items is the JSON body, as one struct is. A `GET`, `HEAD`, `DELETE` or `OPTIONS` route with such a parameter now raises `TypeError` at registration, as it does for one struct."
+   }
+  ]
+ },
+ "642": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A cursor with an integer that the database cannot hold gives the first page** - With an ordering that needs the tie-breaker, for example `ordering = \"author\"`, a cursor that held a primary key of `18446744073709551615` got a 500. On SQLite the error was `OverflowError: Python int too large to convert to SQLite INTEGER`. An integer ordering value had the same problem. A client can make such a cursor. Now `CursorPagination` compares each integer of the cursor with the integer range of its column in the database of the QuerySet. A ForeignKey has the range of its target. A value out of the range means no cursor, as a cursor that does not decode."
+   }
+  ]
+ },
+ "645": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "647": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A cached dependency runs one time when async dependencies run at the same time** - Two or more async dependencies of a handler run at the same time. When two of them needed the same dependency, and that dependency had an `await`, each one found an empty cache and called it. Thus `a=Depends(dep), b=Depends(dep)` called `dep` two times and gave two values. Now a cached dependency that two of them need runs first, and each one reads its value from the cache of the request."
+   }
+  ]
+ },
+ "649": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A response that Rust cannot build gives a 500 that does not tell the cause to the client** - A handler can return a response with a status that is not valid, for example `JSON(data, status_code=70000)`. Rust finds this error when it builds the response. For an async handler, the body of the 500 told the cause, also with `DEBUG = False`. For a sync handler, the body was `Internal Server Error`, but no log record told the cause. Now both handlers get the 500 of each other exception: the body tells the cause only with `DEBUG = True`. Bolt writes the cause to stderr as an ERROR record of the Rust core."
+   }
+  ]
+ },
+ "653": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`NotFound(\"User not found\")` is a 404 with that detail** - The first positional argument of `HTTPException` and its subclasses is `status_code`. Thus `NotFound(\"User not found\")` raised `ValueError: 'User not found' is not a valid HTTPStatus` in the handler, and the client got a 500. Now a `str` in the first position is the detail, and the status is the status of the class. A second detail with it raises `TypeError`. Also, a status with no standard phrase and no detail, such as `HTTPException(499)`, raised the same `ValueError`. Now its detail is `Client Error` (4xx) or `Server Error` (5xx)."
+   }
+  ]
+ },
+ "655": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A session `permissions` guard needs `get_all_permissions` of the user model** - For a `Requires(\"permissions\", ...)` guard on a session route, startup checked that the user model has `aget_all_permissions`. The guard check calls `get_all_permissions`. Thus a user model with only the sync method stopped startup with no cause. A user model with only the async method passed startup, and each request then failed. Now startup checks `get_all_permissions`, and the error names it."
+   }
+  ]
+ },
+ "656": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "657": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The write actions of a ViewSet do not take the primary key from the request body** - `PUT` and `PATCH` of `UpdateMixin` and `PartialUpdateMixin` wrote each serializer field to the object, also the primary key. Thus `PATCH /items/1` with `{\"id\": 2}` wrote the data of row 1 to row 2, also when row 2 was not in `get_queryset()`. An `id` that no row had inserted a row. `field(read_only=True)` did not prevent this. `POST` with the `id` of a row updated that row. Now `update` and `partial_update` do not write the primary key, the lookup field or a `read_only` field. `create` does not write a `read_only` field, and does not write the primary key when the database gives it. `Serializer.to_model()` and `Serializer.update_instance()` do not write a `read_only` field."
+   }
+  ]
+ },
+ "658": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "659": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A parameter model that forbids unknown fields ignores the keys of other parameters** - A `Query()`, `Cookie()` or `Form()` model with `forbid_unknown_fields=True` got the complete query, cookie or form map. Thus the key of another parameter of the handler, also of a `File()` parameter, gave a 422 (`Object contains unknown field`), and the error had the `loc` `[\"body\"]` for each source. Now the model does not get the keys that the other parameters of the handler declare. A key that no parameter declares gives a 422 with the type `unknown_field` and a `loc` that names the source and the key, for example `[\"query\", \"other\"]`."
+   }
+  ]
+ },
+ "660": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A bad `@cors` option stops startup** - `@cors` did not check `methods`, `headers`, `credentials` and `max_age`, and Rust did not read a value of the wrong type. The route got the default of the option, with no error. For example, `@cors(origins=[...], methods=\"GET\")` allowed each default method, and `max_age=\"600\"` gave `3600`. Now `@cors` raises `TypeError` for `methods` or `headers` that is not a list of str, a `credentials` that is not a bool, or a `max_age` that is not an int. A `str` for `methods` or `headers` is an error. It raises `ValueError` for a `max_age` below 0 or above 4294967295. A `cors` dict in the `middleware` of an API or a router gets the same check in Rust at startup, also for `expose_headers`. A bad value raises `TypeError`."
+   }
+  ]
+ },
+ "662": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A response status that is not an HTTP status is a 500** - Rust sent 200 OK for a status that it could not read, such as `HTTPException(99)`, `JSON(..., status_code=1000)` or status 0 from an ASGI mount. A client then took an error for a success. Now a status that is not from 100 to 999 gives a 500, and the Rust log names the bad status. A route with such a `status_code` stops startup with a `TypeError`. An ASGI mount gets a `ValueError` from `send`."
+   }
+  ]
+ },
+ "663": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An optional parameter model takes its default** - A `Query()`, `Header()`, `Cookie()` or `Form()` model with a default, such as `filters: Annotated[Filters | None, Query()] = None`, never got the default. A request with none of its keys gave a 422 for each required field. Now such a request gives the default, or `None` for an `Optional` type without default. A request with one of the keys of the model validates the model as before."
+   }
+  ]
+ },
+ "664": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A Python middleware can answer with a response object** - A middleware that returned `JSON(..., status_code=403)`, another response object or a dict, and did not call `get_response`, gave a 500: \"Middleware chain returned unsupported response type\". Only `raise HTTPException`, a wire tuple and `MiddlewareResponse` worked, although the docstrings promise a returned response. Now a middleware can return what a handler can return. Bolt serializes the value as it serializes the return of the handler of the route, with the headers and the cookies of a response object. A dict gets the status code of the route, and a `response_model` of the route validates it. An outer middleware gets the object that the inner middleware returned. A chain that returns the response of the handler does no more work than before."
+   }
+  ]
+ },
+ "665": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`@api.viewset(auth=..., guards=...)` protects the `@action` routes** - The `auth` and `guards` arguments of `@api.viewset()` applied only to the standard actions. An `@action` route of the same ViewSet answered with no authentication. Now each `@action` route gets the `auth`, `guards`, `status_code`, `validate_response` and `tags` arguments of the decorator. An `@action` that sets one of these options keeps its value. The class attributes `auth` and `guards` applied to `@action` routes before and still do."
+   }
+  ]
+ },
+ "666": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`dump(exclude_defaults=True)` drops a field with an empty list or dict default** - msgspec keeps a default such as `tags: list[str] = []` or `msgspec.field(default_factory=list)` as a factory. `dump(exclude_defaults=True)` compared the value with the factory object, so it kept the field at its default. A default from `field(default_factory=list)` did not have this problem. Now `dump()` compares the value with the result of the factory."
+   }
+  ]
+ },
+ "667": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A ViewSet lookup value of the wrong type answers 404** - `GET`, `PUT`, `PATCH` and `DELETE /articles/abc` on a ViewSet with an integer primary key answered 500: `ValueError: Field 'id' expected a number but got 'abc'`. `get_object()` caught only `ObjectDoesNotExist`. Now a value that the lookup field cannot hold answers 404 `{\"detail\": \"Not found\"}`, as a value that no row has."
+   }
+  ]
+ },
+ "668": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An error handler returns its own headers list** - `handle_exception`, `http_exception_handler` and `format_error_response` returned one list that each default error response of the process shared. A caller that added a header to the result, such as `headers.append((\"x-request-id\", \"abc\"))`, added it to each later error response. Now each call returns a new list."
+   }
+  ]
+ },
+ "669": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "670": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`@middleware` rejects a form that nothing reads** - The docstring of `middleware()` showed `@middleware(cors={\"origins\": [...]})` and `@middleware(skip=[\"auth\"])`. Both attached a dict that no middleware reads, so the route had no CORS headers and skipped nothing, with no error. A dict config with no `type`, or with an unknown type such as `{\"type\": \"bogus\"}`, had the same result in `@middleware` and in the `middleware` list of an API or a router. Now a keyword argument of `@middleware` without `type` raises `TypeError`, and the message names `@cors(...)`, `@skip_middleware(...)` or `@rate_limit(...)`. A dict config whose `type` is not `\"cors\"` or `\"rate_limit\"` raises `ValueError` at each level. The docstring shows only the forms that work."
+   }
+  ]
+ },
+ "671": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An `HTTPException` below 400 does not go to the `error_formatter`** - With an `error_formatter`, each `HTTPException` with a status below 400, such as `HTTPException(307, headers={\"Location\": \"/new\"})`, went to the formatter. The formatter can return only a status from 400 to 599, so Bolt refused its result and wrote an ERROR record for each request. The response was correct. Now Bolt sends the default response of such an exception and does not call the formatter."
+   }
+  ]
+ },
+ "672": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "673": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The write actions of a ViewSet answer 422 for a body that is not a JSON object** - `POST`, `PUT` and `PATCH` of the ViewSet mixins answered 500 for malformed JSON and for an empty body (`msgspec.DecodeError`). `PATCH` also answered 500 for a JSON array, string or `null` (`AttributeError`). Now each of these bodies gives the 422 that a function route with the same serializer gives, for example `json_invalid` with the line and the column."
+   }
+  ]
+ },
+ "674": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A view method gets `self.request` for each position of its request parameter** - The handler of a class-based view took its first argument as the request. Thus `async def get(self)` answered 500 with `IndexError: tuple index out of range`, although the docs show this form. With `async def get(self, user_id: int, request: Request)`, `self.request` was the integer. Now registration finds the parameter with the name `request` or `req`. A method with no such parameter still gets the request for `self.request`. The same applies to `@action` methods."
+   }
+  ]
+ },
+ "675": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "676": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`@skip_middleware` takes a middleware class, and a name ignores the letter case** - `@skip_middleware(SomeMiddleware)`, with the class and not its name, skipped nothing and gave no error. The class in the list also made Rust drop each other name, so `@skip_middleware(SomeMiddleware, \"cors\")` did not skip CORS. The name of a Python middleware had to match the letter case of the class, but `\"CORS\"` matched the Rust middleware, and `\"RATE_LIMIT\"` did not skip the rate limit. Now a class selects that middleware by its dotted path. A name of a Python middleware, a Django middleware or a Rust middleware ignores the letter case. A value that is not a `str` or a class raises `TypeError`."
+   }
+  ]
+ },
+ "677": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`create_serializer()` keeps the order of the fields** - `create_serializer()` put the field names in a `set`. Thus the field order of the serializer, the order of the JSON keys and the schema changed from one process to the next, also between the workers of one server. Now the fields have the order of the `fields` argument, or the order of the model fields when there is no `fields` argument."
+   }
+  ]
+ },
+ "678": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`create_serializer()` gives `bool | None` for a `BooleanField(null=True)`** - The type of a null `BooleanField` was `bool`. Thus a serializer from `create_serializer()` rejected `null` for a field that the model accepts. Now each null field has `None` in its type. The docstring of `create_serializer_set()` said that the Update serializer accepts partial input. It now says that each field of `update_fields` is required, which is what the serializer does."
+   }
+  ]
+ },
+ "679": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A validator error of a renamed serializer names the field as the client sent it** - For a serializer with `rename=`, the `loc` of a `@field_validator` error had the Python name of the field, such as `[\"body\", \"email_address\"]`. A type error or a missing field of the same body had the wire name, `[\"body\", \"emailAddress\"]`. Now each error of a field has the wire name. This includes the errors of a nested serializer field and a `Literal` field."
+   }
+  ]
+ },
+ "680": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A number as a header value of an `HTTPException` keeps the status** - `TooManyRequests(headers={\"Retry-After\": 30})` gave a 500, because Rust accepts only a `str` value. With an `error_formatter`, the log blamed the formatter. Now `HTTPException` converts an `int` or `float` value to a `str`. A header name or value of another type raises `TypeError` where the application makes the exception. Also, Bolt did not send a custom header that is not valid in HTTP, such as a value with a line break, and wrote no log. Now the Rust core writes a WARNING record with the name of the header."
+   }
+  ]
+ },
+ "681": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A second `@rate_limit` on one route raises** - With two `@rate_limit` on one function, the route used the limit of the bottom decorator and dropped the other, with no error. For example, `@rate_limit(rps=1, burst=1)` over `@rate_limit(rps=100)` allowed 100 requests per second. A second `@cors` already raised. Now a second `@rate_limit`, or a `@rate_limit` together with `@middleware(type=\"rate_limit\")`, raises `ValueError`."
+   }
+  ]
+ },
+ "683": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`@api.viewset(lookup_field=...)` reaches `get_object()`** - The `lookup_field` argument of `@api.viewset()` only named the path parameter. `get_object()` read the class attribute, so `GET /articles/t1` with `lookup_field=\"title\"` answered 400 `Missing lookup field: pk`. Now the view instances of the registration get the value of the decorator. The class attribute does not change, so one class can have two registrations with different lookup fields."
+   }
+  ]
+ },
+ "684": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`PATCH` of a ViewSet works with a renamed serializer** - With `class S(Serializer, rename=\"camel\")`, `partial_update` validated the merged data by field name, but validation reads the wire name. Thus each `PATCH` answered 422 \"Object missing required field `isPublished`\" when a renamed field was required. When the renamed field had a default, `PATCH {\"isPublished\": true}` answered 200 and saved the default. Now the merged data uses the wire names."
+   }
+  ]
+ },
+ "685": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "686": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `get_serializer_class()` override can read `self.action` at registration** - `@api.viewset()` calls `get_serializer_class()` to find the response type of a standard action. `self.action` had no value then, so an override such as `return A if self.action == \"list\" else B` stopped registration with `LookupError: <ContextVar name='_current_action'>`. Now `self.action` has the action name during this call: \"list\" for the list route and \"retrieve\" for the other routes."
+   }
+  ]
+ },
+ "687": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A response validation error of a Struct has the field in its `loc`** - With `DEBUG=True`, a handler with a Struct response type that returned `{\"id\": \"x\"}` got the error `{\"loc\": [\"response\"], \"msg\": \"Response validation failed for Item: Expected `int`, got `str` - at `$.id`\"}`. The path of the field was in the message. Now the `loc` is `[\"response\", \"id\"]`, as for a `list[Struct]` and a Serializer, and the message has no path. A missing field has the type `missing_field`."
+   }
+  ]
+ },
+ "688": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The rate limit of the route wins over the limit of the API** - A route can get a `rate_limit` config from the `middleware` of the API, from its router and from `@rate_limit`. Rust used the first config, which is the config of the API. Thus `@rate_limit(rps=1, burst=1)` on a route had no effect when the API had `{\"type\": \"rate_limit\", \"rps\": 100}`, with no error. Now the most specific config applies: the route, then the router, then the API, as for `cors`. Rust also checks each config of the route at startup. Before, it did not read the configs after the first one."
+   }
+  ]
+ },
+ "689": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`Serializer.subset()` keeps the struct options of the parent** - A subset of a serializer with `rename=\"camel\"` read and wrote the Python field names, such as `user_name`, while the parent used `userName`. The subset also lost `omit_defaults`, `forbid_unknown_fields` and `frozen`. Now the subset has the wire names and these options of the parent. The subset still does not have the tag or the model validators of the parent, and the docstring says so."
+   }
+  ]
+ },
+ "690": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A required field with `field()` has the error of a required field** - A field such as `title: str = field(source=\"name\")` has no default, but msgspec got the `field()` marker as its default. Thus a body with no `title` passed msgspec, and the serializer then raised its own error: a 422 with `loc: [\"body\"]` and the type `validation_error`. The OpenAPI schema also showed the field as optional. Now such a field is a required field of the struct. A missing value gives the error of msgspec, with `loc: [\"body\", \"title\"]` and the type `missing_field`. A direct call with no value raises `TypeError`, as for each other required field."
+   }
+  ]
+ },
+ "691": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **Input does not set a `read_only` serializer field** - A request body with `{\"id\": 99}` set `id: int = field(read_only=True, default=0)` to 99. `model_validate()`, `model_validate_json()` and a nested serializer did the same. Now Bolt ignores the input value, and the field gets its default. A serializer with `forbid_unknown_fields=True` rejects the value, as it rejects an unknown field. Direct construction and `from_model()` still set the field. A `read_only` field that input can reach must have a default. Without one, route registration and `model_validate()` raise `ImproperlyConfigured`. The OpenAPI request body schema of such a serializer has no `read_only` field, and the response schema marks the field `readOnly: true`. If an API uses the serializer for the two, the request body uses the component `<Name>Input`."
+   }
+  ]
+ },
+ "692": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`Serializer.model_validate()` lists each value that the conversion rejects** - After a failed conversion, `model_validate()` and `model_validate_json()` checked each field again, but with the lax mode of msgspec. Thus `{\"age\": \"12\"}` for an `int` field was not in the error list, and with no other error the call raised a plain `msgspec.ValidationError`. The `loc` of an error in a list item had the form `(\"body\", \"items\", \"items[1]\", \"city\")`. Now the check of each field is strict, as the conversion is. The `loc` has one item for each step, `(\"body\", \"items\", \"1\", \"city\")`, as a missing field has. A nested serializer whose validators fail gives one entry for each error."
+   }
+  ]
+ },
+ "693": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The `create` action of a ViewSet only inserts** - `perform_create()` called `asave()`. With a primary key that the client supplies, `POST` with the key of an existing row updated that row and answered 201. Now `perform_create()` saves with `force_insert=True`. A primary key or a unique value that a row already has answers 409 `{\"detail\": \"The object conflicts with an existing object\"}`, and the row does not change. An override of `perform_create()` that calls `obj.asave()` directly keeps the old save."
+   }
+  ]
+ },
+ "694": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`@rate_limit` refuses a `key` that is not a header name** - A `key` other than `\"ip\"`, `\"user\"` and `\"api_key\"` is the name of a request header. `@rate_limit` accepted each non-empty str, for example `key=\" \"` or a key with a line break. No request has such a header, so all callers of the route shared one bucket, with no error. Now `@rate_limit` raises `ValueError` for a `key` with a character that a header name cannot have, such as a space, a colon or a line break."
+   }
+  ]
+ },
+ "695": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "696": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Added",
+    "line": "- **`field()` options in the OpenAPI schema** - `field(description=, title=, examples=, deprecated=, include_in_schema=)` of a `Serializer` had no effect. Now the property schema has `description`, `title`, `examples` and `deprecated: true`. `include_in_schema=False` leaves the property out of the schema and out of `required`. The field still validates input and is still in the output. The options apply to request body schemas, response schemas and nested serializers."
+   }
+  ]
+ },
+ "697": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI document shows the media type of a response class in the return annotation** - A route with `-> StreamingResponse`, `-> FileResponse` or another response class as its return annotation showed `application/json` with `{\"type\": \"object\"}`. A `Redirect` annotation showed a 200 with a JSON body. With `response_class=` and the same annotation, the media type was correct but the schema was `{\"type\": \"object\"}`. Now the annotation gives the same response as `response_class=`."
+   }
+  ]
+ },
+ "698": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`runbolt` stops for an option value out of range** - `--port 65536` and `--workers 513` failed after startup with a traceback. `--processes 0` with a recycling option started no worker and exited with status 0. Negative `--max-rss` and `--workers-lifetime` values recycled a worker each second. `runbolt` now prints an error that names the option and its limit, and exits with a non-zero status."
+   }
+  ]
+ },
+ "699": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A generator dependency and a `*args` or `**kwargs` parameter stop the route registration** - Bolt accepted a generator function as a dependency. The handler got the generator object, and the code after `yield` did not run. Bolt also accepted `*args` and `**kwargs` on a dependency or a handler, and then each request got a 422 `Missing required query parameter: args`. Now Bolt raises `TypeError` for these shapes when it registers the route."
+   }
+  ]
+ },
+ "700": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Added",
+    "line": "- **Computed fields in the OpenAPI schema** - The response schema of a `Serializer` has a property for each `@computed_field`. The property is required and has `readOnly: true`, and its type is the return type of the method. `@computed_field(description=, deprecated=, include_in_schema=)` had no effect. Now `description` (or else the docstring of the method), `deprecated` and the new `title` and `examples` arguments are in the property schema, and `include_in_schema=False` leaves the property out. A request body schema has no computed field. The response schema has no `write_only` field and no field with `exclude=True`, because `dump()` does not return them. The request body schema marks a `write_only` field `writeOnly: true`."
+   }
+  ]
+ },
+ "701": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A middleware class needs callable instances** - `BoltAPI(middleware=[int])` registered. Then each request answered 500, because Bolt calls the instance of the class with the request. Now the `middleware` of an API, a router and a route raises `TypeError` for a class with no `__call__` method. A plain class with `__init__(get_response)` and `__call__(request)` is still a middleware, with or without a base class of Bolt."
+   }
+  ]
+ },
+ "703": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI document shows `bytes` in JSON as base64 text** - A `bytes`, `bytearray` or `memoryview` value in a JSON body showed `{\"type\": \"string\", \"format\": \"binary\"}`. msgspec writes and reads these types in JSON as base64 text, so a generated client sent raw bytes that the server rejects. Now the schema is `{\"type\": \"string\", \"contentEncoding\": \"base64\"}`, the OpenAPI 3.1 form. A `File()` parameter keeps `format: binary`."
+   }
+  ]
+ },
+ "704": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`ConnectionClosed` of `WebSocketTestClient` has the close reason** - `receive_text()` and `receive_bytes()` raised `ConnectionClosed` with an empty `reason` for each close. The error now has the reason that the handler gave to `close()`."
+   }
+  ]
+ },
+ "705": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI document shows only `multipart/form-data` for a route with a file** - The request body of a route with a `File()` parameter, or with a form struct that has an `UploadFile` field, also showed `application/x-www-form-urlencoded` with the file as `format: binary`. A urlencoded body cannot hold a file, and the server answers 422 for it. Now such a route shows `multipart/form-data` only. A route with only form fields keeps both content types."
+   }
+  ]
+ },
+ "706": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A CORS value that Rust cannot use stops startup** - Bolt dropped an origin pattern that did not compile and wrote only a warning on stderr. It dropped the `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers` or `Access-Control-Expose-Headers` header when a name had a character that is not valid in an HTTP header, such as a line break. Now `CORS_ALLOWED_ORIGIN_REGEXES`, `CORS_ALLOW_METHODS`, `CORS_ALLOW_HEADERS` and `CORS_EXPOSE_HEADERS` raise `ImproperlyConfigured` at startup. `@cors` and a `cors` dict raise `ValueError` at startup. The error names the setting or the option, and the value. A pattern with look-around stopped no server before. It stops startup now, because the Rust `regex` crate cannot compile it."
+   }
+  ]
+ },
+ "707": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`api.viewset()` registers a sync standard action** - A `ViewSet` with `def list`, `def retrieve` or another standard action as a sync method got no route for it, with no error. The client got 404. A sync `APIView` method and a sync `@action` already worked. Now a sync standard action gets its route."
+   }
+  ]
+ },
+ "708": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`mode=` of `@field_validator` and `@model_validator` has an effect** - The decorators stored `mode` and nothing read it. Validators ran in definition order, and a `mode=\"before\"` validator got the converted value. Now a field validator with `mode=\"before\"` gets the raw input value before the type conversion, and the type of the field validates its result. A model validator with `mode=\"before\"` is a classmethod that gets the raw input data and returns the data to validate. Before validators run before after validators, in the order of pydantic. `mode=\"wrap\"`, `mode=\"plain\"` and each other value raise `ValueError` when the class is created. A serializer with no before validator keeps the direct msgspec decode."
+   }
+  ]
+ },
+ "709": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI document shows the media type of a `str` or `bytes` return type** - A route with `-> str` sends `text/plain`, and a route with `-> bytes` sends `application/octet-stream`. The document showed `application/json` for both. Now it shows `text/plain` with a string schema and `application/octet-stream` with a binary string schema."
+   }
+  ]
+ },
+ "710": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The default logging setup prints a `django` record one time** - With no `LOGGING` setting, `runbolt` printed each record of the `django` logger and of its children two times, for example the `django.request` line of a 500. The `django` logger had the console handler and also sent each record to the root logger. It now prints each record one time."
+   }
+  ]
+ },
+ "711": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`Config.validators` of a `Serializer` is an error** - The base `Config` declared `validators`, and nothing read it. A serializer that set it had no validation from it and gave no error. Now a `Config` with `validators` raises `TypeError` when the class is created. The message names `@field_validator` and `@model_validator`. The base `Config` has no `validators` attribute."
+   }
+  ]
+ },
+ "712": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `cors` or `rate_limit` dict gets the checks of its decorator** - `@middleware(type=\"cors\", ...)` did not get the Python checks of `@cors`. For example, it took a config with no origins. A `rate_limit` dict of an API or a router took a `key` that is not a header name. Now `@cors` and `@rate_limit` share their checks with the dict form. A dict in `@middleware`, or in the `middleware` of an API or a router, raises the error of the decorator when you register it. Before, Rust raised `TypeError` for a wrong type when the server started. The `cors` config of a route needs an origin or a pattern. The `cors` dict of an API or a router does not, because it can keep the allow list of the outer config."
+   }
+  ]
+ },
+ "713": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A parameter model does not set a `read_only` serializer field** - A `Serializer` as a `Query()`, `Header()`, `Cookie()` or `Form()` model took a `read_only` field from the request: `?id=99` set `id: int = field(read_only=True, default=0)` to 99. Now these models follow the rule of the JSON body. Bolt ignores the value, and the field gets its default. A serializer with `forbid_unknown_fields=True` rejects the value, as it rejects an unknown field."
+   }
+  ]
+ },
+ "714": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The admin mount uses the prefix of the admin site** - With `re_path(r\"^manage/\", admin.site.urls)`, `runbolt` mounted the admin at `/^manage`, and `/manage/` answered 404. When a pattern before the admin site had \"admin\" in the name of its module, `runbolt` mounted the admin at the prefix of that pattern. `runbolt` now finds the pattern of the admin site first and removes the regex anchors from its prefix."
+   }
+  ]
+ },
+ "715": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "716": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`exclude_paths` of `OpenAPIConfig` matches whole path segments** - The generator compared the start of the path text. With the default `exclude_paths=[\"/admin\", \"/static\"]`, a route such as `/administrators` or `/static-pages` was not in the OpenAPI document. A route such as `/docs-archive` was also not in the document, because its path starts with the docs path. Now `/admin` excludes `/admin` and each path below `/admin/`."
+   }
+  ]
+ },
+ "717": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`nanodjango convert` keeps class views, routers and mount calls** - The convert hook moved only `BoltAPI()` assignments, decorated functions, and `mount()` and `mount_django()` calls to `api.py`. A class with `@bolt.view()` or `@bolt.viewset()` and a `Router` with its routes went to `unused.py`. The calls `bolt.include_router()`, `bolt.mount_asgi()`, `bolt.mount_mcp()` and `bolt.native_route()` were not in the generated project at all. The hook now moves each of them to `api.py`."
+   }
+  ]
+ },
+ "718": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A subclass replaces a validator that it defines again** - A subclass of a `Serializer` that defined a `@field_validator` or `@model_validator` method again under the same name ran the validator of the parent and its own. Now only the definition of the subclass runs, at the position of the parent definition. This is the rule of pydantic. A validator with a new name still adds to those of the parent. A new definition with no validator decorator removes the validator."
+   }
+  ]
+ },
+ "719": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI schema keeps the null of `T | None`** - A response type such as `int | None` or `list[int | None]` gave the schema of `int`. The JSON body type `Item | None` gave the schema of `Item`, but Bolt accepts the body `null`. Now such a type gives `anyOf` with a `{\"type\": \"null\"}` arm, as the same type gives as a struct field. An optional path, query, header, cookie or form parameter does not change: `required: false` says that it is optional. A `T | None` item type in a list or dict parameter now also has the null arm."
+   }
+  ]
+ },
+ "720": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "721": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "722": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "723": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The docs pages escape the text of the API** - The Swagger UI and ReDoc pages hold the OpenAPI document as JSON in a `<script>` element. A docstring or a description with `</script>` ended that script, and the page did not load. The API title went into `<title>` as HTML. An apostrophe in the `options` of `ScalarRenderPlugin` ended a JavaScript string. Now the JSON in a script has no `<`, `>` or `&`, and the title is escaped."
+   }
+  ]
+ },
+ "724": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "725": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An empty pattern in `CORS_ALLOWED_ORIGIN_REGEXES` stops startup** - Bolt accepted an empty pattern in the setting, for example `CORS_ALLOWED_ORIGIN_REGEXES = [\"\"]`. An empty pattern matches every origin. Thus each origin got `Access-Control-Allow-Origin`, and `Access-Control-Allow-Credentials` with `CORS_ALLOW_CREDENTIALS = True`. `@cors` and a `cors` dict already rejected an empty pattern. Now the setting raises `ImproperlyConfigured` at startup."
+   }
+  ]
+ },
+ "726": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A page of a plain `msgspec.Struct` type validates its items** - `@paginate` on a handler with the return type `list[Item]`, where `Item` is a plain `msgspec.Struct`, read each field with a default of `None`. Thus an object with no such attribute gave `null` for a required field, with status 200. The paginator also took the kind of all items from the first item, so a dict after a Struct gave `null` for each field. Now Bolt converts the page as it converts a `list[Item]` response type with no `@paginate`. The page has the same items: the defaults of the Struct and its wire names (`rename=`). A value that does not fit gives the same response validation error (status 500). `build_response()` gets instances of the Struct, not dicts. A Bolt `Serializer` item type does not change."
+   }
+  ]
+ },
+ "727": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "728": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A WebSocket route takes an async dependency** - A WebSocket handler with an `async def` dependency got a 500 at the handshake under `runbolt`. The handshake called the injector of the route with no await. `WebSocketTestClient` awaited the injector, so a test passed where the server failed. The route now awaits the injector in the handler coroutine, and `WebSocketTestClient` calls the injector as the server does."
+   }
+  ]
+ },
+ "729": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `cors` or `rate_limit` dict refuses a key that nothing reads** - Bolt ignored an unknown key in a `cors` or `rate_limit` dict, with no error. For example, `BoltAPI(middleware=[{\"type\": \"cors\", \"origin\": [\"https://a.test\"]}])` started, and the origin list that the author meant did not apply. Now such a key raises `TypeError` when you register the dict, and the error lists the valid keys. This applies to a dict in the `middleware` of an API or a router and to `@middleware(type=\"cors\", ...)`. The decorators `@cors(...)` and `@rate_limit(...)` already refused an unknown keyword argument."
+   }
+  ]
+ },
+ "730": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A handler gets the disconnect when `WebSocketTestClient` exits** - The exit of the `async with` block cancelled the handler at once. The handler did not get the disconnect, so the code after its receive loop and its `except WebSocketDisconnect` block did not run in a test. On the server they run. The client now waits up to 1 second for the handler to end, and then cancels it. A `WebSocketDisconnect` that the handler does not catch is not a handler error, as on the server."
+   }
+  ]
+ },
+ "731": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "732": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A WebSocket route with a trailing slash in its path accepts connections** - The server removes the trailing slash of a WebSocket request path before it finds the route. But `@api.websocket(\"/ws/\")` kept the slash in the route path, so no request matched it: `/ws` and `/ws/` both found no route. With `trailing_slash=\"append\"`, `mount()` added the slash to each WebSocket route of the mounted API, with the same result. Now Bolt registers a WebSocket route path without its trailing slash, for each `trailing_slash` mode. `/ws` and `/ws/` both reach the route, as before for a route path with no slash."
+   }
+  ]
+ },
+ "733": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI schema shows the 422 of a route with parameters** - The schema showed a 422 response only for a route with a request body. A route with only path, query, header or cookie parameters showed no 422, but a bad value gives 422. Each route with a parameter or a request body now shows its 422. For a route with a parameter or a form field, `detail` in the 422 schema is a list of field errors or a text, because Bolt sends the two forms. A route with no parameter and no body shows no 422. `OpenAPIConfig(strict=True)` now also reports a formatter without `error_schema` when only such a route has a 422."
+   }
+  ]
+ },
+ "734": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A handler can return a number, a `bool`, a date, a `UUID`, a `Decimal` or an `Enum` member** - A handler that returned `3` got a 500 with \"Handler returned unsupported type 'int'\", also with `-> int`, and OpenAPI showed an integer response. Now Bolt sends such a scalar as JSON (`3`, `true`, `\"2020-01-02\"`), with or without a response type. Bolt sends `None` as `null` when the response type allows it (`-> None`, `-> int | None`). With no such type, `None` stays an error, because the handler has no `return`. An `int`, `float` or `bool` response type is now validated as each other type: `-> int` with a `dict` result is a response validation error."
+   }
+  ]
+ },
+ "735": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI schema shows the security of a WebSocket route that uses `BOLT_AUTHENTICATION_CLASSES`** - A WebSocket route with no `auth` argument uses the backends of `BOLT_AUTHENTICATION_CLASSES`, and the server applies them. But the operation of the route had no `security` entry in the schema. An HTTP route with the same backends had one. Now the WebSocket operation lists the same security schemes as an HTTP route."
+   }
+  ]
+ },
+ "736": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A second handler for the method and path of a route stops startup** - Two handlers with the same method and static path, such as `@api.get(\"/d\")` two times, registered with no error, and the last handler answered. A path with a parameter raised `ValueError`. Two mounted APIs with the same route had the same fault. Now each such route raises `ValueError` at startup. The OpenAPI docs routes register each path one time."
+   }
+  ]
+ },
+ "737": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A route path with a space or a non-ASCII character matches its requests** - A client sends such a character as a `%XX` escape, and the router compared the request path with the route path as it was written. Thus `@api.get(\"/\u00fc\")`, `@api.get(\"/a b\")` and `@api.get(\"/\u00fc/{x}\")` answered 404 for each request. Now the router stores the route path with the escapes of a URL path. A path parameter and a `%` stay as they are."
+   }
+  ]
+ },
+ "738": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`mount()` applies the `prefix` of the parent API** - `BoltAPI(prefix=\"/api\").mount(\"/v1\", child)` served the routes of `child` at `/v1/...`. The prefix applied to each route, native route and ASGI mount of the parent, but not to a mounted API. Now the mounted routes, WebSocket routes, native routes, ASGI mounts and MCP mounts of `child` are at `/api/v1/...`. An application that used the old paths must mount the child on an API with no prefix."
+   }
+  ]
+ },
+ "739": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Added",
+    "line": "- **`deprecated=True` on a route** - The route decorators of `BoltAPI` and `Router`, `@api.view()`, `@api.viewset()` and `@action` take `deprecated`. The OpenAPI operation of such a route gets `deprecated: true`. The server continues to serve the route. An operation that is not deprecated has no `deprecated` key. Before, each operation had `\"deprecated\": false`. See [Deprecating endpoints](docs/src/topics/openapi.md#deprecating-endpoints)."
+   }
+  ]
+ },
+ "740": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A handler from a module that is not in `sys.modules` registers** - Bolt read the globals for the annotations of a handler from `sys.modules[handler.__module__]`. A function made with `exec`, or one from a module that was removed from `sys.modules`, failed at registration with `AttributeError: 'dict' object has no attribute '__dict__'`. A function with a changed `__module__` failed with `NameError`. Now Bolt uses the globals of the function, as `typing.get_type_hints` does, and follows `__wrapped__`."
+   }
+  ]
+ },
+ "741": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A path or a prefix with no leading slash gets one** - `BoltAPI(prefix=\"api\")`, `@api.get(\"x\")`, `Router(prefix=\"users\")` and `include_router(router, prefix=\"v1\")` joined the parts as they were. Thus the route was `apix` or `v1users`, and each request got 404. Only the path of `mount()` got its leading slash. Now each route path, WebSocket path, view path, viewset path and prefix gets a leading slash."
+   }
+  ]
+ },
+ "742": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`Annotated[bytes, File()]` gives the content of the file** - A `bytes` file parameter got the file dict that Rust makes (`filename`, `content_type`, `size`, `content`, `temp_path`), and `list[bytes]` got a list of such dicts. Now the handler gets the content of the upload as `bytes`, or a list with the content of each file. This is also true for a file that Rust wrote to disk."
+   }
+  ]
+ },
+ "743": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI schema shows the 401 and the 403 of a guarded route, and the right security scheme** - A route with an auth backend and a guard showed only its success response, but a request with no credential gets 401. Such a route now shows a 401 with the `WWW-Authenticate` header for `IsAuthenticated` or `Requires`, and a 403 for `Requires`. A route with `SessionAuthentication(login_url=...)` shows the 302 to the login page in place of the 401. The body is `{\"detail\": \"<message>\"}` or the body of the `error_formatter`. A route with no auth backend, with no guard, or with `AllowAny` first shows none of them. The security scheme of `JWTAuthentication(cookie=...)` and of `JWTAuthentication(header=...)` was `http` `bearer`, but Bolt reads the token from the cookie or from that header. These backends now get an `apiKey` scheme, `JWTCookieAuth` or `JWTHeaderAuth`. Two `APIKeyAuthentication` backends with different headers shared the scheme of the first header. Each header now has its own scheme."
+   }
+  ]
+ },
+ "744": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI example of a tagged union keeps a `null` field** - The schema shows one example for each variant of a tagged `Struct` union. A field of the type `None` was not in the example, but the response body has it with the value `null`. The example now has each field of the variant."
+   }
+  ]
+ },
+ "745": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `bytes` parameter gets the UTF-8 bytes of its text value** - A `bytes` query, path, header, cookie or form parameter gave the handler a `str`, with no conversion and no error. `list[bytes]` and `bytes` with a `msgspec.Meta` constraint read the text as base64. Now each of them gets the UTF-8 bytes of the text, and `bytearray` does too. A `bytes` field of a parameter model still reads base64, as msgspec does."
+   }
+  ]
+ },
+ "746": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A config decorator above the route decorator stops startup** - `@rate_limit`, `@cors`, `@middleware`, `@skip_middleware`, `@no_compress` or `@paginate` above `@api.get(...)` had no effect and gave no error. The route decorator had read the configuration of the handler before the upper decorator ran. Now `runbolt` and `TestClient` raise `TypeError` at startup, and the message says to put the decorator below the route decorator. A decorator above `@router.get(...)` applies, as before."
+   }
+  ]
+ },
+ "747": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An object with `__call__` is a route handler, and a `functools.partial` gets a clear error** - `api.get(\"/p\")(handler)` raised `AttributeError: ... has no attribute '__name__'` for a callable object and for a `functools.partial`. A bound method worked. Now the route registers the bound `__call__` method of a callable object. A `functools.partial` raises `TypeError` with the cause: registration cannot read its type hints, and its keyword arguments would become parameters that a request can set."
+   }
+  ]
+ },
+ "748": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "749": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "750": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`mount()` refuses an API that it cannot serve** - `api.mount(\"/s\", api)` never returned, because the loop added routes to the list that it read. And with `api.mount(\"/t/{x}\", child)`, a handler of `child` with the argument `x` answered 422 \"Missing required query parameter: x\", because the mounted route was compiled without the mount path. Now `mount()` raises `ValueError` for the API itself, for an API that already has the routes of this API, and for a handler that takes a mount path parameter as an argument. A mounted handler reads a mount path parameter from `request.params`, as before."
+   }
+  ]
+ },
+ "751": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A path with one parameter name two times stops registration** - `@api.get(\"/d/{x}/{x}\")` registered, and the handler got the last value: `/d/1/2` gave `x` as 2. Now the route decorators, `native_route()` and `mount()` raise `ValueError` for a path that has one parameter name two times, also when the prefix or the mount path has the first one."
+   }
+  ]
+ },
+ "752": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`BoltAPI(trailing_slash=...)` refuses an unknown mode** - A value other than `\"strip\"`, `\"append\"` or `\"keep\"`, such as `\"bogus\"` or `\"Strip\"`, was accepted and behaved as `\"keep\"`. Now `BoltAPI()` raises `ValueError` for it."
+   }
+  ]
+ },
+ "753": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`api.viewset()` with a trailing slash in its path, and `api.view()` with an empty `methods` list** - `api.viewset(\"/items/\")` gave the detail route `/items//{pk}`, which no request matches, and the same double slash for each `@action` route. Now the parts join with one slash. With `trailing_slash=\"keep\"`, each route keeps the trailing slash of the viewset path. `api.view(\"/x\", methods=[])` registered no route and gave no error. Now it raises `ValueError`."
+   }
+  ]
+ },
+ "754": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A response type validates a `str` or `bytes` result** - With `-> int`, `-> Decimal` or a Struct as the response type, a `str` result was sent as `text/plain` with status 200, and a `bytes` result as `application/octet-stream`. The check for a `str` ran before the validation. Now such a result is validated as a `dict` result is, and a wrong value is a response validation error. A response type that names `str` or `bytes` allows the result with no check, such as `-> str`, `-> str | None` or `-> bytes | Item`. A `str` that passes the validation as a `str` stays `text/plain`, such as a `Literal` member. A `str` that the type converts, such as a `UUID` in text, is now JSON. A route with `validate_response=False` does not change."
+   }
+  ]
+ },
+ "755": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI document has the request body of a body that is not a struct** - A route with `items: Annotated[list[Item], Body()]` reads the JSON body, but its operation had no `requestBody`. The generator read only a struct body. Now each parameter that reads the body gives a `requestBody` with the schema of its type, and `required` is false when the parameter has a default."
+   }
+  ]
+ },
+ "756": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An HTTP ASGI mount gets the percent-decoded path** - The scope of a `mount_asgi()` or `mount_django()` app had the request bytes in `path`, for example `/caf%C3%A9/a%20b`. The ASGI specification says that `path` is percent-decoded, and Django matches its URL patterns with it. Thus a mounted Django app answered 404 for a URL with an encoded character, such as a space or a letter that is not ASCII. Now `path` is decoded (`/caf\u00e9/a b`), as in the scope of a WebSocket mount. `raw_path` keeps the request bytes."
+   }
+  ]
+ },
+ "757": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "758": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `-> None` route validates its result** - With `-> None`, a handler that returned a `dict`, a `list`, a Struct or a number got status 200 with that value as the body. Now a result that is not `None` is a response validation error, as a wrong result is for each other response type. A `None` result is still `null`, or an empty body with status 204. A response object, such as `JSON(...)`, `Response(...)` or a redirect, has its own body and is not validated on a `-> None` route. A route with `validate_response=False` does not change."
+   }
+  ]
+ },
+ "759": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The `WWW-Authenticate` header of a 401 names the scheme of the auth backends of the route** - Each 401 from Rust had `WWW-Authenticate: Bearer`, also on a route with only an API key backend or only a session backend. A 401 from Python, such as an `HTTPException(401)` of a handler, had no challenge. Now Bolt builds the header value one time at registration, from the backends of the route in their order. `JWTAuthentication` with the token in the `Authorization` header gives `Bearer`. A JWT in another header or in a cookie, `APIKeyAuthentication` and `SessionAuthentication` give `ApiKey`. A route with a JWT backend and an API key backend sends `Bearer, ApiKey`. A WebSocket handshake and an MCP mount send the challenge of their backends. Rust adds the header to each 401 of the route that has none, and a header that your code sets stays. A backend subclass can override `challenge_scheme`. The status and the body of the 401 do not change."
+   }
+  ]
+ },
+ "760": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The scope of `request_started` has the query string and the headers** - With `BOLT_EMIT_SIGNALS = True`, the scope always had `query_string` as `b\"\"`, because the code read a request key that does not exist. `headers` was `{}` unless the route read a header. Now Bolt keeps the query string and the headers of each request when signals are on, and the scope has both. Nothing changes when signals are off."
+   }
+  ]
+ },
+ "761": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `dict` parameter with no marker reads the JSON body** - On a `POST`, `PUT` or `PATCH` route, Bolt read a parameter such as `data: dict` or `counts: dict[str, int]` from the query string. A query string cannot hold a dict. Thus a JSON body got 422 with `Missing required query parameter`, and `?data=x` gave the handler a `str`. Now such a parameter is the JSON body, as a Struct is, and a `dict[K, V]` type validates it. On a route with another method, the parameter stays a query parameter. OpenAPI now shows the request body of a JSON body that is not a Struct, also with the `Body()` marker."
+   }
+  ]
+ },
+ "762": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Changed",
+    "line": "- **A guarded route with no auth backend uses `JWTAuthentication()`** - A route with `guards=[IsAuthenticated()]`, no `auth` and no `BOLT_AUTHENTICATION_CLASSES` had no backend. Thus each request got a 401, also a request with a valid token. Now such a route gets `JWTAuthentication()`, which verifies an HS256 token in the `Authorization` header with `SECRET_KEY`. The rule applies to each guard that needs a user: `IsAuthenticated` and `Requires`, from the route, a router, a class-based view, an `@action`, `BOLT_DEFAULT_PERMISSION_CLASSES`, a WebSocket route or an MCP mount. A route with no guard, or with `AllowAny()` first, still has no backend. `auth=[]` and `BOLT_AUTHENTICATION_CLASSES = []` still mean no backend."
+   }
+  ]
+ },
+ "763": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "764": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`render()` sends `text/html; charset=utf-8`** - `render()` of `django_bolt.shortcuts` sent `content-type: text/html` with no charset. `HTML()` and `render()` of Django send the charset. Now the default content type of `render()` is `text/html; charset=utf-8`. Bolt still sends a `content_type` that you pass with no change."
+   }
+  ]
+ },
+ "765": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "766": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`close()` of a WebSocket refuses a code or a reason that makes an invalid close frame** - `await websocket.close(reason=\"x\" * 200)` sent a close frame with a payload of 202 bytes. RFC 6455 limits it to 125 bytes: 2 bytes of code and 123 bytes of reason. A browser fails such a connection. A code above 65535 raised `OverflowError` from Rust, and `WebSocketTestClient` accepted it. Now `close()` raises `ValueError` for a reason above 123 bytes of UTF-8, and for a code that is not from 1000 to 4999 or that is 1005, 1006 or 1015. The connection stays open after the error. The server does the same check on the `websocket.close` message of a mounted ASGI app, and `WebSocketTestClient` raises the same errors."
+   }
+  ]
+ },
+ "767": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI document shows the media type of a `str` or `bytes` arm of a union and of a `response_model` entry** - A route sends a `str` result as `text/plain` and a `bytes` result as `application/octet-stream`. The document showed only `application/json` for `-> str | None`, `-> bytes | None`, `-> str | Item` and for a `str` or `bytes` entry of a `response_model` dict, such as `{200: str, 404: Error}` or `{404: Error, ...: str}`. Now the document shows `text/plain` for a `str` arm, `application/octet-stream` for a `bytes` arm, and `application/json` for the other arms. For `-> str | None`, the `application/json` schema is `null`."
+   }
+  ]
+ },
+ "768": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A request path matches its route for each form of a `%XX` escape** - The router compared the request path byte for byte. Thus `GET /%c3%bc` got 404 where `GET /%C3%BC` matched `@api.get(\"/\u00fc\")`, and `GET /%61` got 404 for the route `/a`. Now the router reads an escape in lower case as the escape in upper case (RFC 3986, section 6.2.2.1). It reads an escape of a character that a path holds with no escape, such as `%61` or `%3A`, as that character, as Django does. `%2F` and `%25` stay escapes: an escaped `/` does not split a segment. A `%` that starts no escape is a literal `%`, so the route `/100%` matches `GET /100%25`. A route path gets the same form."
+   }
+  ]
+ },
+ "769": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A subclass of `Decimal`, `datetime` or `time` encodes as its base type** - msgspec encodes the exact types itself, and a subclass went to an encoder of Bolt that gave a different result. A subclass of `Decimal` became a JSON number (`1.5`), while a `Decimal` is a string (`\"1.50\"`). A subclass that held `NaN` or `Infinity` raised `TypeError`, and the client got a 500. A subclass of `datetime` or `time` in UTC ended with `+00:00`, while the base type ends with `Z`. Now the encoder gives msgspec a value of the exact base type, so the JSON is the same. **Behavior change:** code that relied on the number of a `Decimal` subclass now gets a string."
+   }
+  ]
+ },
+ "770": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "771": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A WebSocket route path with a space or a non-ASCII character accepts connections** - A client sends such a character as a `%XX` escape, and the WebSocket router compared the request path with the route path as it was written. Thus `@api.websocket(\"/\u00fc\")` and `@api.websocket(\"/a b/{room}\")` refused each handshake with 404, and `WebSocketTestClient` raised `No WebSocket handler found for path`. Now the WebSocket router stores the route path with the escapes of a URL path, as the HTTP router does."
+   }
+  ]
+ },
+ "772": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The admin mount finds an admin site in a nested `include()` or at the root path** - `runbolt` read only the top level of the URLconf. An admin site in a nested `include()` got the mount `/admin`, and its real path answered 404. Now `runbolt` takes the prefix from `reverse(\"admin:index\")`, so Django resolves it through the URL resolver tree. With `path(\"\", admin.site.urls)`, `runbolt` also mounted Django at `/admin`. Now it mounts Django at `/` and prints a warning: Bolt routes still answer first, and Django answers each path that has no Bolt route. The startup banner shows the same path. An error in the import of `ROOT_URLCONF` now stops `runbolt`. Before, `runbolt` printed a warning and mounted `/admin`."
+   }
+  ]
+ },
+ "773": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "774": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`@api.websocket()` takes an object with an async `__call__` and a bound method** - `api.websocket(\"/ws\")(handler)` raised `AttributeError: ... has no attribute '__name__'` for a callable object and `AttributeError: 'method' object has no attribute '_is_websocket_handler'` for a bound method. A `functools.partial` raised a `TypeError` from `typing`. Now the route registers a bound method, and the bound `__call__` method of a callable object, as an HTTP route does. A `functools.partial` raises `TypeError` with the cause. The error for a handler that is not `async` names the handler with its qualified name."
+   }
+  ]
+ },
+ "775": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`runbolt --workers-kill-timeout` works with one process** - With one process and no recycling option, the option had no effect: only the supervising parent passed it to the server. A request that was still running at `SIGTERM` kept the server up for the default 30 seconds. Now the server process itself reads the option, so it is the graceful-shutdown window in each mode. `DJANGO_BOLT_SHUTDOWN_TIMEOUT` still takes precedence. The option alone does not start the supervising parent. The deployment guide said that it does, and now it says what the option does."
+   }
+  ]
+ },
+ "776": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A WebSocket handler that returns closes the connection** - A handler that returned after `accept()` with no `close()` left the connection open. The server sent no close frame, and the client waited with no end. Now the server sends a close frame with code 1000 when the handler returns. A mounted ASGI app that returns gets the same close. A handler that raises still gets code 1011 with the reason `Internal error`. `WebSocketTestClient` gives the same close: the receive methods raise `ConnectionClosed` with code 1000 after the last message."
+   }
+  ]
+ },
+ "777": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The path of a docs UI plugin with no leading slash gets one** - `OpenAPIConfig` gave its own `path` a leading slash, but not the path of a render plugin. Thus `OpenAPIConfig(path=\"docs\", render_plugins=[SwaggerRenderPlugin(path=\"swagger\")])` served the page at `/docsswagger`, and `/docs/swagger` answered 404. Now each plugin path gets a leading slash and loses its trailing slash, as the path of the config does."
+   }
+  ]
+ },
+ "778": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`WebSocketTestClient` has no `auth_context` option** - The option said that it gave the guards an authentication context. The guards did not read it, so a route with `guards=[IsAuthenticated()]` still answered `Authentication required`. The option is removed, and `WebSocketTestClient(..., auth_context=...)` now raises `TypeError`. To authenticate in a test, send the credential that the server reads, for example `headers={\"Authorization\": f\"Bearer {token}\"}`."
+   }
+  ]
+ },
+ "779": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`WebSocketTestClient` gives the close reason of a handler error** - When a handler raises after `accept()`, the server closes with code 1011 and the reason `Internal error`. `WebSocketTestClient` gave code 1011 with an empty reason. `ConnectionClosed` now has the reason `Internal error`, as on the server."
+   }
+  ]
+ },
+ "780": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A JWT of an inactive user loads no user** - A valid token of a user with `is_active=False` gave that user to `request.user`, `request.auser()` and `CurrentUser`. Session authentication rejects such a user. Now the default user loader returns no user, as Django's `ModelBackend.get_user` does: `request.user` is falsy and `CurrentUser` answers 401. The check reads the loaded row and adds no query. `/auth/refresh` of `JWTAuthViews` with the default credential check now answers 401 for an inactive or deleted user. A route that does not read the user still accepts the token."
+   }
+  ]
+ },
+ "781": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "782": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A wrong method on a route path answers 405 with `Allow`** - A request to a path that has routes, but none for its method, got 404. For example, `POST /x` on an API with only `@api.get(\"/x\")`. Bolt now answers `405 Method Not Allowed`, and the `Allow` header lists the methods of the path (RFC 9110 section 15.5.6). The error formatter gets the kind `method_not_allowed`. A path with no route still gets 404."
+   }
+  ]
+ },
+ "783": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A raised `WebSocketException` closes the connection with its code and reason** - `WebSocketException` and `WebSocketClose` are public names, but nothing handled them. A handler that raised `WebSocketException(code=4001, reason=\"nope\")` got a close frame with code 1011 and an error in the log. Now the server sends a close frame with the code and the reason of the exception. Before `accept()`, the exception refuses the handshake with 403, as `close()` does. `WebSocketClose` gets the same close. `WebSocketTestClient` gives the same close and the same refusal, and its exit does not raise the exception again."
+   }
+  ]
+ },
+ "784": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`APIKeyAuthentication` rejects a key that starts with `Bearer ` or `ApiKey `** - Bolt removes one of these scheme words from the value of the API key header. Thus the key `ApiKey xyz` got a 401 when a client sent it as it is. With the keys `abc` and `Bearer abc`, the header value `Bearer abc` authenticated as the key `abc`, with the permissions of that key. Now such a key raises `ImproperlyConfigured` at construction, in any letter case of the scheme. The docs now state the three forms of the header value: `<key>`, `Bearer <key>` and `ApiKey <key>`."
+   }
+  ]
+ },
+ "785": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An `@action` method can have the name of an HTTP method or of a standard action** - `api.viewset()` did not register an `@action` method with the name `get`, `post`, `put`, `patch`, `delete`, `head`, `options`, `list`, `retrieve`, `create`, `update`, `partial_update` or `destroy`. The method got no route and no error, so `/products/options` answered 404. Now each `@action` method is a route, with its path from the `@action` arguments."
+   }
+  ]
+ },
+ "786": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`receive_text()` and `receive_bytes()` raise for a frame of the other type** - `WebSocket.receive_text()` gave `\"\"` for a binary frame, and `receive_bytes()` gave `b\"\"` for a text frame. The data of the frame was lost with no error. Now each raises `WebSocketException` with code 1003, and the reason names the frame: `receive_text() got a binary frame`. The connection stays open, and the next call reads the next frame. `receive_json()` and the iterators raise the same error. `receive()` does not change."
+   }
+  ]
+ },
+ "787": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A failed login of `JWTAuthViews` has a `WWW-Authenticate` header** - `POST /auth/login` with wrong credentials answered 401 with no challenge. The login route has no auth backend, so Bolt had no challenge to add. RFC 9110 section 15.5.2 requires one in each 401. The 401 now has the challenge of the token routes of the views."
+   }
+  ]
+ },
+ "788": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A parameter type that Bolt cannot convert stops the registration** - A path, query, header, cookie or form parameter of a type such as `complex`, `dict` or a dataclass got the text of the request. The handler of `def h(value: complex)` got the str `\"abc\"` for `/h?value=abc`, with no error. A `File()` parameter of a type such as `str` got the file dict. Now the route decorator raises a `TypeError` that names the handler, the parameter and the type. Each type that converted before still registers. On a `POST`, `PUT` or `PATCH` route, a parameter with no marker of a type that only JSON gives, such as `list[dict]`, `list[list[int]]` or a `TypedDict`, reads the JSON body. Before, it was a query parameter, and a JSON body got 422 \"Missing required query parameter\". A `dict` parameter of a `GET` route gets the `TypeError` too. `Any` stays a query parameter, as in FastAPI."
+   }
+  ]
+ },
+ "789": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An empty string for an auth backend option is a configuration error** - `JWTAuthentication` accepted `header=\"\"`, `cookie=\"\"`, `audience=\"\"`, `issuer=\"\"` and `token_type=\"\"`. `APIKeyAuthentication` accepted `header=\"\"`. The backend then rejected each request, or accepted only a token whose claim is an empty string. An unset environment variable, as in `audience=os.environ.get(\"JWT_AUDIENCE\", \"\")`, gave this result. Now the constructor raises `ImproperlyConfigured`. Use `None` for no value."
+   }
+  ]
+ },
+ "790": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "791": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A router with a parent registers one time** - With `child = Router(prefix=\"/users\", parent=parent)`, `api.include_router(parent)` plus `api.include_router(child)` registered each route of the child two times: at `/v1/users/me` and at `/users/me`. `api.include_router(child)` alone gave `/users/me`, with the middleware of the parent but not its prefix. `parent.include_router(child)` for a router made with `parent=parent` also added the child two times. Now `include_router()` registers a router with a parent one time for each `prefix`, with the prefixes of its parents: `/v1/users/me`. The order of the calls has no effect. A router that you include with two different prefixes still registers two times."
+   }
+  ]
+ },
+ "792": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`Token` checks its time claims and its extra claims at construction** - `Token(nbf=123)` or an `iat` that is not a datetime was accepted, and `to_dict()` or `encode()` failed later with `AttributeError`. An entry of `extras` with the name of a Token field, such as `exp`, `sub` or `is_staff`, replaced the value of that field in the encoded token. Thus `Token.create(sub, exp=...)` made a token with another expiry than its `exp` field. Now a wrong type raises `TypeError`, and such an extra raises `ValueError`. `Token.create()` sets the fields `jti`, `nbf` and `is_superuser` from keyword arguments of these names."
+   }
+  ]
+ },
+ "793": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A response status is from 200 to 599** - A handler could send a 1xx status or a status from 600 to 999, for example `JSON(data, status_code=700)`, `HTTPException(status_code=100)` or `@api.get(\"/x\", status_code=150)`. The status went to the client as it was. A 1xx status is interim and is not the status of a response, and no status from 600 has a meaning (RFC 9110 section 15). Now a status outside 200 to 599 from a handler gives a 500, and the Rust log names the bad status. A `status_code=` of a route outside this range raises `ValueError` at the decorator."
+   }
+  ]
+ },
+ "794": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`JWTAuthViews(prefix=\"/\")` gives the refresh cookie the path `/`** - With `prefix=\"/\"` or `prefix=\"\"`, the routes are at the root, and the refresh cookie had an empty `Path` attribute. A browser then uses the directory of the request URL, which is not a value that Bolt selects. Now the refresh cookie and the cookie that clears it have `Path=/`. Other prefixes keep their path."
+   }
+  ]
+ },
+ "795": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A response type of `dict`, `list` or `list[Serializer]` refuses a result of another kind** - With `-> list[UserSerializer]`, `return 3` answered 200 with the body `3`, and a `str` or a `dict` result passed too. With `-> dict`, `return \"abc\"` gave the JSON `\"abc\"` from a handler with no `await`, and `text/plain` from each other handler. `bytes` gave base64 JSON or `application/octet-stream` in the same way. Now a `list[Serializer]` route answers with a response validation error for a result that is not a list, and `None` is the empty list, as for `list[Struct]`. A `-> dict`, `-> list`, `-> str` or `-> bytes` route answers with a response validation error for a `str` or `bytes` result that its type does not name. A route with `validate_response=False` sends a `str` as `text/plain` and `bytes` as `application/octet-stream` from each kind of handler. A `@paginate` method with `@action` now has the pagination envelope as its response type, as a paginated route has."
+   }
+  ]
+ },
+ "796": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A page of a `Serializer` type validates its items** - `@paginate` on a handler with the return type `list[Row]`, where `Row` is a Bolt `Serializer`, took the kind of all items from the first item. For a page that starts with a dict, it read each field with `item.get(field)`. Thus a dict with no required field gave `null` with status 200, a dict got `null` where the serializer has a default, and an object after a dict gave a 500 with `AttributeError`. Now each item goes through the serializer as the same route with no `@paginate` sends it: Bolt validates a dict, keeps a serializer instance, and reads each other object with `from_model()`. An item that does not fit gives the same response validation error (status 500). A `values()` QuerySet must now select each required field of the serializer."
+   }
+  ]
+ },
+ "797": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A nested `Router` inherits `auth`, `guards` and `tags` of its parent router** - A child router took only the middleware of its parent. A route of the child was open when only the parent set `guards`. Now the child takes each value that it does not set from the nearest parent router that sets it. A value of the child router or of the route wins."
+   }
+  ]
+ },
+ "798": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A dict or a list `detail` of an `HTTPException` is JSON in the body** - `HTTPException(400, detail={\"code\": \"x\"})` sent `{\"detail\": \"{'code': 'x'}\"}`. The detail went through `str()`, so the client got the text of a Python repr. Now a dict or a list goes to the body as a JSON value: `{\"detail\": {\"code\": \"x\"}}`. `exc.detail` and the `detail` of the error formatter hold the dict or the list. A detail of another type still becomes its text, and an empty detail still gives the phrase of the status."
+   }
+  ]
+ },
+ "799": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "800": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "801": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A view decorator on a handler with no `request` parameter stops registration** - `@csrf_exempt` below the route decorator on a handler with no parameter answered 500 for each request. The wrapper of a Django view decorator takes `request` as its first argument, and Bolt calls it with the arguments of the handler. Registration now raises a `TypeError` that says the handler must take `request` as its first parameter."
+   }
+  ]
+ },
+ "802": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The options of `Body()` have an effect** - `Body()` took `embed`, `alias`, `description` and `example`, and nothing read them. With `Body(embed=True)`, Bolt still read the value from the whole body, so `{\"item\": {...}}` got 422. Now `embed=True` reads the value from the key of the parameter name in a JSON object, and `alias` sets that key. A default applies to a request with no body and to an object with no such key. The OpenAPI document shows the wrapper object, the `description` and the `example` of the request body. `Form(example=...)` is now in the schema of the form field. Without `embed`, `alias` has no effect, as in FastAPI."
+   }
+  ]
+ },
+ "803": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The write actions of a ViewSet give the 422 body of a function route** - For one bad body, a function route and a ViewSet gave two different 422 bodies. A function route reports the first error, with the type `missing_field` for a missing field. The generated `create` and `update` actions reported each error, with the type `missing`. `partial_update` reported each bad value. Now the three actions decode the body with the body extractor of the framework. They give the same 422 body as a function route with the same serializer: the first error, with the type `missing_field` for a missing field. `Serializer.model_validate()` and `model_validate_json()` do not change: they still collect each error."
+   }
+  ]
+ },
+ "804": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An unknown `samesite` value of a cookie raises `ValueError`** - `set_cookie(..., samesite=\"bogus\")` and `Cookie(..., samesite=\"bogus\")` sent `SameSite=Lax`, with no error. Rust read only `strict` and `none`, and each other value became `Lax`. Now the value must be `\"lax\"`, `\"none\"` or `\"strict\"` in any letter case, or a false value to omit the attribute. Another value raises `ValueError('samesite must be \"lax\", \"none\", or \"strict\".')` when the cookie is set, as in Django."
+   }
+  ]
+ },
+ "805": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "806": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `websocket.close` message takes `None` for the reason, and reserved close codes are refused** - A mounted ASGI app that sent `{\"type\": \"websocket.close\", \"reason\": None}` got a `TypeError`, and the client got close code 1011. The ASGI specification permits `None`. Bolt now sends an empty reason. `close()` also accepted 1004 and 1016 to 2999, which RFC 6455 reserves. `close()`, the server and `WebSocketTestClient` now accept 1000 to 1003, 1007 to 1014 and 3000 to 4999, as the `websockets` library does."
+   }
+  ]
+ },
+ "807": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A Django middleware sees the scheme of the Bolt request** - Behind a proxy in `BOLT_TRUSTED_PROXIES` that sends `X-Forwarded-Proto: https`, `request.build_absolute_uri()` of the handler gave an `https` URL. But the Django request of a Django middleware had `request.scheme == \"http\"` and `request.is_secure() == False`, unless `SECURE_PROXY_SSL_HEADER` was also set. Thus `SecurityMiddleware` with `SECURE_SSL_REDIRECT` sent a redirect for a request that came over TLS. Now the Django request reads the scheme of the Bolt request, as a Django request reads it from a WSGI or ASGI server. `SECURE_PROXY_SSL_HEADER` still applies on top, as in Django. `request.META[\"wsgi.url_scheme\"]` holds the scheme."
+   }
+  ]
+ },
+ "808": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "809": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`create_serializer()` gives a ForeignKey that `to_model()` can save, and a `Decimal` for a `DecimalField`** - A `ForeignKey` or `OneToOneField` became an `int` field, the primary key. `to_model()` and `update_instance()` gave that `int` to the relation, so Django raised `ValueError: Cannot assign \"1\": \"BlogPost.author\" must be a \"Author\" instance`. The create and update actions of a `ModelViewSet` call these methods. Now they write a primary key to the column attribute, such as `author_id`. A model instance still goes to the relation. This applies to each Serializer with such a field. A `DecimalField` became a `float` field, which loses digits. Now it is a `Decimal` field. Its JSON output is a string such as `\"19.99\"`, not a number. The input can be a string or a number."
+   }
+  ]
+ },
+ "810": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The `status_code` of a ViewSet class applies to its `@action` routes** - A class with `status_code = 202` answered 202 for the standard actions and 200 for an `@action` route. Now an action with no `status_code` uses the value of `@api.viewset(...)`, then the class attribute."
+   }
+  ]
+ },
+ "811": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`WebSocketTestClient` refuses a send after the close** - A mounted ASGI app that sent `websocket.send` after its own `websocket.close` got no error in the test client. On the server that send raises `ConnectionResetError`. The test client now raises the same error. The WebSocket scope of the test client also has no `auth_context` key now. The server scope has no such key, and nothing read it."
+   }
+  ]
+ },
+ "812": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Removed",
+    "line": "- **Definitions and branches that nothing reached** - `APIView.initialize()` was a hook that Bolt never called. `as_view()` copied a `validate_response` attribute that nothing read. Route metadata had a `path_params` key that nothing read. `django_bolt._kwargs.create_file_extractor()` took `max_size`, `min_size`, `allowed_types` and `max_files` and ignored them: Rust checks these limits from the route metadata. `Serializer` had the class attributes `__default_values_map__` and `__field_marker_defaults__`, and `subset()` set `__parent_serializer__` and `__subset_fields__`: nothing read them. `get_msgspec_type_for_django_field()` had branches for `EmailField`, `URLField`, `SlugField` and `OneToOneField` after the branches of their base classes. `WebSocketTestClient` had a path for a route with no injector, but each WebSocket route has one. `check_database()` had an answer for an installation with no Django. `UploadFile` had an error for a file with no content and no temp path, which no constructor of `UploadFile` makes. No behavior changes."
+   }
+  ]
+ },
+ "813": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "814": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `bool` key of `response_model` stops registration** - `response_model={True: A, 201: A}` registered, because `True` is an `int` in Python. The key counted as the status code 1. Now a `bool` key raises `TypeError` at registration."
+   }
+  ]
+ },
+ "815": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A subclass of `int`, `float`, `bytes` or `timedelta` encodes as its base type** - msgspec encodes only the exact types, and Bolt had no encoder for a subclass. A response with such a value raised `TypeError: Unsupported type`, and the client got a 500. Now the encoder gives msgspec a value of the exact base type, so the JSON is the same as for the base type."
+   }
+  ]
+ },
+ "816": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `bytes` field of a parameter model gets the UTF-8 bytes of its text value** - A `bytes` field of a `Query()`, `Form()`, `Header()` or `Cookie()` model read its text as base64, and a plain `bytes` parameter did not. Text that was not base64 gave a 422. The `bytes` item of a `tuple[bytes, int]` parameter also read base64. Each now gets the UTF-8 bytes of the text, as a plain `bytes` parameter and as FastAPI do. A `bytes` field of a JSON body continues to read base64."
+   }
+  ]
+ },
+ "817": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`field(alias=...)` of a Serializer is the name of the field in JSON** - The docstring said that the alias is the name in JSON input and output. But the input accepted only the field name, and the output had the alias only with `dump(by_alias=True)`. With `user_name: str = field(alias=\"userName\")`, a body `{\"userName\": \"a\"}` got 422. Now the alias is the key in a request body, in `model_validate()`, in `dump()` and in a response, as with `Field(alias=...)` in pydantic and FastAPI. The input does not accept the field name any more. The alias wins over the `rename` option of the class. `by_alias` of `dump()` has no effect, because a field has one name in JSON."
+   }
+  ]
+ },
+ "818": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `response_model` dict with no 2xx code keeps the default status 200** - With `response_model={404: Err, ...: str}`, a bare `return \"hello\"` answered 404. The default status of the route was the lowest code of the dict when the dict had no 2xx code. Now such a dict does not change the default status. A bare return answers 200, or the `status_code` of the decorator. A dict with a 2xx code still makes its lowest 2xx code the default, as the docs say."
+   }
+  ]
+ },
+ "819": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`process_exception` of a Django middleware runs** - Bolt did not call `process_exception` when a handler raised an exception. `DjangoMiddleware`, `DjangoMiddlewareStack` and `django_middleware=[...]` now call the hook of each middleware, the last middleware first, as Django does. The first response that a hook returns answers the request. If no hook returns a response, the Bolt error handlers answer as before. An `HTTPException` and a validation error do not go to the hook."
+   }
+  ]
+ },
+ "820": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A route with the response type `dict` can return a response object** - A handler with `-> dict` that returned `JSON(..., status_code=201)`, `Redirect(...)` or another response object answered 500. The same was true for a `list[...]` or `dict[...]` type with `validate_response=False`. Now the response object goes out, as for a route with no response type."
+   }
+  ]
+ },
+ "821": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`create_jwt_for_user()` refuses an extra claim that replaces a standard claim** - `extra_claims` was merged last, so `extra_claims={\"is_superuser\": True}` or `{\"sub\": \"1\"}` replaced the claim of the user. Now `sub`, `exp`, `iat`, `is_staff` or `is_superuser` in `extra_claims` raises `ValueError`. Other claims, such as `jti` and `permissions`, work as before. **Behavior change:** code that set one of these five claims through `extra_claims` now gets the error."
+   }
+  ]
+ },
+ "822": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`subset()` keeps the model validators that it can run** - `Serializer.subset()` copied the field validators of its fields, but no `@model_validator`. A body that the parent rejects, such as `low` above `high`, passed for the subset with status 200. Now the subset gets each model validator of the parent that names only fields of the subset. A model validator that names a field outside the subset stays out, because the subset does not have that attribute."
+   }
+  ]
+ },
+ "823": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A wrong method on the other slash form of a route path answers 405** - With only `GET /x`, `GET /x/` redirected to `/x`, but `POST /x/` answered 404, because the redirect check is for each method. Now a path whose other slash form has routes answers 405, and `Allow` lists the methods of the route path. An `OPTIONS` request to that path gets the automatic 204 with the same `Allow`. A method of the route still gets the 308 redirect."
+   }
+  ]
+ },
+ "824": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`BoltAPI(compression=...)` refuses a value of a wrong type** - `compression=True`, a dict or a string was stored as it was. The server then stopped at startup with `AttributeError: ... has no attribute to_rust_config`. Now `BoltAPI()` raises `TypeError` for a value that is not a `CompressionConfig`, `None` or `False`."
+   }
+  ]
+ },
+ "825": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`problem_details` sends a string as `\"detail\"`** - A `dict` or a `list` detail of an `HTTPException` was the `\"detail\"` member of the Problem Details body. RFC 9457 specifies a string there. Now the keys of a `dict` detail are extension members, and a `list` detail is the `\"extra\"` member, by the rules of `error.extra`. `\"detail\"` is then the title of the status. **Behavior change:** a client of an API with `problem_details` that read a `dict` from `\"detail\"` now reads the extension members."
+   }
+  ]
+ },
+ "826": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`DjangoMiddlewareStack` takes the dotted path of a middleware class** - `DjangoMiddlewareStack([\"django.contrib.sessions.middleware.SessionMiddleware\"])` raised no error, but each request answered 500 with `'str' object is not callable`. `DjangoMiddleware` already imports a dotted path. Now the stack imports it too."
+   }
+  ]
+ },
+ "827": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`process_response` of a Django middleware gets the error response of a handler** - When a handler raised an exception, Bolt made the error response after the Django middleware chain. Thus `SessionMiddleware` did not save the session, and a middleware that adds a header did not add it. Bolt now makes the error response inside the chain, as Django does, after the `process_exception` hooks. `get_response` returns the error response and does not raise. In a list of `DjangoMiddleware` wrappers, `process_exception` of each wrapper now runs before the error response, and the response goes through `process_response` of each wrapper."
+   }
+  ]
+ },
+ "828": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Added",
+    "line": "- **`request.scheme` and `request.is_secure()`** - The Bolt request gives its scheme, as a Django request does. `request.scheme` is `\"http\"` or `\"https\"`, and `request.is_secure()` is `True` for `\"https\"`. They give the scheme of `request.build_absolute_uri()`: the scheme follows `BOLT_TRUSTED_PROXIES`, and `SECURE_PROXY_SSL_HEADER` applies on top of it. Bolt finds the value on the first read, so a handler that does not read it pays nothing. See [Scheme](docs/src/topics/requests.md#scheme)."
+   }
+  ]
+ },
+ "829": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`Config.read_only` with a plain default is the same as `field(read_only=True, default=...)`** - With `forbid_unknown_fields=True`, a `Config.read_only` field such as `id: int = 0` accepted an input value equal to its default, and rejected each other value. The serializer now gives the field the marker default of `field()` at class creation. Thus each input value is an unknown field, as with `field(read_only=True, default=0)`."
+   }
+  ]
+ },
+ "830": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "831": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "832": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `timedelta` parameter converts its value** - A path, query, header, cookie or form parameter of the type `datetime.timedelta` gave the handler the text of the request, such as `\"PT5S\"`. A `list[timedelta]` parameter converted its items. The parameter now gives a `timedelta`, and text that is not a duration answers 422."
+   }
+  ]
+ },
+ "833": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **Each 401 has the `WWW-Authenticate` header** - The 401 of Rust for a missing or invalid credential has `WWW-Authenticate: Bearer`. The 401 of `CurrentUser` and the 401 of a revoked token had no such header. Now they have the header that Rust sends for the route. A route with no auth backend has no challenge."
+   }
+  ]
+ },
+ "834": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The test clients remove the spaces around a request header value** - An HTTP server removes the spaces and tabs around a header value. `TestClient`, `AsyncTestClient` and `WebSocketTestClient` sent the value as the test gave it. Thus `X-API-Key: \" key1\"` got a 401 in a test and a 200 from `runbolt`, and an API key that starts with a space worked only in a test. Now the test clients remove these characters, as the server does."
+   }
+  ]
+ },
+ "835": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "836": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "837": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "838": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `-> dict` or `-> list` route refuses each result of another kind** - A `-> dict` route sent a list or a number as JSON, and a `-> list` route sent a dict, with no error. A `-> dict` route now takes a `dict`. A `-> list` route takes a `list`, a `tuple` or a QuerySet. Each other result is a response validation error. A tuple of a `-> list` route was an error and is now a JSON array. A route with `validate_response=False` does no such check."
+   }
+  ]
+ },
+ "839": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "840": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The OpenAPI document shows a `bytes` parameter as plain text** - A `bytes` path, query, header, cookie or form parameter, and a `bytes` field of a `Query()`, `Form()`, `Header()` or `Cookie()` model, showed `contentEncoding: base64`. Bolt gives such a value as the UTF-8 bytes of its text, so the schema is now `{\"type\": \"string\"}`. A `bytes` field of a JSON body keeps `contentEncoding: base64`, and a `bytes` file part keeps `format: binary`."
+   }
+  ]
+ },
+ "841": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The access log has a line for a request that Bolt rejects before the handler** - The `django.server` access log of `runbolt` had no line for a response that Rust gives before the handler runs. Thus a 401 or a 403 from authentication or a guard, a 429 from a rate limit, and a 422 from path or query validation were not in the log. Now each response of a matched route writes its line, at `WARNING` for a 4xx. The 308 redirect to the other slash form of a route path and the automatic `OPTIONS` answer also write a line, at `INFO`. With an `error_formatter`, the line has the status of the formatted response. A request with no route, a mount and a native route write no line, as before."
+   }
+  ]
+ },
+ "842": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A subclass of `bytearray` in a response encodes as a `bytearray`** - A response with a `bytearray` value is base64 text in JSON. A value of a subclass of `bytearray` gave a 500 with `TypeError: Unsupported type`. Now it encodes as base64 text too."
+   }
+  ]
+ },
+ "843": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "844": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": false,
+  "entries": []
+ },
+ "845": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`WebSocketException` refuses a code or a reason that makes an invalid close frame** - A handler could raise `WebSocketException` or `WebSocketClose` with a reserved code such as 1005, or with a reason of more than 123 bytes of UTF-8. Bolt then sent that close frame. The exception now does the check of `WebSocket.close()` and raises `ValueError` when the handler makes it. The server also refuses such a code or reason on a raised exception and closes with 1011."
+   }
+  ]
+ },
+ "846": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`sample_rate` and `min_duration_ms` of `LoggingConfig` have an effect** - The docs give the two options to make the access log smaller in production. Only `LoggingMiddleware.log_response()` read them, and nothing calls it, so the access log of `runbolt` wrote each response. The settings `DJANGO_BOLT_LOG_SAMPLE` and `DJANGO_BOLT_LOG_SLOW_MS` had no effect for the same reason. Now the Rust access log applies them to the 1xx to 3xx responses of each route of the API: `BoltAPI(logging_config=LoggingConfig(sample_rate=0.05, min_duration_ms=250))`. An API with no `logging_config` takes the two settings. A 4xx or a 5xx response always writes its line. Bolt reads the values once, at route registration, and Rust applies them with no Python call. A value out of range stops startup: `ValueError` for a `LoggingConfig`, `ImproperlyConfigured` for a setting. Before, a wrong setting value was ignored. **Behavior change:** the default config had `min_duration_ms=250` when `DEBUG = False`, with no effect. Bolt removes this default, so a project with neither option keeps each line. Bolt no longer reads `DJANGO_BOLT_LOG_LEVEL`. It had no effect and no documentation. Set the level of the `django.server` logger in `LOGGING`."
+   }
+  ]
+ },
+ "847": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The admin mount serves an admin site in `i18n_patterns()`** - With `i18n_patterns(path(\"admin/\", admin.site.urls))`, `runbolt` mounted the admin only at the prefix of the default language. Thus `/en/admin/` worked, and `/fr/admin/` and `/admin/` answered 404. Now `runbolt` mounts the prefix of each language of `settings.LANGUAGES`. It also mounts the path with no language, so Django's `LocaleMiddleware` redirects `/admin/` to the prefix of a language. With `prefix_default_language=False`, the default language has no prefix. An admin site behind a path parameter, such as `path(\"<tenant>/admin/\", admin.site.urls)`, cannot be a mount. `runbolt` mounted `/admin` with no message, and each admin path answered 404. Now `runbolt` prints a warning that names `api.mount_django(\"/\", clear_root_path=True)` as the way to serve it."
+   }
+  ]
+ },
+ "848": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `(status, response object)` tuple sends the response object with the status of the tuple** - On a route with a `response_model` dict, `return 404, JSON({\"detail\": \"no\"})` gave a 500 with `TypeError: Handler returned unsupported type 'JSON'`. Now Bolt sends the response object with the status of the tuple. The body, the headers and the cookies come from the response object. The response object of the handler keeps its own status."
+   }
+  ]
+ },
+ "849": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "850": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`settings.BOLT_COMPRESSION` refuses a value of a wrong type** - `BOLT_COMPRESSION = True` or a dict stopped `runbolt` and `TestClient` with `AttributeError: 'bool' object has no attribute 'to_rust_config'`. The error did not name the setting. Now such a value raises `ImproperlyConfigured`, and the message names `settings.BOLT_COMPRESSION` and the type. The setting and the `compression` argument of `BoltAPI` use one check."
+   }
+  ]
+ },
+ "851": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `response_model` key that is not an integer or `...` stops registration** - A key such as `\"404\"`, `404.0` or `None` matched no status. Thus the schema of that key had no effect on the response and was not in the OpenAPI document, and nothing reported it. Now such a key raises `TypeError` at the decorator, as a `bool` key does."
+   }
+  ]
+ },
+ "852": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **`skip_paths` and `skip_status_codes` of `LoggingConfig` have an effect** - The docs give the two options to remove lines from the log. Only `LoggingMiddleware.log_request()` and `log_response()` read them, and nothing calls these, so the access log of `runbolt` wrote each response. Now the Rust access log applies them to each route of the API: `BoltAPI(logging_config=LoggingConfig(skip_paths={\"/health\"}, skip_status_codes={204}))`. A request with a path in `skip_paths` writes no line. The match is exact, on the complete request path. A response with a status in `skip_status_codes` writes no line. The two options apply to each status class. Bolt reads the values once, at route registration, and Rust applies them with no Python call. A value of a wrong type stops startup with `ValueError`. **Behavior change:** the default `skip_paths` is `/health`, `/ready` and `/metrics`, as the docs say. Thus these paths write no access-log line now. Use `LoggingConfig(skip_paths=set())` to log them. The docs now say that the field options, the obfuscation options and `log_request_body` do not change the access-log line."
+   }
+  ]
+ },
+ "853": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `Header()` or `Cookie()` model is one parameter for each field in the OpenAPI document** - A header or cookie model was one parameter with the name of the handler argument and an object schema. No client sends such a header. A `Query()` model was already one parameter for each field. Now each field of a header or cookie model is its own parameter, with `required`, the schema and the default of the field. The name is the name that Bolt reads: a header field is in lower case with `-` for each `_`, for example `x-request-id`."
+   }
+  ]
+ },
+ "854": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `deque`, a generator, a `Fraction` or a compiled pattern in a response is JSON** - `return {\"recent\": collections.deque([1, 2])}` gave a 500 with `TypeError: Unsupported type`. A subclass of `deque` did the same. Now a `deque` and a generator are a JSON array, and their items go through the encoder again. A `fractions.Fraction` is text, such as `\"1/3\"`. A compiled `re.Pattern` is its pattern text. pydantic gives the same JSON for each of them."
+   }
+  ]
+ },
+ "855": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An optional field of a parameter model has the schema of an optional parameter** - `opt: str | None = None` in a `Form()` model gave `{\"type\": \"string\", \"default\": null}` in the OpenAPI document. That default is not valid for the type, and a client generator can refuse it. The same field in a `Query()` model gave `anyOf` with a null arm, but a query value cannot be null. Now a `T | None` field of a `Query()` or `Form()` model gives the schema of `T` with no `None` default, as a parameter with no model does. `required: false` says that the field is optional. A default that is not `None` stays. A union of two types or more keeps each arm."
+   }
+  ]
+ },
+ "856": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The access log writes one 429 line for each second** - After the access log got a line for each response of a route, a flood of rejected requests wrote one `WARNING` line for each 429. A client could thus fill the log. The line of the rate limiter on stderr already has a limit. Now each worker thread writes the access-log line of the first 429 response of each second. The next 429 line of that worker ends with `| suppressed: N`, the number of 429 responses that wrote no line. The limit applies to each 429 response of a route. Other status codes are not limited."
+   }
+  ]
+ },
+ "857": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The admin in `i18n_patterns()` uses the default language that Django serves** - With `LANGUAGE_CODE = \"en-us\"`, the default of Django, and only `\"en\"` in `LANGUAGES`, Django serves the default language at `/en/admin/`. Bolt took the prefix from `LANGUAGE_CODE`. Thus the `runbolt` banner showed `/en-us/admin/`, which Django answers with 404, and Bolt made a mount at that path. Now Bolt reads the variant of `LANGUAGE_CODE` that `LANGUAGES` has, as `LocaleMiddleware` does. The banner shows `/en/admin/`, and `/en-us/admin` is not a mount. With `prefix_default_language=False`, the default language keeps the path with no prefix."
+   }
+  ]
+ },
+ "858": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A list parameter with an empty default has a valid OpenAPI schema** - `tags: Annotated[list[str], Header()] = []` had `minItems: 1` together with `default: []` in the document. The same was true for `Cookie()`. Thus the default was not a valid value of its own schema, and an OpenAPI validator refused the document. Now a header or cookie list with an empty default has no `minItems`. `maxItems: 1` stays, because a header or a cookie gives one value."
+   }
+  ]
+ },
+ "859": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **A `response_model` key outside 200 to 599 stops registration** - `response_model={200: Item, 700: Err}` and `{99: Err, 200: Item}` registered. A response status is from 200 to 599, so no response could use such a key. The key was in the OpenAPI document as a status that the route cannot send. Now an integer key outside 200 to 599 raises `ValueError` at the decorator."
+   }
+  ]
+ },
+ "860": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **The access log has a line for a 405** - A request with a method that a route path does not have answers 405. This answer wrote no line in the `django.server` access log. Now it writes a line at `WARNING`, as each other 4xx of a route does."
+   }
+  ]
+ },
+ "861": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": [
+   {
+    "section": "Fixed",
+    "line": "- **An optional field of a parameter model has the schema of an optional parameter** - `opt: str | None = None` in a `Form()` model gave `{\"type\": \"string\", \"default\": null}` in the OpenAPI document. That default is not valid for the type, and a client generator can refuse it. The same field in a `Query()` model gave `anyOf` with a null arm, but a query value cannot be null. Now a `T | None` field of a `Query()`, `Header()`, `Cookie()` or `Form()` model gives the schema of `T` with no `None` default, as a parameter with no model does. `required: false` says that the field is optional. A default that is not `None` stays. A union of two types or more keeps each arm."
+   }
+  ]
+ },
+ "862": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "863": {
+  "mb": "7530034503dbfbdbe90e25856d4dca7d1e95ad6a",
+  "changes_changelog": true,
+  "entries": []
+ },
+ "876": {
+  "mb": "5d1e3f6690d1ae7370802442f8db86491c9a53ee",
+  "changes_changelog": false,
+  "entries": []
+ }
+}
