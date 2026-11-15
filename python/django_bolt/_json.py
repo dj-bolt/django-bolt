@@ -30,7 +30,6 @@ from uuid import UUID
 
 import msgspec
 
-
 # Default type encoders for non-JSON-native types
 # Maps type -> encoder function
 DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
