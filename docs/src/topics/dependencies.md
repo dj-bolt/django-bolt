@@ -196,6 +196,21 @@ async def get_data(db=Depends(DatabaseSession)):
         pass
 ```
 
+An object with a `__call__` method is also a dependency. Bolt reads the parameters of `__call__`. Bolt awaits the call when `__call__` is `async def`:
+
+```python
+class PageSize:
+    def __init__(self, max_size: int):
+        self.max_size = max_size
+
+    async def __call__(self, size: int = 20) -> int:
+        return min(size, self.max_size)
+
+@api.get("/items")
+async def list_items(size=Depends(PageSize(max_size=100))):
+    return {"size": size}
+```
+
 ## Parameter extraction in dependencies
 
 Dependencies can use the same parameter markers as handlers:
