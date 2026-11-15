@@ -320,6 +320,39 @@ async def test_websocket_path_param_is_url_decoded(api):
         assert welcome == "Joined room: hello world"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "url", "expected"),
+    [
+        ("/ws/ü", "/ws/%C3%BC", "/ws/ü"),
+        ("/ws/a b", "/ws/a%20b", "/ws/a b"),
+        ("/ws/ü b/{room}", "/ws/%C3%BC%20b/x%20y", "/ws/ü b/x y"),
+        # A path that has the escapes already keeps them.
+        ("/ws/%C3%A9", "/ws/%C3%A9", "/ws/%C3%A9"),
+    ],
+)
+async def test_websocket_route_path_with_a_character_that_a_url_escapes_matches(route, url, expected):
+    """A client sends such a character as a percent escape, and the route accepts."""
+    escape_api = BoltAPI()
+
+    if "{room}" in route:
+
+        @escape_api.websocket(route)
+        async def handler(websocket: WebSocket, room: str):
+            await websocket.accept()
+            await websocket.send_text(route.replace("{room}", room))
+
+    else:
+
+        @escape_api.websocket(route)
+        async def handler(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text(route)
+
+    async with WebSocketTestClient(escape_api, url) as ws:
+        assert await ws.receive_text() == expected
+
+
 # --- Query Parameter Tests ---
 
 
