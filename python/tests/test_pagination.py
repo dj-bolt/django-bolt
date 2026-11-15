@@ -953,6 +953,25 @@ def test_cursor_pagination_values_queryset_without_primary_key_is_an_error(sampl
     assert "needs the primary key" in response.text
 
 
+def test_cursor_pagination_of_a_list_is_an_error_that_names_the_queryset(settings):
+    """A cursor is a database filter. A list has no filter, so the page fails with the reason."""
+    settings.DEBUG = True  # the 500 body then shows the exception
+    api = BoltAPI()
+
+    @api.get("/articles")
+    @paginate(CursorPagination)
+    async def list_articles(request):
+        return [{"id": 1, "title": "Article 1"}]
+
+    with TestClient(api) as client:
+        response = client.get("/articles")
+
+    assert response.status_code == 500
+    assert "TypeError" in response.text
+    assert "CursorPagination needs a Django QuerySet" in response.text
+    assert "list" in response.text
+
+
 @pytest.mark.django_db(transaction=True)
 def test_cursor_pagination_keeps_tied_rows_with_a_composite_primary_key(db):
     """A composite primary key breaks ties with all of its columns."""

@@ -93,6 +93,8 @@ A `values()` queryset must include the ordering field and the primary key, for e
 
 The `ordering` field must not be null. A null value cannot make a cursor, and SQL compares no value with null. When the last row of a page has a null value, the paginator raises `ValueError`. Order by a field that is never null, or exclude the null values, for example `Article.objects.exclude(published_at=None)`.
 
+The handler must return a QuerySet. The cursor is a filter on the database, and a list has no such filter. For a list, the paginator raises `TypeError`. Use `PageNumberPagination` or `LimitOffsetPagination` for a list.
+
 ## Specifying the Serializer
 
 Two equivalent ways to specify which serializer to use:
