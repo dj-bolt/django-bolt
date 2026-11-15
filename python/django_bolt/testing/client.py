@@ -132,8 +132,8 @@ class BoltTestTransport(httpx.BaseTransport):
         path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
-        # Extract headers
-        headers = [(k.decode("utf-8"), v.decode("utf-8")) for k, v in request.headers.raw]
+        # Extract headers. An HTTP server removes the spaces and tabs around a value.
+        headers = [(k.decode("utf-8"), v.decode("utf-8").strip(" \t")) for k, v in request.headers.raw]
 
         # Get body
         if hasattr(request, "_content"):
@@ -202,8 +202,8 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
         path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
-        # Extract headers
-        headers = [(k.decode("utf-8"), v.decode("utf-8")) for k, v in request.headers.raw]
+        # Extract headers. An HTTP server removes the spaces and tabs around a value.
+        headers = [(k.decode("utf-8"), v.decode("utf-8").strip(" \t")) for k, v in request.headers.raw]
 
         # Get body
         if hasattr(request, "_content"):
