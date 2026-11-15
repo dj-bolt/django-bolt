@@ -67,6 +67,7 @@ All notable changes to this project will be documented in this file.
 - **A `(status, list)` tuple uses the fields of its entry** - With `response_model={200: list[Row], ...: list[Row]}`, `return 201, [article]` sent the list to the JSON encoder as it was. Thus a list of model instances gave a 500 with `TypeError: Unsupported type`. Now the tuple uses the fields of `Row`, as a bare return does.
 - **`TestClient` applies `BOLT_ALLOWED_FILE_PATHS`** - Only `runbolt` read the setting, at startup. Under `TestClient`, a `FileResponse` served each file, and a test could pass where the server answers 403. Now the first `FileResponse` reads the setting if nothing read it. `override_settings` and the `settings` fixture of pytest-django change the limit for the next `FileResponse`. `runbolt` still reads the setting at startup, so a wrong value stops the server.
 - **`ConnectionClosed` of `WebSocketTestClient` has the close reason** - `receive_text()` and `receive_bytes()` raised `ConnectionClosed` with an empty `reason` for each close. The error now has the reason that the handler gave to `close()`.
+- **`WebSocketTestClient` gives the close reason of a handler error** - When a handler raises after `accept()`, the server closes with code 1011 and the reason `Internal error`. `WebSocketTestClient` gave code 1011 with an empty reason. `ConnectionClosed` now has the reason `Internal error`, as on the server.
 
 ### Changed
 

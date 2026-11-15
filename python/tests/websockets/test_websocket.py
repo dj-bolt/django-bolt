@@ -396,6 +396,18 @@ async def test_websocket_server_close_reason_reaches_receive_bytes(api):
         assert exc_info.value.reason == "something went wrong"
 
 
+@pytest.mark.asyncio
+async def test_websocket_handler_error_closes_with_the_reason_of_the_server(api):
+    """The server closes with 1011 and the reason "Internal error" when the handler raises after accept."""
+    with pytest.raises(ValueError, match="Test error"):
+        async with WebSocketTestClient(api, "/ws/error") as ws:
+            with pytest.raises(ConnectionClosed) as exc_info:
+                await ws.receive_text()
+
+            assert exc_info.value.code == CloseCode.INTERNAL_ERROR
+            assert exc_info.value.reason == "Internal error"
+
+
 # --- Type Coercion Tests ---
 
 
