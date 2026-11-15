@@ -890,6 +890,13 @@ async fn route_request<const ACCESS_LOG: bool>(
                 }
             }
 
+            // The path has routes, but none for this method: 405 with `Allow`
+            // (RFC 9110 section 15.5.6). This lookup runs on a miss only.
+            let allowed_methods = router.find_all_methods(path);
+            if !allowed_methods.is_empty() {
+                return responses::error_405(&allowed_methods);
+            }
+
             // Route not found - return 404
             // CORS headers will be added by CorsMiddleware if configured
             return responses::error_404();
