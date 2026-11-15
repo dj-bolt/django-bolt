@@ -30,6 +30,7 @@ from django_bolt.responses import (
     HTML,
     EventSourceResponse,
     File,
+    FileResponse,
     PlainText,
     Redirect,
     StreamingResponse,
@@ -159,9 +160,12 @@ def test_paginated_route_documents_the_envelope_not_a_bare_list():
     @api.get("/users")
     @paginate(PageNumberPagination)
     async def list_users(request) -> list[UserRead]:
+        """List the users."""
         return [UserRead(id=1, name="a")]
 
     schema = _get_schema(api)
+    # The paginated handler keeps its docstring.
+    assert schema["paths"]["/users"]["get"]["summary"] == "List the users."
     body = _ok_response(schema, "/users")["content"]["application/json"]["schema"]
     assert body == {"$ref": "#/components/schemas/PaginatedResponse_UserRead_"}
 
@@ -287,23 +291,35 @@ def test_include_in_schema_false_hides_route_in_prefixed_api():
     assert not any(path.endswith("/internal") for path in schema["paths"])
 
 
+def _register_with_response_class(api, path, handler, response_class, declared_by):
+    """Register ``handler`` with the response class as an option, as a return annotation, or as both."""
+    if declared_by != "option":
+        handler.__annotations__["return"] = response_class
+    api.get(path, response_class=None if declared_by == "annotation" else response_class)(handler)
+
+
+@pytest.mark.parametrize("declared_by", ["option", "annotation", "both"])
 @pytest.mark.parametrize(
     ("response_class", "media_type", "expected_schema"),
     [
         (HTML, "text/html", {"type": "string"}),
         (PlainText, "text/plain", {"type": "string"}),
         (File, "application/octet-stream", {"type": "string", "format": "binary"}),
+        (FileResponse, "application/octet-stream", {"type": "string", "format": "binary"}),
         (StreamingResponse, "application/octet-stream", {"type": "string", "format": "binary"}),
         (EventSourceResponse, "text/event-stream", {"type": "string"}),
     ],
-    ids=["html", "plaintext", "file", "streaming", "sse"],
+    ids=["html", "plaintext", "file", "file_response", "streaming", "sse"],
 )
-def test_response_class_sets_media_type_instead_of_json_object(response_class, media_type, expected_schema):
+def test_response_class_sets_media_type_instead_of_json_object(
+    response_class, media_type, expected_schema, declared_by
+):
     api = BoltAPI(openapi_config=_config())
 
-    @api.get("/thing", response_class=response_class)
     async def thing():
         pass
+
+    _register_with_response_class(api, "/thing", thing, response_class, declared_by)
 
     schema = _get_schema(api)
     content = _ok_response(schema, "/thing")["content"]
@@ -311,12 +327,14 @@ def test_response_class_sets_media_type_instead_of_json_object(response_class, m
     assert content[media_type]["schema"] == expected_schema
 
 
-def test_response_class_redirect_documents_3xx_without_content():
+@pytest.mark.parametrize("declared_by", ["option", "annotation", "both"])
+def test_response_class_redirect_documents_3xx_without_content(declared_by):
     api = BoltAPI(openapi_config=_config())
 
-    @api.get("/go", response_class=Redirect)
     async def go():
         return Redirect("/elsewhere")
+
+    _register_with_response_class(api, "/go", go, Redirect, declared_by)
 
     schema = _get_schema(api)
     responses = schema["paths"]["/go"]["get"]["responses"]
