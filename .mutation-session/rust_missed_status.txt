@@ -1,0 +1,106 @@
+SURVIVED  crates/bolt-core/src/error.rs:93:5: replace internal_error_response -> HttpResponse with HttpResponse::Ok().finish()
+KILLED    crates/bolt-core/src/error.rs:106:5: replace handle_python_exception -> HttpResponse with HttpResponse::Ok().finish()
+KILLED    crates/bolt-core/src/error.rs:120:5: replace default_exception_response -> HttpResponse with HttpResponse::Ok().finish()
+KILLED    crates/bolt-core/src/error.rs:197:5: replace handle_python_error -> HttpResponse with HttpResponse::Ok().finish()
+UNCHECKED crates/bolt-core/src/form_parsing.rs:564:32: replace && with || in read_file_content
+UNCHECKED crates/bolt-core/src/form_parsing.rs:564:40: replace <= with > in read_file_content
+KILLED    crates/bolt-core/src/lane.rs:42:5: replace idle_time -> Duration with Default::default()
+KILLED    crates/bolt-core/src/lane.rs:164:8: delete ! in lane_main
+KILLED    crates/bolt-core/src/lane.rs:160:5: replace lane_main with ()
+SURVIVED  crates/bolt-core/src/lane.rs:185:63: replace == with != in lane_main
+KILLED    crates/bolt-core/src/lane.rs:220:32: delete ! in lane_main
+SURVIVED  crates/bolt-core/src/lane.rs:233:20: delete ! in lane_main
+KILLED    crates/bolt-core/src/lane.rs:247:28: replace && with || in lane_main
+KILLED    crates/bolt-core/src/lane.rs:247:20: delete ! in lane_main
+KILLED    crates/bolt-core/src/lane.rs:247:31: delete ! in lane_main
+KILLED    crates/bolt-core/src/lane.rs:270:5: replace while_python_open -> bool with true
+KILLED    crates/bolt-core/src/lane.rs:270:5: replace while_python_open -> bool with false
+KILLED    crates/bolt-core/src/lane.rs:271:16: delete ! in while_python_open
+KILLED    crates/bolt-core/src/lane.rs:284:5: replace go_idle -> bool with true
+KILLED    crates/bolt-core/src/lane.rs:284:5: replace go_idle -> bool with false
+KILLED    crates/bolt-core/src/lane.rs:306:5: replace run_call with ()
+KILLED    crates/bolt-core/src/lane.rs:308:24: replace match guard !running.is_truthy().unwrap_or(false) with true in run_call
+SURVIVED  crates/bolt-core/src/lane.rs:308:24: replace match guard !running.is_truthy().unwrap_or(false) with false in run_call
+UNCHECKED crates/bolt-core/src/lane.rs:308:24: delete ! in run_call
+UNCHECKED crates/bolt-core/src/lane.rs:334:5: replace call_concurrency with ()
+UNCHECKED crates/bolt-core/src/lane.rs:338:5: replace call_concurrency_attached with ()
+UNCHECKED crates/bolt-core/src/lane.rs:386:5: replace shutdown -> usize with 0
+UNCHECKED crates/bolt-core/src/lane.rs:386:5: replace shutdown -> usize with 1
+UNCHECKED crates/bolt-core/src/lane.rs:397:35: replace + with - in shutdown
+UNCHECKED crates/bolt-core/src/lane.rs:398:36: replace && with || in shutdown
+UNCHECKED crates/bolt-core/src/lane.rs:398:11: delete ! in shutdown
+UNCHECKED crates/bolt-core/src/lane.rs:398:54: replace < with == in shutdown
+UNCHECKED crates/bolt-core/src/lane.rs:398:54: replace < with > in shutdown
+UNCHECKED crates/bolt-core/src/lane.rs:398:54: replace < with <= in shutdown
+UNCHECKED crates/bolt-core/src/lane.rs:418:39: replace + with - in stop_idle_lanes
+UNCHECKED crates/bolt-core/src/lane.rs:417:5: replace stop_idle_lanes with ()
+UNCHECKED crates/bolt-core/src/lane.rs:428:40: replace || with && in stop_idle_lanes
+UNCHECKED crates/bolt-core/src/lane.rs:428:58: replace >= with < in stop_idle_lanes
+KILLED    crates/bolt-core/src/response_meta.rs:162:9: replace ResponseMeta::from_tag -> Option<&'static ResponseMeta> with None
+KILLED    crates/bolt-core/src/response_meta.rs:163:13: delete match arm 0 in ResponseMeta::from_tag
+KILLED    crates/bolt-core/src/response_meta.rs:164:13: delete match arm 1 in ResponseMeta::from_tag
+KILLED    crates/bolt-core/src/response_meta.rs:165:13: delete match arm 2 in ResponseMeta::from_tag
+SURVIVED  crates/bolt-core/src/response_meta.rs:166:13: delete match arm 3 in ResponseMeta::from_tag
+KILLED    crates/bolt-core/src/response_meta.rs:167:13: delete match arm 4 in ResponseMeta::from_tag
+KILLED    crates/bolt-core/src/router.rs:258:23: replace && with || in Router::insert
+KILLED    crates/bolt-core/src/settings.rs:44:25: replace match guard is_missing(py, &err, name) with false in DjangoSettings<'py>::get
+KILLED    crates/bolt-core/src/settings.rs:44:25: replace match guard is_missing(py, &err, name) with true in DjangoSettings<'py>::get
+KILLED    crates/bolt-core/src/settings.rs:101:24: replace >= with < in DjangoSettings<'py>::positive_int
+SURVIVED  crates/bolt-core/src/settings.rs:110:55: replace <= with > in DjangoSettings<'py>::int_up_to
+KILLED    crates/bolt-core/src/settings.rs:126:24: replace > with == in DjangoSettings<'py>::positive_seconds
+KILLED    crates/bolt-core/src/settings.rs:124:12: delete ! in DjangoSettings<'py>::positive_seconds
+KILLED    crates/bolt-core/src/settings.rs:126:24: replace > with >= in DjangoSettings<'py>::positive_seconds
+SURVIVED  crates/bolt-core/src/settings.rs:126:24: replace > with < in DjangoSettings<'py>::positive_seconds
+KILLED    crates/bolt-core/src/settings.rs:173:12: delete ! in DjangoSettings<'py>::int
+KILLED    crates/bolt-core/src/settings.rs:237:16: replace >= with < in env_positive_int
+SURVIVED  crates/bolt-core/src/settings.rs:248:16: replace >= with < in env_non_negative_int
+KILLED    crates/bolt-core/src/settings.rs:281:5: replace is_missing -> bool with false
+KILLED    crates/bolt-core/src/settings.rs:281:5: replace is_missing -> bool with true
+KILLED    crates/bolt-core/src/settings.rs:282:9: replace && with || in is_missing
+KILLED    crates/bolt-core/src/settings.rs:286:36: replace == with != in is_missing
+KILLED    crates/bolt-core/src/static_files.rs:100:5: replace find_with_django_finders -> Option<PathBuf> with Some(Default::default())
+KILLED    crates/bolt-core/src/static_files.rs:100:5: replace find_with_django_finders -> Option<PathBuf> with None
+KILLED    crates/bolt-core/src/static_files.rs:142:5: replace handle_file -> HttpResponse with HttpResponse::Ok().finish()
+KILLED    crates/bolt-core/src/static_files.rs:198:36: replace && with || in handle_file
+KILLED    crates/bolt-core/src/static_files.rs:207:52: replace && with || in handle_file
+KILLED    crates/bolt-core/src/static_files.rs:222:5: replace serve_file -> HttpResponse with HttpResponse::Ok().finish()
+SURVIVED  crates/bolt-core/src/static_files.rs:223:52: replace * with + in serve_file
+SURVIVED  crates/bolt-core/src/static_files.rs:223:52: replace * with / in serve_file
+SURVIVED  crates/bolt-core/src/static_files.rs:238:5: replace disarm_scripting_response with ()
+KILLED    crates/bolt-core/src/static_files.rs:250:5: replace not_found_response -> HttpResponse with HttpResponse::Ok().finish()
+SURVIVED  crates/bolt-core/src/type_coercion.rs:526:15: replace == with != in set_slot
+KILLED    crates/bolt-core/src/middleware/auth.rs:380:5: replace log_jwks_refresh_failure with ()
+KILLED    crates/bolt-native-abi/src/lib.rs:221:9: replace RequestRef<'a>::method -> &'a[u8] with Vec::leak(Vec::new())
+KILLED    crates/bolt-native-abi/src/lib.rs:221:9: replace RequestRef<'a>::method -> &'a[u8] with Vec::leak(vec![0])
+KILLED    crates/bolt-native-abi/src/lib.rs:221:9: replace RequestRef<'a>::method -> &'a[u8] with Vec::leak(vec![1])
+KILLED    crates/bolt-native-abi/src/lib.rs:226:9: replace RequestRef<'a>::path -> &'a[u8] with Vec::leak(Vec::new())
+KILLED    crates/bolt-native-abi/src/lib.rs:226:9: replace RequestRef<'a>::path -> &'a[u8] with Vec::leak(vec![0])
+KILLED    crates/bolt-native-abi/src/lib.rs:231:9: replace RequestRef<'a>::query -> &'a[u8] with Vec::leak(Vec::new())
+KILLED    crates/bolt-native-abi/src/lib.rs:226:9: replace RequestRef<'a>::path -> &'a[u8] with Vec::leak(vec![1])
+KILLED    crates/bolt-native-abi/src/lib.rs:231:9: replace RequestRef<'a>::query -> &'a[u8] with Vec::leak(vec![0])
+KILLED    crates/bolt-native-abi/src/lib.rs:231:9: replace RequestRef<'a>::query -> &'a[u8] with Vec::leak(vec![1])
+KILLED    crates/bolt-native-abi/src/lib.rs:236:9: replace RequestRef<'a>::client_addr -> &'a[u8] with Vec::leak(Vec::new())
+KILLED    crates/bolt-native-abi/src/lib.rs:236:9: replace RequestRef<'a>::client_addr -> &'a[u8] with Vec::leak(vec![0])
+KILLED    crates/bolt-native-abi/src/lib.rs:236:9: replace RequestRef<'a>::client_addr -> &'a[u8] with Vec::leak(vec![1])
+UNCHECKED src/dev_reload.rs:65:9: replace Paint::log with ()
+UNCHECKED src/dev_reload.rs:215:16: replace match guard matches!( err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory ) with true in first_relevant_file_in
+UNCHECKED src/dev_reload.rs:490:65: replace == with != in run_dev_reloader_inner
+UNCHECKED src/dev_reload.rs:538:12: delete ! in run_dev_reloader_inner
+UNCHECKED src/dev_reload.rs:551:17: replace += with -= in run_dev_reloader_inner
+UNCHECKED src/dev_reload.rs:551:17: replace += with *= in run_dev_reloader_inner
+UNCHECKED src/dev_reload.rs:554:16: replace == with != in run_dev_reloader_inner
+UNCHECKED src/dev_reload.rs:580:16: delete ! in run_dev_reloader_inner
+UNCHECKED src/dev_reload.rs:611:23: replace match guard shutdown.load(Ordering::SeqCst) with true in run_dev_reloader_inner
+UNCHECKED src/dev_reload.rs:611:23: replace match guard shutdown.load(Ordering::SeqCst) with false in run_dev_reloader_inner
+UNCHECKED src/dev_reload.rs:606:30: replace += with -= in run_dev_reloader_inner
+UNCHECKED src/dev_reload.rs:606:30: replace += with *= in run_dev_reloader_inner
+SURVIVED  src/logging.rs:37:9: replace <impl Log for StderrLogger>::enabled -> bool with true
+KILLED    src/logging.rs:37:9: replace <impl Log for StderrLogger>::enabled -> bool with false
+KILLED    src/logging.rs:41:9: replace <impl Log for StderrLogger>::log with ()
+KILLED    src/logging.rs:41:12: delete ! in <impl Log for StderrLogger>::log
+SURVIVED  src/logging.rs:51:9: replace <impl Log for StderrLogger>::flush with ()
+SURVIVED  src/response_body.rs:13:9: replace <impl From<PyBackedBytes> for AttachedBytes>::from -> Self with Default::default()
+SURVIVED  src/response_body.rs:20:9: replace <impl AsRef<[u8]> for AttachedBytes>::as_ref -> &[u8] with Vec::leak(Vec::new())
+SURVIVED  src/response_body.rs:20:9: replace <impl AsRef<[u8]> for AttachedBytes>::as_ref -> &[u8] with Vec::leak(vec![0])
+SURVIVED  src/response_body.rs:20:9: replace <impl AsRef<[u8]> for AttachedBytes>::as_ref -> &[u8] with Vec::leak(vec![1])
+SURVIVED  src/response_body.rs:29:9: replace <impl Drop for AttachedBytes>::drop with ()

@@ -1,0 +1,11 @@
+crates/bolt-core/src/router.rs:422:19: replace += with -= in decode_escaped_query_component
+crates/bolt-core/src/router.rs:422:19: replace += with *= in decode_escaped_query_component
+crates/bolt-core/src/router.rs:427:23: replace += with -= in decode_escaped_query_component
+crates/bolt-core/src/router.rs:427:23: replace += with *= in decode_escaped_query_component
+crates/bolt-core/src/router.rs:432:23: replace += with -= in decode_escaped_query_component
+crates/bolt-core/src/router.rs:432:23: replace += with *= in decode_escaped_query_component
+crates/bolt-core/src/router.rs:437:19: replace += with -= in decode_escaped_query_component
+crates/bolt-core/src/router.rs:437:19: replace += with *= in decode_escaped_query_component
+crates/bolt-core/src/type_coercion.rs:97:11: replace += with *= in is_valid_decimal_literal
+crates/bolt-core/src/type_coercion.rs:103:15: replace += with *= in is_valid_decimal_literal
+crates/bolt-core/src/type_coercion.rs:117:15: replace += with *= in is_valid_decimal_literal
