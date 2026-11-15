@@ -80,6 +80,8 @@ async def list_articles(request) -> list[ArticleSerializer]:
 
 Query: `/articles?cursor=eyJ2IjoxMDB9`
 
+The cursor is the `next_cursor` of the page before. It uses the URL-safe base64 alphabet, so put it into the query string as it is. A cursor that Bolt cannot read gives the first page. This includes a cursor with a value of the wrong type for the `ordering` field or the primary key.
+
 The `ordering` field does not have to be unique. Bolt also orders by the primary key, so rows with equal values keep their place across pages. The cursor holds the value and the primary key of the last row. For an index, add the primary key after the ordering field, for example `models.Index(fields=["-created_at", "-id"])`.
 
 A `values()` queryset must include the ordering field and the primary key, for example `Article.objects.values("id", "created_at", "title")`. Without one of them, the paginator cannot make the next cursor and raises `ValueError`.

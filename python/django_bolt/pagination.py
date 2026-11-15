@@ -30,7 +30,8 @@ from functools import wraps
 from typing import Any, Generic, TypeVar, get_args, get_origin
 
 import msgspec
-from django.db.models import CompositePrimaryKey, F
+from django.core.exceptions import FieldDoesNotExist, ValidationError
+from django.db.models import CompositePrimaryKey, F, Field
 from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, TupleLessThan
 
 from . import _json
@@ -49,6 +50,40 @@ __all__ = [
 
 T = TypeVar("T")
 _PAGINATION_UNSET = object()
+# A cursor uses the URL-safe base64 alphabet. A cursor from an earlier release has "+" and "/".
+_URL_SAFE_TO_STANDARD = str.maketrans("-_", "+/")
+
+
+def _cursor_field(model: Any, name: str) -> Any:
+    """Return the model field that a cursor value must fit. Return None when ``name`` is not a model field."""
+    if name == "pk":
+        return model._meta.pk
+    try:
+        field = model._meta.get_field(name)
+    except FieldDoesNotExist:
+        return None
+    # A reverse relation is not a Field and has no get_prep_value().
+    return field if isinstance(field, Field) else None
+
+
+def _field_accepts(field: Any, value: Any) -> bool:
+    """Return True when a lookup on ``field`` can use ``value``. A cursor value comes from the client."""
+    if field is None:
+        return True
+    if isinstance(field, CompositePrimaryKey):
+        # The cursor holds a list with one value for each column of the key.
+        columns = field.fields
+        return (
+            isinstance(value, list)
+            and len(value) == len(columns)
+            and all(_field_accepts(column, item) for column, item in zip(columns, value, strict=True))
+        )
+    try:
+        # The lookup makes the same call. Without this check, its error is a 500.
+        field.get_prep_value(value)
+    except (ValueError, TypeError, ValidationError):
+        return False
+    return True
 
 
 class PaginatedResponse(msgspec.Struct, Generic[T], omit_defaults=True):  # noqa: UP046 — PEP 695 params are unresolvable under PEP 563
@@ -578,34 +613,38 @@ class CursorPagination(PaginationBase):
 
     def _encode_cursor(self, value: Any, pk: Any = None) -> str:
         """
-        Encode cursor position to base64 string.
+        Encode cursor position to a URL-safe base64 string.
 
         Args:
             value: Ordering value of the last row
             pk: Primary key of the last row. None when the ordering field is the primary key.
 
         Returns:
-            Base64-encoded cursor string
+            Cursor string. A client can put it into a query string with no percent-encoding.
         """
         cursor_data = _json.encode({"v": value} if pk is None else {"v": value, "pk": pk})
-        return base64.b64encode(cursor_data).decode("utf-8")
+        return base64.urlsafe_b64encode(cursor_data).decode("ascii")
 
     def _decode_cursor(self, cursor: str) -> tuple[Any, Any]:
         """
         Decode cursor string to position.
 
         Args:
-            cursor: Base64-encoded cursor string
+            cursor: Cursor string in the URL-safe or the standard base64 alphabet
 
         Returns:
             (ordering value, primary key). Each is None when the cursor does not hold it.
+            A cursor that is not base64 of a JSON object gives (None, None).
         """
         try:
-            cursor_data = base64.b64decode(cursor.encode("utf-8"))
-            data = msgspec.json.decode(cursor_data)
-            return data.get("v"), data.get("pk")
-        except Exception:
+            data = msgspec.json.decode(base64.b64decode(cursor.translate(_URL_SAFE_TO_STANDARD)))
+        except (ValueError, RecursionError):
+            # ValueError includes binascii.Error, UnicodeError and msgspec.DecodeError.
+            # JSON with too many levels raises RecursionError.
             return None, None
+        if not isinstance(data, dict):
+            return None, None
+        return data.get("v"), data.get("pk")
 
     async def get_page_params(self, request: dict[str, Any]) -> dict[str, Any]:
         """Extract cursor and page_size from request."""
@@ -651,6 +690,13 @@ class CursorPagination(PaginationBase):
             ordered_qs = queryset.order_by(ordering, "-pk" if is_descending else "pk")
         else:
             ordered_qs = queryset.order_by(ordering)
+
+        # A value that its field cannot use means no cursor, as a cursor that does not decode.
+        if cursor_value is not None and not (
+            _field_accepts(_cursor_field(queryset.model, ordering_field), cursor_value)
+            and (cursor_pk is None or not tie_break or _field_accepts(pk_field, cursor_pk))
+        ):
+            cursor_value = None
 
         # Apply cursor filter if present
         if cursor_value is not None:
