@@ -769,6 +769,7 @@ class SchemaGenerator:
             security=security,
             tags=tags,
             operation_id=f"{method.lower()}_{handler.__name__}",
+            deprecated=bool(meta.get("openapi_deprecated")),
         )
 
         return operation

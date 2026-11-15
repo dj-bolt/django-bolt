@@ -822,6 +822,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "GET",
@@ -837,6 +838,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def post(
@@ -854,6 +856,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "POST",
@@ -869,6 +872,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def put(
@@ -886,6 +890,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "PUT",
@@ -901,6 +906,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def patch(
@@ -918,6 +924,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "PATCH",
@@ -933,6 +940,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def delete(
@@ -950,6 +958,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "DELETE",
@@ -965,6 +974,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def head(
@@ -982,6 +992,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "HEAD",
@@ -997,6 +1008,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def options(
@@ -1014,6 +1026,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "OPTIONS",
@@ -1029,6 +1042,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def query(
@@ -1046,6 +1060,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "QUERY",
@@ -1061,6 +1076,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def websocket(
@@ -1232,6 +1248,7 @@ class BoltAPI:
         validate_response: bool | None = None,
         tags: list[str] | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         """
         Register a class-based view as a decorator.
@@ -1255,6 +1272,7 @@ class BoltAPI:
             auth: Optional per-route auth overrides (merged with class-level auth)
             status_code: Optional per-route status code override
             tags: Optional per-route tags override
+            deprecated: True marks each operation of the view as deprecated in the OpenAPI schema
 
         Returns:
             Decorator function that registers the view class
@@ -1335,6 +1353,7 @@ class BoltAPI:
                     auth=merged_auth,
                     tags=tags,
                     include_in_schema=merged_include_in_schema,
+                    deprecated=deprecated,
                 )
 
                 # Apply decorator to register the handler
@@ -1367,6 +1386,7 @@ class BoltAPI:
         lookup_field: str = "pk",
         tags: list[str] | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         """
         Register a ViewSet with automatic CRUD route generation as a decorator.
@@ -1418,6 +1438,8 @@ class BoltAPI:
                 It applies to the routes of this registration only.
             tags: Optional tags to apply to all routes. An @action that sets
                 ``tags`` keeps its value.
+            deprecated: True marks each operation of the viewset as deprecated in the
+                OpenAPI schema. This includes its @action routes.
 
         Returns:
             Decorator function that registers the viewset
@@ -1552,6 +1574,7 @@ class BoltAPI:
                     auth=merged_auth,
                     tags=tags,
                     include_in_schema=merged_include_in_schema,
+                    deprecated=deprecated,
                 )
                 route_decorator(handler)
 
@@ -1561,6 +1584,7 @@ class BoltAPI:
                 base_path=path,
                 lookup_field=actual_lookup_field,
                 include_in_schema=merged_include_in_schema,
+                deprecated=deprecated,
                 base_name=vs_base,
                 base_name_explicit=name is not None,
                 view_kwargs=view_kwargs,
@@ -1600,6 +1624,7 @@ class BoltAPI:
         base_name: str | None = None,
         base_name_explicit: bool = False,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
         view_kwargs: dict[str, Any] | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
@@ -1761,6 +1786,7 @@ class BoltAPI:
                         summary=attr.summary,
                         description=attr.description,
                         include_in_schema=include_in_schema,
+                        deprecated=attr.deprecated or deprecated,
                     )
                     decorator(custom_action_handler)
 
@@ -1780,6 +1806,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
         _name_explicit: bool = True,
         _skip_prefix: bool = False,
         _router_middleware: list[Any] | None = None,
@@ -2011,6 +2038,9 @@ class BoltAPI:
                 meta["openapi_summary"] = summary
             if description is not None:
                 meta["openapi_description"] = description
+            # Only the schema generator reads this key.
+            if deprecated:
+                meta["openapi_deprecated"] = True
 
             # Pre-compute per-status-code mini-metas at registration time.
             # Only store the 3-4 keys actually read by the serialization hot path,

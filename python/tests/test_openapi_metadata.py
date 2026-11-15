@@ -2,6 +2,9 @@
 Tests for OpenAPI tags, summary, and description metadata.
 """
 
+import pytest
+from openapi_spec_validator import validate
+
 from django_bolt import BoltAPI, Router
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.decorators import ActionHandler, action
@@ -10,7 +13,7 @@ from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.openapi.spec import Tag
 from django_bolt.responses import Redirect
 from django_bolt.testing import TestClient
-from django_bolt.views import ViewSet
+from django_bolt.views import APIView, ViewSet
 from django_bolt.websocket import WebSocket
 
 
@@ -369,6 +372,114 @@ def test_partial_metadata_override():
     assert operation.summary == "Custom summary only"
     # Description should fall back to docstring
     assert operation.description == "Docstring description that should be used."
+
+
+def _document(api: BoltAPI) -> dict:
+    """The OpenAPI document as a client reads it from the docs route."""
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        response = client.get("/docs/openapi.json")
+    assert response.status_code == 200
+    document = response.json()
+    validate(document)
+    return document
+
+
+@pytest.mark.parametrize("method", ["get", "post", "put", "patch", "delete", "head", "options", "query"])
+def test_deprecated_route_is_deprecated_in_the_document(method):
+    """``deprecated=True`` on a route decorator sets ``deprecated: true`` on the operation."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @getattr(api, method)("/old", deprecated=True)
+    async def old_route() -> dict:
+        return {}
+
+    @getattr(api, method)("/current")
+    async def current_route() -> dict:
+        return {}
+
+    paths = _document(api)["paths"]
+    assert paths["/old"][method]["deprecated"] is True
+    # The default of the specification is false, so a current operation has no key.
+    assert "deprecated" not in paths["/current"][method]
+
+
+def test_deprecated_reaches_router_view_viewset_and_action_routes():
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+    router = Router(prefix="/router")
+
+    @router.get("/old", deprecated=True)
+    async def old_router_route() -> dict:
+        return {}
+
+    @router.get("/current")
+    async def current_router_route() -> dict:
+        return {}
+
+    api.include_router(router)
+
+    @api.view("/old-view", deprecated=True)
+    class OldView(APIView):
+        async def get(self, request) -> dict:
+            return {}
+
+        async def post(self, request) -> dict:
+            return {}
+
+    @api.viewset("/old-things", deprecated=True)
+    class OldViewSet(ViewSet):
+        async def list(self, request):
+            return []
+
+        async def retrieve(self, request, pk: int) -> dict:
+            return {}
+
+        @action(methods=["GET"], detail=False)
+        async def recent(self, request) -> dict:
+            return {}
+
+    @api.viewset("/things")
+    class ThingViewSet(ViewSet):
+        async def list(self, request):
+            return []
+
+        @action(methods=["GET", "POST"], detail=False, deprecated=True)
+        async def legacy(self, request) -> dict:
+            return {}
+
+        @action(methods=["GET"], detail=False)
+        async def recent(self, request) -> dict:
+            return {}
+
+    paths = _document(api)["paths"]
+    deprecated = {
+        f"{method} {path}"
+        for path, item in paths.items()
+        for method, operation in item.items()
+        if operation.get("deprecated")
+    }
+    assert deprecated == {
+        "get /router/old",
+        "get /old-view",
+        "post /old-view",
+        "get /old-things",
+        "get /old-things/{pk}",
+        "get /old-things/recent",
+        "get /things/legacy",
+        "post /things/legacy",
+    }
+    for path in ("/router/current", "/things", "/things/recent"):
+        assert "deprecated" not in paths[path]["get"]
+
+
+def test_websocket_operation_has_no_deprecated_key():
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.websocket("/ws")
+    async def socket(websocket: WebSocket):
+        await websocket.accept()
+
+    assert "deprecated" not in _document(api)["paths"]["/ws"]["get"]
 
 
 def _websocket_operation_tags(api: BoltAPI, path: str) -> list[str] | None:
