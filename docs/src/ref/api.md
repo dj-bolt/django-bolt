@@ -261,6 +261,8 @@ Mount another BoltAPI under a prefix.
 api.mount("/v1", v1_api)
 ```
 
+The `prefix` of `api` comes before the mount path. With `BoltAPI(prefix="/api")`, the routes of `v1_api` are at `/api/v1/...`.
+
 #### api.mount_asgi(path, app)
 
 Mount an HTTP ASGI application under a static prefix.

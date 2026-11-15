@@ -464,6 +464,28 @@ class TestEmptyRouteRegistration:
             )
             assert response.json() == {"message": "v1 root"}
 
+    def test_mount_on_api_with_prefix(self):
+        """The prefix of the parent API applies to a mounted route, as to each other route of the parent."""
+        main_api = BoltAPI(prefix="/api")
+        sub_api = BoltAPI()
+
+        @main_api.get("/health")
+        async def health():
+            return {"ok": True}
+
+        @sub_api.get("/users")
+        async def list_users():
+            return {"users": []}
+
+        main_api.mount("/v1", sub_api)
+
+        with TestClient(main_api) as client:
+            assert client.get("/api/health").status_code == 200
+            response = client.get("/api/v1/users")
+            assert response.status_code == 200
+            assert response.json() == {"users": []}
+            assert client.get("/v1/users").status_code == 404
+
 
 class TestTrailingSlashSetting:
     """Tests for trailing_slash parameter behavior."""
