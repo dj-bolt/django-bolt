@@ -73,6 +73,7 @@ def urlconf_factory():
         ("/missions/{id}", "missions/<id>"),
         ("/missions/{id:int}", "missions/<id>"),  # router ignores :int; reverse stays untyped
         ("/files/{path:path}", "files/<path:path>"),  # catch-all keeps Django's path converter
+        ("/Xray/{id}", "Xray/<id>"),  # only slashes are stripped, not other leading letters
         ("/health", "health"),
         ("/", ""),
     ],
@@ -302,7 +303,7 @@ def test_duplicate_explicit_names_on_different_paths_raise():
     def b():
         return {}
 
-    with pytest.raises(ImproperlyConfigured):
+    with pytest.raises(ImproperlyConfigured, match=r"Duplicate route name 'dup' maps to both"):
         build_urlpatterns(api)
 
 
@@ -322,3 +323,69 @@ def test_explicit_name_overrides_derived_collision(urlconf_factory):
 
     urlconf = urlconf_factory(api)
     assert django_reverse("thing", urlconf=urlconf) == "/explicit"
+
+
+def test_unnamed_websocket_and_repeated_routes_do_not_hide_later_names(urlconf_factory):
+    """Skipped and deduplicated routes must not stop the scan of later routes."""
+    api = BoltAPI()
+
+    @api.get("/empty", name="")
+    def empty():
+        return {}
+
+    @api.get("/same")
+    def same_get():
+        return {}
+
+    @api.post("/same", name="same_get")
+    def same_post():
+        return {}
+
+    @api.websocket("/ws", name="chat")
+    async def chat(ws):
+        pass
+
+    @api.get("/last", name="last")
+    def last():
+        return {}
+
+    urlconf = urlconf_factory(api)
+    assert django_reverse("same_get", urlconf=urlconf) == "/same"
+    assert django_reverse("chat", urlconf=urlconf) == "/ws"
+    assert django_reverse("last", urlconf=urlconf) == "/last"
+
+
+def test_first_derived_name_wins_over_later_derived_name(urlconf_factory):
+    api = BoltAPI()
+
+    @api.get("/first")
+    def thing():
+        return {}
+
+    def make_second():
+        @api.get("/second")
+        def thing():
+            return {}
+
+    make_second()
+
+    assert django_reverse("thing", urlconf=urlconf_factory(api)) == "/first"
+
+
+def test_second_explicit_name_after_override_raises_with_namespace_label():
+    api = BoltAPI(namespace="ns")
+
+    @api.get("/derived")
+    def thing():
+        return {}
+
+    @api.get("/one", name="thing")
+    def one():
+        return {}
+
+    @api.get("/two", name="thing")
+    def two():
+        return {}
+
+    with pytest.raises(ImproperlyConfigured, match=r"Duplicate route name 'ns:thing' maps to both '/?one' and '/?two'"):
+        build_urlpatterns(api)

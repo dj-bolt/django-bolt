@@ -97,6 +97,23 @@ data = user.dump(exclude_none=True)
 
 # Exclude default values
 data = user.dump(exclude_defaults=True)
+
+# Exclude fields that hold msgspec.UNSET
+data = user.dump(exclude_unset=True)
+```
+
+Use `exclude_unset` for a partial update. Give each optional field the default `msgspec.UNSET`. A field that the request body does not contain keeps that value, and `dump(exclude_unset=True)` leaves it out:
+
+```python
+import msgspec
+
+class UserPatch(Serializer):
+    username: str | msgspec.UnsetType = msgspec.UNSET
+    email: str | None | msgspec.UnsetType = msgspec.UNSET
+
+patch = UserPatch(email=None)
+patch.dump(exclude_unset=True)
+# {'email': None}
 ```
 
 ### Default values

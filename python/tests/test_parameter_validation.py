@@ -40,11 +40,16 @@ def test_get_with_body_param_raises_error():
     assert "Change HTTP method to POST/PUT/PATCH" in error_msg
 
 
-def test_head_with_body_param_raises_error():
-    """Test that HEAD endpoints cannot have body parameters."""
-    # Note: BoltAPI doesn't have @api.head() decorator yet, but we test the principle
-    # This would be the expected behavior if we add HEAD support
-    pass
+@pytest.mark.parametrize("method", ["head", "options"])
+def test_head_or_options_with_body_param_raises_error(method):
+    """Test that HEAD and OPTIONS endpoints cannot have body parameters."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match=f"{method.upper()} /users cannot have body parameters"):
+
+        @getattr(api, method)("/users")
+        async def create_user(user: UserCreate):
+            return {"id": 1}
 
 
 def test_delete_with_body_param_raises_error():
