@@ -134,6 +134,40 @@ def test_model_viewset_crud(api):
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("body", [b"{bad", b"", b"[1, 2]", b'"x"'])
+def test_write_actions_answer_422_for_a_body_that_is_not_a_json_object(api, body):
+    """POST, PUT and PATCH give the 422 of a function route for the same bad body."""
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+    @api.post("/function")
+    async def function_route(data: ArticleSchema):
+        return {"ok": True}
+
+    article = Article.objects.create(title="t", content="c", author="a")
+    request = {"content": body, "headers": {"content-type": "application/json"}}
+
+    with TestClient(api) as client:
+        expected = client.post("/function", **request)
+        assert expected.status_code == 422
+        assert expected.json()["detail"][0]["loc"][0] == "body"
+
+        responses = [
+            client.post("/articles", **request),
+            client.put(f"/articles/{article.id}", **request),
+            client.patch(f"/articles/{article.id}", **request),
+        ]
+        for response in responses:
+            assert response.status_code == 422
+            assert response.json() == expected.json()
+
+    assert list(Article.objects.values_list("id", "title")) == [(article.id, "t")]
+
+
+@pytest.mark.django_db(transaction=True)
 def test_model_viewset_lookup_field(api):
     """Test ModelViewSet with custom lookup_field."""
     # Create article
