@@ -244,6 +244,8 @@ def sync_handler():
 
 Sync handlers are automatically wrapped to run in a thread pool.
 
+A handler is a function, a bound method, or an object with `__call__`. For an object, Bolt registers its `__call__` method. A `functools.partial` is not a handler, and the route decorator raises `TypeError` for it. Register a function that calls the partial.
+
 ## WebSocket routes
 
 Define WebSocket endpoints using `@api.websocket()`:
