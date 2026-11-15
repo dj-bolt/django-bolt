@@ -221,7 +221,7 @@ class WebSocket:
 
         Args:
             code: WebSocket close code (default: 1000 Normal Closure). Use
-                1000 to 4999, but not 1005, 1006 or 1015.
+                1000 to 1003, 1007 to 1014 or 3000 to 4999.
             reason: Human-readable close reason, at most 123 bytes of UTF-8
 
         Raises:
