@@ -526,6 +526,9 @@ impl RouteMetadataStore {
 #[derive(Debug, Clone)]
 pub struct RouteMetadata {
     pub auth_backends: Vec<AuthBackend>,
+    /// The `WWW-Authenticate` value of a 401 of this route. Python builds it
+    /// one time from the auth backends. None for a route with no backend.
+    pub www_authenticate: Option<HeaderValue>,
     /// Cookie names whose presence subjects unsafe requests to the CSRF
     /// origin check. Precomputed from `auth_backends` at registration so
     /// the hot path never re-scans the backend list.
@@ -664,6 +667,25 @@ fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<u16>
         .map_err(|_| wrong_type(py_meta, key, "an int from 0 to 65535", &value))
 }
 
+/// Read the `WWW-Authenticate` value that Python built for a route or a mount.
+///
+/// A missing key or None gives None. A value that is not a header value
+/// stops startup.
+pub fn parse_challenge(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<HeaderValue>> {
+    let Some(value) = dict.get_item(key)?.filter(|value| !value.is_none()) else {
+        return Ok(None);
+    };
+    let text: String = value
+        .extract()
+        .map_err(|_| PyTypeError::new_err(format!("Metadata '{key}' must be a str or None")))?;
+    let challenge = HeaderValue::from_str(&text).map_err(|_| {
+        PyValueError::new_err(format!(
+            "Invalid '{key}' metadata: {text:?} is not an HTTP header value"
+        ))
+    })?;
+    Ok(Some(challenge))
+}
+
 impl RouteMetadata {
     /// Parse Python metadata dict into strongly-typed Rust metadata
     pub fn from_python(py_meta: &Bound<'_, PyDict>, py: Python) -> PyResult<Self> {
@@ -723,6 +745,8 @@ impl RouteMetadata {
                 auth_backends.push(parse_auth_backend(&backend_dict, py)?);
             }
         }
+
+        let www_authenticate = parse_challenge(py_meta, "www_authenticate")?;
 
         // Parse guards
         if let Some(guard_list) = py_meta.get_item("guards")?
@@ -873,6 +897,7 @@ impl RouteMetadata {
 
         Ok(RouteMetadata {
             auth_backends,
+            www_authenticate,
             guards,
             skip,
             cors_config,
@@ -2382,6 +2407,29 @@ mod tests {
         assert!(matches!(meta.auth_backends[1], AuthBackend::APIKey { .. }));
         assert!(matches!(meta.auth_backends[2], AuthBackend::Session { .. }));
         assert_eq!(readings(meta.plan), only(7));
+    }
+
+    #[test]
+    fn the_challenge_of_a_route_is_a_prebuilt_header_value() {
+        let meta = route(&format!(
+            "'auth_backends': [{JWT}], 'www_authenticate': 'Bearer, ApiKey'"
+        ));
+        assert_eq!(
+            meta.www_authenticate,
+            Some(HeaderValue::from_static("Bearer, ApiKey"))
+        );
+        // A route with no backend has no challenge.
+        assert_eq!(route("'www_authenticate': None").www_authenticate, None);
+        assert_eq!(route("'auth_backends': []").www_authenticate, None);
+        // A value that is not a header value stops startup.
+        assert_eq!(
+            error_of(parse_route("'www_authenticate': 'Bearer\\nX-Other: 1'")),
+            "ValueError: Invalid 'www_authenticate' metadata: \"Bearer\\nX-Other: 1\" is not an HTTP header value"
+        );
+        assert_eq!(
+            error_of(parse_route("'www_authenticate': 7")),
+            "TypeError: Metadata 'www_authenticate' must be a str or None"
+        );
     }
 
     #[test]

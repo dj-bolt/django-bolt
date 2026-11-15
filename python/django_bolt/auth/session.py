@@ -34,9 +34,6 @@ _AUTH_MIDDLEWARE = "django.contrib.auth.middleware.AuthenticationMiddleware"
 _SESSION_CLAIMS = frozenset({"sub", "is_staff", "is_superuser", "permissions"})
 _NO_PERMISSIONS: frozenset[str] = frozenset()
 
-# The challenge of a 401, as Rust sends it for a request with no credential.
-_CHALLENGE = {"WWW-Authenticate": "Bearer"}
-
 # The result is None for an allowed request. It is a response for a redirect
 # to the login page. It is an HTTPException for a 401 or a 403. The check
 # returns the exception, so the response still passes through Django's middleware.
@@ -188,7 +185,8 @@ def build_session_guard_check(
             return MiddlewareResponse(302, {"location": redirect["Location"]}, b"", "empty")
         # The API formats this error as each other 401 and 403. See _build_route_executor.
         if status_code == 401:
-            return HTTPException(401, "Authentication required", headers=_CHALLENGE)
+            # Rust adds the WWW-Authenticate challenge of the route.
+            return HTTPException(401, "Authentication required")
         return HTTPException(403, _json.decode(body)["detail"])
 
     return check_session_guards

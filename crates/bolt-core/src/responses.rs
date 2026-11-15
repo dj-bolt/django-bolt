@@ -5,6 +5,8 @@
 use crate::error::{ErrorInfo, with_error_info};
 use crate::permissions::GuardDenial;
 use actix_web::HttpResponse;
+use actix_web::http::StatusCode;
+use actix_web::http::header::{HeaderValue, WWW_AUTHENTICATE};
 use bytes::Bytes;
 use std::borrow::Cow;
 
@@ -39,18 +41,47 @@ pub fn get_rate_limit_body(retry_after: u64) -> Bytes {
 /// Create error responses using static bodies
 /// These functions build HttpResponse objects from pre-allocated static byte slices
 /// The benefit: no heap allocation for the response body
+/// The challenge of a 401 for a route with no auth backend.
+static DEFAULT_CHALLENGE: HeaderValue = HeaderValue::from_static("Bearer");
+
 #[inline]
 pub fn error_401() -> HttpResponse {
-    // RFC 6750 §3: a 401 to a request for a Bearer-protected resource
-    // carries a WWW-Authenticate challenge. No error attribute is included
-    // (the failure reason is deliberately not disclosed to clients).
+    error_401_challenge(None)
+}
+
+/// A 401 with the `WWW-Authenticate` value of the route.
+///
+/// RFC 9110 section 15.5.2: a 401 carries a challenge that applies to the
+/// resource. Python builds the value one time from the auth backends of the
+/// route. No error attribute is included (the failure reason is deliberately
+/// not disclosed to clients).
+#[inline]
+pub fn error_401_challenge(challenge: Option<&HeaderValue>) -> HttpResponse {
     let response = HttpResponse::Unauthorized()
         .content_type("application/json")
-        .insert_header(("WWW-Authenticate", "Bearer"))
+        .insert_header((
+            WWW_AUTHENTICATE,
+            challenge.unwrap_or(&DEFAULT_CHALLENGE).clone(),
+        ))
         .body(ERROR_BODY_401);
     with_error_info(response, || {
         ErrorInfo::core("not_authenticated", "Authentication required")
     })
+}
+
+/// Give a 401 from Python the `WWW-Authenticate` value of the route.
+///
+/// A challenge that the response has already stays as it is.
+#[inline]
+pub fn add_challenge(response: &mut HttpResponse, challenge: Option<&HeaderValue>) {
+    if response.status() == StatusCode::UNAUTHORIZED
+        && let Some(challenge) = challenge
+        && !response.headers().contains_key(WWW_AUTHENTICATE)
+    {
+        response
+            .headers_mut()
+            .insert(WWW_AUTHENTICATE, challenge.clone());
+    }
 }
 
 #[inline]
@@ -271,6 +302,50 @@ mod tests {
         ];
         for (response, kind, detail) in cases {
             assert_eq!(core_info(&response), (kind, detail.to_string(), None));
+        }
+    }
+
+    #[test]
+    fn a_401_names_the_challenge_of_the_route() {
+        let of = |response: &HttpResponse| response.headers().get(WWW_AUTHENTICATE).cloned();
+        let route = HeaderValue::from_static("Bearer, ApiKey");
+        assert_eq!(of(&error_401_challenge(Some(&route))), Some(route.clone()));
+        // A route with no auth backend keeps the Bearer challenge.
+        let bearer = Some(HeaderValue::from_static("Bearer"));
+        assert_eq!(of(&error_401_challenge(None)), bearer);
+        assert_eq!(of(&error_401()), bearer);
+    }
+
+    #[test]
+    fn add_challenge_changes_only_a_401_with_no_challenge() {
+        let of = |response: &HttpResponse| response.headers().get(WWW_AUTHENTICATE).cloned();
+        let route = HeaderValue::from_static("ApiKey");
+
+        let mut plain = HttpResponse::Unauthorized().finish();
+        add_challenge(&mut plain, Some(&route));
+        assert_eq!(of(&plain), Some(route.clone()));
+
+        // The challenge of the handler stays.
+        let own = HeaderValue::from_static("Bearer realm=\"api\"");
+        let mut with_own = HttpResponse::Unauthorized()
+            .insert_header((WWW_AUTHENTICATE, own.clone()))
+            .finish();
+        add_challenge(&mut with_own, Some(&route));
+        assert_eq!(of(&with_own), Some(own));
+
+        // A route with no auth backend has no challenge to add.
+        let mut no_backend = HttpResponse::Unauthorized().finish();
+        add_challenge(&mut no_backend, None);
+        assert_eq!(of(&no_backend), None);
+
+        for status in [
+            StatusCode::OK,
+            StatusCode::FORBIDDEN,
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+        ] {
+            let mut other = HttpResponse::new(status);
+            add_challenge(&mut other, Some(&route));
+            assert_eq!(of(&other), None, "{status}");
         }
     }
 

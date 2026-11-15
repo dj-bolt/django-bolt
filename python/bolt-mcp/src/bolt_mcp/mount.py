@@ -164,6 +164,7 @@ def mount_mcp(
     # explicit list wins, otherwise the API-wide default authentication
     # classes apply (harmless context enrichment when no guards are set).
     from django_bolt.auth import get_default_authentication_classes  # noqa: PLC0415 — Django must be configured first
+    from django_bolt.auth.backends import www_authenticate_challenge  # noqa: PLC0415 — Django must be configured first
     from django_bolt.auth.session import auth_without_session  # noqa: PLC0415 — Django must be configured first
 
     # Django middleware does not run on a mount, so a session backend cannot work there.
@@ -208,6 +209,7 @@ def mount_mcp(
         secret_key=secret_key,
         max_body_bytes=getattr(settings, "BOLT_MAX_UPLOAD_SIZE", 1024 * 1024),
         auth_metadata=auth_metadata,
+        auth_challenge=www_authenticate_challenge(backends),
         guards_metadata=guards_metadata,
         verify_token=verify_token,
         www_authenticate=www_authenticate,
