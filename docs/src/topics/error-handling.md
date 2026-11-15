@@ -367,6 +367,17 @@ www-authenticate: Bearer
 
 An error with field errors also has `"errors"`, a list of `{"loc", "msg", "type"}` objects. Some objects also have `"ctx"`. The keys of `error.extra` become extension members, for example `"retry_after"` for a 429. A key does not replace a standard member. Bolt does not use an `"errors"` key of `error.extra`, because `"errors"` holds only field errors. The `title` is the RFC 9110 name of the status, on each Python version.
 
+`"detail"` is a string, as RFC 9457 specifies. A `dict` or a `list` detail of an `HTTPException` goes to extension members, by the rules of `error.extra`:
+
+```python
+raise HTTPException(status_code=400, detail={"code": "out_of_stock", "items": [3, 7]})
+# body: {"type": "about:blank", "title": "Bad Request", "status": 400,
+#        "detail": "Bad Request", "instance": "/order",
+#        "code": "out_of_stock", "items": [3, 7]}
+```
+
+The keys of a `dict` detail become extension members. A `list` detail becomes the `"extra"` member. `"detail"` is then the title. A key of `error.extra` wins over the same key of the detail.
+
 ### Your own formatter
 
 A formatter gets a `BoltError` and the request. It returns a `Response`, `JSON`, `PlainText` or `HTML`:
