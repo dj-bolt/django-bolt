@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_
 import msgspec
 from django.conf import settings as django_settings
 
+from .._serializer_input import input_has_read_only_fields
 from ..datastructures import UploadFile
 from ..responses import (
     HTML,
@@ -99,6 +100,22 @@ def _type_display_name(annotation: Any) -> str:
         args = ", ".join(_type_display_name(a) for a in get_args(annotation))
         return f"{getattr(origin, '__name__', repr(origin))}[{args}]"
     return getattr(annotation, "__name__", None) or repr(annotation)
+
+
+class _InputComponent:
+    """The component key of the request body schema of a serializer.
+
+    A serializer with a ``read_only`` field has two schemas. The response
+    schema keeps the name of the class. The request body schema has the name
+    ``<class>Input``. The attributes are those that the component names read.
+    """
+
+    def __init__(self, struct_type: Any) -> None:
+        origin = _struct_origin(struct_type)
+        display = _type_display_name(struct_type)
+        self.__module__ = origin.__module__
+        self.__name__ = f"{display}Input"
+        self.__qualname__ = f"{display.replace(origin.__name__, origin.__qualname__, 1)}Input"
 
 
 class ComponentNameCollisionError(ValueError):
@@ -296,6 +313,10 @@ class SchemaGenerator:
         # registration order the name map iterates.
         self._component_ref: dict[type, Reference] = {}
         self._component_schema: dict[type, Schema] = {}
+        # True while the schema of a JSON request body is built. Input cannot
+        # set a read_only serializer field, so that schema leaves it out.
+        self._input_schema = False
+        self._input_components: dict[type, _InputComponent] = {}
         # strict mode bookkeeping (see OpenAPIStrictError)
         self._opaque_operations: list[str] = []
         self._qualified_components: list[str] = []
@@ -1017,7 +1038,11 @@ class SchemaGenerator:
             return None
 
         # JSON request body
-        schema = self._type_to_schema(body_type, register_component=True)
+        self._input_schema = True
+        try:
+            schema = self._type_to_schema(body_type, register_component=True)
+        finally:
+            self._input_schema = False
 
         return RequestBody(
             description=f"Request body for {body_param}",
@@ -1467,11 +1492,16 @@ class SchemaGenerator:
         properties = {}
         required = []
 
+        read_only = self._read_only_fields(struct_type)
+
         for field in struct_info.fields:
+            is_read_only = field.name in read_only
+            if is_read_only and self._input_schema:
+                continue
             field_name, field_schema, field_required = self._msgspec_field_schema(
                 field, register_component=register_component
             )
-            properties[field_name] = field_schema
+            properties[field_name] = self._mark_read_only(field_schema) if is_read_only else field_schema
 
             # Check if required
             if field_required:
@@ -1493,6 +1523,31 @@ class SchemaGenerator:
             properties=properties,
             required=required or None,
         )
+
+    @staticmethod
+    def _read_only_fields(struct_type: Any) -> frozenset[str]:
+        """The ``read_only`` field names of a Serializer. Empty for each other struct."""
+        cls = _struct_origin(struct_type)
+        if not getattr(cls, "__is_bolt_serializer__", False):
+            return frozenset()
+        cls._ensure_dump_ready()
+        return cls.__read_only_fields__
+
+    @staticmethod
+    def _mark_read_only(schema: Schema | Reference) -> Schema:
+        """Add ``readOnly: true`` to an inline schema or to a component reference."""
+        if isinstance(schema, Schema):
+            return replace(schema, read_only=True)
+        return Schema(all_of=[schema], read_only=True)
+
+    def _component_key(self, struct_type: Any) -> Any:
+        """The registry key of a struct: the type, or its input variant in a request body."""
+        if not (self._input_schema and input_has_read_only_fields(struct_type)):
+            return struct_type
+        key = self._input_components.get(struct_type)
+        if key is None:
+            key = self._input_components[struct_type] = _InputComponent(struct_type)
+        return key
 
     def _register_component(self, cls: type, build_schema: Callable[[], Schema]) -> Reference:
         """Register ``cls`` as a component (by type identity) and return its shared Reference.
@@ -1521,7 +1576,7 @@ class SchemaGenerator:
     def _struct_to_component_schema(self, struct_type: type) -> Reference:
         """Convert msgspec.Struct to a component schema and return its reference."""
         return self._register_component(
-            struct_type,
+            self._component_key(struct_type),
             lambda: self._struct_to_schema(struct_type, register_component=True),
         )
 

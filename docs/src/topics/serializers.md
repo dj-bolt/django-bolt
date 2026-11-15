@@ -571,6 +571,35 @@ result = user.dump()
 # {'email': 'test@example.com'}  # password excluded
 ```
 
+## Read-only fields
+
+A read-only field holds a value that the server sets, such as `id` or `created_at`. Mark it with `field(read_only=True)` or with `Config.read_only`. Give it a default.
+
+```python
+from django_bolt.serializers import Serializer, field
+
+class UserSerializer(Serializer):
+    id: int = field(read_only=True, default=0)
+    name: str
+
+# Input cannot set the field. The field gets its default.
+user = UserSerializer.model_validate({"id": 99, "name": "alice"})
+# UserSerializer(id=0, name='alice')
+
+# Python code sets the field.
+user = UserSerializer(id=5, name="alice")
+user.dump()
+# {'id': 5, 'name': 'alice'}
+```
+
+Input is a JSON request body, `model_validate()` and `model_validate_json()`. The rule also applies to a nested serializer in that input. `from_model()` and direct construction set the field.
+
+- Bolt ignores the input value. With `forbid_unknown_fields=True` on the serializer, the input value is an error, as an unknown field is.
+- A read-only field must have a default. Without one, route registration and `model_validate()` raise `ImproperlyConfigured`. A serializer that is only a response needs no default.
+- In the OpenAPI document, the request body schema has no read-only field. The schema has the name `UserSerializerInput`. The response schema marks the field `readOnly: true`.
+
+With `forbid_unknown_fields=True`, a `Config.read_only` field that has a plain default accepts an input value equal to that default. Use `field(read_only=True, default=...)` to reject each input value.
+
 ## Nested serializers
 
 ### Basic nesting

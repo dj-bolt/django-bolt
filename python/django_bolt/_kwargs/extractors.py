@@ -14,6 +14,7 @@ from typing import Annotated, Any, get_args, get_origin
 import msgspec
 from django.db.models import QuerySet
 
+from .._serializer_input import ignore_read_only_input
 from ..concurrency import run_in_orm_executor
 from ..datastructures import UploadFile
 from ..exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
@@ -822,7 +823,8 @@ def _build_body_extractor(annotation: Any) -> Callable:
                     body=body_bytes,
                 ) from e
 
-    return extract
+    # A body with no read_only serializer field keeps `extract` as it is.
+    return ignore_read_only_input(annotation, extract)
 
 
 def create_extractor_for_field(field: FieldDefinition) -> Callable | None:

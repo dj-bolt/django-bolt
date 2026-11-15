@@ -2,13 +2,42 @@
 
 from __future__ import annotations
 
-import pytest
+from typing import Annotated
 
+import msgspec
+import pytest
+from django.core.exceptions import ImproperlyConfigured
+
+from django_bolt import BoltAPI
+from django_bolt.param_functions import Body
 from django_bolt.serializers import (
     Serializer,
     SerializerView,
     computed_field,
+    field,
 )
+from django_bolt.testing import TestClient
+
+
+class ReadOnlyAddress(Serializer):
+    id: int = field(read_only=True, default=0)
+    city: str = ""
+
+
+class ReadOnlyUser(Serializer):
+    id: int = field(read_only=True, default=0)
+    name: str
+    created: str | None = None
+    tags: list[str] = field(read_only=True, default_factory=list)
+    address: ReadOnlyAddress = field(default_factory=ReadOnlyAddress)
+
+    class Config:
+        read_only = {"created"}
+
+
+class NoDefaultBody(Serializer):
+    id: int = field(read_only=True)
+    name: str
 
 
 class TestFieldFunction:
@@ -33,6 +62,81 @@ class TestFieldFunction:
         assert "id" in result
         assert "name" in result
         assert "internal_id" not in result
+
+    def test_read_only_field_ignores_the_input_value(self):
+        """Input cannot set a read_only field. The field gets its default."""
+        data = {"id": 99, "name": "n", "address": {"id": 5, "city": "c"}, "created": "x"}
+
+        loaded = ReadOnlyUser.model_validate(data)
+        assert (loaded.id, loaded.created, loaded.tags, loaded.name) == (0, None, [], "n")
+        assert loaded.address.id == 0
+        assert loaded.address.city == "c"
+
+        loaded = ReadOnlyUser.model_validate_json(msgspec.json.encode({**data, "tags": ["t"]}))
+        assert (loaded.id, loaded.created, loaded.tags, loaded.address.id) == (0, None, [], 0)
+        # Each instance gets its own default list.
+        assert loaded.tags is not ReadOnlyUser.model_validate(data).tags
+
+    def test_read_only_field_is_set_by_python_code(self):
+        """The server fills a read_only field: direct construction and validate() keep it."""
+        user = ReadOnlyUser(id=5, name="n", created="now", tags=["t"], address=ReadOnlyAddress(id=7, city="c"))
+        assert (user.id, user.created, user.tags, user.address.id) == (5, "now", ["t"], 7)
+        assert user.validate().id == 5
+        assert user.dump()["id"] == 5
+        # No state is left behind by an earlier input validation.
+        ReadOnlyUser.model_validate({"id": 99, "name": "n"})
+        assert ReadOnlyUser(id=6, name="n").id == 6
+
+    def test_read_only_field_is_an_unknown_field_when_unknown_fields_are_forbidden(self):
+        class Strict(Serializer, forbid_unknown_fields=True):
+            id: int = field(read_only=True, default=0)
+            name: str
+
+        with pytest.raises(msgspec.ValidationError, match="Object contains unknown field `id`"):
+            Strict.model_validate({"id": 99, "name": "n"})
+        with pytest.raises(msgspec.ValidationError, match="Object contains unknown field `id`"):
+            Strict.model_validate_json(b'{"id": 99, "name": "n"}')
+        assert Strict.model_validate({"name": "n"}).id == 0
+        assert Strict(id=4, name="n").id == 4
+
+    def test_read_only_field_with_no_default_cannot_validate_input(self):
+        """Input has no value for the field, and there is no default to use."""
+
+        class NoDefault(Serializer):
+            id: int = field(read_only=True)
+            name: str
+
+        with pytest.raises(ImproperlyConfigured, match=r"NoDefault\.id is read_only and has no default"):
+            NoDefault.model_validate({"id": 1, "name": "n"})
+        # Python code still builds and dumps it.
+        assert NoDefault(id=1, name="n").dump() == {"id": 1, "name": "n"}
+
+    def test_read_only_field_of_a_request_body_is_ignored(self):
+        """A JSON request body cannot set a read_only field, also in a nested serializer."""
+        api = BoltAPI()
+
+        @api.post("/users")
+        async def create_user(body: ReadOnlyUser) -> dict:
+            return {"id": body.id, "created": body.created, "address_id": body.address.id, "name": body.name}
+
+        @api.post("/users/bulk")
+        async def create_users(body: Annotated[list[ReadOnlyUser], Body()]) -> list[int]:
+            return [user.id for user in body]
+
+        payload = {"id": 99, "name": "n", "created": "x", "address": {"id": 5, "city": "c"}}
+        with TestClient(api) as client:
+            response = client.post("/users", json=payload)
+            assert response.status_code == 200
+            assert response.json() == {"id": 0, "created": None, "address_id": 0, "name": "n"}
+            assert client.post("/users/bulk", json=[payload, payload]).json() == [0, 0]
+
+    def test_request_body_with_a_read_only_field_and_no_default_stops_registration(self):
+        api = BoltAPI()
+        with pytest.raises(ImproperlyConfigured, match=r"NoDefaultBody\.id is read_only and has no default"):
+
+            @api.post("/users")
+            async def create_user(body: NoDefaultBody) -> dict:
+                return {}
 
     def test_field_write_only_meta(self):
         """Test write_only fields via Meta class."""

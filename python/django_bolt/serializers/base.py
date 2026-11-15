@@ -29,7 +29,7 @@ from typing import (
 from weakref import WeakKeyDictionary
 
 import msgspec
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
 from django.db.models import Choices
 from django.db.models import Model as DjangoModel
 from django.db.models.manager import BaseManager
@@ -38,6 +38,7 @@ from msgspec import ValidationError as MsgspecValidationError
 from msgspec import structs as msgspec_structs
 
 from django_bolt import _json
+from django_bolt._serializer_input import INPUT_MODE, input_has_read_only_fields
 from django_bolt.error_handlers import msgspec_validation_error_to_dict
 from django_bolt.exceptions import (
     RequestValidationError,
@@ -69,6 +70,14 @@ _MISSING = object()
 _USE_DEFAULT = object()
 _STRUCT_META = type(msgspec.Struct)
 _MODEL_VALUE_NOOP_TYPES = (str, int, float, bool, bytes, type(None))
+
+
+class _FactoryDefault(msgspec.Struct):
+    value: list = []
+
+
+# msgspec keeps a mutable default as an object of this type, with a ``factory`` attribute.
+_MSGSPEC_FACTORY = type(_FactoryDefault.__struct_defaults__[0])
 
 
 @dataclass(frozen=True)
@@ -182,6 +191,24 @@ def _build_rename_map(cls: type[msgspec.Struct]) -> dict[str, str]:
         # Forward reference not resolvable yet
         pass
     return rename_map
+
+
+def _read_only_input_default(default: Any) -> tuple[Any, Any, bool]:
+    """
+    How input mode fills a ``read_only`` field: ``(default, factory, is_marker)``.
+
+    ``factory`` makes the value when it is not None. Without it, ``default`` is
+    the value, and ``msgspec.NODEFAULT`` tells that the field has no default.
+    ``is_marker`` tells that the struct default is a ``field()`` marker.
+    """
+    if isinstance(default, _FieldMarker):
+        config = default.config
+        if config.default_factory is not None:
+            return msgspec.NODEFAULT, config.default_factory, True
+        return (config.default if config.has_default() else msgspec.NODEFAULT), None, True
+    if type(default) is _MSGSPEC_FACTORY:
+        return msgspec.NODEFAULT, default.factory, False
+    return default, None, False
 
 
 def _resolve_dump_default(default_value: Any) -> Any:
@@ -370,7 +397,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
     Example:
         class UserCreate(Serializer):
-            id: int = field(read_only=True)  # Optional field can come first
+            id: int = field(read_only=True, default=0)  # Optional field can come first
             username: str                     # Required field can come after - OK!
             email: str
             password: str
@@ -411,6 +438,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __field_configs__: ClassVar[dict[str, FieldConfig]] = {}
     __computed_fields__: ClassVar[dict[str, ComputedFieldConfig]] = {}
     __read_only_fields__: ClassVar[frozenset[str]] = frozenset()
+    # (field name, name in the input, default, default factory, is field() marker)
+    # of each read_only field. See _read_only_input_default().
+    __read_only_input_fields__: ClassVar[tuple[tuple[str, str, Any, Any, bool], ...]] = ()
+    # True if the struct forbids unknown fields: an input value for a read_only field is an error.
+    __read_only_input_forbidden__: ClassVar[bool] = False
+    # Tells if input of this type can set a read_only field, here or in a
+    # nested serializer. None = not computed yet.
+    __read_only_input__: ClassVar[bool | None] = None
     __write_only_fields__: ClassVar[frozenset[str]] = frozenset()
     __source_mapping__: ClassVar[dict[str, str]] = {}  # API field name -> source attribute
     __field_sets__: ClassVar[dict[str, list[str]]] = {}  # Named field sets for use() method
@@ -425,7 +460,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __has_field_validators__: ClassVar[bool] = False  # Has custom field validators
     __has_model_validators__: ClassVar[bool] = False  # Has model validators
     __has_computed_fields__: ClassVar[bool] = False  # Has computed fields
-    __has_field_markers__: ClassVar[bool] = False  # Has fields defined with field()
+    __has_field_markers__: ClassVar[bool] = False  # Has fields defined with field(), or read_only fields
     __field_configs_collected__: ClassVar[bool] = False  # Lazy config collection done
 
     # Pre-computed default values mapping for dump() (populated lazily on first use)
@@ -481,6 +516,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # A subclass must rebuild its own specs even when the parent already
         # collected (otherwise it inherits ``True`` and dumps ``{}``).
         cls.__field_configs_collected__ = False
+        cls.__read_only_input__ = None
         cls._dump_field_specs = ()
         cls._dump_field_spec_cache = {}
         cls._computed_dump_spec_cache = {}
@@ -553,6 +589,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls.__field_marker_defaults__ = {}
         cls.__field_marker_fields__ = ()
         cls.__read_only_fields__ = frozenset(read_only)
+        cls.__read_only_input_fields__ = ()
         cls.__write_only_fields__ = frozenset(write_only)
         cls.__source_mapping__ = {}
         cls.__has_field_markers__ = False
@@ -658,6 +695,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # OPTIMIZATION: Only check for _FieldMarker defaults if the class uses field()
         # This avoids iterating through all fields for simple serializers
         if cls.__has_field_markers__:
+            # Input cannot set a read_only field. A class with no field() marker
+            # and no read_only field does not come here.
+            if cls.__read_only_input_fields__ and INPUT_MODE.get():
+                self._reset_read_only_fields()
             self._fix_field_marker_defaults_impl()
 
         # Fast path: skip validation if there are no validators
@@ -677,6 +718,49 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Raise all errors at once if any occurred
         if errors:
             raise RequestValidationError(errors=errors)
+
+    def _reset_read_only_fields(self) -> None:
+        """
+        Give each ``read_only`` field its default, in place of the input value.
+
+        A struct that forbids unknown fields rejects the input value, as it
+        rejects an unknown field. msgspec adds the path of a nested struct to
+        the message of the ``ValueError``.
+        """
+        cls = self.__class__
+        forbid_unknown = cls.__read_only_input_forbidden__
+        _setattr = msgspec_structs.force_setattr
+
+        for field_name, input_name, default, factory, is_marker in cls.__read_only_input_fields__:
+            if factory is not None:
+                default = factory()
+            elif default is msgspec.NODEFAULT:
+                raise ImproperlyConfigured(cls._read_only_no_default_message(field_name))
+            if forbid_unknown:
+                value = getattr(self, field_name)
+                # An absent ``field()`` field holds its marker. A plain default
+                # has no such sign, so an input value equal to it passes.
+                if not isinstance(value, _FieldMarker) if is_marker else value != default:
+                    raise ValueError(f"Object contains unknown field `{input_name}`")
+            _setattr(self, field_name, default)
+
+    @classmethod
+    def _read_only_no_default_message(cls, field_name: str) -> str:
+        return (
+            f"{cls.__name__}.{field_name} is read_only and has no default. Input cannot set a "
+            f"read_only field. Give the field a default (for example `field(read_only=True, default=None)`), "
+            f"or use a serializer without the field for input."
+        )
+
+    @classmethod
+    def _check_read_only_input(cls) -> bool:
+        """Tell if this class has a ``read_only`` field. Each such field must have a default."""
+        if not cls.__field_configs_collected__:
+            cls._lazy_collect_field_configs()
+        for field_name, _input_name, default, factory, _is_marker in cls.__read_only_input_fields__:
+            if factory is None and default is msgspec.NODEFAULT:
+                raise ImproperlyConfigured(cls._read_only_no_default_message(field_name))
+        return bool(cls.__read_only_input_fields__)
 
     def _fix_field_marker_defaults_impl(self) -> None:
         """
@@ -737,6 +821,17 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Merge with existing configs from Meta class
         cls.__field_configs__.update(field_configs)
         cls.__read_only_fields__ = cls.__read_only_fields__ | frozenset(read_only)
+        struct_defaults = dict(_iter_field_defaults(cls))
+        cls.__read_only_input_fields__ = tuple(
+            (
+                field_name,
+                cls.__rename_map__.get(field_name, field_name),
+                *_read_only_input_default(struct_defaults.get(field_name, msgspec.NODEFAULT)),
+            )
+            for field_name in cls.__struct_fields__
+            if field_name in cls.__read_only_fields__
+        )
+        cls.__read_only_input_forbidden__ = cls.__struct_config__.forbid_unknown_fields
         cls.__write_only_fields__ = cls.__write_only_fields__ | frozenset(write_only)
         cls.__source_mapping__.update(source_mapping)
         cls.__field_marker_fields__ = tuple(field_marker_fields)
@@ -753,7 +848,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         )
 
         # Update the has_field_markers flag based on actual _FieldMarker defaults found
-        cls.__has_field_markers__ = bool(field_configs)
+        # Config.read_only needs the same step of __post_init__ as a marker.
+        cls.__has_field_markers__ = bool(field_configs) or bool(cls.__read_only_input_fields__)
 
         # Build rename map if deferred from _SerializerMeta.__new__ (forward reference)
         if not cls.__has_rename__ and not cls.__rename_map__:
@@ -934,6 +1030,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         return msgspec.convert(data, type=self.__class__)
 
     @classmethod
+    def _input_ignores_read_only(cls) -> bool:
+        """Tell if input of this class can set a ``read_only`` field. Computed one time."""
+        flag = cls.__read_only_input__
+        if flag is None:
+            flag = cls.__read_only_input__ = input_has_read_only_fields(cls)
+        return flag
+
+    @classmethod
     def _collect_msgspec_errors(cls: type[T], data: dict[str, Any]) -> list[dict[str, Any]]:
         """
         Collect all msgspec validation errors by validating each field individually.
@@ -1026,6 +1130,13 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # author.name == 'John' (stripped)
             # author.email == 'john@example.com' (lowercased)
         """
+        if cls.__read_only_input__ is not False and not INPUT_MODE.get() and cls._input_ignores_read_only():
+            token = INPUT_MODE.set(True)
+            try:
+                return cls.model_validate(data)
+            finally:
+                INPUT_MODE.reset(token)
+
         try:
             return msgspec.convert(data, type=cls)
         except MsgspecValidationError as e:
@@ -1060,6 +1171,13 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             # author.name == 'John' (stripped)
             # author.email == 'john@example.com' (lowercased)
         """
+        if cls.__read_only_input__ is not False and not INPUT_MODE.get() and cls._input_ignores_read_only():
+            token = INPUT_MODE.set(True)
+            try:
+                return cls.model_validate_json(json_data)
+            finally:
+                INPUT_MODE.reset(token)
+
         try:
             return msgspec.json.decode(json_data, type=cls)
         except MsgspecValidationError as e:
@@ -1821,7 +1939,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         """Field names that should only be accepted on input, not returned"""
 
         read_only: set[str] = set()
-        """Field names that should only be returned, not accepted on input"""
+        """Field names that input cannot set. Each field gets its default and must have one."""
 
         validators: dict[str, list[Any]] = {}
         """Additional validators to apply to fields"""
