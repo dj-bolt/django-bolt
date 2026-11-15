@@ -64,6 +64,7 @@ from .error_handlers import (
     render_core_error,
 )
 from .exceptions import HTTPException
+from .logging.config import access_log_filter_meta
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
 from .middleware import CompressionConfig, DjangoMiddleware, DjangoMiddlewareStack
 from .middleware.compiler import (
@@ -672,6 +673,11 @@ class BoltAPI:
             else:
                 # Use default logging configuration
                 self._logging_middleware = create_logging_middleware()
+        # Sampling and the slow-request threshold of the Rust access log. Each
+        # route of this API carries them in its metadata.
+        self._access_log_filter_meta = (
+            access_log_filter_meta(self._logging_middleware.config) if self._logging_middleware else {}
+        )
 
         # Compression configuration.
         # - `compression=False` → explicitly disabled (no buffered or streaming
@@ -2149,6 +2155,8 @@ class BoltAPI:
                 # Rust binds every argument from its own request maps, so the
                 # Python source dicts have no reader. Rust then does not build them.
                 middleware_meta["prebind_only"] = True
+
+            middleware_meta.update(self._access_log_filter_meta)
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
