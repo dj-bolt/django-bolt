@@ -29,8 +29,9 @@ from .serialization import _render_response_body
 
 logger = logging.getLogger(__name__)
 
-# Pre-computed constant headers (avoid per-error allocation)
-_DEFAULT_JSON_HEADERS: list[tuple[str, str]] = [("content-type", "application/json")]
+# Each response gets its own list, because the public handlers return it and a
+# caller can change it. The entry is a tuple, so the responses can share it.
+_JSON_CONTENT_TYPE: tuple[str, str] = ("content-type", "application/json")
 
 # Django import - may fail if Django not configured
 try:
@@ -53,11 +54,9 @@ def _json_response(
     status_code: int, headers: dict[str, str] | None, payload: Any
 ) -> tuple[int, list[tuple[str, str]], bytes]:
     """Encode ``payload`` as a JSON response tuple with optional extra headers."""
+    response_headers = [_JSON_CONTENT_TYPE]
     if headers:
-        response_headers = list(_DEFAULT_JSON_HEADERS)
         response_headers.extend(headers.items())
-    else:
-        response_headers = _DEFAULT_JSON_HEADERS
     return status_code, response_headers, _json.encode(payload)
 
 
