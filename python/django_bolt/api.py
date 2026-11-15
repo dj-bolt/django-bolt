@@ -105,7 +105,7 @@ from .serialization import (
 )
 from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata, HandlerPattern
-from .views import APIView, ViewSet, _copy_route_middleware, _layer
+from .views import APIView, ViewSet, _copy_route_middleware, _layer, _plan_request_argument
 from .websocket import mark_websocket_handler
 
 logger = logging.getLogger(__name__)
@@ -1742,6 +1742,13 @@ class BoltAPI:
                     # Example: /users/active
                     action_path = _join_viewset_path(base_path, attr.path)
 
+                # Decide one time where the request is. A method with no request
+                # parameter gets one in the handler signature, for `self.request`.
+                sig = inspect.signature(unbound_fn)
+                params, request_index, request_name, skip = _plan_request_argument(
+                    list(sig.parameters.values())[1:]  # Skip 'self'
+                )
+
                 # Register route for each HTTP method
                 for http_method in attr.methods:
                     # Create a wrapper that instantiates the view per request,
@@ -1755,13 +1762,18 @@ class BoltAPI:
                             __view_cls=view_cls,
                             __view_kwargs=view_kwargs,
                             _action=name,
+                            _request_index=request_index,
+                            _request_name=request_name,
+                            _skip=skip,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
                             _current_action.set(_action)
-                            _current_request.set(args[0])
+                            _current_request.set(
+                                args[_request_index] if _request_name is None else kwargs[_request_name]
+                            )
                             view_instance = __view_cls(**__view_kwargs)
-                            return await __unbound_fn(view_instance, *args, **kwargs)
+                            return await __unbound_fn(view_instance, *args[_skip:], **kwargs)
                     else:
 
                         def custom_action_handler(
@@ -1770,17 +1782,20 @@ class BoltAPI:
                             __view_cls=view_cls,
                             __view_kwargs=view_kwargs,
                             _action=name,
+                            _request_index=request_index,
+                            _request_name=request_name,
+                            _skip=skip,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
                             _current_action.set(_action)
-                            _current_request.set(args[0])
+                            _current_request.set(
+                                args[_request_index] if _request_name is None else kwargs[_request_name]
+                            )
                             view_instance = __view_cls(**__view_kwargs)
-                            return __unbound_fn(view_instance, *args, **kwargs)
+                            return __unbound_fn(view_instance, *args[_skip:], **kwargs)
 
                     # Preserve signature and annotations from original method
-                    sig = inspect.signature(unbound_fn)
-                    params = list(sig.parameters.values())[1:]  # Skip 'self'
                     custom_action_handler.__signature__ = sig.replace(parameters=params)
                     custom_action_handler.__annotations__ = {
                         k: v for k, v in inspect.get_annotations(unbound_fn).items() if k != "self"
