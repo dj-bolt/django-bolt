@@ -239,6 +239,14 @@ async def create_user(user: CreateUser):
     return {"username": user.username}
 ```
 
+A list of structs reads a JSON array:
+
+```python
+@api.post("/users/bulk")
+async def create_users(users: list[CreateUser]):
+    return {"count": len(users)}
+```
+
 A request with no body gives a 422. To make the body optional, give the parameter a default:
 
 ```python
