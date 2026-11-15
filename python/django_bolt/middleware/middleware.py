@@ -487,6 +487,26 @@ def _cors_str_list(name: str, value: Any) -> list[str]:
     return items
 
 
+def _cors_name_list(name: str, value: Any) -> list[str] | None:
+    """Return the methods or the headers of @cors as a list of str. None stays None.
+
+    A str raises TypeError. It is not one name here, and it is not a sequence of characters.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) or not isinstance(value, (list, tuple, set, frozenset)):
+        raise TypeError(f"@cors() {name} must be a list of str, not {type(value).__name__} {value!r}")
+    items = list(value)
+    for item in items:
+        if not isinstance(item, str):
+            raise TypeError(f"@cors() {name} must hold only str, not {type(item).__name__} {item!r}")
+    return items
+
+
+# Rust keeps max_age in a u32.
+_CORS_MAX_AGE_LIMIT = 2**32 - 1
+
+
 def cors(
     origins: list[str] | str = None,
     methods: list[str] = None,
@@ -511,10 +531,11 @@ def cors(
         origin_regexes: Patterns for allowed origins, as in CORS_ALLOWED_ORIGIN_REGEXES. Start
                  each pattern with ^ and end it with $. Patterns use the syntax of the Rust
                  regex crate, which has no look-around and no back-references.
-        methods: Allowed methods (default: GET, POST, PUT, PATCH, DELETE, OPTIONS)
-        headers: Allowed headers
-        credentials: Allow credentials (cannot be combined with wildcard "*")
-        max_age: Preflight cache duration in seconds (default: 3600)
+        methods: Allowed methods, as a list of str (default: GET, POST, PUT, PATCH, DELETE,
+                 OPTIONS, QUERY)
+        headers: Allowed headers, as a list of str (default: Content-Type, Authorization)
+        credentials: Allow credentials (cannot be combined with wildcard "*"). A bool.
+        max_age: Preflight cache duration in seconds (default: 3600). An int of 0 or more.
 
     Examples:
         @cors(origins=["https://example.com"])
@@ -531,11 +552,24 @@ def cors(
 
     Raises:
         ValueError: If origins and origin_regexes are both missing or empty (empty @cors() is not allowed),
-            if a pattern is empty, or if the route already has a @cors
-        TypeError: If origins or origin_regexes holds a value that is not a str
+            if a pattern is empty, if max_age is less than 0 or too large, or if the route
+            already has a @cors
+        TypeError: If origins or origin_regexes holds a value that is not a str, if methods or
+            headers is not a list of str, if credentials is not a bool, or if max_age is not an int
     """
 
     def decorator(func):
+        # Check the values here. The route must not get the default of an
+        # option when its author gave another value.
+        method_list = _cors_name_list("methods", methods)
+        header_list = _cors_name_list("headers", headers)
+        if not isinstance(credentials, bool):
+            raise TypeError(f"@cors() credentials must be a bool, not {type(credentials).__name__} {credentials!r}")
+        if isinstance(max_age, bool) or not isinstance(max_age, int):
+            raise TypeError(f"@cors() max_age must be an int, not {type(max_age).__name__} {max_age!r}")
+        if not 0 <= max_age <= _CORS_MAX_AGE_LIMIT:
+            raise ValueError(f"@cors() max_age must be from 0 to {_CORS_MAX_AGE_LIMIT}, got {max_age}")
+
         # A str is one origin or one pattern, not a sequence of characters.
         origin_list = _cors_str_list("origins", origins)
         regex_list = _cors_str_list("origin_regexes", origin_regexes)
@@ -575,8 +609,8 @@ def cors(
                 "type": "cors",
                 "origins": origin_list,
                 "origin_regexes": regex_list,
-                "methods": methods or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"],
-                "headers": headers,
+                "methods": method_list or ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"],
+                "headers": header_list,
                 "credentials": credentials,
                 "max_age": max_age,
             }
