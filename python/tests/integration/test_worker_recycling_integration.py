@@ -299,6 +299,38 @@ def test_max_rss_recycles_worker(make_server_project):
         assert new_pid != first_pid
 
 
+def test_workers_kill_timeout_is_the_sigkill_deadline_of_the_supervisor(make_server_project):
+    """The supervisor sends SIGKILL to a worker that still runs after --workers-kill-timeout.
+
+    The environment sets a 60 s graceful-shutdown window for the server, and a
+    request runs for 60 s. Thus the worker does not exit by itself in time.
+    Only the SIGKILL of the supervisor can stop it after 2 s. The default
+    kill timeout is 30 s.
+    """
+    project = make_server_project(api_module=app_module("shutdown_slow"))
+
+    with (
+        project.start(
+            processes=2,
+            extra_args=["--workers-kill-timeout", "2"],
+            env={"DJANGO_BOLT_SHUTDOWN_TIMEOUT": "60"},
+        ) as server,
+        socket.create_connection((server.host, server.port), timeout=5) as in_flight,
+    ):
+        in_flight.sendall(f"GET /slow?seconds=60 HTTP/1.1\r\nHost: {server.host}\r\n\r\n".encode())
+        # Let the handler start before the signal.
+        time.sleep(1.0)
+
+        started = time.monotonic()
+        os.kill(server.process.pid, signal.SIGTERM)
+        server.process.wait(timeout=90)
+        elapsed = time.monotonic() - started
+        stdout, _ = server.stop()
+
+    assert 2 <= elapsed < 15, f"runbolt stopped {elapsed:.1f} s after SIGTERM with --workers-kill-timeout 2"
+    assert stdout.count("did not exit within kill timeout; sending SIGKILL") == 1, stdout
+
+
 def test_respawn_failed_workers_replaces_crashed_worker(make_server_project):
     project = make_server_project(api_module=app_module("recycling_pid"))
 
