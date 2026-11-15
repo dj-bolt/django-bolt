@@ -231,3 +231,20 @@ def test_file_header_replaces_the_filename_disposition(tmp_path, response_class)
     assert response.status_code == 200
     assert response.headers.get_list("content-disposition") == ["inline"]
     assert response.content == b"report"
+
+
+@pytest.mark.parametrize("response_class", [File, FileResponse])
+def test_file_media_type_replaces_the_guessed_type(tmp_path, response_class):
+    note = tmp_path / "note.txt"
+    note.write_bytes(b"note")
+    api = BoltAPI()
+
+    @api.get("/note")
+    def get_note():
+        return response_class(str(note), media_type="application/x-custom")
+
+    with TestClient(api) as client:
+        response = client.get("/note")
+
+    assert response.headers["content-type"] == "application/x-custom"
+    assert response.content == b"note"
