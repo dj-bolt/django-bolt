@@ -192,6 +192,7 @@ All route decorators accept these options:
 | `auth` | `list` | Authentication backends |
 | `guards` | `list` | Permission guards |
 | `include_in_schema` | `bool` or `None` | Include in OpenAPI docs. `None` inherits from the view class, then from the `BoltAPI` |
+| `deprecated` | `bool` | Mark the operation as deprecated in OpenAPI docs. The default is `False` |
 
 ### Class-based view decorators
 

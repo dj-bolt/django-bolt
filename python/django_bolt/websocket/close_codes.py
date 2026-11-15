@@ -23,6 +23,27 @@ class CloseCode:
     TLS_HANDSHAKE = 1015
 
 
+# RFC 6455 5.5: the payload of a control frame is at most 125 bytes. The close code takes 2.
+MAX_CLOSE_REASON_BYTES = 123
+
+# RFC 6455 7.4.1: an endpoint must not send these codes in a close frame.
+_CODES_NOT_FOR_A_FRAME = frozenset({CloseCode.NO_STATUS_RECEIVED, CloseCode.ABNORMAL_CLOSURE, CloseCode.TLS_HANDSHAKE})
+
+
+def check_close_frame(code: int, reason: str) -> None:
+    """Raise ``ValueError`` for a code or a reason that makes an invalid close frame.
+
+    The server does the same check on each ``websocket.close`` message.
+    """
+    if not isinstance(code, int) or not 1000 <= code <= 4999 or code in _CODES_NOT_FOR_A_FRAME:
+        raise ValueError(f"WebSocket close code {code} is not valid: use 1000 to 4999, but not 1005, 1006 or 1015")
+    size = len(reason.encode("utf-8"))
+    if size > MAX_CLOSE_REASON_BYTES:
+        raise ValueError(
+            f"WebSocket close reason is {size} bytes: the limit is {MAX_CLOSE_REASON_BYTES} bytes of UTF-8"
+        )
+
+
 # Alias for convenience
 WS_1000_NORMAL_CLOSURE = CloseCode.NORMAL
 WS_1001_GOING_AWAY = CloseCode.GOING_AWAY
