@@ -52,6 +52,8 @@ def test_admin_root_redirect():
     [
         ("tests.admin_tests.urls_regex_prefix", "/manage/login/"),
         ("tests.admin_tests.urls_include_before_admin", "/backoffice/login/"),
+        ("tests.admin_tests.urls_nested_include", "/portal/internal/staff/login/"),
+        ("tests.admin_tests.urls_custom_site", "/office/login/"),
     ],
 )
 def test_admin_mount_uses_the_prefix_of_the_admin_site(settings, urlconf, login_path):
@@ -62,6 +64,27 @@ def test_admin_mount_uses_the_prefix_of_the_admin_site(settings, urlconf, login_
 
     with TestClient(api, use_http_layer=True) as client:
         response = client.get(login_path)
+
+    assert response.status_code == 200
+    assert "csrfmiddlewaretoken" in response.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_at_the_root_path_leaves_the_bolt_routes(settings, capsys):
+    """With the admin site at "", Django answers each path that has no Bolt route."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_root_admin"
+    api = BoltAPI()
+
+    @api.get("/items/{item_id}")
+    async def item(item_id: int):
+        return {"item_id": item_id}
+
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    assert "Django answers each path that has no Bolt route" in capsys.readouterr().err
+    with TestClient(api, use_http_layer=True) as client:
+        assert client.get("/items/7").json() == {"item_id": 7}
+        response = client.get("/login/")
 
     assert response.status_code == 200
     assert "csrfmiddlewaretoken" in response.text

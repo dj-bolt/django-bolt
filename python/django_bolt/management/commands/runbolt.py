@@ -822,8 +822,9 @@ class Command(BaseCommand):
         if admin_enabled and detect_admin_url_prefix is not None:
             merged_api._register_admin_routes(options["host"], options["port"])
             if merged_api._admin_routes_registered:
-                admin_prefix = detect_admin_url_prefix() or "admin"
-                features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
+                admin_prefix = detect_admin_url_prefix()
+                admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
+                features.append(("Admin", f"{banner_base_url}{admin_path}"))
 
         _total_route_count = len(merged_api._routes) + len(merged_api._native_routes)
         _framework_route_count = _total_route_count - _user_route_count
@@ -930,8 +931,9 @@ class Command(BaseCommand):
             merged_api._register_admin_routes(options["host"], options["port"])
 
             if merged_api._admin_routes_registered:
-                admin_prefix = detect_admin_url_prefix() or "admin"
-                features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
+                admin_prefix = detect_admin_url_prefix()
+                admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
+                features.append(("Admin", f"{banner_base_url}{admin_path}"))
 
         # Compute route counts
         _total_route_count = len(merged_api._routes) + len(merged_api._native_routes)
