@@ -2175,10 +2175,15 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         if cls.__dump_fast_path__ and not exclude_none and not exclude_defaults and not exclude_unset and not by_alias:
             if cls.__orm_state_check_fields__:
                 self._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
-            # to_builtins handles rename and tag injection natively; asdict is
-            # cheaper when neither applies, so keep the split for the common case.
-            if cls.__has_rename__ or cls.__tag_value__ is not None:
-                return msgspec.to_builtins(self)
+            # asdict is cheapest when the keys are the field names. For a rename,
+            # pair the encoded names with the values. The values stay as they are,
+            # as on the slow path.
+            if cls.__tag_value__ is not None:
+                result = {cls.__tag_field__: cls.__tag_value__}
+                result.update(zip(cls.__struct_encode_fields__, msgspec_structs.astuple(self), strict=True))
+                return result
+            if cls.__has_rename__:
+                return dict(zip(cls.__struct_encode_fields__, msgspec_structs.astuple(self), strict=True))
             return msgspec_structs.asdict(self)
 
         # SLOW PATH: Need special handling.
@@ -2360,9 +2365,14 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if cls.__orm_state_check_fields__:
                 for instance in instances_list:
                     instance._ensure_dumpable_orm_state(cls.__orm_state_check_fields__)
-            if cls.__has_rename__ or cls.__tag_value__ is not None:
-                _to_builtins = msgspec.to_builtins
-                return [_to_builtins(instance) for instance in instances_list]
+            _astuple = msgspec_structs.astuple
+            if cls.__tag_value__ is not None:
+                keys = (cls.__tag_field__, *cls.__struct_encode_fields__)
+                tag = cls.__tag_value__
+                return [dict(zip(keys, (tag, *_astuple(instance)), strict=True)) for instance in instances_list]
+            if cls.__has_rename__:
+                keys = cls.__struct_encode_fields__
+                return [dict(zip(keys, _astuple(instance), strict=True)) for instance in instances_list]
             _asdict = msgspec_structs.asdict
             return [_asdict(instance) for instance in instances_list]
 
