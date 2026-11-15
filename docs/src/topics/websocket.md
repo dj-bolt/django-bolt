@@ -408,6 +408,13 @@ assert rejected.value.status_code == 403
 
 An error in the handler before `accept()` fails the `async with` with that error.
 
+When the `async with` block ends, the client disconnects. The handler gets the
+disconnect and runs to its end, as on the server. Thus a test can check what
+the handler does after the client leaves. An error of the handler after the
+disconnect fails the `async with`. A `WebSocketDisconnect` that the handler
+does not catch is not an error. The client cancels a handler that still runs
+after 1 second.
+
 ## Real-time patterns
 
 ### Broadcast to all clients

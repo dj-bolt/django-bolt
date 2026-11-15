@@ -29,7 +29,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from django_bolt import BoltAPI, _core
-from django_bolt.websocket import CloseCode, WebSocket
+from django_bolt.websocket import CloseCode, WebSocket, WebSocketDisconnect
 from django_bolt.websocket.handlers import build_websocket_request, get_websocket_param_name
 
 # Each WebSocketTestClient is one connection with its own test app. The
@@ -47,6 +47,9 @@ def _rate_limiters(api: BoltAPI) -> _core.TestRateLimiters:
 
 # Seconds the client waits for the handler to accept or refuse the handshake.
 HANDSHAKE_TIMEOUT = 5.0
+
+# Seconds the client waits at its exit for the handler to end, before it cancels the handler.
+HANDLER_EXIT_TIMEOUT = 1.0
 
 # Response headers that the handshake sets. `accept(headers=...)` cannot set them, as on the server.
 HANDSHAKE_HEADERS = frozenset(
@@ -394,7 +397,9 @@ class WebSocketTestClient:
                 # An error before accept fails the handshake, as the server answers 500.
                 self._decide(e)
                 return
-            self._handler_exception = e
+            # The server does not report a client that left as a handler error.
+            if not isinstance(e, (WebSocketDisconnect, ConnectionResetError)):
+                self._handler_exception = e
             # Send disconnect on error
             if not self._closed:
                 await self._server_to_client.put(
@@ -410,7 +415,12 @@ class WebSocketTestClient:
             self._decide(403)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Exit async context - close connection and cleanup."""
+        """Exit async context - close connection and cleanup.
+
+        The handler gets the disconnect and can end, as on the server. A
+        handler that still runs after ``HANDLER_EXIT_TIMEOUT`` seconds is
+        cancelled.
+        """
         if not self._closed:
             # Send disconnect to handler
             await self._client_to_server.put(
@@ -421,6 +431,10 @@ class WebSocketTestClient:
             )
             self._closed = True
 
+        # The server lets the handler run after the client leaves. Give the
+        # handler the time to read the disconnect and to end.
+        if self._handler_task is not None:
+            await asyncio.wait({self._handler_task}, timeout=HANDLER_EXIT_TIMEOUT)
         await self._cancel_handler_task()
 
         # Cleanup test app instance
