@@ -663,12 +663,18 @@ class TestTokenDecodeChecks:
         assert decoded.aud == "my-api"
 
     def test_empty_audience_and_issuer_ask_for_no_check(self):
-        """An empty string works as no value. A token without ``aud`` and ``iss`` stays valid."""
+        """An empty string works as no value. A token with or without ``aud`` and ``iss`` stays valid."""
         encoded = self._encode()
 
         decoded = Token.decode(encoded, secret=self.SECRET, audience="", issuer="")
 
         assert decoded.sub == "user123"
+
+        with_claims = self._encode(aud="other-service", iss="other-issuer")
+
+        decoded = Token.decode(with_claims, secret=self.SECRET, audience="", issuer="")
+
+        assert (decoded.aud, decoded.iss) == ("other-service", "other-issuer")
 
     def test_wrong_issuer_is_rejected(self):
         encoded = self._encode(iss="evil-service")

@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Sequence
 from contextlib import suppress
 from typing import Any, get_origin, get_type_hints
 
@@ -479,20 +479,29 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
     return int(status), meta, _BODY_BYTES, body
 
 
+@contextlib.asynccontextmanager
+async def run_lifespans(source_lifespans: list[tuple[BoltAPI, Callable]]) -> AsyncIterator[None]:
+    """Enter every lifespan context in *source_lifespans*.
+
+    Each ``(api, lifespan_ctx)`` pair is entered in order; teardown runs in
+    reverse order (LIFO) via :class:`contextlib.AsyncExitStack`.
+    """
+    async with contextlib.AsyncExitStack() as stack:
+        for api, lifespan_ctx in source_lifespans:
+            await stack.enter_async_context(lifespan_ctx(api))
+        yield
+
+
 async def serve_with_lifespan(
     source_lifespans: list[tuple[BoltAPI, Callable]],
     server_fn: Callable,
 ) -> None:
     """Run *server_fn* inside every lifespan context in *source_lifespans*.
 
-    Each ``(api, lifespan_ctx)`` pair is entered in order; teardown runs in
-    reverse order (LIFO) via :class:`contextlib.AsyncExitStack`.
     *server_fn* is executed in a thread so the async event-loop stays free
     for lifespan teardown when the server stops.
     """
-    async with contextlib.AsyncExitStack() as stack:
-        for api, lifespan_ctx in source_lifespans:
-            await stack.enter_async_context(lifespan_ctx(api))
+    async with run_lifespans(source_lifespans):
         await asyncio.to_thread(server_fn)
 
 
@@ -685,7 +694,9 @@ class BoltAPI:
         self._emit_signals = getattr(django_settings, "BOLT_EMIT_SIGNALS", False) if django_settings else False
         # Lifecycle: async context manager for startup/shutdown
         self._lifespan_context: Callable | None = lifespan
-        self._source_lifespans: list[tuple[BoltAPI, Callable]] | None = None
+        # The lifespans that a server of this API runs, in startup order: the
+        # lifespan of this API, then the lifespans of the APIs that it mounts.
+        self._source_lifespans: list[tuple[BoltAPI, Callable]] = [(self, lifespan)] if lifespan is not None else []
 
         # Signal support: wrap _dispatch when enabled
         # This is done at init time (not per-request) for zero overhead when disabled
@@ -3223,6 +3234,9 @@ class BoltAPI:
             async def execute_handler(req):
                 rejection = await check_session_guards(req)
                 if rejection is not None:
+                    if isinstance(rejection, HTTPException):
+                        # The error format of the API, as for an HTTPException of the handler.
+                        return MiddlewareResponse.from_tuple(self._handle_http_exception(rejection, req))
                     return rejection
                 return await self._execute_handler_as_middleware_response(handler, req, meta)
 
@@ -3334,7 +3348,9 @@ class BoltAPI:
             # pragma: no mutate end
         revoked = await handler(jti, claims) if takes_claims else await handler(jti)
         if revoked:
-            raise HTTPException(status_code=401, detail="Token has been revoked")
+            raise HTTPException(
+                status_code=401, detail="Token has been revoked", headers={"WWW-Authenticate": "Bearer"}
+            )
 
     async def _websocket_token_revoked(
         self,
@@ -3553,6 +3569,8 @@ class BoltAPI:
 
         The mounted app's routes are copied to this app with the path prefix prepended.
         Each sub-app maintains its own middleware, auth, and configuration.
+        The lifespan of the mounted app runs with this app. It starts after
+        the lifespan of this app, and it stops before it.
 
         Usage:
             # Create a sub-application with its own middleware
@@ -3594,8 +3612,10 @@ class BoltAPI:
                 "The mounted API sets a different error_formatter. Set the same error_formatter on both APIs, or on one."
             )
 
-        # Normalize path prefix: ensure leading slash, strip trailing slash
-        mount_path = "/" + path.strip("/") if path else ""
+        # Normalize path prefix: ensure leading slash, strip trailing slash.
+        # A path of only slashes is the root, as an empty path is.
+        stripped_path = path.strip("/")
+        mount_path = "/" + stripped_path if stripped_path else ""
 
         # Prepare MCP definitions before mutating the parent. A mounted child
         # is removed from global discovery below, so its MCP endpoints must be
@@ -3697,6 +3717,11 @@ class BoltAPI:
             self._asgi_mounts.append((new_asgi_prefix, asgi_app))
 
         self._mcp_mounts.extend(child_mcp_mounts)
+        # A server of this API also runs the lifespans of the mounted API. An
+        # API that is mounted two times still starts one time.
+        for source_lifespan in app._source_lifespans:
+            if source_lifespan not in self._source_lifespans:
+                self._source_lifespans.append(source_lifespan)
         # Last, so that a mount that raises does not change the formatter.
         if child_formatter is not None:
             self._error_formatter = child_formatter
@@ -3873,5 +3898,5 @@ class BoltAPI:
 
     @property
     def _has_lifespan(self) -> bool:
-        """Check if this API has a lifespan context manager."""
-        return self._lifespan_context is not None
+        """Check if this API, or an API that it mounts, has a lifespan context manager."""
+        return bool(self._source_lifespans)

@@ -411,3 +411,17 @@ def test_async_serializer_route_loads_a_relation_of_a_model_in_a_returned_struct
         resp = client.get("/holder")
         assert resp.status_code == 200, resp.text
         assert resp.json() == {"user": {"id": user.pk, "profile": profile.pk}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db(transaction=True)
+async def test_serializer_view_afrom_model_forwards_to_serializer():
+    author = await Author.objects.acreate(name="Alice", email="alice@example.com")
+
+    view = AuthorWithPlainPostsSerializer.only("id", "name")
+    serializer = await view.afrom_model(author)
+
+    assert isinstance(serializer, AuthorWithPlainPostsSerializer)
+    assert view.dump(serializer) == {"id": author.id, "name": "Alice"}
+    with pytest.raises(ValueError, match="Maximum recursion depth"):
+        await view.afrom_model(author, max_depth=-1)
