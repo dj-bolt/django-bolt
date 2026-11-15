@@ -11,8 +11,11 @@ Each value arrives with its declared type, and a bad value gives a 422:
 
 # No ``from __future__ import annotations``: the tests declare the handlers
 # with local types, and the handlers must resolve them.
+import datetime
+import enum
+import uuid
 from decimal import Decimal
-from typing import Annotated, NewType
+from typing import Annotated, Literal, NewType
 from urllib.parse import parse_qsl
 
 import msgspec
@@ -397,6 +400,138 @@ def test_a_parameterized_type_alias_converts_as_the_type_it_names(generic_alias_
 def test_a_bad_parameterized_type_alias_value_is_a_422(generic_alias_client, url):
     response = generic_alias_client.get(url)
     assert response.status_code == 422, response.text
+
+
+# --- Enum and Literal ---------------------------------------------------------------
+
+
+class _Color(enum.Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class _Level(enum.IntEnum):
+    LOW = 1
+    HIGH = 2
+
+
+def test_an_enum_or_literal_parameter_converts_its_value_and_rejects_another_value():
+    api = BoltAPI()
+
+    @api.get("/query")
+    async def query(color: _Color, level: _Level = _Level.LOW, mode: Literal["asc", "desc"] | None = None):
+        return {"color": color.name, "level": level.name, "mode": mode}
+
+    @api.get("/path/{color}")
+    async def path(color: _Color):
+        return {"color": color.name}
+
+    @api.get("/header")
+    async def header(x_color: Annotated[_Color, Header()], level: Annotated[_Level | None, Cookie()] = None):
+        return {"color": x_color.name, "level": level and level.name}
+
+    @api.post("/form")
+    async def form(color: Annotated[_Color, Form()]):
+        return {"color": color.name}
+
+    with TestClient(api) as client:
+        assert client.get("/query?color=red").json() == {"color": "RED", "level": "LOW", "mode": None}
+        assert client.get("/query?color=blue&level=2&mode=desc").json() == {
+            "color": "BLUE",
+            "level": "HIGH",
+            "mode": "desc",
+        }
+        assert client.get("/path/blue").json() == {"color": "BLUE"}
+        assert client.get("/header", headers={"x-color": "red"}).json() == {"color": "RED", "level": None}
+        assert client.get("/header", headers={"x-color": "red", "cookie": "level=2"}).json() == {
+            "color": "RED",
+            "level": "HIGH",
+        }
+        assert client.post("/form", data={"color": "blue"}).json() == {"color": "BLUE"}
+
+        bad = [
+            (client.get("/query?color=green"), ["query", "color"]),
+            (client.get("/query?color=red&level=3"), ["query", "level"]),
+            (client.get("/query?color=red&mode=up"), ["query", "mode"]),
+            (client.get("/path/green"), ["path", "color"]),
+            (client.get("/header", headers={"x-color": "green"}), ["header", "x-color"]),
+            (client.get("/header", headers={"x-color": "red", "cookie": "level=3"}), ["cookie", "level"]),
+            (client.post("/form", data={"color": "green"}), ["body", "color"]),
+        ]
+        for response, loc in bad:
+            assert response.status_code == 422, loc
+            assert response.json()["detail"][0]["loc"] == loc
+
+
+# --- Scalar types that are not text ---------------------------------------------------
+
+
+_SCALAR_VALUES = [
+    (datetime.timedelta, "PT5S", datetime.timedelta(seconds=5)),
+    (datetime.timedelta, "P1DT2H", datetime.timedelta(days=1, hours=2)),
+    (datetime.time, "10:20:30", datetime.time(10, 20, 30)),
+    (datetime.date, "2024-01-02", datetime.date(2024, 1, 2)),
+    (datetime.datetime, "2024-01-02T03:04:05", datetime.datetime(2024, 1, 2, 3, 4, 5)),
+    (Decimal, "1.50", Decimal("1.50")),
+    (uuid.UUID, "12345678-1234-5678-1234-567812345678", uuid.UUID("12345678-1234-5678-1234-567812345678")),
+]
+
+
+@pytest.mark.parametrize(("scalar_type", "text", "expected"), _SCALAR_VALUES, ids=str)
+def test_a_scalar_parameter_converts_its_text_for_each_source(scalar_type, text, expected):
+    """The handler gets a value of the declared type, not the text of the request."""
+    api = BoltAPI()
+    seen = {}
+
+    def route(name, annotation, default=None):
+        if default is None:
+
+            async def handler(value):
+                seen[name] = value
+                return {}
+
+        else:
+
+            async def handler(value=default):
+                seen[name] = value
+                return {}
+
+        handler.__annotations__ = {"value": annotation}
+        return handler
+
+    api.get("/query")(route("query", scalar_type))
+    api.get("/optional")(route("optional", scalar_type | None, default=expected))
+    api.get("/path/{value}")(route("path", scalar_type))
+    api.get("/header")(route("header", Annotated[scalar_type, Header(alias="x-value")]))
+    api.get("/cookie")(route("cookie", Annotated[scalar_type, Cookie()]))
+    api.post("/form")(route("form", Annotated[scalar_type, Form()]))
+
+    with TestClient(api) as client:
+        responses = [
+            client.get("/query", params={"value": text}),
+            client.get("/optional", params={"value": text}),
+            client.get(f"/path/{text}"),
+            client.get("/header", headers={"x-value": text}),
+            client.get("/cookie", headers={"cookie": f"value={text}"}),
+            client.post("/form", data={"value": text}),
+        ]
+        assert [response.status_code for response in responses] == [200] * 6
+        assert seen == dict.fromkeys(["query", "optional", "path", "header", "cookie", "form"], expected)
+        assert {name: type(value) for name, value in seen.items()} == dict.fromkeys(seen, scalar_type)
+
+        # A missing optional value takes the default with no conversion.
+        seen.clear()
+        assert client.get("/optional").status_code == 200
+        assert seen == {"optional": expected}
+
+        bad = [
+            client.get("/query", params={"value": "no"}),
+            client.get("/path/no"),
+            client.get("/header", headers={"x-value": "no"}),
+            client.get("/cookie", headers={"cookie": "value=no"}),
+            client.post("/form", data={"value": "no"}),
+        ]
+        assert [response.status_code for response in bad] == [422] * 5
 
 
 # --- msgspec.Meta constraints ----------------------------------------------------------
