@@ -1,9 +1,121 @@
 from __future__ import annotations
 
+import re
+from collections import deque
+from datetime import UTC, datetime, time, timedelta
+from decimal import Decimal
+from fractions import Fraction
+
 import msgspec
+import pytest
 from django.utils.safestring import mark_safe
 
-from django_bolt import _json
+from django_bolt import BoltAPI, _json
+from django_bolt.testing import TestClient
+
+
+class MyDecimal(Decimal):
+    pass
+
+
+class MyDateTime(datetime):
+    pass
+
+
+class MyTime(time):
+    pass
+
+
+class MyInt(int):
+    pass
+
+
+class MyFloat(float):
+    pass
+
+
+class MyBytes(bytes):
+    pass
+
+
+class MyTimedelta(timedelta):
+    pass
+
+
+class MyByteArray(bytearray):
+    pass
+
+
+# msgspec encodes the exact type itself. Only a subclass goes to DEFAULT_TYPE_ENCODERS.
+SUBCLASS_VALUES = {
+    "decimal": (Decimal("1.50"), MyDecimal("1.50")),
+    "decimal-integer": (Decimal("5"), MyDecimal("5")),
+    "decimal-nan": (Decimal("NaN"), MyDecimal("NaN")),
+    "decimal-infinity": (Decimal("-Infinity"), MyDecimal("-Infinity")),
+    "datetime-utc": (datetime(2020, 1, 2, 3, 4, 5, 6, tzinfo=UTC), MyDateTime(2020, 1, 2, 3, 4, 5, 6, tzinfo=UTC)),
+    "time-utc": (time(3, 4, 5, tzinfo=UTC), MyTime(3, 4, 5, tzinfo=UTC)),
+    "int": (7, MyInt(7)),
+    "int-big": (2**63, MyInt(2**63)),
+    "float": (1.5, MyFloat(1.5)),
+    "float-nan": (float("nan"), MyFloat("nan")),
+    "bytes": (b"ab", MyBytes(b"ab")),
+    "bytearray": (bytearray(b"ab"), MyByteArray(b"ab")),
+    "timedelta": (timedelta(days=1, seconds=5, microseconds=6), MyTimedelta(days=1, seconds=5, microseconds=6)),
+}
+EXPECTED_JSON = {
+    "decimal": '"1.50"',
+    "decimal-integer": '"5"',
+    "decimal-nan": '"NaN"',
+    "decimal-infinity": '"-Infinity"',
+    "datetime-utc": '"2020-01-02T03:04:05.000006Z"',
+    "time-utc": '"03:04:05Z"',
+    "int": "7",
+    "int-big": "9223372036854775808",
+    "float": "1.5",
+    "float-nan": "null",
+    "bytes": '"YWI="',
+    "bytearray": '"YWI="',
+    "timedelta": '"P1DT5.000006S"',
+}
+
+
+class MyDeque(deque):
+    pass
+
+
+def _numbers():
+    yield 1
+    yield 2
+
+
+# Standard types that msgspec does not encode. The value is a function, because a generator runs one time.
+STANDARD_VALUES = {
+    "deque": (lambda: deque([1, 2]), "[1,2]"),
+    "deque-maxlen": (lambda: deque([1, 2, 3], maxlen=2), "[2,3]"),
+    "deque-subclass": (lambda: MyDeque([1, 2]), "[1,2]"),
+    "deque-empty": (lambda: deque(), "[]"),
+    # The items of the list go through the encoder again.
+    "deque-nested": (lambda: deque([Decimal("1.50"), deque([b"ab"])]), '["1.50",["YWI="]]'),
+    "generator": (_numbers, "[1,2]"),
+    "fraction": (lambda: Fraction(-1, 3), '"-1/3"'),
+    "fraction-integer": (lambda: Fraction(4, 2), '"2"'),
+    "pattern": (lambda: re.compile("a+"), '"a+"'),
+}
+
+
+@pytest.mark.parametrize("name", list(STANDARD_VALUES))
+def test_a_standard_container_or_scalar_in_a_response_encodes(name: str) -> None:
+    api = BoltAPI()
+    make_value, expected = STANDARD_VALUES[name]
+
+    @api.get("/value")
+    async def value():
+        return {"v": make_value()}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/value")
+        assert response.status_code == 200
+        assert response.text == '{"v":' + expected + "}"
 
 
 def test_encode_django_safe_string() -> None:
@@ -13,3 +125,23 @@ def test_encode_django_safe_string() -> None:
 
     assert msgspec.json.decode(encoded) == {"html": "<strong>Hello</strong>"}
     assert type(msgspec.json.decode(encoded)["html"]) is str
+
+
+@pytest.mark.parametrize("name", list(SUBCLASS_VALUES))
+def test_a_subclass_value_encodes_as_its_base_type(name: str) -> None:
+    api = BoltAPI()
+
+    @api.get("/base/{name}")
+    async def base(name: str):
+        return {"v": SUBCLASS_VALUES[name][0]}
+
+    @api.get("/subclass/{name}")
+    async def subclass(name: str):
+        return {"v": SUBCLASS_VALUES[name][1]}
+
+    with TestClient(api) as client:
+        expected = '{"v":' + EXPECTED_JSON[name] + "}"
+        assert client.get(f"/base/{name}").text == expected
+        response = client.get(f"/subclass/{name}")
+        assert response.status_code == 200
+        assert response.text == expected

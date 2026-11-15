@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::cors::{add_cors_headers_with_config, add_preflight_headers_with_config};
 use crate::metadata::CorsConfig;
+use crate::router::normalize_request_path;
 use crate::state::AppState;
 
 /// CORS middleware factory
@@ -115,7 +116,8 @@ fn add_cors_headers<B>(res: Outcome<B>) -> Outcome<B> {
     };
 
     // Find CORS config: route-level first, then global
-    let cors_config = find_cors_config(method, requested_method, req.path(), state_ref);
+    let route_path = normalize_request_path(req.path());
+    let cors_config = find_cors_config(method, requested_method, &route_path, state_ref);
 
     // Apply CORS headers
     match cors_config {
@@ -280,16 +282,19 @@ mod tests {
                     channel_capacity: 32,
                     max_sync_threads: 1000,
                 },
-                global_cors_config: Some(CorsConfig::from_django_settings(
-                    vec![GLOBAL.to_string()],
-                    Vec::new(),
-                    false,
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                )),
+                global_cors_config: Some(
+                    CorsConfig::from_django_settings(
+                        vec![GLOBAL.to_string()],
+                        Vec::new(),
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
                 global_compression_config: None,
                 trusted_proxies: Arc::new(TrustedProxies::default()),
                 rate_limiters: Arc::new(RateLimiters::default()),

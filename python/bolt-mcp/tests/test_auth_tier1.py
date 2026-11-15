@@ -8,7 +8,15 @@ from bolt_mcp import MCP, mount_mcp
 from django.core.exceptions import ImproperlyConfigured
 from django.test import override_settings
 
-from django_bolt import BoltAPI, IsAuthenticated, JWTAuthentication, Request, Requires, SessionAuthentication
+from django_bolt import (
+    APIKeyAuthentication,
+    BoltAPI,
+    IsAuthenticated,
+    JWTAuthentication,
+    Request,
+    Requires,
+    SessionAuthentication,
+)
 from django_bolt.testing import TestClient
 
 SECRET = "tier1-secret-key-0123456789-abcdefgh"
@@ -37,6 +45,28 @@ def test_missing_token_is_rejected():
     with TestClient(api) as client:
         resp, _ = initialize(client)  # no Authorization header
         assert resp.status_code == 401
+
+
+def test_a_401_of_a_mount_names_the_scheme_of_each_backend():
+    """The Tier-1 401 has the challenge of the backends of the mount."""
+    api, _ = _build()
+    key_api = BoltAPI()
+    backends = [JWTAuthentication(secret=SECRET), APIKeyAuthentication(api_keys={"key-one"})]
+    mount_mcp(key_api, MCP("key-server"), auth=backends, guards=[IsAuthenticated()])
+    for mount_api, challenge in [(api, "Bearer"), (key_api, "Bearer, ApiKey")]:
+        with TestClient(mount_api) as client:
+            resp, _ = initialize(client)
+            assert (resp.status_code, resp.headers.get("www-authenticate")) == (401, challenge)
+
+
+def test_a_guarded_mount_with_no_auth_backend_uses_jwt(settings):
+    """A mount with a guard that needs a user, with no ``auth`` and no setting, gets ``JWTAuthentication()``."""
+    api = BoltAPI()
+    mount_mcp(api, MCP("default-jwt-server"), guards=[IsAuthenticated()])
+    with TestClient(api) as client:
+        assert initialize(client)[0].status_code == 401
+        bearer = f"Bearer {mint_jwt(settings.SECRET_KEY, sub='7')}"
+        assert initialize(client, authorization=bearer)[0].status_code == 200
 
 
 def test_valid_token_exposes_principal_to_tool():

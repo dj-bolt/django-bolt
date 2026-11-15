@@ -1,4 +1,4 @@
-"""`request.build_absolute_uri()` for a Bolt request, built by Django.
+"""`request.build_absolute_uri()` and `request.scheme` for a Bolt request, built by Django.
 
 Django joins the location and gives the scheme. When Django builds the URL
 from the request host, it checks that host. Thus `ALLOWED_HOSTS`,
@@ -34,3 +34,13 @@ class _BoltHttpRequest(HttpRequest):
 def build_absolute_uri(meta: dict, path: str, full_path: str, scheme: str, location: str | None) -> str:
     """Return Django's `build_absolute_uri(location)` for a Bolt request."""
     return _BoltHttpRequest(meta, path, full_path, scheme).build_absolute_uri(location)
+
+
+def scheme(meta: dict, scheme: str) -> str:
+    """Return Django's `request.scheme` for a Bolt request."""
+    # Django's `scheme` property reads only META and `_get_scheme()`. Thus the
+    # request needs no `__init__`, which makes objects that nothing reads here.
+    request = _BoltHttpRequest.__new__(_BoltHttpRequest)
+    request.META = meta
+    request._bolt_scheme = scheme
+    return request.scheme
