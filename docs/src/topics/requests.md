@@ -238,7 +238,7 @@ This applies to path, query, header, cookie and form parameters.
 ### Types that Bolt cannot convert
 
 A path, query, header, cookie or form parameter gets text from the request.
-Bolt converts the text to `str`, `int`, `float`, `bool`, `Decimal`, `UUID`, `date`, `datetime`, `time`, an `Enum` and a `Literal`.
+Bolt converts the text to `str`, `int`, `float`, `bool`, `Decimal`, `UUID`, `date`, `datetime`, `time`, `timedelta`, an `Enum` and a `Literal`.
 It also builds one `list`, `set`, `frozenset` or `tuple` of these types.
 A parameter with no annotation, or of the type `Any`, gets the text.
 

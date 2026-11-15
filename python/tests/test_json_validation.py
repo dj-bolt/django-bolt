@@ -565,6 +565,37 @@ def test_each_parameter_type_that_converts_from_text_registers():
         }
 
 
+def test_a_timedelta_parameter_registers_and_converts_and_the_hint_names_it():
+    """A scalar timedelta converts for each text source, so the hint of the error lists it."""
+    api = BoltAPI()
+
+    @api.get("/wait/{pause}")
+    async def wait(
+        pause: datetime.timedelta,
+        timeout: datetime.timedelta,
+        x_ttl: Annotated[datetime.timedelta, Header()],
+        ttl: Annotated[datetime.timedelta, Cookie()],
+        grace: datetime.timedelta | None = None,
+    ):
+        values = {"pause": pause, "timeout": timeout, "x_ttl": x_ttl, "ttl": ttl, "grace": grace}
+        return {name: value.total_seconds() if value is not None else None for name, value in values.items()}
+
+    @api.post("/form")
+    async def form(delay: Annotated[datetime.timedelta, Form()]):
+        return {"delay": delay.total_seconds()}
+
+    with TestClient(api) as client:
+        response = client.get("/wait/PT1S?timeout=PT5S", headers={"x-ttl": "P1D", "cookie": "ttl=PT2M"})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"pause": 1.0, "timeout": 5.0, "x_ttl": 86400.0, "ttl": 120.0, "grace": None}
+        assert client.post("/form", data={"delay": "PT90S"}).json() == {"delay": 90.0}
+        assert client.get("/wait/PT1S?timeout=soon", headers={"x-ttl": "P1D", "cookie": "ttl=PT2M"}).status_code == 422
+
+    with pytest.raises(TypeError) as error:
+        _complex_query(BoltAPI())
+    assert "date, datetime, time, timedelta, an Enum" in str(error.value)
+
+
 def test_a_json_only_parameter_with_no_marker_is_the_json_body():
     """A list of dicts, a nested list and a TypedDict come only from JSON. `Any` stays a query parameter."""
     api = BoltAPI()

@@ -159,7 +159,7 @@ def _check_field_type(fn: Callable, field: FieldDefinition) -> None:
         if is_msgspec_struct(inner) or reads_text_value(annotation):
             return
         hint = (
-            "Bolt converts text to str, int, float, bool, Decimal, UUID, date, datetime, time, "
+            "Bolt converts text to str, int, float, bool, Decimal, UUID, date, datetime, time, timedelta, "
             "an Enum, a Literal, bytes, and to one list, set or tuple of them. "
             "A dict or a list of dicts comes from the JSON body of a POST, PUT or PATCH route."
         )
