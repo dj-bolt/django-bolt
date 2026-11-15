@@ -582,19 +582,20 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
 
 
 def _collect_header_struct_errors(
-    header_fields: tuple[tuple[str, str, Any, bool], ...], data: dict[str, Any]
+    header_fields: tuple[tuple[str, str, Any, bool], ...], data: dict[str, Any], strict: bool = True
 ) -> list[dict[str, Any]]:
     """Return one error for each missing or invalid field of a header struct.
 
     ``header_fields`` holds the header name, the encoded name, the type and the
     required flag of each field. ``data`` maps encoded names to header values.
+    ``strict`` is the conversion mode of the extractor.
     The ``loc`` of each error is ``("header", header name)``, as for a scalar header.
     """
     errors: list[dict[str, Any]] = []
     for header_name, encoded_name, field_type, required in header_fields:
         if encoded_name in data:
             try:
-                msgspec.convert(data[encoded_name], type=field_type)
+                msgspec.convert(data[encoded_name], type=field_type, strict=strict)
             except msgspec.ValidationError as e:
                 errors.append(
                     {
@@ -627,6 +628,11 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     ``create_header_extractor``), so msgspec gets typed values. A missing or
     invalid field gives a RequestValidationError with one error for each field.
 
+    A header gives one value. A sequence field (``list``, ``set``, ``frozenset``
+    or ``tuple``) gets a sequence of that one item, as a sequence header
+    parameter does. Rust does not convert the item, so a struct with a sequence
+    field converts with ``strict=False``, as the cookie struct does.
+
     Args:
         struct_type: The msgspec.Struct or Serializer class
         default: Default value if the entire struct is optional
@@ -638,26 +644,27 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
 
     # Pre-compute header name mapping at registration time
     # Maps kebab-case header name → encoded field name (for msgspec alias support)
-    header_to_encoded: list[tuple[str, str]] = []
+    header_to_encoded: list[tuple[str, str, bool]] = []
     header_fields: list[tuple[str, str, Any, bool]] = []
     for field in msgspec.structs.fields(struct_type):
         encoded_name = getattr(field, "encode_name", field.name)
         header_name = encoded_name.lower().replace("_", "-")
-        header_to_encoded.append((header_name, encoded_name))
+        header_to_encoded.append((header_name, encoded_name, _is_sequence_field(field.type)))
         header_fields.append((header_name, encoded_name, field.type, field.required))
     error_fields = tuple(header_fields)
+    strict = not any(wrap for _, _, wrap in header_to_encoded)
 
     def extract(headers_map: dict[str, str]) -> Any:
         converted = {}
-        for header_name, encoded_name in header_to_encoded:
+        for header_name, encoded_name, wrap in header_to_encoded:
             value = headers_map.get(header_name)
             if value is not None:
-                converted[encoded_name] = value
+                converted[encoded_name] = [value] if wrap else value
 
         try:
-            return msgspec.convert(converted, struct_type)
+            return msgspec.convert(converted, struct_type, strict=strict)
         except msgspec.ValidationError as e:
-            errors = _collect_header_struct_errors(error_fields, converted)
+            errors = _collect_header_struct_errors(error_fields, converted, strict)
             if errors:
                 raise RequestValidationError(errors=errors) from e
             raise
