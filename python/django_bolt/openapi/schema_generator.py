@@ -84,6 +84,13 @@ def _response_class_media(response_class: type | None) -> tuple[str, Schema] | N
     return None
 
 
+def _is_response_class(annotation: Any) -> bool:
+    """True for a response class that the generator documents with its own media type or as a redirect."""
+    return isinstance(annotation, type) and (
+        issubclass(annotation, Redirect) or _response_class_media(annotation) is not None
+    )
+
+
 def _struct_origin(annotation: Any) -> type | None:
     """The msgspec.Struct class behind ``annotation`` — itself, or the origin of ``Struct[T]``."""
     if is_msgspec_struct(annotation):
@@ -1128,6 +1135,10 @@ class SchemaGenerator:
             default_status = meta.get("default_status_code", 200)
 
             response_class = meta.get("response_class")
+            if _is_response_class(response_type):
+                # ``-> StreamingResponse`` names the response class. It is not the type of a JSON body.
+                response_class = response_class or response_type
+                response_type = None
             has_type = bool(response_type) and response_type != inspect._empty
             media = _response_class_media(response_class)
 
