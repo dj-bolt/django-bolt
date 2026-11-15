@@ -36,6 +36,7 @@ from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, Tuple
 from . import _json
 from .concurrency import run_in_orm_executor
 from .exceptions import UnloadedRelationError
+from .middleware.middleware import note_config_decorator
 
 __all__ = [
     "PaginationBase",
@@ -762,6 +763,7 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     """
 
     def decorator(handler: Callable) -> Callable:
+        note_config_decorator(handler, "paginate")
         # Store original handler for introspection
         original_handler = handler
         request_getter = _compile_request_getter(original_handler)

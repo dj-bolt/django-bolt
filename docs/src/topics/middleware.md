@@ -530,6 +530,19 @@ The `DjangoMiddlewareStack` automatically categorizes your middleware for optima
 
 If a `DjangoMiddlewareStack` mixes hook middleware (`process_request` / `process_view` / `process_response`) with `__call__`-only middleware, Django-Bolt uses a correctness-first compatibility path to preserve strict declared order and hook semantics. This path is slower than the pure hook fast path.
 
+## Position of the route decorators
+
+Put `@cors`, `@rate_limit`, `@middleware`, `@skip_middleware`, `@no_compress` and `@paginate` below the route decorator:
+
+```python
+@api.get("/limited")
+@rate_limit(rps=10)
+async def limited():
+    return {"ok": True}
+```
+
+The route decorator reads the configuration of the handler when it registers the route. A decorator above it has no effect, so Bolt raises `TypeError` at startup. A `Router` registers its routes in `include_router()`, so a decorator above `@router.get(...)` applies.
+
 ## Middleware order
 
 Python middleware execution order is explicit and strict:

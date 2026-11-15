@@ -74,7 +74,7 @@ from .middleware.compiler import (
     route_auth_backends,
 )
 from .middleware.django_loader import load_django_middleware
-from .middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
+from .middleware.middleware import FunctionMiddlewareSpec, mark_route_handler, normalize_middleware_specs
 from .middleware_response import MiddlewareResponse
 from .openapi import (
     OpenAPIConfig,
@@ -1063,6 +1063,8 @@ class BoltAPI:
             # Store the route
             self._websocket_routes.append((full_path, handler_id, fn))
             self._handlers[handler_id] = fn
+            # A config decorator that runs after this one is above it, and has no effect.
+            mark_route_handler(fn)
 
             # Compile parameter binder for WebSocket (reuses HTTP binding logic)
             # This enables injection of path params, query params, headers, cookies
@@ -1672,6 +1674,8 @@ class BoltAPI:
 
             self._routes.append((method, full_path, handler_id, fn))
             self._handlers[handler_id] = fn
+            # A config decorator that runs after this one is above it, and has no effect.
+            mark_route_handler(fn)
 
             # Pre-compile parameter binder (handles parameter binding only)
             meta = self._compile_binder(fn, method, full_path)

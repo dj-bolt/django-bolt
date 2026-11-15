@@ -31,6 +31,7 @@ from django_bolt.api import (
     serve_with_lifespan,
 )
 from django_bolt.concurrency import close_connections_and_pools
+from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.workers import MIB, WorkerSupervisor
 
 try:
@@ -944,6 +945,8 @@ class Command(BaseCommand):
             merged_api._asgi_mounts,
             merged_api._mcp_mounts,
         )
+        # A config decorator above a route decorator has no effect.
+        refuse_unread_route_config(merged_api._routes, merged_api._websocket_routes)
 
         # Register routes with Rust. Each route carries per-route bound
         # dispatch callables (partial binding handler + handler_id) so the

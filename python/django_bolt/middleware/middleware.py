@@ -21,7 +21,7 @@ import traceback
 import uuid
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from re import Pattern
 from typing import (
@@ -62,6 +62,55 @@ class FunctionMiddlewareSpec:
     """Marker for function-style middleware attached to route handlers."""
 
     func: Callable
+
+
+def mark_route_handler(handler: Callable) -> None:
+    """Record that a route decorator of an API read the configuration of a handler.
+
+    The mark is a list of the config decorators that ran after the last route
+    decorator. `functools.wraps` copies the reference, so a wrapper shares the
+    list of its function.
+    """
+    unread = getattr(handler, "__bolt_unread_config__", None)
+    if unread is not None:
+        unread.clear()
+        return
+    try:
+        handler.__bolt_unread_config__ = []
+    except AttributeError:
+        # A bound method takes no attribute, so it takes no config decorator either.
+        return
+
+
+def note_config_decorator(handler: Callable, decorator: str) -> None:
+    """Record a config decorator that ran after a route decorator registered the handler.
+
+    The next route decorator reads the configuration and clears the record. A
+    record that stays is a decorator above the route decorator, which has no
+    effect. `refuse_unread_route_config` raises for it at startup.
+    """
+    unread = getattr(handler, "__bolt_unread_config__", None)
+    if unread is not None:
+        unread.append(decorator)
+
+
+def refuse_unread_route_config(
+    routes: Iterable[tuple[str, str, int, Callable]], websocket_routes: Iterable[tuple[str, int, Callable]]
+) -> None:
+    """Raise TypeError for a config decorator that is above the route decorator of a route.
+
+    The arguments are the `_routes` and the `_websocket_routes` of the API that starts.
+    """
+    handlers = [(f"{method} {path}", handler) for method, path, _handler_id, handler in routes]
+    handlers.extend((f"WEBSOCKET {path}", handler) for path, _handler_id, handler in websocket_routes)
+    for route, handler in handlers:
+        unread = getattr(handler, "__bolt_unread_config__", None)
+        if unread:
+            raise TypeError(
+                f"@{unread[0]} is above the route decorator of {route}, so it has no effect. "
+                "Put it below the route decorator: the route decorator reads the configuration of the handler "
+                "when it registers the route."
+            )
 
 
 def _ensure_handler_middleware_list(handler: Callable) -> list[Any]:
@@ -358,6 +407,7 @@ def middleware(*args, **kwargs):
     """
 
     def attach_middleware(handler: Callable, middleware_spec: Any) -> Callable:
+        note_config_decorator(handler, "middleware")
         handler_middleware = _ensure_handler_middleware_list(handler)
         handler_middleware.append(middleware_spec)
         return handler
@@ -451,6 +501,7 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
     def decorator(func):
         if not hasattr(func, "__bolt_middleware__"):
             func.__bolt_middleware__ = []
+        note_config_decorator(func, "rate_limit")
         func.__bolt_middleware__.append({"type": "rate_limit", "rps": rps, "burst": burst, "key": key})
         return func
 
@@ -536,6 +587,7 @@ def cors(
     """
 
     def decorator(func):
+        note_config_decorator(func, "cors")
         # A str is one origin or one pattern, not a sequence of characters.
         origin_list = _cors_str_list("origins", origins)
         regex_list = _cors_str_list("origin_regexes", origin_regexes)
@@ -616,6 +668,7 @@ def skip_middleware(*middleware_names: str):
     """
 
     def decorator(func):
+        note_config_decorator(func, "skip_middleware")
         if not hasattr(func, "__bolt_skip_middleware__"):
             func.__bolt_skip_middleware__ = set()
         func.__bolt_skip_middleware__.update(middleware_names)
