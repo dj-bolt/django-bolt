@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
+import re
 import time
 from types import SimpleNamespace
 
@@ -42,6 +44,17 @@ def _each_test_reports_again(monkeypatch):
     the same process (as mutmut runs) reports the line again.
     """
     monkeypatch.setattr(concurrency, "_reported_slow_reads", set())
+
+
+@pytest.fixture(autouse=True)
+def _mutmut_trampolines_are_framework_frames(monkeypatch):
+    """mutmut calls each function of Bolt through a trampoline in its own package.
+
+    Bolt reports the first caller outside Bolt, Django, and asgiref. Without
+    this, that caller is the trampoline, and the tests fail for each mutant.
+    """
+    parts = (*concurrency._FRAMEWORK_PATH_PARTS, f"{os.sep}mutmut{os.sep}")
+    monkeypatch.setattr(concurrency, "_FRAMEWORK_PATH_PARTS", parts)
 
 
 class _SlowAuth(JWTAuthentication):
@@ -81,9 +94,21 @@ def _hints(caplog) -> list[logging.LogRecord]:
     return [r for r in caplog.records if r.levelno == logging.WARNING and "blocked the event loop" in r.getMessage()]
 
 
-@pytest.mark.parametrize("debug", [True, False], ids=["dev", "production"])
-def test_a_slow_blocking_read_is_reported_one_time_in_dev_mode(caplog, monkeypatch, debug):
-    monkeypatch.delenv("DJANGO_BOLT_DEV_WORKER", raising=False)
+@pytest.mark.parametrize(
+    ("debug", "dev_worker", "reported"),
+    [
+        pytest.param(True, None, True, id="debug"),
+        # ``runbolt --dev`` sets this variable in its worker.
+        pytest.param(False, "1", True, id="dev-worker"),
+        pytest.param(False, "0", False, id="no-dev-worker"),
+        pytest.param(False, None, False, id="production"),
+    ],
+)
+def test_a_slow_blocking_read_is_reported_one_time_in_dev_mode(caplog, monkeypatch, debug, dev_worker, reported):
+    if dev_worker is None:
+        monkeypatch.delenv("DJANGO_BOLT_DEV_WORKER", raising=False)
+    else:
+        monkeypatch.setenv("DJANGO_BOLT_DEV_WORKER", dev_worker)
     caplog.set_level(logging.WARNING, logger="django_bolt")
     with override_settings(DEBUG=debug), TestClient(_api(delay=0.08)) as client:
         for _ in range(3):
@@ -91,13 +116,17 @@ def test_a_slow_blocking_read_is_reported_one_time_in_dev_mode(caplog, monkeypat
             assert response.status_code == 200, response.text
 
     hints = _hints(caplog)
-    if not debug:
+    if not reported:
         assert hints == []
         return
     assert len(hints) == 1, [r.getMessage() for r in hints]
     message = hints[0].getMessage()
     assert f"test_slow_user_read_hint.py:{_READ_LINE}" in message
     assert "await request.auser()" in message
+    # The read took 80 ms or more.
+    blocked = re.search(r"blocked the event loop for (\d+) ms", message)
+    assert blocked is not None, message
+    assert int(blocked.group(1)) >= 80, message
 
 
 def test_a_fast_read_is_not_reported(caplog):
