@@ -65,6 +65,12 @@ class TestAuthenticationClasses:
         assert set(metadata["api_keys"]) == {"key1", "key2", "key3"}
         assert metadata["header"] == "x-api-key"
 
+    def test_api_key_authentication_rejects_an_empty_header(self):
+        with pytest.raises(ImproperlyConfigured) as error:
+            APIKeyAuthentication(api_keys={"key-1"}, header="")
+
+        assert str(error.value) == "APIKeyAuthentication header must not be empty."
+
     def test_api_key_with_permissions(self):
         """Test API key authentication with permission mapping"""
         auth = APIKeyAuthentication(

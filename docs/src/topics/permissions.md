@@ -34,6 +34,8 @@ async def profile(request):
 
 Returns 401 Unauthorized if authentication fails.
 
+A guard needs an auth backend to find the user. With no `auth` on the route and no `BOLT_AUTHENTICATION_CLASSES` setting, a route with `IsAuthenticated()` or `Requires(...)` uses `JWTAuthentication()`. See [A guard with no auth backend](authentication.md#a-guard-with-no-auth-backend).
+
 ## AllowAny
 
 Explicitly allows any request, bypassing global default guards:
