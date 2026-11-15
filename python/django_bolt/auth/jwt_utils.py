@@ -20,6 +20,10 @@ from django_bolt.types import Request
 if TYPE_CHECKING:
     from django.contrib.auth.base_user import AbstractBaseUser
 
+# The claims that give the identity, the lifetime and the privilege flags.
+# ``extra_claims`` cannot hold them.
+_RESERVED_CLAIMS = frozenset({"sub", "exp", "iat", "is_staff", "is_superuser"})
+
 
 def create_jwt_for_user(
     user,
@@ -36,7 +40,9 @@ def create_jwt_for_user(
         secret: JWT secret key. If None, uses Django's SECRET_KEY
         algorithm: JWT algorithm (default: "HS256")
         expires_in: Token expiration time in seconds (default: 3600 = 1 hour)
-        extra_claims: Additional claims to include in the token
+        extra_claims: Additional claims to include in the token, such as
+            ``jti`` or ``permissions``. A claim with the name ``sub``, ``exp``,
+            ``iat``, ``is_staff`` or ``is_superuser`` raises ``ValueError``.
 
     Returns:
         JWT token string
@@ -98,8 +104,15 @@ def create_jwt_for_user(
     if hasattr(user, "last_name") and user.last_name:
         payload["last_name"] = user.last_name
 
-    # Merge extra claims
+    # Merge extra claims. An extra with the name of a reserved claim would
+    # replace the identity, the lifetime or a privilege flag of the token.
     if extra_claims:
+        reserved = _RESERVED_CLAIMS.intersection(extra_claims)
+        if reserved:
+            raise ValueError(
+                f"extra_claims must not contain the standard claims {sorted(reserved)}. "
+                "create_jwt_for_user() sets them from the user and from expires_in."
+            )
         payload.update(extra_claims)
 
     return jwt.encode(payload, secret, algorithm=algorithm)
@@ -157,7 +170,7 @@ async def require_current_user(request: Request) -> Any:
     """Dependency that gives the authenticated user, or answers 401 when there is none."""
     user = await get_current_user(request)
     if user is None:
-        raise Unauthorized(detail="Authentication required")
+        raise Unauthorized(detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
     return user
 
 
@@ -165,7 +178,7 @@ def require_current_user_sync(request: Request) -> Any:
     """Sync form of :func:`require_current_user`."""
     user = get_current_user_sync(request)
     if user is None:
-        raise Unauthorized(detail="Authentication required")
+        raise Unauthorized(detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
     return user
 
 
