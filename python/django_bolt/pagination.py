@@ -93,18 +93,24 @@ class PaginatedResponse(msgspec.Struct, Generic[T], omit_defaults=True):  # noqa
     Uses omit_defaults=True so only relevant fields are included in response:
     - PageNumberPagination: page, page_size, total_pages, next_page, previous_page
     - LimitOffsetPagination: limit, offset
-    - CursorPagination: next_cursor, previous_cursor
+    - CursorPagination: page_size, next_cursor
 
     Attributes:
         items: List of paginated items
         total: Total number of items across all pages
         has_next: Whether there is a next page (always included)
-        has_previous: Whether there is a previous page (always included)
+        has_previous: Whether there is a previous page (always included).
+            For CursorPagination, it is True when the request has a valid cursor.
+            A cursor page gives no cursor to go back.
         page: Current page number (for PageNumber pagination)
         page_size: Number of items per page
         total_pages: Total number of pages
         next_page: Next page number (None if no next page)
         previous_page: Previous page number (None if no previous page)
+        limit: Number of items requested (for LimitOffset pagination)
+        offset: Position of the first item (for LimitOffset pagination)
+        next_cursor: Cursor of the next page (for Cursor pagination, None if no next page)
+        previous_cursor: Not set by the built-in schemes. A custom scheme can set it.
     """
 
     # Required fields (always included in response)
@@ -199,7 +205,7 @@ class PaginationBase(ABC):
         """Build the envelope for one page.
 
         ``info`` carries the scheme-specific fields (page/page_size/total_pages/
-        next_page/previous_page, limit/offset, next_cursor/previous_cursor).
+        next_page/previous_page, limit/offset, page_size/next_cursor).
         Override to return an instance of a custom ``response_class``.
         """
         return self.response_class(items=items, total=total, has_next=has_next, has_previous=has_previous, **info)

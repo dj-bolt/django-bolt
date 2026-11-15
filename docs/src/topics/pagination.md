@@ -81,6 +81,8 @@ async def list_articles(request) -> list[ArticleSerializer]:
     return Article.objects.all()
 ```
 
+Response includes `page_size`, `next_cursor`, `has_next`, `has_previous`. A cursor goes forward only: the response has no cursor for the page before. `has_previous` is true when the request has a valid cursor. To go back, keep the cursors that the client used.
+
 Query: `/articles?cursor=eyJ2IjoxMDB9`
 
 The cursor is the `next_cursor` of the page before. It uses the URL-safe base64 alphabet, so put it into the query string as it is. A cursor that Bolt cannot read gives the first page. This includes a cursor with a value of the wrong type for the `ordering` field or the primary key.
