@@ -65,6 +65,12 @@ class TestAuthenticationClasses:
         assert set(metadata["api_keys"]) == {"key1", "key2", "key3"}
         assert metadata["header"] == "x-api-key"
 
+    def test_api_key_authentication_rejects_an_empty_header(self):
+        with pytest.raises(ImproperlyConfigured) as error:
+            APIKeyAuthentication(api_keys={"key-1"}, header="")
+
+        assert str(error.value) == "APIKeyAuthentication header must not be empty."
+
     def test_api_key_with_permissions(self):
         """Test API key authentication with permission mapping"""
         auth = APIKeyAuthentication(
@@ -75,6 +81,49 @@ class TestAuthenticationClasses:
         metadata = auth.to_metadata()
         assert "admin-key" in metadata["key_permissions"]
         assert "users.create" in metadata["key_permissions"]["admin-key"]
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"api_keys": {""}}, "api_keys must not contain an empty key"),
+            ({"api_keys": {"key-1", ""}}, "api_keys must not contain an empty key"),
+            ({"api_keys": "sk-prod-123abc"}, "api_keys must be a set, list or tuple of str, not str"),
+            ({"api_keys": ""}, "api_keys must be a set, list or tuple of str, not str"),
+            ({"api_keys": b"sk-prod-123abc"}, "api_keys must be a set, list or tuple of str, not bytes"),
+            ({"api_keys": (key for key in ["key-1"])}, "api_keys must be a set, list or tuple of str, not generator"),
+            ({"api_keys": {b"key-1"}}, "each key in api_keys must be a str, not bytes"),
+            ({"api_keys": {"Bearer abc"}}, "api_keys has the key 'Bearer abc', which starts with the scheme 'Bearer '"),
+            (
+                {"api_keys": ["abc", "ApiKey xyz"]},
+                "api_keys has the key 'ApiKey xyz', which starts with the scheme 'ApiKey '",
+            ),
+            ({"api_keys": {"bearer abc"}}, "api_keys has the key 'bearer abc', which starts with the scheme 'Bearer '"),
+            ({"api_keys": {"APIKEY "}}, "api_keys has the key 'APIKEY ', which starts with the scheme 'ApiKey '"),
+            ({"api_keys": [None]}, "each key in api_keys must be a str, not NoneType"),
+            (
+                {"api_keys": {"key-1"}, "key_permissions": {"key-1": "read"}},
+                "key_permissions['key-1'] must be a set, list or tuple of str, not str",
+            ),
+            (
+                {"api_keys": {"key-1"}, "key_permissions": {"key-1": [1]}},
+                "each permission in key_permissions['key-1'] must be a str, not int",
+            ),
+            (
+                {"api_keys": {"key-1"}, "key_permissions": [("key-1", ["read"])]},
+                "key_permissions must be a dict, not list",
+            ),
+            (
+                {"api_keys": {"key-1"}, "key_permissions": {"key-2": ["read"]}},
+                "key_permissions has the key 'key-2', which is not in api_keys",
+            ),
+            ({"key_permissions": {"key-1": ["read"]}}, "key_permissions has the key 'key-1', which is not in api_keys"),
+        ],
+    )
+    def test_api_key_authentication_rejects_an_unsafe_configuration(self, kwargs, message):
+        with pytest.raises(ImproperlyConfigured) as error:
+            APIKeyAuthentication(**kwargs)
+
+        assert str(error.value) == f"APIKeyAuthentication {message}."
 
 
 class TestPermissionGuards:

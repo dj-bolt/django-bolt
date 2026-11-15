@@ -24,6 +24,8 @@ async def create_user():
     return {"created": True}
 ```
 
+Each method and path has one handler. A second handler for the same method and path stops startup with a `ValueError`.
+
 ## HTTP methods
 
 Django-Bolt supports all common HTTP methods:
@@ -321,6 +323,10 @@ api.mount("/api/v1", users_api)
 
 Routes from `users_api` are now available at `/api/v1/users`.
 
+An API cannot mount itself, and two APIs cannot mount each other. `mount()` raises `ValueError`.
+
+A mount path can have a parameter, such as `api.mount("/tenants/{tenant}", users_api)`. A handler of the mounted API reads the value from `request.params["tenant"]`. It cannot take `tenant` as an argument, because the mounted API compiled its routes without the mount path. `mount()` raises `ValueError` for such a handler. A `Router` with the prefix `/tenants/{tenant}` gives the value as an argument.
+
 ## ASGI mounts
 
 If you want to mount Django or other ASGI apps under path prefixes, see [ASGI Mounts](asgi-mounts.md).
@@ -346,6 +352,8 @@ You can control this behavior with the `trailing_slash` parameter:
 | `"strip"` | Remove trailing slashes (default) | `/users/` → `/users` |
 | `"append"` | Add trailing slashes | `/users` → `/users/` |
 | `"keep"` | No normalization | `/users/` → `/users/` |
+
+Another value raises `ValueError` when you make the `BoltAPI`.
 
 ### Runtime redirect behavior
 
@@ -417,6 +425,20 @@ async def list_items(): ...
 # GET /users/  → 308 Redirect to /users (if /users exists)
 # GET /items   → 308 Redirect to /items/ (if /items/ exists)
 ```
+
+### WebSocket routes
+
+An HTTP route answers the other form of its path with a redirect. A WebSocket client usually does not follow a redirect. Thus a WebSocket route accepts both forms of its path, in each `trailing_slash` mode:
+
+```python
+@api.websocket("/ws/room/")   # Registered as /ws/room
+async def room(websocket: WebSocket): ...
+
+# /ws/room   → connects
+# /ws/room/  → connects
+```
+
+Django-Bolt stores a WebSocket route path with no trailing slash. It removes the trailing slash of a WebSocket request path before it finds the route. `WebSocketTestClient` follows the same rule.
 
 ### Multiple APIs with different settings
 

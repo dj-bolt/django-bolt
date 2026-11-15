@@ -53,6 +53,27 @@ config = LoggingConfig(
 )
 ```
 
+Give the config to the API to apply `skip_paths` and `skip_status_codes` to the [access log](#access-log) of `runbolt`:
+
+```python
+from django_bolt import BoltAPI
+from django_bolt.logging import LoggingConfig
+
+api = BoltAPI(logging_config=LoggingConfig(skip_paths={"/health"}, skip_status_codes={204, 304}))
+```
+
+A request with a path in `skip_paths` writes no line. The match is exact, on the complete request path.
+Thus `/health` does not skip `/health/` or `/api/health`. For a mounted API, give the path with the mount prefix.
+A response with a status in `skip_status_codes` writes no line.
+The two options apply to each status class, also to a 4xx and a 5xx.
+An API with no `logging_config` has the default `skip_paths`: `/health`, `/ready` and `/metrics`.
+To log these paths, use `LoggingConfig(skip_paths=set())`.
+
+The access log of `runbolt` applies four options: `skip_paths`, `skip_status_codes`, `sample_rate` and `min_duration_ms`.
+Its line always contains the method, the path, the status and the duration.
+The field options, the obfuscation options and `log_request_body` do not change that line.
+They apply only to the records that your code writes with `log_request()` and `log_response()` of [LoggingMiddleware](#loggingmiddleware).
+
 ### Request logging fields
 
 Control which request fields are logged:
@@ -379,6 +400,17 @@ With an `error_formatter`, the line has the status of the formatted response.
 
 Bolt writes no line for a request with no route (404), for a mounted ASGI app or MCP server, for a static or media file, and for a [native route](native-routes.md).
 
+A flood of 429 responses does not fill the log.
+Each worker thread writes one line for the first 429 response of each second.
+The next 429 line of that worker has the number of 429 responses that wrote no line:
+
+```text
+GET /items/7 429 0.1ms | suppressed: 41
+```
+
+The limit applies to each 429 response of a route, from a rate limit and from a handler.
+The rate limiter also writes its own line to stderr, one for each second and bucket.
+
 The log level follows the status code, the same as Django's `runserver`:
 
 | Status | Level |
@@ -389,6 +421,7 @@ The log level follows the status code, the same as Django's `runserver`:
 
 Set `django.server` to `WARNING` to keep only the 4xx and 5xx lines. Set it above `WARNING` to turn the access log off. The check runs once at startup. When the log is off, the request path has no logging code.
 
+`skip_paths` and `skip_status_codes` remove the lines of some paths and status codes. See [Basic options](#basic-options).
 `sample_rate` and `min_duration_ms` remove lines of 1xx to 3xx responses. See [Production settings](#production-settings).
 This includes the 308 redirect and the automatic `OPTIONS` answer of a route path. They use the values of the API of that route.
 
@@ -396,14 +429,10 @@ This includes the 308 redirect and the automatic `OPTIONS` answer of a route pat
 
 ```python
 from django_bolt import BoltAPI
-from django_bolt.logging import LoggingConfig, create_logging_middleware
-
-api = BoltAPI()
+from django_bolt.logging import LoggingConfig
 
 # Production logging config
 config = LoggingConfig(
-    logger_name="myapp.api",
-
     # Performance: Don't log every request
     sample_rate=0.1,          # Log 10% of successful requests
     min_duration_ms=100,      # Only log requests > 100ms
@@ -411,26 +440,9 @@ config = LoggingConfig(
     # Skip noisy paths
     skip_paths={"/health", "/ready", "/metrics", "/favicon.ico"},
     skip_status_codes={204, 304},
-
-    # Request logging
-    request_log_fields={"method", "path", "client_ip", "user_agent"},
-
-    # Response logging
-    response_log_fields={"status_code", "duration"},
-
-    # Security
-    obfuscate_headers={"authorization", "cookie", "x-api-key"},
-    obfuscate_cookies={"sessionid", "csrftoken", "jwt"},
-
-    # Body logging (careful in production)
-    log_request_body=False,
 )
 
-middleware = create_logging_middleware(
-    logger_name=config.logger_name,
-    skip_paths=config.skip_paths,
-    sample_rate=config.sample_rate,
-)
+api = BoltAPI(logging_config=config)
 ```
 
 ## Checking log configuration

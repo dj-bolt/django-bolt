@@ -133,6 +133,33 @@ class TestLoggingConfig:
         with pytest.raises(ValueError, match=re.escape(message)):
             BoltAPI(logging_config=config)
 
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (LoggingConfig(skip_paths="/health"), "LoggingConfig.skip_paths must be a set of paths, got '/health'"),
+            (
+                LoggingConfig(skip_paths={b"/health"}),
+                "LoggingConfig.skip_paths must hold only str paths, got b'/health'",
+            ),
+            (
+                LoggingConfig(skip_status_codes=204),
+                "LoggingConfig.skip_status_codes must be a set of status codes, got 204",
+            ),
+            (
+                LoggingConfig(skip_status_codes={"204"}),
+                "LoggingConfig.skip_status_codes must hold only status codes from 100 to 599, got '204'",
+            ),
+            (
+                LoggingConfig(skip_status_codes={600}),
+                "LoggingConfig.skip_status_codes must hold only status codes from 100 to 599, got 600",
+            ),
+        ],
+    )
+    def test_a_skip_option_of_a_wrong_type_stops_the_api(self, config, message):
+        """Rust applies the two skip options, so a value that it cannot read is an error."""
+        with pytest.raises(ValueError, match=re.escape(message)):
+            BoltAPI(logging_config=config)
+
     def test_the_default_config_takes_the_two_log_settings(self, settings):
         """Without the settings, the default config sets no limit, also with DEBUG off."""
         settings.DEBUG = False
@@ -1001,6 +1028,24 @@ class TestQueueBasedLogging:
         root_logger = logging.getLogger()
         has_queue_handler = any(isinstance(h, QueueHandler) for h in root_logger.handlers)
         assert has_queue_handler, "Root logger should have a QueueHandler"
+
+    def test_setup_django_logging_prints_each_record_one_time(self, capsys):
+        """A record of the django logger or of one of its children goes to the console one time."""
+        config_module._LOGGING_CONFIGURED = False
+
+        setup_django_logging(force=True)
+        logging.getLogger("django.request").warning("one request record")
+        logging.getLogger("django.server").warning("one server record")
+        logging.getLogger("django_bolt").warning("one bolt record")
+        logging.getLogger("another_app").warning("one app record")
+        # stop() sends each queued record to the console handler.
+        config_module._QUEUE_LISTENER.stop()
+
+        console = capsys.readouterr().err
+        assert [
+            console.count(text)
+            for text in ("one request record", "one server record", "one bolt record", "one app record")
+        ] == [1, 1, 1, 1]
 
     def test_setup_django_logging_respects_explicit_logging_config(self):
         """setup_django_logging should skip setup when LOGGING is explicitly configured."""
