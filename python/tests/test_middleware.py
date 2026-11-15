@@ -97,6 +97,13 @@ class TestMiddlewareDecorators:
         assert middleware[0]["burst"] == 100
         assert middleware[0]["key"] == "ip"
 
+        # With no argument, the limit is 100 per second per address. The burst is two times the limit.
+        @rate_limit()
+        async def default_limit():
+            return {"status": "ok"}
+
+        assert default_limit.__bolt_middleware__ == [{"type": "rate_limit", "rps": 100, "burst": 200, "key": "ip"}]
+
     @pytest.mark.parametrize(
         ("kwargs", "error", "message"),
         [
