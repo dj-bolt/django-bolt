@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 
 import msgspec
 
-from .close_codes import CloseCode
+from .close_codes import CloseCode, check_close_frame
 from .exceptions import WebSocketDisconnect
 from .state import WebSocketState
 
@@ -220,11 +220,17 @@ class WebSocket:
         Close the WebSocket connection.
 
         Args:
-            code: WebSocket close code (default: 1000 Normal Closure)
-            reason: Human-readable close reason
+            code: WebSocket close code (default: 1000 Normal Closure). Use
+                1000 to 4999, but not 1005, 1006 or 1015.
+            reason: Human-readable close reason, at most 123 bytes of UTF-8
+
+        Raises:
+            ValueError: The code or the reason makes an invalid close frame
+                (RFC 6455). The connection stays open.
         """
         if self._state is WebSocketState.DISCONNECTED:
             return
+        check_close_frame(code, reason)
 
         # Close before accept refuses the handshake with 403.
         self._state = WebSocketState.DISCONNECTED

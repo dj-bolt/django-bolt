@@ -74,9 +74,14 @@ def load_user_by_pk_sync(model: type, user_id: Any) -> Any | None:
     Load a user by primary key, skipping per-call SQL compilation when safe.
 
     Behaviorally equivalent to ``model._default_manager.get(pk=user_id)``
-    returning ``None`` for a missing or malformed pk. Models whose default
+    returning ``None`` for a missing or malformed pk, and for a pk that is
+    too large for the database. Models whose default
     manager customizes ``get_queryset`` use that manager per call instead of
     the compiled statement.
+
+    A user with ``is_active=False`` is no user: the result is ``None``, as
+    Django's ``ModelBackend.get_user`` gives for a user that cannot
+    authenticate. The check reads the loaded row. It adds no query.
     """
     pk_field = model._meta.pk
     try:
@@ -89,9 +94,10 @@ def load_user_by_pk_sync(model: type, user_id: Any) -> Any | None:
     compiled = _compiled_pk_query(model, alias)
     if compiled is None:
         try:
-            return model._default_manager.using(alias).get(pk=pk_python)
+            user = model._default_manager.using(alias).get(pk=pk_python)
         except model.DoesNotExist:
             return None
+        return user if getattr(user, "is_active", True) else None
 
     connection = connections[alias]
     try:
@@ -101,7 +107,12 @@ def load_user_by_pk_sync(model: type, user_id: Any) -> Any | None:
 
     sql, fields, converters = compiled
     with connection.cursor() as cursor:
-        cursor.execute(sql, (pk_value,))
+        try:
+            cursor.execute(sql, (pk_value,))
+        except OverflowError:
+            # The database driver cannot bind an integer of this size, as
+            # sqlite3 cannot above 64 bits. No row has this pk.
+            return None
         row = cursor.fetchone()
     if row is None:
         return None
@@ -112,4 +123,6 @@ def load_user_by_pk_sync(model: type, user_id: Any) -> Any | None:
             for converter in column_converters:
                 value = converter(value, expression, connection)
             row[position] = value
-    return model.from_db(alias, fields, row)
+    user = model.from_db(alias, fields, row)
+    # As ModelBackend.user_can_authenticate: a model with no is_active field is active.
+    return user if getattr(user, "is_active", True) else None

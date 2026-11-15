@@ -59,6 +59,16 @@ def test_a_401_of_a_mount_names_the_scheme_of_each_backend():
             assert (resp.status_code, resp.headers.get("www-authenticate")) == (401, challenge)
 
 
+def test_a_guarded_mount_with_no_auth_backend_uses_jwt(settings):
+    """A mount with a guard that needs a user, with no ``auth`` and no setting, gets ``JWTAuthentication()``."""
+    api = BoltAPI()
+    mount_mcp(api, MCP("default-jwt-server"), guards=[IsAuthenticated()])
+    with TestClient(api) as client:
+        assert initialize(client)[0].status_code == 401
+        bearer = f"Bearer {mint_jwt(settings.SECRET_KEY, sub='7')}"
+        assert initialize(client, authorization=bearer)[0].status_code == 200
+
+
 def test_valid_token_exposes_principal_to_tool():
     api, _ = _build()
     bearer = f"Bearer {mint_jwt(SECRET, sub='42')}"

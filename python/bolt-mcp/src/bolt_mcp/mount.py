@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from django.conf import settings
 
 from django_bolt import JSON, BoltAPI, Request
+from django_bolt.auth.guards import guards_need_user
 
 from ._catalog import build_mount_definition
 from ._dispatch import make_verify_token
@@ -169,10 +170,11 @@ def mount_mcp(
 
     # Django middleware does not run on a mount, so a session backend cannot work there.
     backends = auth_without_session(auth, f"MCP mount {path}")
-    if backends is None:
-        backends = get_default_authentication_classes() or []
-    auth_metadata = [b.to_metadata() for b in backends] or None
     mount_guards = [] if oauth_resource is not None else list(guards or [])
+    if backends is None:
+        # As for a route: a guard that needs a user and no backend gives JWTAuthentication().
+        backends = get_default_authentication_classes(needs_user=guards_need_user(mount_guards)) or []
+    auth_metadata = [b.to_metadata() for b in backends] or None
     guards_metadata = [g.to_metadata() for g in mount_guards]
 
     verify_token = None
