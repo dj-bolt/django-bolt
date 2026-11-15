@@ -53,7 +53,7 @@ from .decorators import (
 )
 from .fields import FieldConfig, _FieldMarker
 from .loading import LoadingPlan, build_loading_plan
-from .nested import resolve_nested_config, validate_nested_field
+from .nested import _is_serializer_type, resolve_nested_config, validate_nested_field
 
 # Regex to extract field path from msgspec error messages (e.g., "at `$.field_name`")
 # Borrowed from Litestar's approach
@@ -98,6 +98,8 @@ class _DumpFieldSpec:
     alias: str | None
     nested: _ModelOutputNested | None
     default_value: Any = _MISSING
+    # True for a field that holds a serializer in a container (dict, tuple, set, union).
+    holds_serializer: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,6 +203,45 @@ def _get_model_output_nested(field_type: Any) -> _ModelOutputNested | None:
         serializer_class=nested_config.serializer_class,
         many=nested_config.many,
     )
+
+
+def _type_contains_serializer(field_type: Any) -> bool:
+    """Return True when a Serializer class is in the field type at any depth."""
+    if _is_serializer_type(field_type):
+        return True
+    return any(_type_contains_serializer(arg) for arg in get_args(field_type))
+
+
+def _dump_contained_serializers(
+    value: Any,
+    exclude_none: bool,
+    exclude_unset: bool,
+    exclude_defaults: bool,
+    by_alias: bool,
+) -> Any:
+    """Dump each serializer in a container value. Other values stay as they are."""
+    if isinstance(value, Serializer):
+        return value.dump(
+            exclude_none=exclude_none,
+            exclude_unset=exclude_unset,
+            exclude_defaults=exclude_defaults,
+            by_alias=by_alias,
+        )
+    if isinstance(value, dict):
+        return {
+            key: _dump_contained_serializers(item, exclude_none, exclude_unset, exclude_defaults, by_alias)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(
+            _dump_contained_serializers(item, exclude_none, exclude_unset, exclude_defaults, by_alias) for item in value
+        )
+    if isinstance(value, (list, set, frozenset)):
+        # A dumped serializer is a dict. A set cannot hold it.
+        return [
+            _dump_contained_serializers(item, exclude_none, exclude_unset, exclude_defaults, by_alias) for item in value
+        ]
+    return value
 
 
 def _field_type_may_hold_orm_state(field_type: Any) -> bool:
@@ -621,6 +662,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             nested_config = resolve_nested_config(field_type)
             if nested_config is not None:
                 nested_fields[field_name] = nested_config
+                has_serializer_fields = True
+            elif _type_contains_serializer(field_type):
                 has_serializer_fields = True
 
             # Check if field is a Literal type (for Django choices validation)
@@ -1113,15 +1156,16 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if field_config and field_config.exclude:
                 continue
 
+            field_type = cls.__cached_type_hints__.get(field_name, Any)
+            nested = _get_model_output_nested(field_type) if field_name in nested_fields else None
             specs.append(
                 _DumpFieldSpec(
                     field_name=field_name,
                     output_key=rename_map.get(field_name, field_name),
                     alias=field_config.alias if field_config else None,
-                    nested=_get_model_output_nested(cls.__cached_type_hints__.get(field_name, Any))
-                    if field_name in nested_fields
-                    else None,
+                    nested=nested,
                     default_value=default_values.get(field_name, _MISSING),
+                    holds_serializer=nested is None and _type_contains_serializer(field_type),
                 )
             )
 
@@ -2268,6 +2312,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                     )
                 else:
                     result[output_key] = value
+            elif spec.holds_serializer:
+                result[output_key] = _dump_contained_serializers(
+                    value, exclude_none, exclude_unset, exclude_defaults, by_alias
+                )
             else:
                 result[output_key] = value
 

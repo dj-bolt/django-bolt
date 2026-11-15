@@ -1708,6 +1708,30 @@ def test_serializer_route_validates_a_returned_dict_and_drops_write_only_fields(
             assert response.json() == [{"id": 1, "username": "a"}], path
 
 
+class Team(Serializer):
+    """A team. Its users are in containers that are not a plain list."""
+
+    by_role: dict[str, PublicUser]
+    pair: tuple[PublicUser, PublicUser]
+
+
+def test_serializer_route_drops_write_only_fields_of_a_serializer_in_a_container_field():
+    """A write-only field stays out of the response for each field type that holds a serializer."""
+    api = BoltAPI()
+
+    @api.post("/team")
+    async def team(data: Team) -> Team:
+        return data
+
+    user = {"id": 1, "username": "a", "password": "p"}
+    with TestClient(api) as client:
+        response = client.post("/team", json={"by_role": {"admin": user}, "pair": [user, user]})
+
+    assert response.status_code == 200, response.text
+    public = {"id": 1, "username": "a"}
+    assert response.json() == {"by_role": {"admin": public}, "pair": [public, public]}
+
+
 def test_serializer_route_dumps_a_returned_serializer_instance():
     """The route dumps the instance. It does not read the instance again with from_model()."""
     api = BoltAPI()
