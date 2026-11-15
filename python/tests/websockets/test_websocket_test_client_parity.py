@@ -11,7 +11,8 @@ import asyncio
 import pytest
 
 from django_bolt import BoltAPI
-from django_bolt.testing import HandshakeRejected, WebSocketTestClient
+from django_bolt.testing import ConnectionClosed, HandshakeRejected, WebSocketTestClient
+from tests.integration.apps import websocket_send_after_close
 
 
 async def _error_of(send, message) -> str:
@@ -58,6 +59,22 @@ async def test_the_test_client_refuses_what_the_server_refuses():
         "TypeError: websocket.send 'text' must be str, not NoneType",
         "TypeError: websocket.send 'bytes' must be bytes, not str",
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_send_after_the_close_of_the_app_finds_no_client():
+    """The same app runs on the server in test_websocket_send_after_close_server_integration.py."""
+    websocket_send_after_close.results.clear()
+
+    async with WebSocketTestClient(websocket_send_after_close.api, "/raw/ws") as ws:
+        with pytest.raises(ConnectionClosed) as closed:
+            await ws.receive_text()
+        async with asyncio.timeout(5):
+            while not websocket_send_after_close.results:
+                await asyncio.sleep(0.01)
+
+    assert closed.value.code == 4000
+    assert websocket_send_after_close.results == {"send": "ConnectionResetError: WebSocket client disconnected"}
 
 
 @pytest.mark.asyncio
