@@ -16,7 +16,6 @@ Performance: ~60k+ RPS with JWT validation happening entirely in Rust.
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 import logging
@@ -34,6 +33,7 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
 from django.db import InterfaceError, OperationalError
 
+from ..concurrency import run_in_orm_executor
 from .pk_loader import load_user_by_pk_sync
 from .revocation import create_revocation_handler
 
@@ -444,17 +444,15 @@ class JWTAuthentication(BaseAuthentication):
 
         The user_id should be the primary key of the user in the database.
 
-        Runs the pre-compiled pk query off the event loop. Deliberately NOT
-        ``User.objects.aget``: asgiref's thread_sensitive executor is a single
-        shared thread per process, which serializes every user load in the
-        worker (measured ~3k req/s ceiling); the default executor runs loads
-        concurrently and the compiled query skips per-call SQL compilation.
+        Runs the pre-compiled pk query on the ORM pool, as ``await
+        request.auser()`` does. The pool runs loads in parallel, and Bolt
+        drops a dead connection of a pool thread when the query raises.
+        ``User.objects.aget`` compiles the SQL again on each call.
         """
         if not user_id:
             return None
 
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.get_user_sync, user_id)
+        return await run_in_orm_executor(self.get_user_sync, user_id)
 
     def get_user_sync(self, user_id: str | None) -> Any | None:
         """

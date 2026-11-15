@@ -69,3 +69,16 @@ async def async_sync_read(request: Request):
 def sync_current(user: CurrentUser):
     # A sync handler uses the sync form of the dependency, so the request stays on the lane.
     return {"username": user.username, "schema": _schema_name()}
+
+
+class _AsyncLoader(JWTAuthentication):
+    """A backend with its own async ``get_user`` that calls the one of ``JWTAuthentication``."""
+
+    async def get_user(self, user_id, auth_context):
+        return await super().get_user(user_id, auth_context)
+
+
+@api.get("/async/loader", auth=[_AsyncLoader(secret=SECRET)], guards=[IsAuthenticated()])
+async def async_loader(request: Request):
+    user = await request.auser()
+    return {"username": user.username, "schema": await sync_to_thread(_schema_name)}
