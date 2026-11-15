@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::cors::{add_cors_headers_with_config, add_preflight_headers_with_config};
 use crate::metadata::CorsConfig;
+use crate::router::normalize_request_path;
 use crate::state::AppState;
 
 /// CORS middleware factory
@@ -115,7 +116,8 @@ fn add_cors_headers<B>(res: Outcome<B>) -> Outcome<B> {
     };
 
     // Find CORS config: route-level first, then global
-    let cors_config = find_cors_config(method, requested_method, req.path(), state_ref);
+    let route_path = normalize_request_path(req.path());
+    let cors_config = find_cors_config(method, requested_method, &route_path, state_ref);
 
     // Apply CORS headers
     match cors_config {
