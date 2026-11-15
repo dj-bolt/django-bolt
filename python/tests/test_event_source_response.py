@@ -24,6 +24,10 @@ class TestFormatSSEEvent:
         result = format_sse_event(data_str="line1\nline2\nline3")
         assert result == b"data: line1\ndata: line2\ndata: line3\n\n"
 
+    def test_multiline_bytes_data(self):
+        """Bytes data with a line break gets one data line for each line, as str data does."""
+        assert format_sse_event(data_bytes=b"line1\nline2\r\nline3") == b"data: line1\ndata: line2\ndata: line3\n\n"
+
     def test_all_fields(self):
         result = format_sse_event(
             data_str="payload",
@@ -53,6 +57,18 @@ class TestFormatSSEEvent:
     def test_multiline_comment(self):
         result = format_sse_event(comment="line1\nline2")
         assert result == b": line1\n: line2\n\n"
+
+    @pytest.mark.parametrize(
+        ("fields", "expected"),
+        [
+            ({"event": "e"}, b"event: e\ndata: a\ndata: b\n\n"),
+            ({"id": "7"}, b"data: a\ndata: b\nid: 7\n\n"),
+            ({"retry": 9}, b"data: a\ndata: b\nretry: 9\n\n"),
+            ({"comment": "c"}, b": c\ndata: a\ndata: b\n\n"),
+        ],
+    )
+    def test_data_bytes_is_framed_line_by_line_with_each_field(self, fields, expected):
+        assert format_sse_event(data_bytes=b"a\nb", **fields) == expected
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -326,3 +342,26 @@ def test_sse_route_keeps_its_status_and_frames_every_event_field():
         b': c\nevent: e\ndata: {"a":1}\nid: 1\nretry: 500\n\n'
         b": keepalive\n\n"
     )
+
+
+def test_event_source_response_keeps_headers_and_ping_interval():
+    api = BoltAPI()
+
+    @api.get("/ev")
+    def ev():
+        async def gen():
+            yield {"a": 1}
+
+        response = EventSourceResponse(gen(), headers={"X-Custom": "yes"}, ping_interval=2.5)
+        assert response.ping_interval == 2.5
+        return response
+
+    with TestClient(api) as client:
+        response = client.get("/ev")
+
+    assert response.headers["x-custom"] == "yes"
+    assert response.content == b'data: {"a":1}\n\n'
+
+
+def test_server_sent_event_retry_zero_is_valid():
+    assert ServerSentEvent(retry=0).retry == 0

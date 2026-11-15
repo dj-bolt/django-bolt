@@ -237,3 +237,20 @@ def test_admin_login_page():
         # Should contain login form
         body_text = response.text.lower()
         assert "login" in body_text or "django" in body_text, f"Expected login content, got: {body_text[:200]}"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_mount_serves_only_the_admin_prefix(settings):
+    """The admin mount gives Django the admin prefix, not each path of the URLconf."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_site_page"
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        admin_response = client.get("/admin/login/")
+        site_response = client.get("/site/")
+
+    assert admin_response.status_code == 200
+    assert "csrfmiddlewaretoken" in admin_response.text
+    assert site_response.status_code == 404
+    assert "a page of Django" not in site_response.text

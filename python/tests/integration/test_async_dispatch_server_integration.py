@@ -279,8 +279,12 @@ def test_dispatch_probes_worker_loop_default(make_server_project):
 
             # Cancelled timers are compacted out of the Rust heap rather than
             # retained until their (here: one-hour) deadlines.
+            # The timer thread compacts when 64 cancel notices are pending
+            # (TIMER_COMPACTION_MIN_CANCELLED). On the free-threaded build it
+            # compacts while the handler still cancels. Thus up to 63 cancelled
+            # timers can stay. Without compaction, all 200 stay.
             assert server.get("/t-cancelled-timers").json() == {"scheduled": 200}
-            server.wait_for_json("/t-timer-stats", lambda body: body["live"] <= 20)
+            server.wait_for_json("/t-timer-stats", lambda body: body["live"] < 64)
     finally:
         echo_server.shutdown()
         echo_server.server_close()
