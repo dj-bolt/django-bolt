@@ -1035,13 +1035,6 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     refuse_text = refuses and plain_type is not str
     refuse_bytes = refuses and plain_type not in (bytes, bytearray)
 
-    # A JSON or Response object has its own body. A -> None route does not
-    # validate that body, so a handler that builds each response can use -> None.
-    if meta.get("response_type") is type(None):
-        content_validator_sync = content_validator_async = None
-    else:
-        content_validator_sync, content_validator_async = validator_sync, validator_async
-
     _serializer_cls, _serializer_many = _response_serializer_info(meta.get("response_type"))
     is_serializer_response = _serializer_cls is not None
     # list[Serializer] routes returning a QuerySet: pre-load what the serializer
@@ -1202,6 +1195,13 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     # JSON or Response with another status (a 400 error map, a 202 receipt)
     # carries a different body, so Bolt encodes it as-is. Per-status schemas
     # come from ``response_model={code: type}``.
+    # A -> None route does not validate the body of a JSON or Response object,
+    # so a handler that builds each response can use -> None.
+    if meta.get("response_type") is type(None):
+        content_validator_sync = content_validator_async = None
+    else:
+        content_validator_sync, content_validator_async = validator_sync, validator_async
+
     async def response_type_handler(result: Any) -> ResponseWireV1:
         # The lookup gives an exact response type its own class. This check only skips it.
         if (cls := result.__class__) is not JSON and cls not in _RESPONSE_CLASSES:  # pragma: no mutate
