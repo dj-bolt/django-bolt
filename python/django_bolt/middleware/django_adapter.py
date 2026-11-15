@@ -22,6 +22,7 @@ from collections.abc import Callable
 from functools import partial
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote_to_bytes
 
 from .._core import RequestLane, populate_response_cookies
 from ..concurrency import drive_on_lane, in_lane_mode, run_orm_blocking
@@ -46,6 +47,7 @@ try:
     )
     from django.http import HttpRequest, HttpResponse, QueryDict
     from django.utils.deprecation import MiddlewareMixin
+    from django.utils.encoding import repercent_broken_unicode
     from django.utils.functional import LazyObject, empty
     from django.utils.module_loading import import_string
 
@@ -56,6 +58,7 @@ except ImportError:
     ThreadSensitiveContext = None
     SyncToAsync = None
     HttpRequest = None
+    repercent_broken_unicode = None
     HttpResponse = None
     QueryDict = None
     import_string = None
@@ -929,8 +932,14 @@ def _to_django_request(request: Request) -> HttpRequest:
 
     # Copy basic attributes (direct assignment is faster)
     django_request.method = request.method
-    django_request.path = request.path
-    django_request.path_info = request.path
+    # Django servers give the decoded path. Rust gives the encoded one.
+    path = request.path
+    if "%" in path:
+        # An invalid UTF-8 sequence stays percent-encoded, as in Django's WSGI handler.
+        path = repercent_broken_unicode(unquote_to_bytes(path)).decode()
+        request.META["PATH_INFO"] = path
+    django_request.path = path
+    django_request.path_info = path
 
     # One META dict per request. Rust builds it once (REMOTE_ADDR from the
     # client-ip resolver, SERVER_NAME from Host, HTTP_* headers) and caches it,

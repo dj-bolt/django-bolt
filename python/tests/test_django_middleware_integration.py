@@ -1308,6 +1308,9 @@ class _DjangoRequestRecorder(MiddlewareMixin):
             "method": request.method,
             "path": request.path,
             "path_info": request.path_info,
+            "meta_path_info": request.META["PATH_INFO"],
+            "full_path": request.get_full_path(),
+            "absolute_uri": request.build_absolute_uri(),
             "get_tags": request.GET.getlist("tag"),
             "get_x": request.GET.get("x"),
             "get_is_mutable": request.GET._mutable,
@@ -1349,6 +1352,32 @@ class TestDjangoSideRequest:
         assert seen["get_is_mutable"] is True
         assert seen["post"] == {}
         assert seen["read"] == seen["body"] == b""
+
+    @pytest.mark.parametrize(
+        ("raw_path", "path", "full_path"),
+        [
+            ("/p/%C3%A9", "/p/\u00e9", "/p/%C3%A9"),
+            ("/p/a%2Fb", "/p/a/b", "/p/a/b"),
+            ("/p/a%20b", "/p/a b", "/p/a%20b"),
+            ("/p/%FF", "/p/%FF", "/p/%25FF"),
+        ],
+        ids=["utf-8", "encoded-slash", "space", "invalid-utf-8"],
+    )
+    def test_path_is_decoded_as_django_servers_give_it(self, layout, raw_path, path, full_path):
+        _DjangoRequestRecorder.seen = {}
+        api = BoltAPI(middleware=[layout()])
+
+        @api.get("/p/{name:path}")
+        async def route(name: str):
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            assert client.get(raw_path + "?q=1").status_code == 200
+        seen = _DjangoRequestRecorder.seen
+
+        assert seen["path"] == seen["path_info"] == seen["meta_path_info"] == path
+        assert seen["full_path"] == full_path + "?q=1"
+        assert seen["absolute_uri"] == "http://testserver" + full_path + "?q=1"
 
     def test_request_with_no_query_has_an_empty_query_dict(self, layout):
         seen = self._send(layout, "GET", "/plain")
