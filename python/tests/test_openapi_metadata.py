@@ -2,11 +2,14 @@
 Tests for OpenAPI tags, summary, and description metadata.
 """
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Router
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.decorators import ActionHandler, action
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.openapi.spec import Tag
+from django_bolt.responses import Redirect
+from django_bolt.testing import TestClient
 from django_bolt.views import ViewSet
 from django_bolt.websocket import WebSocket
 
@@ -313,6 +316,38 @@ def test_empty_tags_not_stored():
     assert meta.get("openapi_tags") is None
 
 
+def test_operation_ids_are_unique_when_function_names_repeat():
+    """Two routes with one function name still get different operationId values."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+    first = Router(prefix="/first")
+    second = Router(prefix="/second")
+
+    @first.get("/items")
+    async def list_items() -> dict:
+        return {}
+
+    @second.get("/items")
+    async def list_items() -> dict:  # noqa: F811
+        return {}
+
+    @api.get("/third")
+    async def list_items() -> dict:  # noqa: F811
+        return {}
+
+    api.include_router(first)
+    api.include_router(second)
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        document = client.get("/docs/openapi.json").json()
+
+    operation_ids = [
+        operation["operationId"] for path_item in document["paths"].values() for operation in path_item.values()
+    ]
+    assert len(operation_ids) == 3
+    assert len(set(operation_ids)) == 3
+    assert set(operation_ids) == {"get_list_items", "get_list_items_2", "get_list_items_3"}
+
+
 def test_partial_metadata_override():
     """Test that only specified metadata overrides docstring."""
     api = BoltAPI()
@@ -393,6 +428,24 @@ def test_websocket_empty_tags_match_http():
     assert schema.paths["/ws/stream"].get.tags == schema.paths["/items"].get.tags == []
 
 
+def test_websocket_security_with_default_authentication_classes(settings):
+    """A WebSocket route that uses BOLT_AUTHENTICATION_CLASSES documents the same security as an HTTP route."""
+    settings.BOLT_AUTHENTICATION_CLASSES = [JWTAuthentication(secret="test-secret")]
+    api = BoltAPI()
+
+    @api.websocket("/ws/stream", guards=[IsAuthenticated()])
+    async def stream(websocket: WebSocket):
+        await websocket.accept()
+
+    @api.get("/items", guards=[IsAuthenticated()])
+    async def items():
+        return []
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate()
+    assert schema.paths["/items"].get.security == [{"BearerAuth": []}]
+    assert schema.paths["/ws/stream"].get.security == [{"BearerAuth": []}]
+
+
 def test_websocket_summary_and_description():
     """Explicit summary and description on a WebSocket route replace the docstring."""
     api = BoltAPI()
@@ -407,6 +460,48 @@ def test_websocket_summary_and_description():
     assert operation.summary == "WebSocket: Stream prices"
     assert "Sends each price change." in operation.description
     assert "Docstring summary." not in operation.description
+
+
+def test_websocket_operation_documents_the_upgrade_handshake():
+    """A WebSocket operation lists the upgrade headers and the 101, 400 and 403 responses."""
+    api = BoltAPI()
+
+    @api.websocket("/ws/stream")
+    async def stream(websocket: WebSocket):
+        await websocket.accept()
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate().to_schema()
+    operation = schema["paths"]["/ws/stream"]["get"]
+    assert operation["operationId"] == "websocket_stream"
+    assert operation["summary"] == "WebSocket Connection"
+    headers = {p["name"]: p for p in operation["parameters"]}
+    assert set(headers) == {"Upgrade", "Connection"}
+    assert headers["Upgrade"]["in"] == "header"
+    assert headers["Upgrade"]["required"] is True
+    assert headers["Upgrade"]["schema"] == {"type": "string", "enum": ["websocket"]}
+    assert headers["Connection"]["schema"] == {"type": "string", "enum": ["Upgrade"]}
+    assert set(operation["responses"]) == {"101", "400", "403"}
+    assert set(operation["responses"]["101"]["headers"]) == {"Upgrade", "Connection"}
+
+
+def test_redirect_route_documents_the_location_header():
+    """A Redirect route shows a 307 response, or its own status code, with a Location header."""
+    api = BoltAPI()
+
+    @api.get("/temporary", response_class=Redirect)
+    async def temporary():
+        return Redirect("/new")
+
+    @api.get("/permanent", status_code=301, response_class=Redirect)
+    async def permanent():
+        return Redirect("/new")
+
+    schema = SchemaGenerator(api, OpenAPIConfig(title="Test API", version="1.0.0")).generate().to_schema()
+    assert list(schema["paths"]["/temporary"]["get"]["responses"]) == ["307"]
+    assert list(schema["paths"]["/permanent"]["get"]["responses"]) == ["301"]
+    response = schema["paths"]["/permanent"]["get"]["responses"]["301"]
+    assert response["description"] == "Moved Permanently"
+    assert response["headers"]["Location"]["schema"] == {"type": "string"}
 
 
 def test_websocket_include_in_schema_false():

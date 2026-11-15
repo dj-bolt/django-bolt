@@ -13,11 +13,13 @@ from django.core.exceptions import PermissionDenied
 from django_bolt import BoltAPI
 from django_bolt.error_handlers import (
     BoltError,
+    bolt_error_from_exception,
     format_error_response,
     generic_exception_handler,
     handle_exception,
     http_exception_handler,
     msgspec_validation_error_to_dict,
+    problem_details,
     request_validation_error_handler,
     response_validation_error_handler,
 )
@@ -57,6 +59,59 @@ class TestExceptions:
         exc = HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Bearer"})
         assert exc.status_code == 401
         assert exc.headers == {"WWW-Authenticate": "Bearer"}
+
+    @pytest.mark.parametrize("formatter", [None, problem_details], ids=["default", "formatter"])
+    @pytest.mark.parametrize(("value", "sent"), [(30, "30"), (1.5, "1.5")])
+    def test_http_exception_converts_a_number_header_value_to_a_str(self, formatter, value, sent, caplog):
+        api = BoltAPI(error_formatter=formatter)
+
+        @api.get("/busy")
+        async def busy():
+            raise TooManyRequests(detail="Slow down", headers={"Retry-After": value})
+
+        with caplog.at_level(logging.ERROR, logger="django_bolt"), TestClient(api) as client:
+            response = client.get("/busy")
+        assert response.status_code == 429
+        assert response.headers["retry-after"] == sent
+        assert [record.getMessage() for record in caplog.records] == []
+
+    @pytest.mark.parametrize(
+        ("headers", "message"),
+        [
+            ({"X-Trace": None}, "The value of the header 'X-Trace' must be a str or a number, not NoneType"),
+            ({"X-Trace": b"abc"}, "The value of the header 'X-Trace' must be a str or a number, not bytes"),
+            ({"X-Trace": True}, "The value of the header 'X-Trace' must be a str or a number, not bool"),
+            ({1: "abc"}, "The name of a header must be a str, not int"),
+        ],
+    )
+    def test_http_exception_refuses_a_header_that_is_not_a_str_or_a_number(self, headers, message):
+        with pytest.raises(TypeError, match=message):
+            HTTPException(400, headers=headers)
+
+    def test_http_exception_does_not_change_the_headers_dict_of_the_caller(self):
+        headers = {"Retry-After": 30, "X-Trace": "abc"}
+        exc = TooManyRequests(headers=headers)
+        assert exc.headers == {"Retry-After": "30", "X-Trace": "abc"}
+        assert headers == {"Retry-After": 30, "X-Trace": "abc"}
+
+    def test_a_header_value_with_a_line_break_is_not_sent_and_is_logged(self, capfd):
+        api = BoltAPI()
+
+        @api.get("/split")
+        async def split():
+            raise BadRequest(detail="No", headers={"X-A": "1\r\nX-Injected: yes", "X-B": "kept"})
+
+        with TestClient(api) as client:
+            response = client.get("/split")
+        assert response.status_code == 400
+        assert "x-a" not in response.headers
+        assert "x-injected" not in response.headers
+        assert response.headers["x-b"] == "kept"
+        # The Rust core writes its log records to stderr.
+        assert (
+            "[django-bolt] WARNING bolt_core::response_builder: "
+            "The response header 'X-A' is not valid in an HTTP response. Bolt does not send it."
+        ) in capfd.readouterr().err.splitlines()
 
     def test_http_exception_with_extra(self):
         """Test HTTPException with extra data."""
@@ -136,6 +191,50 @@ class TestExceptions:
     def test_http_exception_with_an_empty_detail_uses_the_status_phrase(self):
         assert HTTPException(404, detail=[]).detail == "Not Found"
         assert HTTPException(404, detail="").detail == "Not Found"
+
+    @pytest.mark.parametrize(
+        ("path", "status", "detail"),
+        [
+            ("/detail-first", 404, "User not found"),
+            ("/detail-first-with-headers", 401, "Token expired"),
+            ("/base-detail-first", 500, "Storage is down"),
+            ("/no-phrase-499", 499, "Client Error"),
+            ("/no-phrase-599", 599, "Server Error"),
+        ],
+    )
+    def test_http_exception_takes_a_str_as_the_detail_and_a_status_with_no_phrase(self, path, status, detail):
+        api = BoltAPI()
+
+        @api.get("/detail-first")
+        async def detail_first():
+            raise NotFound("User not found")
+
+        @api.get("/detail-first-with-headers")
+        async def detail_first_with_headers():
+            raise Unauthorized("Token expired", headers={"WWW-Authenticate": "Bearer"})
+
+        @api.get("/base-detail-first")
+        async def base_detail_first():
+            raise HTTPException("Storage is down")
+
+        @api.get("/no-phrase-499")
+        async def no_phrase_499():
+            raise HTTPException(499)
+
+        @api.get("/no-phrase-599")
+        async def no_phrase_599():
+            raise HTTPException(599)
+
+        with TestClient(api) as client:
+            response = client.get(path)
+        assert response.status_code == status
+        assert response.json() == {"detail": detail}
+        if status == 401:
+            assert response.headers["www-authenticate"] == "Bearer"
+
+    def test_http_exception_refuses_a_str_detail_with_a_second_detail(self):
+        with pytest.raises(TypeError, match="status_code must be an int"):
+            NotFound("User not found", "Another detail")
 
     def test_validation_exception_has_a_fixed_detail(self):
         assert ValidationException([1]).detail == "Validation error"
@@ -459,6 +558,37 @@ class TestErrorHandlers:
         assert status == 404
         data = json.loads(body)
         assert data["detail"] == "Resource not found"
+
+    @pytest.mark.parametrize(
+        "make_parts",
+        [
+            lambda: handle_exception(NotFound(detail="x")),
+            lambda: http_exception_handler(NotFound(detail="x")),
+            lambda: format_error_response(404, "x"),
+        ],
+        ids=["handle_exception", "http_exception_handler", "format_error_response"],
+    )
+    def test_a_change_to_the_returned_headers_does_not_reach_a_later_error_response(self, make_parts):
+        api = BoltAPI()
+
+        @api.get("/missing")
+        async def missing():
+            raise NotFound(detail="No such item")
+
+        _, headers, _ = make_parts()
+        extra = ("x-request-id", "abc")
+        headers.append(extra)
+        try:
+            with TestClient(api) as client:
+                response = client.get("/missing")
+            assert response.status_code == 404
+            assert "x-request-id" not in response.headers
+            assert make_parts()[1] == [("content-type", "application/json")]
+        finally:
+            # Before the fix, the list was shared by each error response of the process.
+            shared = make_parts()[1]
+            if extra in shared:
+                shared.remove(extra)
 
     def test_handle_exception_validation_error(self):
         """Test main exception handler with validation error."""
@@ -843,6 +973,53 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
+def _status_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.get("/async-raise/{code}")
+    async def async_raise(code: int):
+        raise HTTPException(code, detail="boom")
+
+    @api.get("/sync-raise/{code}")
+    def sync_raise(code: int):
+        raise HTTPException(code, detail="boom")
+
+    @api.get("/async-json/{code}")
+    async def async_json(code: int):
+        return JSON({"ok": True}, status_code=code)
+
+    @api.get("/sync-json/{code}")
+    def sync_json(code: int):
+        return JSON({"ok": True}, status_code=code)
+
+    return api
+
+
+@pytest.mark.parametrize("route", ["async-raise", "sync-raise", "async-json", "sync-json"])
+@pytest.mark.parametrize("code", [0, 99, 1000, 65535, 65536, -1])
+def test_a_status_that_is_not_an_http_status_is_a_500_and_not_a_200(route, code, capfd):
+    with TestClient(_status_api()) as client:
+        response = client.get(f"/{route}/{code}")
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+    # The Rust core writes its log records to stderr.
+    assert (
+        f"[django-bolt] ERROR django_bolt::handler: The response status must be an int from 100 to 999, got {code}."
+        " Bolt sends a 500."
+    ) in capfd.readouterr().err.splitlines()
+
+
+def test_a_route_status_code_that_is_not_an_http_status_stops_the_start():
+    api = BoltAPI()
+
+    @api.get("/created", status_code=1000)
+    def created():
+        return {"ok": True}
+
+    with pytest.raises(TypeError, match="'default_status_code' for GET /created must be an int from 100 to 999"):
+        TestClient(api).__enter__()
+
+
 class Item(msgspec.Struct):
     id: int
 
@@ -857,6 +1034,14 @@ def _bad_response_api(**api_kwargs) -> BoltAPI:
     @api.get("/sync-bad")
     def sync_bad() -> Item:
         return {"id": "not-an-int"}
+
+    @api.get("/async-missing")
+    async def async_missing() -> Item:
+        return {}
+
+    @api.get("/sync-missing")
+    def sync_missing() -> Item:
+        return {}
 
     return api
 
@@ -899,6 +1084,36 @@ class TestResponseValidationDisclosure:
         assert errors[0]["loc"][0] == "response"
         assert "Expected `int`, got `str`" in errors[0]["msg"]
 
+    @pytest.mark.parametrize("kind", ["async", "sync"])
+    @pytest.mark.parametrize(
+        ("case", "error"),
+        [
+            (
+                "bad",
+                {
+                    "loc": ["response", "id"],
+                    "msg": "Response validation failed for Item: Expected `int`, got `str`",
+                    "type": "validation_error",
+                },
+            ),
+            (
+                "missing",
+                {
+                    "loc": ["response", "id"],
+                    "msg": "Response validation failed for Item: Object missing required field `id`",
+                    "type": "missing_field",
+                },
+            ),
+        ],
+    )
+    def test_debug_on_gives_the_field_in_the_location_of_the_error(self, settings, kind, case, error):
+        settings.DEBUG = True
+        with TestClient(_bad_response_api()) as client:
+            response = client.get(f"/{kind}-{case}")
+
+        assert response.status_code == 500
+        assert response.json()["extra"]["validation_errors"] == [error]
+
     def test_formatter_gets_no_errors_when_debug_is_off(self, settings, caplog):
         """A formatter can show `error.errors` to the client, so Bolt leaves them out. The log keeps them."""
         settings.DEBUG = False
@@ -918,6 +1133,18 @@ class TestResponseValidationDisclosure:
         logged = _validation_log_messages(caplog)
         assert len(logged) == 1
         assert "Response validation failed for Item" in logged[0]
+
+    @pytest.mark.parametrize(("setting", "debug"), [(False, True), (True, False)])
+    def test_the_debug_argument_decides_before_the_debug_setting(self, settings, setting, debug):
+        """A caller that gives ``debug`` gets the errors only when it is true."""
+        settings.DEBUG = setting
+        errors = [{"loc": ["response", "id"], "msg": "Expected `int`, got `str`", "type": "validation_error"}]
+
+        error = bolt_error_from_exception(ResponseValidationError(errors), debug=debug)
+
+        assert (error.status, error.kind, error.detail) == (500, "response_validation", "Response validation error")
+        assert error.errors == (errors if debug else [])
+        assert error.exception.errors() == errors
 
     def test_formatter_gets_the_errors_when_debug_is_on(self, settings):
         settings.DEBUG = True
