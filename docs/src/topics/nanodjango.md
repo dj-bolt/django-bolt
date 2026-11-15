@@ -102,7 +102,7 @@ The `django_bolt.nanodjango` plugin handles all of that:
 - Configures `BOLT_API` (the setting that tells `runbolt` where to find your API instance) by detecting the variable name at decoration time
 - Subclasses `django_bolt.BoltAPI` so `runbolt`'s autodiscovery accepts it
 - Registers as a nanodjango plugin via setuptools entry points (no config needed)
-- Supports `nanodjango convert` by detecting `BoltAPI` instances and route-decorated functions in the AST and moving them to `api.py` in the generated project
+- Supports `nanodjango convert` by detecting `BoltAPI` and `Router` instances, route-decorated functions and classes, and mount calls in the AST and moving them to `api.py` in the generated project
 
 ## Running the server
 
@@ -269,7 +269,12 @@ When you outgrow the single-file format, nanodjango can scaffold a full Django p
 nanodjango convert myapp.py /path/to/project --name=myproject
 ```
 
-The plugin's `convert_build_app_api` hook detects `BoltAPI()` assignments and `@bolt.get/post/...` decorated functions and moves them into `api.py` in the generated project.
+The plugin's `convert_build_app_api` hook moves each statement that adds a route into `api.py` in the generated project:
+
+- `BoltAPI()` and `Router()` assignments
+- Functions with a route decorator, for example `@bolt.get(...)` or `@router.post(...)`
+- Classes with `@bolt.view(...)` or `@bolt.viewset(...)`
+- Calls to `bolt.mount(...)`, `bolt.mount_django(...)`, `bolt.mount_asgi(...)`, `bolt.mount_mcp(...)`, `bolt.include_router(...)` and `bolt.native_route(...)`
 
 !!! note
     Due to how nanodjango is written, you will get some superfluous code referring to django-ninja calls in the generated project. Strip or adapt those references after the conversion.
