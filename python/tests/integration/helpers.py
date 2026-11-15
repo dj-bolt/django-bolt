@@ -1019,6 +1019,9 @@ class SimpleWebSocketClient:
     def send_text(self, message: str) -> None:
         self._send_frame(0x1, message.encode("utf-8"))
 
+    def send_bytes(self, message: bytes) -> None:
+        self._send_frame(0x2, message)
+
     def receive_text(self) -> str:
         opcode, payload = self._receive_frame()
         assert opcode == 0x1, f"Expected text frame, got opcode {opcode}"

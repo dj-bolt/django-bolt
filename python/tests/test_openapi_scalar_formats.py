@@ -10,16 +10,19 @@ the same schema, or code generators see ``object`` (``dynamic`` in Dart). (#337)
 import datetime
 import decimal
 import enum
+import json
 import uuid
 from typing import Annotated
 
 import msgspec
 import pytest
+from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
-from django_bolt.param_functions import Cookie, Form, Header, Query
+from django_bolt.param_functions import Cookie, File, Form, Header, Query
+from django_bolt.testing import TestClient
 
 SCALARS = [
     (datetime.datetime, {"type": "string", "format": "date-time"}),
@@ -95,6 +98,210 @@ def test_a_json_body_struct_field_has_the_format_of_its_type(scalar, expected):
         return {}
 
     assert _spec(api)["components"]["schemas"]["Item"]["properties"]["value"] == expected
+
+
+class Attachment(msgspec.Struct):
+    data: bytes
+    preview: bytearray
+    view: memoryview
+
+
+def test_bytes_are_base64_text_in_json_and_binary_in_a_file_part():
+    """msgspec writes bytes in JSON as base64 text. A file part of a multipart body holds the raw bytes."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+    base64_text = {"type": "string", "contentEncoding": "base64"}
+    binary = {"type": "string", "format": "binary"}
+
+    @api.get("/attachment")
+    async def get_attachment() -> Attachment:
+        return Attachment(data=b"\x00\x01hi", preview=bytearray(b"hi"), view=memoryview(b"hi"))
+
+    @api.get("/chunks")
+    async def get_chunks() -> list[bytes]:
+        return [b"\x00\x01hi"]
+
+    @api.post("/upload")
+    async def upload(raw: Annotated[bytes, File()], parts: Annotated[list[bytes], File()]):
+        return {}
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+        assert client.get("/attachment").json() == {"data": "AAFoaQ==", "preview": "aGk=", "view": "aGk="}
+        assert client.get("/chunks").json() == ["AAFoaQ=="]
+
+    validate(spec)
+    assert spec["openapi"] == "3.1.0"
+    assert spec["components"]["schemas"]["Attachment"]["properties"] == {
+        "data": base64_text,
+        "preview": base64_text,
+        "view": base64_text,
+    }
+    chunks = spec["paths"]["/chunks"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert chunks == {"type": "array", "items": base64_text}
+    assert _form_schema(spec, "/upload")["properties"] == {"raw": binary, "parts": {"type": "array", "items": binary}}
+
+
+class TokenParams(msgspec.Struct):
+    token: bytes
+    tags: list[bytes] = []
+    hint: bytes | None = None
+
+
+def test_bytes_in_a_parameter_are_plain_text():
+    """A bytes parameter gets the UTF-8 bytes of the text value. Only a JSON body holds base64 text."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+    text = {"type": "string"}
+    seen = {}
+
+    @api.get("/scalars/{part}")
+    async def scalars(
+        part: bytes,
+        key: bytes,
+        keys: list[bytes],
+        hint: bytes | None = None,
+        x_key: Annotated[bytes, Header()] = b"",
+        session: Annotated[bytes, Cookie()] = b"",
+    ):
+        seen.update(part=part, key=key, keys=keys, x_key=x_key, session=session)
+        return {}
+
+    @api.get("/query-model")
+    async def query_model(params: Annotated[TokenParams, Query()]):
+        seen.update(token=params.token, tags=params.tags)
+        return {}
+
+    @api.get("/header-model")
+    async def header_model(params: Annotated[TokenParams, Header()]):
+        return {}
+
+    @api.get("/cookie-model")
+    async def cookie_model(params: Annotated[TokenParams, Cookie()]):
+        return {}
+
+    @api.post("/form")
+    async def form(name: Annotated[bytes, Form()], raw: Annotated[bytes, File()]):
+        return {}
+
+    @api.post("/form-model")
+    async def form_model(params: Annotated[TokenParams, Form()]):
+        return {}
+
+    @api.post("/json")
+    async def json_body(body: Attachment):
+        return {}
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+        # The wire form that the schema describes.
+        response = client.get(
+            "/scalars/p%C3%A9?key=abc&keys=a&keys=b", headers={"x-key": "hdr", "cookie": "session=sid"}
+        )
+        assert response.status_code == 200
+        assert seen == {"part": "pé".encode(), "key": b"abc", "keys": [b"a", b"b"], "x_key": b"hdr", "session": b"sid"}
+        assert client.get("/query-model?token=abc&tags=a&tags=b").status_code == 200
+        assert (seen["token"], seen["tags"]) == (b"abc", [b"a", b"b"])
+
+    validate(spec)
+    model_fields = {
+        "token": text,
+        "tags": {"type": "array", "items": text, "default": []},
+        "hint": {"anyOf": [text, {"type": "null"}], "default": None},
+    }
+
+    def parameters(path):
+        return {(p["in"], p["name"]): p["schema"] for p in spec["paths"][path]["get"]["parameters"]}
+
+    assert parameters("/scalars/{part}") == {
+        ("path", "part"): text,
+        ("query", "key"): text,
+        ("query", "keys"): {"type": "array", "items": text},
+        ("query", "hint"): text,
+        ("header", "x-key"): {**text, "default": ""},
+        ("cookie", "session"): {**text, "default": ""},
+    }
+    assert parameters("/query-model") == {("query", name): schema for name, schema in model_fields.items()}
+    # A header or a cookie gives one value, so an array field holds one item at most.
+    one_value = {**model_fields, "tags": {**model_fields["tags"], "maxItems": 1}}
+    assert parameters("/header-model") == {("header", name): schema for name, schema in one_value.items()}
+    assert parameters("/cookie-model") == {("cookie", name): schema for name, schema in one_value.items()}
+    # A form field is text. A file part stays binary.
+    assert _form_schema(spec, "/form")["properties"] == {"name": text, "raw": {"type": "string", "format": "binary"}}
+    form_model_fields = _form_schema(spec, "/form-model")["properties"]
+    assert form_model_fields["token"] == text
+    assert form_model_fields["tags"] == {"type": "array", "items": text, "default": []}
+    assert "contentEncoding" not in json.dumps(form_model_fields)
+    # A bytes field of a JSON body is base64 text.
+    assert spec["components"]["schemas"]["Attachment"]["properties"]["data"] == {
+        "type": "string",
+        "contentEncoding": "base64",
+    }
+
+
+class TraceParams(msgspec.Struct):
+    token: str
+    x_request_id: str = "none"
+    retries: Annotated[int, msgspec.Meta(ge=0)] | None = None
+    custom: str = msgspec.field(default="std", name="X_Custom")
+
+
+def test_a_header_or_cookie_model_is_one_parameter_for_each_field():
+    """A parameter model is one parameter for each field, with the name that Bolt reads on the wire."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/query")
+    async def query_model(params: Annotated[TraceParams, Query()]):
+        return msgspec.to_builtins(params)
+
+    @api.get("/header")
+    async def header_model(params: Annotated[TraceParams, Header()]):
+        return msgspec.to_builtins(params)
+
+    @api.get("/cookie")
+    async def cookie_model(params: Annotated[TraceParams, Cookie()]):
+        return msgspec.to_builtins(params)
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+        # The wire form that the document describes.
+        from_headers = client.get(
+            "/header", headers={"token": "t", "x-request-id": "rid", "retries": "3", "x-custom": "c"}
+        )
+        from_cookies = client.get("/cookie", headers={"cookie": "token=t; x_request_id=rid; retries=3; X_Custom=c"})
+        no_token = client.get("/header", headers={"x-request-id": "rid"})
+
+    sent = {"token": "t", "x_request_id": "rid", "retries": 3, "X_Custom": "c"}
+    assert (from_headers.status_code, from_headers.json()) == (200, sent)
+    assert (from_cookies.status_code, from_cookies.json()) == (200, sent)
+    assert no_token.status_code == 422
+
+    validate(spec)
+
+    def parameters(path):
+        return [(p["in"], p["name"], p["required"], p["schema"]) for p in spec["paths"][path]["get"]["parameters"]]
+
+    schemas = [
+        {"type": "string"},
+        {"type": "string", "default": "none"},
+        {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}], "default": None},
+        {"type": "string", "default": "std"},
+    ]
+    required = [True, False, False, False]
+    assert parameters("/query") == [
+        ("query", name, *rest)
+        for name, *rest in zip(["token", "x_request_id", "retries", "X_Custom"], required, schemas, strict=True)
+    ]
+    # Bolt reads a header field in lower case, with "-" for each "_".
+    assert parameters("/header") == [
+        ("header", name, *rest)
+        for name, *rest in zip(["token", "x-request-id", "retries", "x-custom"], required, schemas, strict=True)
+    ]
+    assert parameters("/cookie") == [
+        ("cookie", name, *rest)
+        for name, *rest in zip(["token", "x_request_id", "retries", "X_Custom"], required, schemas, strict=True)
+    ]
 
 
 class UserGender(enum.StrEnum):
