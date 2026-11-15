@@ -28,6 +28,12 @@ def _normalize_datetime(value: datetime) -> datetime:
     return value.replace(microsecond=0, tzinfo=UTC)
 
 
+# The claims that are Token fields. ``extras`` cannot hold them.
+_STANDARD_CLAIMS = frozenset(
+    {"exp", "sub", "iat", "iss", "aud", "jti", "nbf", "is_staff", "is_superuser", "is_admin", "permissions"}
+)
+
+
 @dataclass
 class Token:
     """
@@ -96,7 +102,8 @@ class Token:
 
     # Extra custom claims
     extras: dict[str, Any] = field(default_factory=dict)
-    """Any additional custom claims not covered by standard fields"""
+    """Any additional custom claims not covered by standard fields.
+    A claim with the name of a Token field raises ``ValueError``."""
 
     # Internal flag to skip validation (used during decoding)
     _skip_validation: bool = field(default=False, repr=False, compare=False)
@@ -118,16 +125,25 @@ class Token:
             raise ValueError("exp must be a datetime object")
 
         # Normalize iat
-        if isinstance(self.iat, datetime):
-            self.iat = _normalize_datetime(self.iat)
-            if not self._skip_validation:
-                now = _normalize_datetime(datetime.now(UTC))
-                if self.iat.timestamp() > now.timestamp():
-                    raise ValueError("iat (issued at) must be current or past time")
+        if not isinstance(self.iat, datetime):
+            raise TypeError(f"iat must be a datetime object, not {type(self.iat).__name__}")
+        self.iat = _normalize_datetime(self.iat)
+        if not self._skip_validation:
+            now = _normalize_datetime(datetime.now(UTC))
+            if self.iat.timestamp() > now.timestamp():
+                raise ValueError("iat (issued at) must be current or past time")
 
         # Normalize nbf if provided
-        if self.nbf is not None and isinstance(self.nbf, datetime):
+        if self.nbf is not None:
+            if not isinstance(self.nbf, datetime):
+                raise TypeError(f"nbf must be a datetime object, not {type(self.nbf).__name__}")
             self.nbf = _normalize_datetime(self.nbf)
+
+        # to_dict() writes the extras last. An extra with the name of a field
+        # would replace the value of that field in the encoded token.
+        standard = _STANDARD_CLAIMS.intersection(self.extras)
+        if standard:
+            raise ValueError(f"extras must not contain the standard claims {sorted(standard)}. Set the Token fields.")
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -257,21 +273,7 @@ class Token:
             if "nbf" in payload:
                 nbf = datetime.fromtimestamp(payload["nbf"], tz=UTC)
 
-            # Extract known fields
-            known_fields = {
-                "exp",
-                "sub",
-                "iat",
-                "iss",
-                "aud",
-                "jti",
-                "nbf",
-                "is_staff",
-                "is_superuser",
-                "is_admin",
-                "permissions",
-            }
-            extras = {k: v for k, v in payload.items() if k not in known_fields}
+            extras = {k: v for k, v in payload.items() if k not in _STANDARD_CLAIMS}
 
             return cls(
                 exp=exp,
@@ -314,7 +316,10 @@ class Token:
             is_staff: Staff flag
             is_admin: Admin flag. An admin is also staff, so it sets ``is_staff`` too.
             permissions: List of permissions
-            **extra_claims: Any additional claims
+            **extra_claims: Any additional claims. ``jti``, ``nbf`` and
+                ``is_superuser`` set the Token fields of these names. Another
+                claim with the name of a Token field, such as ``exp``, raises
+                ``ValueError``.
 
         Returns:
             New Token instance
@@ -334,5 +339,9 @@ class Token:
             is_staff=is_staff or is_admin,  # An admin is also staff.
             is_admin=is_admin,
             permissions=permissions,
+            # The fields that have no parameter of their own.
+            jti=extra_claims.pop("jti", None),
+            nbf=extra_claims.pop("nbf", None),
+            is_superuser=extra_claims.pop("is_superuser", None),
             extras=extra_claims,
         )

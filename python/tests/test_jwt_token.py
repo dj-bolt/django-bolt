@@ -497,6 +497,37 @@ class TestTokenClaimValidation:
         with pytest.raises(ValueError, match=r"^exp must be a datetime object$"):
             Token(sub="user123", exp="tomorrow")
 
+    @pytest.mark.parametrize("field", ["nbf", "iat"])
+    def test_time_claim_that_is_not_a_datetime_raises_type_error(self, field):
+        """An int for ``nbf`` or ``iat`` fails at construction, not later in ``to_dict()``."""
+        with pytest.raises(TypeError) as raised:
+            Token(sub="user123", exp=datetime.now(UTC) + timedelta(hours=1), **{field: 1700000000})
+
+        assert str(raised.value) == f"{field} must be a datetime object, not int"
+
+    @pytest.mark.parametrize(
+        "name",
+        ["exp", "sub", "iat", "iss", "aud", "jti", "nbf", "is_staff", "is_superuser", "is_admin", "permissions"],
+    )
+    def test_extra_claim_with_the_name_of_a_standard_claim_raises_value_error(self, name):
+        """``extras`` cannot replace the value of a Token field in the encoded token."""
+        with pytest.raises(ValueError, match="^extras must not contain") as raised:
+            Token(sub="user123", exp=datetime.now(UTC) + timedelta(hours=1), extras={name: "other", "tenant": "acme"})
+
+        assert str(raised.value) == f"extras must not contain the standard claims ['{name}']. Set the Token fields."
+
+    def test_create_refuses_an_extra_claim_that_replaces_the_expiry(self):
+        with pytest.raises(ValueError, match="^extras must not contain the standard claims"):
+            Token.create(sub="user123", exp=4102444800)
+
+    def test_create_sets_the_fields_that_have_no_parameter(self):
+        """``jti``, ``nbf`` and ``is_superuser`` given to ``create()`` are Token fields, not extras."""
+        nbf = datetime.now(UTC) - timedelta(minutes=1)
+        token = Token.create(sub="user123", jti="token-1", nbf=nbf, is_superuser=True, tenant="acme")
+
+        assert (token.jti, token.is_superuser, token.extras) == ("token-1", True, {"tenant": "acme"})
+        assert token.to_dict()["nbf"] == int(nbf.timestamp())
+
     def test_future_iat_message(self):
         with pytest.raises(ValueError, match=r"^iat \(issued at\) must be current or past time$"):
             Token(
