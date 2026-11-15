@@ -393,7 +393,13 @@ api = BoltAPI(
 
 Each wrapper runs the `process_view` hook of its middleware before the handler. The hook gets the route handler as the view, so view decorators such as `@csrf_exempt` and `@login_not_required` work.
 
-Bolt runs three hooks of a Django middleware: `process_request`, `process_view` and `process_response`. It does not run `process_exception` or `process_template_response`. A handler exception goes to the Bolt error handlers, and `process_exception` does not see it. See [Error Handling](error-handling.md).
+Bolt runs four hooks of a Django middleware: `process_request`, `process_view`, `process_response` and `process_exception`. It does not run `process_template_response`.
+
+When a handler raises an exception, Bolt calls `process_exception` of each middleware, as Django does. The last middleware runs first. The first response that a hook returns answers the request. If no hook returns a response, the exception goes to the Bolt error handlers. See [Error Handling](error-handling.md).
+
+An `HTTPException` and a validation error do not go to `process_exception`. They are responses of the API, and Bolt builds them.
+
+With `django_middleware=[...]` or `DjangoMiddlewareStack`, the response of `process_exception` goes through `process_response` of each middleware. In a list of `DjangoMiddleware` wrappers, it goes through `process_response` of the wrapper that answered and of the wrappers before it.
 
 A list of wrappers runs the hooks in a different order from Django. Each wrapper runs its `process_request` and then its `process_view`, before the next wrapper starts. Django runs all `process_request` hooks first, and then all `process_view` hooks. If the order of the hooks is important, use `django_middleware=[...]` or `DjangoMiddlewareStack`. They use the order of Django.
 

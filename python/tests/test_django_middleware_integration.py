@@ -36,6 +36,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django_bolt import BoltAPI, Request, Router
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
 from django_bolt.concurrency import run_orm_blocking
+from django_bolt.exceptions import HTTPException
 from django_bolt.middleware import (
     DjangoMiddleware,
     DjangoMiddlewareStack,
@@ -1693,37 +1694,165 @@ class TestCSRFMiddleware:
 _CSRF_SECRET = "abcdefghijklmnopqrstuvwxyz012345"
 
 
-class _RecordsUnsupportedHooks(MiddlewareMixin):
-    """Record the hooks that Bolt does not run. process_view is the one that it runs."""
+_exception_calls: list = []
 
-    calls: list = []
 
-    def process_view(self, request, view_func, view_args, view_kwargs):
-        type(self).calls.append("process_view")
+class _ExceptionHookMiddleware(MiddlewareMixin):
+    """Record process_exception and process_response. ``answer`` is the response of process_exception."""
+
+    name = ""
+    answer = None
 
     def process_exception(self, request, exception):
-        type(self).calls.append("process_exception")
-        return HttpResponse("handled", status=418)
+        _exception_calls.append((self.name, "process_exception", type(exception).__name__))
+        return self.answer
+
+    def process_response(self, request, response):
+        _exception_calls.append((self.name, "process_response", response.status_code))
+        return response
 
 
-@pytest.mark.parametrize(
-    "layout",
-    [lambda: DjangoMiddleware(_RecordsUnsupportedHooks), lambda: DjangoMiddlewareStack([_RecordsUnsupportedHooks])],
-    ids=["wrapper", "stack"],
-)
-def test_process_view_runs_and_process_exception_does_not(layout):
-    _RecordsUnsupportedHooks.calls = []
-    api = BoltAPI(middleware=[layout()])
+class _FirstExceptionHook(_ExceptionHookMiddleware):
+    name = "first"
 
-    @api.get("/boom")
-    async def boom():
-        raise ValueError("boom")
 
-    with TestClient(api, raise_server_exceptions=False) as client:
-        response = client.get("/boom")
+class _SecondExceptionHook(_ExceptionHookMiddleware):
+    name = "second"
 
-    assert _RecordsUnsupportedHooks.calls == ["process_view"]
-    assert response.status_code == 500
+    def process_exception(self, request, exception):
+        super().process_exception(request, exception)
+        return HttpResponse(f"handled {exception}", status=418)
+
+
+class _ThirdExceptionHook(_ExceptionHookMiddleware):
+    name = "third"
+
+
+class _CallStyleExceptionHook:
+    """A middleware with ``__call__`` and process_exception, and no other hook."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        return self.get_response(request)
+
+    def process_exception(self, request, exception):
+        _exception_calls.append(("call-style", "process_exception", type(exception).__name__))
+
+
+def _exception_layout(layout, classes):
+    if layout == "wrappers":
+        return [DjangoMiddleware(cls) for cls in classes]
+    return [DjangoMiddlewareStack(list(classes))]
+
+
+def _exception_api(middleware, kind):
+    api = BoltAPI(middleware=middleware)
+    if kind == "sync":
+
+        @api.get("/boom")
+        def boom():
+            raise ValueError("boom")
+
+        @api.get("/conflict")
+        def conflict():
+            raise HTTPException(status_code=409, detail="conflict")
+
+    else:
+
+        @api.get("/boom")
+        async def boom():
+            raise ValueError("boom")
+
+        @api.get("/conflict")
+        async def conflict():
+            raise HTTPException(status_code=409, detail="conflict")
+
+    return api
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("layout", ["stack", "wrappers"])
+class TestProcessException:
+    """Django calls process_exception when the view raises. The last middleware runs first."""
+
+    def test_the_first_response_of_process_exception_answers_the_request(self, layout, kind):
+        _exception_calls.clear()
+        classes = (_FirstExceptionHook, _SecondExceptionHook, _ThirdExceptionHook)
+        api = _exception_api(_exception_layout(layout, classes), kind)
+
+        with TestClient(api) as client:
+            response = client.get("/boom")
+
+        assert response.status_code == 418
+        assert response.text == "handled boom"
+        # The hooks run in reverse order. "first" does not run after the response of "second".
+        hooks = [("third", "process_exception", "ValueError"), ("second", "process_exception", "ValueError")]
+        if layout == "stack":
+            # As in Django, the response goes through process_response of each middleware.
+            assert _exception_calls == [
+                *hooks,
+                ("third", "process_response", 418),
+                ("second", "process_response", 418),
+                ("first", "process_response", 418),
+            ]
+        else:
+            # Each wrapper is a layer. The exception left the layer of "third" before "second" answered.
+            assert _exception_calls == [
+                *hooks,
+                ("second", "process_response", 418),
+                ("first", "process_response", 418),
+            ]
+
+    def test_the_exception_goes_to_the_error_handlers_when_no_hook_answers(self, layout, kind):
+        _exception_calls.clear()
+        api = _exception_api(_exception_layout(layout, (_FirstExceptionHook, _ThirdExceptionHook)), kind)
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.get("/boom")
+
+        assert response.status_code == 500
+        assert _exception_calls == [
+            ("third", "process_exception", "ValueError"),
+            ("first", "process_exception", "ValueError"),
+        ]
+
+    def test_an_http_exception_is_a_response_and_not_an_exception_for_the_hooks(self, layout, kind):
+        _exception_calls.clear()
+        api = _exception_api(_exception_layout(layout, (_FirstExceptionHook, _SecondExceptionHook)), kind)
+
+        with TestClient(api) as client:
+            response = client.get("/conflict")
+
+        assert response.status_code == 409
+        assert _exception_calls == []
+
+    def test_a_call_style_middleware_gets_the_exception(self, layout, kind):
+        """A stack of hook and ``__call__`` middleware uses the compatibility chain."""
+        _exception_calls.clear()
+        classes = (_FirstExceptionHook, _CallStyleExceptionHook, _SecondExceptionHook)
+        api = _exception_api(_exception_layout(layout, classes), kind)
+
+        with TestClient(api) as client:
+            response = client.get("/boom")
+
+        assert response.status_code == 418
+        assert _exception_calls == [
+            ("second", "process_exception", "ValueError"),
+            ("second", "process_response", 418),
+            ("first", "process_response", 418),
+        ]
+
+    def test_a_stack_of_call_style_middleware_gets_the_exception(self, layout, kind):
+        _exception_calls.clear()
+        api = _exception_api(_exception_layout(layout, (_CallStyleExceptionHook,)), kind)
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.get("/boom")
+
+        assert response.status_code == 500
+        assert _exception_calls == [("call-style", "process_exception", "ValueError")]
 
 
 class _BlockInViewMiddleware(MiddlewareMixin):
