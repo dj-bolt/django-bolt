@@ -447,6 +447,8 @@ api = BoltAPI(
 )
 ```
 
+An entry of the list can also be the dotted path of a class, as for `DjangoMiddleware`.
+
 ### Accessing Django request attributes
 
 Django middleware sets attributes on the request that are automatically synced to the Bolt request:
