@@ -571,6 +571,8 @@ async def internal_endpoint(request):
 
 API keys are sent in the `X-API-Key` header by default.
 
+`api_keys` must be a set, list or tuple of non-empty strings. A str, such as `api_keys="sk-prod-123abc"`, or an empty key raises `ImproperlyConfigured`. Thus a missing environment variable in `api_keys={os.environ.get("API_KEY", "")}` stops startup.
+
 ### API key permissions (In Development)
 
 Assign different permissions to different keys:
@@ -586,6 +588,8 @@ APIKeyAuthentication(
     key_permissions=key_permissions
 )
 ```
+
+Each key of `key_permissions` must be in `api_keys`. Each value must be a set, list or tuple of strings.
 
 ### Custom header
 

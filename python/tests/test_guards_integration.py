@@ -265,6 +265,8 @@ def test_api_key_authentication_without_key(client):
     """Test API key authentication without key"""
     response = client.get("/api-endpoint")
     assert response.status_code == 401
+    # An empty header value is not a key.
+    assert client.get("/api-endpoint", headers={"X-API-Key": ""}).status_code == 401
 
 
 def test_api_key_authentication_with_valid_key(client):
