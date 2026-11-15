@@ -461,6 +461,29 @@ class TestInvalidTypeInput:
 
         assert response.status_code in [400, 422]
 
+    @pytest.mark.parametrize(
+        ("path", "payload", "field_name"),
+        [
+            ("/users", {"email": "test@example.com", "username": "john_doe"}, "email"),
+            ("/users", {"email": "test@example.com", "username": "john_doe"}, "username"),
+            ("/users", {"email": "a@b.co", "username": "john", "website": "https://example.com"}, "website"),
+            ("/contacts", {"name": "John", "email": "john@example.com", "phone": "+14155551234"}, "phone"),
+            ("/servers", {"name": "Web", "host": "192.168.1.1", "port": 8080}, "host"),
+            ("/themes", {"name": "Dark", "primary_color": "#FF5733", "secondary_color": "#000000"}, "primary_color"),
+            ("/entities", {"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Entity"}, "id"),
+            ("/posts", {"title": "Post", "slug": "my-blog-post"}, "slug"),
+            ("/posts", {"title": "Post", "slug": "post", "external_url": "https://example.com/post"}, "external_url"),
+        ],
+    )
+    def test_value_with_a_line_break_at_its_end_is_rejected(self, client, path, payload, field_name):
+        """A pattern type accepts the value, but not the value with a line break after it."""
+        assert client.post(path, json=payload).status_code == 200
+
+        response = client.post(path, json={**payload, field_name: payload[field_name] + "\n"})
+
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"][0]["loc"] == ["body", field_name]
+
     def test_create_contact_invalid_phone(self, client):
         """Test that invalid phone is rejected."""
         payload = {

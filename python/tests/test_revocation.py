@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from django.core.cache import caches
 from django.core.cache.backends.locmem import LocMemCache
+from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
 from django.db import IntegrityError
 
 from django_bolt import BoltAPI
-from django_bolt.auth import JWTAuthViews
+from django_bolt.auth import JWTAuthentication, JWTAuthViews
 from django_bolt.auth.revocation import (
     _DEFAULT_TTL_SECONDS,
     DjangoCacheRevocation,
@@ -66,30 +67,39 @@ def test_in_memory_consume_is_single_use():
 # ---------------------------------------------------------------------------
 
 
-def test_ttl_for_derives_from_future_exp():
-    """exp in the future → seconds-until-exp."""
+@pytest.mark.parametrize(("leeway", "expected"), [(0, 3600), (60, 3660)], ids=["no-leeway", "leeway-60"])
+def test_ttl_for_derives_from_future_exp(leeway, expected):
+    """exp in the future → seconds until ``exp + leeway``."""
     exp = int(time.time()) + 3600
-    resolved = _ttl_for(exp)
+    resolved = _ttl_for(exp, leeway=leeway)
     # Allow ±2s drift between the time.time() inside _ttl_for and the
     # one in the test setup
-    assert 3598 <= resolved <= 3600
+    assert expected - 2 <= resolved <= expected
 
 
-def test_ttl_for_clamps_past_exp_to_zero():
-    """An already-expired token must produce 0, never a negative value
-    (timedelta(seconds=-N) would silently subtract from now)."""
+@pytest.mark.parametrize("leeway", [0, 60])
+def test_ttl_for_clamps_past_exp_to_zero(leeway):
+    """A token that is after ``exp + leeway`` must produce 0, never a negative
+    value (timedelta(seconds=-N) would silently subtract from now)."""
     past = int(time.time()) - 3600
-    assert _ttl_for(past) == 0
+    assert _ttl_for(past, leeway=leeway) == 0
+
+
+def test_ttl_for_keeps_an_entry_for_a_token_inside_the_leeway():
+    """The backend still accepts a token 10 seconds after ``exp``. Its entry must live."""
+    just_expired = int(time.time()) - 10
+    assert 48 <= _ttl_for(just_expired, leeway=60) <= 50
+    assert _ttl_for(just_expired, leeway=0) == 0
 
 
 def test_ttl_for_falls_back_to_default_when_exp_none():
-    """No exp → falls back to the supplied default."""
-    assert _ttl_for(None) == _DEFAULT_TTL_SECONDS
+    """No exp → falls back to the supplied default. The leeway does not change it."""
+    assert _ttl_for(None, leeway=60) == _DEFAULT_TTL_SECONDS
 
 
 def test_ttl_for_uses_supplied_default():
     """Stores pass their own per-instance default_ttl through to the resolver."""
-    assert _ttl_for(None, default=12345) == 12345
+    assert _ttl_for(None, default=12345, leeway=60) == 12345
 
 
 # ---------------------------------------------------------------------------
@@ -105,25 +115,25 @@ def _make_cache_revocation(cache_alias="default"):
 
 
 def test_cache_revocation_no_exp_uses_default():
-    """revoke(jti) with no exp → cache timeout = 30-day default."""
+    """revoke(jti) with no exp → cache timeout = 7-day default."""
     store, mock_cache = _make_cache_revocation()
     asyncio.run(store.revoke("jti-1"))
     mock_cache.set.assert_called_once_with("revoked:jti-1", "1", timeout=_DEFAULT_TTL_SECONDS)
 
 
 def test_cache_revocation_exp_drives_timeout():
-    """revoke(jti, exp=future) → cache timeout ≈ exp - now."""
+    """revoke(jti, exp=future) → cache timeout ≈ exp + leeway - now."""
     store, mock_cache = _make_cache_revocation()
     exp = int(time.time()) + 3600
     asyncio.run(store.revoke("jti-2", exp=exp))
 
     _, call_kwargs = mock_cache.set.call_args
     timeout = call_kwargs["timeout"]
-    assert 3598 <= timeout <= 3600
+    assert 3658 <= timeout <= 3660
 
 
 def test_cache_revocation_past_exp_clamps_to_zero():
-    """An exp in the past → cache timeout=0 (not the 30-day default,
+    """An exp before now - leeway → cache timeout=0 (not the 7-day default,
     not a negative value)."""
     store, mock_cache = _make_cache_revocation()
     past = int(time.time()) - 3600
@@ -151,7 +161,32 @@ def test_cache_revocation_per_call_exp_beats_per_instance_default():
 
     _, call_kwargs = mock_cache.set.call_args
     timeout = call_kwargs["timeout"]
-    assert 3598 <= timeout <= 3600
+    assert 3658 <= timeout <= 3660
+
+
+@pytest.mark.parametrize("store_class", [DjangoCacheRevocation, DjangoORMRevocation])
+def test_store_rejects_a_negative_leeway(store_class):
+    with pytest.raises(ImproperlyConfigured) as raised:
+        store_class(leeway=-1)
+
+    assert str(raised.value) == f"{store_class.__name__} leeway must be >= 0 seconds."
+
+
+def test_jwt_backend_rejects_a_store_with_a_smaller_leeway():
+    """An entry of that store would expire while the backend still accepts the token."""
+    with pytest.raises(ImproperlyConfigured) as raised:
+        JWTAuthentication(secret="s" * 32, leeway=120, revocation_store=DjangoCacheRevocation())
+
+    assert str(raised.value) == (
+        "JWTAuthentication leeway is 120 seconds, but its revocation_store has a leeway of 60 seconds. "
+        "A revoked token would be accepted again before it expires. Pass leeway=120 to the store."
+    )
+    # An equal or larger leeway of the store is correct. So is a store that keeps each entry.
+    assert (
+        JWTAuthentication(secret="s" * 32, leeway=120, revocation_store=DjangoORMRevocation(leeway=120)).leeway == 120
+    )
+    assert JWTAuthentication(secret="s" * 32, leeway=0, revocation_store=DjangoCacheRevocation()).leeway == 0
+    assert JWTAuthentication(secret="s" * 32, leeway=120, revocation_store=InMemoryRevocation()).leeway == 120
 
 
 def test_cache_consume_uses_atomic_add():
@@ -202,7 +237,7 @@ def _make_orm_revocation(model_path="myapp.RevokedToken"):
 
 
 def test_orm_revocation_no_exp_uses_default():
-    """revoke(jti) with no exp → expires_at ≈ now + 30 days."""
+    """revoke(jti) with no exp → expires_at ≈ now + 7 days."""
     store, mock_model = _make_orm_revocation()
     before = datetime.now(UTC)
     asyncio.run(store.revoke("jti-orm-1"))
@@ -217,7 +252,7 @@ def test_orm_revocation_no_exp_uses_default():
 
 
 def test_orm_revocation_exp_drives_expires_at():
-    """revoke(jti, exp=future) → expires_at ≈ datetime(exp)."""
+    """revoke(jti, exp=future) → expires_at ≈ datetime(exp + leeway)."""
     store, mock_model = _make_orm_revocation()
     exp = int(time.time()) + 7200
     asyncio.run(store.revoke("jti-orm-2", exp=exp))
@@ -225,14 +260,14 @@ def test_orm_revocation_exp_drives_expires_at():
     _, call_kwargs = mock_model.objects.aupdate_or_create.call_args
     expires_at = call_kwargs["defaults"]["expires_at"]
 
-    expected = datetime.fromtimestamp(exp, tz=UTC)
+    expected = datetime.fromtimestamp(exp + 60, tz=UTC)
     # ±2s for clock drift between time.time() in _ttl_for and datetime.now()
     # in revoke
     assert abs((expires_at - expected).total_seconds()) <= 2
 
 
 def test_orm_revocation_past_exp_clamps_to_now():
-    """An exp already in the past → expires_at ≈ now (row is immediately
+    """An exp before now - leeway → expires_at ≈ now (row is immediately
     eligible for cleanup; is_revoked still returns True until cleanup
     runs)."""
     store, mock_model = _make_orm_revocation()
@@ -403,44 +438,48 @@ def test_cache_consumed_token_counts_as_revoked(cache_store):
 
 FUTURE = 3600
 PAST = -3600
+# 10 seconds after ``exp``: the default leeway of 60 seconds still accepts the token.
+IN_LEEWAY = -10
 
-
-@pytest.mark.parametrize(
-    ("ttl", "exp_offset", "second_call_is_blocked"),
+_CACHE_MARKER_CASES = pytest.mark.parametrize(
+    ("kwargs", "exp_offset", "marker_lives"),
     [
-        (None, FUTURE, True),
-        (None, PAST, False),
-        (0, None, False),
-        (900, None, True),
+        ({}, FUTURE, True),
+        ({}, PAST, False),
+        ({}, IN_LEEWAY, True),
+        ({"leeway": 0}, IN_LEEWAY, False),
+        ({"default_ttl": 0}, None, False),
+        ({"default_ttl": 900}, None, True),
     ],
-    ids=["exp-in-future", "exp-in-past", "default-ttl-zero", "default-ttl-900"],
+    ids=[
+        "exp-in-future",
+        "exp-in-past",
+        "exp-inside-leeway",
+        "exp-in-past-no-leeway",
+        "default-ttl-zero",
+        "default-ttl-900",
+    ],
 )
-def test_cache_consume_marker_lifetime(cache_store, ttl, exp_offset, second_call_is_blocked):
-    """The marker lives until ``exp``. With no ``exp`` it lives for ``default_ttl`` seconds."""
-    store = cache_store(**({} if ttl is None else {"default_ttl": ttl}))
+
+
+@_CACHE_MARKER_CASES
+def test_cache_consume_marker_lifetime(cache_store, kwargs, exp_offset, marker_lives):
+    """The marker lives until ``exp + leeway``. With no ``exp`` it lives for ``default_ttl`` seconds."""
+    store = cache_store(**kwargs)
     exp = None if exp_offset is None else int(time.time()) + exp_offset
 
     assert asyncio.run(store.consume("a", exp=exp)) is True
-    assert asyncio.run(store.consume("a", exp=exp)) is (not second_call_is_blocked)
+    assert asyncio.run(store.consume("a", exp=exp)) is (not marker_lives)
 
 
-@pytest.mark.parametrize(
-    ("ttl", "exp_offset", "is_revoked_after"),
-    [
-        (None, FUTURE, True),
-        (None, PAST, False),
-        (0, None, False),
-        (900, None, True),
-    ],
-    ids=["exp-in-future", "exp-in-past", "default-ttl-zero", "default-ttl-900"],
-)
-def test_cache_family_marker_lifetime(cache_store, ttl, exp_offset, is_revoked_after):
-    store = cache_store(**({} if ttl is None else {"default_ttl": ttl}))
+@_CACHE_MARKER_CASES
+def test_cache_family_marker_lifetime(cache_store, kwargs, exp_offset, marker_lives):
+    store = cache_store(**kwargs)
     exp = None if exp_offset is None else int(time.time()) + exp_offset
 
     asyncio.run(store.revoke_family("f", exp=exp))
 
-    assert asyncio.run(store.is_family_revoked("f")) is is_revoked_after
+    assert asyncio.run(store.is_family_revoked("f")) is marker_lives
 
 
 def test_cache_family_revocation_is_per_family(cache_store):
@@ -545,17 +584,27 @@ def test_orm_consume_is_single_use_for_each_jti(orm_store):
 
 
 @pytest.mark.parametrize(
-    ("default_ttl", "exp_offset", "expected"),
+    ("kwargs", "exp_offset", "expected"),
     [
-        (None, FUTURE, FUTURE),
-        (None, PAST, 0),
-        (None, None, _DEFAULT_TTL_SECONDS),
-        (900, None, 900),
+        ({}, FUTURE, FUTURE + 60),
+        ({"leeway": 0}, FUTURE, FUTURE),
+        ({}, PAST, 0),
+        ({}, IN_LEEWAY, 50),
+        ({}, None, _DEFAULT_TTL_SECONDS),
+        ({"default_ttl": 900}, None, 900),
     ],
-    ids=["exp-in-future", "exp-in-past", "module-default", "default-ttl-900"],
+    ids=[
+        "exp-in-future",
+        "exp-in-future-no-leeway",
+        "exp-in-past",
+        "exp-inside-leeway",
+        "module-default",
+        "default-ttl-900",
+    ],
 )
-def test_orm_consume_row_expires_with_the_token(orm_store, default_ttl, exp_offset, expected):
-    store = orm_store(**({} if default_ttl is None else {"default_ttl": default_ttl}))
+def test_orm_consume_row_expires_with_the_token(orm_store, kwargs, exp_offset, expected):
+    """The row expires at ``exp + leeway``, the time when the backend stops accepting the token."""
+    store = orm_store(**kwargs)
     exp = None if exp_offset is None else int(time.time()) + exp_offset
 
     assert asyncio.run(store.consume("a", exp=exp)) is True
@@ -574,7 +623,7 @@ def test_orm_family_revocation_is_per_family(orm_store):
     # A family and a token with the same name are not the same thing.
     assert asyncio.run(store.is_revoked("f")) is False
     assert asyncio.run(store.is_revoked("family:f")) is True
-    assert _expires_in("family:f") == pytest.approx(FUTURE, abs=3)
+    assert _expires_in("family:f") == pytest.approx(FUTURE + 60, abs=3)
 
 
 def test_orm_user_version_counts_each_logout_all(orm_store):
