@@ -208,6 +208,11 @@ async def room(websocket: WebSocket, room: str):
         raise WebSocketException(code=4004, reason="No such room")
 ```
 
+`WebSocketException` and `WebSocketClose` do the same check when the handler
+makes the exception. `WebSocketException(code=1005)` raises `ValueError`, and
+the handler then ends with that error: the connection closes with 1011.
+`WebSocketDisconnect` reports the close of the client, so it has no check.
+
 ### Refuse the handshake
 
 Bolt sends the `101` response only when the handler calls `accept()`.

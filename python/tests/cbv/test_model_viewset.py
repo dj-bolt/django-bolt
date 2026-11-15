@@ -366,6 +366,56 @@ def test_write_actions_answer_the_422_of_a_function_route_for_a_bad_field(api, b
 
 
 @pytest.mark.django_db(transaction=True)
+def test_partial_update_with_a_renamed_serializer(api):
+    """PATCH works when the serializer has wire names that differ from the field names."""
+
+    class CamelRequired(Serializer, rename="camel"):
+        title: str
+        is_published: bool
+
+    class CamelDefault(Serializer, rename="camel"):
+        title: str
+        is_published: bool = False
+
+    @api.viewset("/required")
+    class RequiredViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = CamelRequired
+
+    @api.viewset("/default")
+    class DefaultViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = CamelDefault
+
+    article = Article.objects.create(title="t", content="c", author="a")
+
+    with TestClient(api) as client:
+        # A field with no rename effect. The required renamed field comes from the object.
+        response = client.patch(f"/required/{article.id}", json={"title": "new"})
+        assert response.status_code == 200
+        assert response.json() == {"title": "new", "isPublished": False}
+
+        # A renamed field, by its wire name.
+        response = client.patch(f"/required/{article.id}", json={"isPublished": True})
+        assert response.status_code == 200
+        assert response.json() == {"title": "new", "isPublished": True}
+        article.refresh_from_db()
+        assert (article.title, article.is_published) == ("new", True)
+
+        # A renamed field with a default: the value of the body applies, not the default.
+        Article.objects.filter(id=article.id).update(is_published=False)
+        response = client.patch(f"/default/{article.id}", json={"isPublished": True})
+        assert response.status_code == 200
+        assert response.json() == {"title": "new", "isPublished": True}
+        article.refresh_from_db()
+        assert article.is_published is True
+
+        # A value of the wrong type is still a validation error.
+        response = client.patch(f"/required/{article.id}", json={"isPublished": "text"})
+        assert response.status_code == 422
+
+
+@pytest.mark.django_db(transaction=True)
 def test_model_viewset_lookup_field(api):
     """Test ModelViewSet with custom lookup_field."""
     # Create article

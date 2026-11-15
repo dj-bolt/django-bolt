@@ -38,6 +38,7 @@ from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, Tuple
 from . import _json
 from .concurrency import run_in_orm_executor
 from .exceptions import ResponseValidationError, UnloadedRelationError
+from .middleware.middleware import note_config_decorator
 from .typing import REQUEST_PARAM_NAMES
 
 __all__ = [
@@ -917,6 +918,7 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     """
 
     def decorator(handler: Callable) -> Callable:
+        note_config_decorator(handler, "paginate")
         # The route decorator uses the same test for is_async.
         handler_is_async = inspect.iscoroutinefunction(handler)
         # Store original handler for introspection

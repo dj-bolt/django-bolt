@@ -244,6 +244,128 @@ class TestInvalidJSONParsing:
             assert client.post("/required").status_code == 422
 
 
+class TestBodyMarkerOptions:
+    """`Body()` options do what the `Body()` options of FastAPI do."""
+
+    def test_embed_reads_the_value_from_the_key_of_the_parameter_name(self):
+        api = BoltAPI()
+
+        @api.post("/struct")
+        async def struct(user: Annotated[UserCreate, Body(embed=True)]):
+            return {"name": user.name}
+
+        @api.post("/scalar")
+        async def scalar(count: Annotated[int, Body(embed=True)]):
+            return {"count": count}
+
+        @api.post("/alias")
+        async def alias(count: Annotated[int, Body(embed=True, alias="item-count")]):
+            return {"count": count}
+
+        @api.post("/default")
+        async def default(count: Annotated[int, Body(embed=True)] = 5):
+            return {"count": count}
+
+        @api.post("/optional")
+        async def optional(count: Annotated[int | None, Body(embed=True)]):
+            return {"count": count}
+
+        @api.post("/default-in-marker")
+        async def default_in_marker(count: int = Body(7, embed=True)):
+            return {"count": count}
+
+        with TestClient(api) as client:
+            user = {"name": "Ana", "email": "ana@example.com", "age": 30}
+            assert client.post("/struct", json={"user": user}).json() == {"name": "Ana"}
+            # The object of the type with no wrapper has no "user" key.
+            response = client.post("/struct", json=user)
+            assert response.status_code == 422
+            assert response.json()["detail"][0]["loc"] == ["body", "user"]
+            assert client.post("/struct", json={"user": {"name": "Ana"}}).json()["detail"][0]["loc"] == [
+                "body",
+                "user",
+                "email",
+            ]
+
+            assert client.post("/scalar", json={"count": 3, "other": 1}).json() == {"count": 3}
+            assert client.post("/scalar", json={"count": "x"}).json()["detail"][0]["loc"] == ["body", "count"]
+            # The value with no wrapper is not an object.
+            assert client.post("/scalar", json=3).status_code == 422
+            assert client.post("/scalar", json={}).status_code == 422
+            assert client.post("/scalar").status_code == 422
+
+            assert client.post("/alias", json={"item-count": 3}).json() == {"count": 3}
+            assert client.post("/alias", json={"count": 3}).status_code == 422
+
+            for path, value in (("/default", 5), ("/optional", None), ("/default-in-marker", 7)):
+                assert client.post(path).json() == {"count": value}, path
+                assert client.post(path, json={}).json() == {"count": value}, path
+                assert client.post(path, json={"count": 2}).json() == {"count": 2}, path
+
+    def test_embed_alias_description_and_example_are_in_the_openapi_document(self):
+        api = BoltAPI()
+
+        @api.post("/embed")
+        async def embed(
+            user: Annotated[UserCreate, Body(embed=True, alias="account", description="The account", example={"a": 1})],
+        ):
+            return {"name": user.name}
+
+        @api.post("/embed-default")
+        async def embed_default(count: Annotated[int, Body(embed=True)] = 5):
+            return {"count": count}
+
+        @api.post("/plain")
+        async def plain(user: Annotated[UserCreate, Body(description="The user", example={"name": "Ana"})]):
+            return {"name": user.name}
+
+        @api.post("/no-options")
+        async def no_options(user: UserCreate):
+            return {"name": user.name}
+
+        @api.post("/form")
+        async def form(tag: Annotated[str, Form(example="blue", description="A tag")]):
+            return {"tag": tag}
+
+        api._register_openapi_routes()
+
+        with TestClient(api) as client:
+            paths = client.get("/docs/openapi.json").json()["paths"]
+
+        user_ref = {"$ref": "#/components/schemas/UserCreate"}
+        assert paths["/embed"]["post"]["requestBody"] == {
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object", "properties": {"account": user_ref}, "required": ["account"]},
+                    "example": {"account": {"a": 1}},
+                }
+            },
+            "description": "The account",
+            "required": True,
+        }
+        assert paths["/embed-default"]["post"]["requestBody"] == {
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object", "properties": {"count": {"type": "integer", "default": 5}}}
+                }
+            },
+            "description": "Request body for count",
+            "required": False,
+        }
+        assert paths["/plain"]["post"]["requestBody"] == {
+            "content": {"application/json": {"schema": user_ref, "example": {"name": "Ana"}}},
+            "description": "The user",
+            "required": True,
+        }
+        assert paths["/no-options"]["post"]["requestBody"] == {
+            "content": {"application/json": {"schema": user_ref}},
+            "description": "Request body for user",
+            "required": True,
+        }
+        form_schema = paths["/form"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+        assert form_schema["properties"]["tag"] == {"type": "string", "description": "A tag", "examples": ["blue"]}
+
+
 class TestBodyOfNonStructType:
     """A body with a type that is not a Struct is decoded as the type, with the same errors."""
 
@@ -609,6 +731,37 @@ def test_each_parameter_type_that_converts_from_text_registers():
             "ratio": None,
             "tags": ["a", "b"],
         }
+
+
+def test_a_timedelta_parameter_registers_and_converts_and_the_hint_names_it():
+    """A scalar timedelta converts for each text source, so the hint of the error lists it."""
+    api = BoltAPI()
+
+    @api.get("/wait/{pause}")
+    async def wait(
+        pause: datetime.timedelta,
+        timeout: datetime.timedelta,
+        x_ttl: Annotated[datetime.timedelta, Header()],
+        ttl: Annotated[datetime.timedelta, Cookie()],
+        grace: datetime.timedelta | None = None,
+    ):
+        values = {"pause": pause, "timeout": timeout, "x_ttl": x_ttl, "ttl": ttl, "grace": grace}
+        return {name: value.total_seconds() if value is not None else None for name, value in values.items()}
+
+    @api.post("/form")
+    async def form(delay: Annotated[datetime.timedelta, Form()]):
+        return {"delay": delay.total_seconds()}
+
+    with TestClient(api) as client:
+        response = client.get("/wait/PT1S?timeout=PT5S", headers={"x-ttl": "P1D", "cookie": "ttl=PT2M"})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"pause": 1.0, "timeout": 5.0, "x_ttl": 86400.0, "ttl": 120.0, "grace": None}
+        assert client.post("/form", data={"delay": "PT90S"}).json() == {"delay": 90.0}
+        assert client.get("/wait/PT1S?timeout=soon", headers={"x-ttl": "P1D", "cookie": "ttl=PT2M"}).status_code == 422
+
+    with pytest.raises(TypeError) as error:
+        _complex_query(BoltAPI())
+    assert "date, datetime, time, timedelta, an Enum" in str(error.value)
 
 
 def test_a_json_only_parameter_with_no_marker_is_the_json_body():

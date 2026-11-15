@@ -541,6 +541,58 @@ def test_a_route_path_with_a_character_that_a_url_escapes_matches_the_request(ro
         assert response.json() == expected
 
 
+@pytest.mark.parametrize(
+    ("route", "url", "expected"),
+    [
+        # RFC 3986 section 6.2.2.1: the letter case of an escape has no meaning.
+        ("/ü", "/%c3%bc", {"route": "/ü"}),
+        ("/a b/{x}", "/a%20b/a%2fb", {"route": "/a b/{x}", "x": "a/b"}),
+        ("/%c3%a9", "/%C3%A9", {"route": "/%c3%a9"}),
+        # RFC 3986 section 6.2.2.2: an escape of an unreserved character is that character.
+        ("/a", "/%61", {"route": "/a"}),
+        ("/%61", "/a", {"route": "/%61"}),
+        ("/a-b/{x}", "/a%2Db/%61", {"route": "/a-b/{x}", "x": "a"}),
+        # Django decodes each escape before it matches. So does Bolt, but not `%2F` and `%25`.
+        ("/a:b,c", "/a%3Ab%2cc", {"route": "/a:b,c"}),
+        ("/files/{x}", "/files/a%2Fb%2541", {"route": "/files/{x}", "x": "a/b%41"}),
+    ],
+)
+def test_an_escape_in_another_form_matches_the_same_route(route, url, expected):
+    """A client can write an escape in lower case, or escape a character that needs no escape."""
+    api = BoltAPI()
+
+    if "{x}" in route:
+
+        @api.get(route)
+        async def handler(x: str):
+            return {"route": route, "x": x}
+
+    else:
+
+        @api.get(route)
+        async def handler():
+            return {"route": route}
+
+    with TestClient(api) as client:
+        response = client.get(url)
+        assert response.status_code == 200, response.text
+        assert response.json() == expected
+
+
+def test_an_escaped_slash_does_not_split_a_segment():
+    """`%2F` is data of one segment. It does not match the `/` between two segments."""
+    api = BoltAPI()
+
+    @api.get("/a/b")
+    async def handler():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        assert client.get("/a/b").status_code == 200
+        assert client.get("/a%2Fb").status_code == 404
+        assert client.get("/a%2fb").status_code == 404
+
+
 class TestEmptyRouteRegistration:
     """Tests for empty route ("") registration behavior."""
 
@@ -900,6 +952,58 @@ class TestTrailingSlashSetting:
 
             registered_paths = [path for _method, path, _handler_id, _handler in api._routes]
             assert "/" in registered_paths, f"Root '/' should be unchanged in '{mode}' mode"
+
+
+@pytest.mark.parametrize(
+    "order",
+    [("parent",), ("child",), ("parent", "child"), ("child", "parent"), ("nest", "parent", "child")],
+    ids=lambda order: "+".join(order),
+)
+def test_a_router_with_a_parent_registers_one_time_with_the_prefix_of_its_parent(order):
+    """The order of the include calls does not change the routes of the child."""
+    parent = Router(prefix="/v1")
+    child = Router(prefix="/users", parent=parent)
+
+    @parent.get("/status")
+    async def status():
+        return {"route": "status"}
+
+    @child.get("/me")
+    async def me():
+        return {"route": "me"}
+
+    api = BoltAPI()
+    for name in order:
+        if name == "nest":
+            # The child is already a child of this parent.
+            parent.include_router(child)
+        else:
+            api.include_router(parent if name == "parent" else child)
+
+    paths = sorted(path for _method, path, _id, handler in api._routes if handler in (status, me))
+    assert paths == (["/v1/users/me"] if order == ("child",) else ["/v1/status", "/v1/users/me"])
+    with TestClient(api) as client:
+        assert client.get("/v1/users/me").json() == {"route": "me"}
+        assert client.get("/users/me").status_code == 404
+
+
+def test_a_router_included_with_two_prefixes_registers_two_times():
+    parent = Router(prefix="/v1")
+    child = Router(prefix="/users", parent=parent)
+
+    @child.get("/me")
+    async def me():
+        return {"route": "me"}
+
+    api = BoltAPI()
+    api.include_router(parent, prefix="/a")
+    api.include_router(parent, prefix="/b")
+    api.include_router(child, prefix="/b")
+
+    with TestClient(api) as client:
+        assert client.get("/a/v1/users/me").json() == {"route": "me"}
+        assert client.get("/b/v1/users/me").json() == {"route": "me"}
+    assert sum(handler is me for *_route, handler in api._routes) == 2
 
 
 def _api_with_route_and_prefix_without_slash():

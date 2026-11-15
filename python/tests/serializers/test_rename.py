@@ -196,21 +196,89 @@ class TestRenameWithFieldAlias:
     """Test rename with per-field alias override."""
 
     def test_field_alias_overrides_rename(self):
-        """Per-field alias takes precedence over class-level rename when by_alias=True."""
+        """The alias of a field is its key in JSON. It wins over the rename option of the class."""
 
         class CreateUser(Serializer, rename="camel"):
             user_name: str
             created_at: str = field(alias="creation_date")
 
-        user = CreateUser(user_name="alice", created_at="2024-01-01")
+        user = CreateUser.model_validate({"userName": "alice", "creation_date": "2024-01-01"})
+        assert user.created_at == "2024-01-01"
 
-        # Without by_alias, rename mapping is used
-        data = user.dump()
-        assert data == {"userName": "alice", "createdAt": "2024-01-01"}
+        assert user.dump() == {"userName": "alice", "creation_date": "2024-01-01"}
+        assert user.dump(by_alias=True) == {"userName": "alice", "creation_date": "2024-01-01"}
+        assert msgspec.json.decode(user.dump_json()) == {"userName": "alice", "creation_date": "2024-01-01"}
 
-        # With by_alias, explicit alias overrides rename for that field
-        data_alias = user.dump(by_alias=True)
-        assert data_alias == {"userName": "alice", "creation_date": "2024-01-01"}
+    def test_field_alias_is_the_key_of_the_request_body_and_of_the_response(self):
+        """The input accepted only the field name. Now the alias is the key, as `Field(alias=...)` in pydantic."""
+
+        class Account(Serializer):
+            user_name: str = field(alias="userName")
+            nick_name: str = field(alias="nick-name", default="none")
+            age: int = 0
+
+            @field_validator("user_name")
+            def strip_name(cls, value):
+                return value.strip()
+
+        api = BoltAPI()
+
+        @api.post("/accounts")
+        async def create_account(account: Account) -> Account:
+            return account
+
+        @api.get("/accounts/first")
+        async def first_account() -> Account:
+            return Account(user_name="ana")
+
+        with TestClient(api) as client:
+            response = client.post("/accounts", json={"userName": " ana ", "nick-name": "a", "age": 3})
+            assert response.status_code == 200, response.text
+            assert response.json() == {"userName": "ana", "nick-name": "a", "age": 3}
+
+            # The field name is not a key of the JSON object.
+            assert client.post("/accounts", json={"user_name": "ana"}).status_code == 422
+
+            assert client.post("/accounts", json={"userName": "ana"}).json() == {
+                "userName": "ana",
+                "nick-name": "none",
+                "age": 0,
+            }
+            assert client.get("/accounts/first").json() == {"userName": "ana", "nick-name": "none", "age": 0}
+
+    def test_required_field_with_an_alias_stays_required_under_its_alias(self):
+        """field(alias=...) with no default: the alias is the key, and a missing value is an error."""
+
+        class Item(Serializer):
+            x: str = field(alias="y")
+
+        item = Item.model_validate({"y": "v"})
+        assert item.x == "v"
+        assert item.dump() == {"y": "v"}
+        assert msgspec.json.decode(Item.model_validate_json(b'{"y": "v"}').dump_json()) == {"y": "v"}
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Item.model_validate({})
+        assert exc_info.value.errors() == [
+            {"loc": ("body", "y"), "msg": "Object missing required field `y`", "type": "missing"}
+        ]
+        with pytest.raises(RequestValidationError) as exc_info:
+            Item.model_validate_json(b"{}")
+        assert [error["msg"] for error in exc_info.value.errors()] == ["Object missing required field `y`"]
+        with pytest.raises(TypeError, match="Missing required argument 'x'"):
+            Item()
+
+    def test_field_alias_stays_in_a_subclass_and_in_a_subset(self):
+        class Account(Serializer):
+            user_name: str = field(alias="userName")
+            age: int = 0
+
+        class Admin(Account):
+            level: int = 1
+
+        assert Admin.model_validate({"userName": "ana"}).dump() == {"userName": "ana", "age": 0, "level": 1}
+        NameOnly = Account.subset("user_name")
+        assert NameOnly.model_validate({"userName": "ana"}).dump() == {"userName": "ana"}
 
 
 class TestRenameErrorCollection:

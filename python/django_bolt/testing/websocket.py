@@ -282,6 +282,9 @@ class WebSocketTestClient:
                     raise RuntimeError("WebSocket is not accepted: call accept() before send")
                 # The server refused the upgrade, so no client is there.
                 raise ConnectionResetError("WebSocket client disconnected")
+            if self._closed:
+                # The app closed the connection or the client left, so no client is there.
+                raise ConnectionResetError("WebSocket client disconnected")
 
         elif msg_type == "websocket.close":
             # The server refuses a close that makes an invalid close frame.
@@ -396,8 +399,15 @@ class WebSocketTestClient:
                 # A raised WebSocketException refuses the handshake with 403, as on the server.
                 self._decide(403)
             elif not self._closed:
-                # After accept, it closes the connection with its code and reason.
-                await self._server_to_client.put({"type": "websocket.close", "code": e.code, "reason": e.reason})
+                try:
+                    check_close_frame(e.code, e.reason)
+                except ValueError as invalid:
+                    # The handler changed the code or the reason after it made the
+                    # exception. This is an error of the handler, as on the server.
+                    await self._handler_failed(invalid)
+                else:
+                    # After accept, it closes the connection with its code and reason.
+                    await self._server_to_client.put({"type": "websocket.close", "code": e.code, "reason": e.reason})
         except Exception as e:
             await self._handler_failed(e)
         else:

@@ -74,7 +74,7 @@ from .middleware.compiler import (
     route_auth_backends,
 )
 from .middleware.django_loader import load_django_middleware
-from .middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
+from .middleware.middleware import FunctionMiddlewareSpec, mark_route_handler, normalize_middleware_specs
 from .middleware_response import MiddlewareResponse
 from .openapi import (
     OpenAPIConfig,
@@ -105,7 +105,7 @@ from .serialization import (
 )
 from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata, HandlerPattern
-from .views import APIView, ViewSet, _copy_route_middleware, _layer
+from .views import APIView, ViewSet, _copy_route_middleware, _layer, _plan_request_argument
 from .websocket import mark_websocket_handler
 
 logger = logging.getLogger(__name__)
@@ -761,6 +761,8 @@ class BoltAPI:
         # Django admin configuration (controlled by --no-admin flag)
         self._admin_routes_registered = False
         self._asgi_mounts: list[tuple[str, Callable[..., Any]]] = []
+        # Routers with a parent that include_router() registered, for each prefix of the call.
+        self._included_child_routers: dict[str, set[Router]] = {}
         # MCP mount definitions (dicts consumed by _core.register_mcp_mounts).
         # Populated by bolt_mcp.mount_mcp; empty for APIs without MCP.
         self._mcp_mounts: list[dict[str, Any]] = []
@@ -1188,6 +1190,8 @@ class BoltAPI:
             _refuse_repeated_path_params(full_path)
 
             self._handlers[handler_id] = fn
+            # A config decorator that runs after this one is above it, and has no effect.
+            mark_route_handler(fn)
 
             # Compile parameter binder for WebSocket (reuses HTTP binding logic)
             # This enables injection of path params, query params, headers, cookies
@@ -1742,6 +1746,13 @@ class BoltAPI:
                     # Example: /users/active
                     action_path = _join_viewset_path(base_path, attr.path)
 
+                # Decide one time where the request is. A method with no request
+                # parameter gets one in the handler signature, for `self.request`.
+                sig = inspect.signature(unbound_fn)
+                params, request_index, request_name, skip = _plan_request_argument(
+                    list(sig.parameters.values())[1:]  # Skip 'self'
+                )
+
                 # Register route for each HTTP method
                 for http_method in attr.methods:
                     # Create a wrapper that instantiates the view per request,
@@ -1755,13 +1766,18 @@ class BoltAPI:
                             __view_cls=view_cls,
                             __view_kwargs=view_kwargs,
                             _action=name,
+                            _request_index=request_index,
+                            _request_name=request_name,
+                            _skip=skip,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
                             _current_action.set(_action)
-                            _current_request.set(args[0])
+                            _current_request.set(
+                                args[_request_index] if _request_name is None else kwargs[_request_name]
+                            )
                             view_instance = __view_cls(**__view_kwargs)
-                            return await __unbound_fn(view_instance, *args, **kwargs)
+                            return await __unbound_fn(view_instance, *args[_skip:], **kwargs)
                     else:
 
                         def custom_action_handler(
@@ -1770,17 +1786,20 @@ class BoltAPI:
                             __view_cls=view_cls,
                             __view_kwargs=view_kwargs,
                             _action=name,
+                            _request_index=request_index,
+                            _request_name=request_name,
+                            _skip=skip,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
                             _current_action.set(_action)
-                            _current_request.set(args[0])
+                            _current_request.set(
+                                args[_request_index] if _request_name is None else kwargs[_request_name]
+                            )
                             view_instance = __view_cls(**__view_kwargs)
-                            return __unbound_fn(view_instance, *args, **kwargs)
+                            return __unbound_fn(view_instance, *args[_skip:], **kwargs)
 
                     # Preserve signature and annotations from original method
-                    sig = inspect.signature(unbound_fn)
-                    params = list(sig.parameters.values())[1:]  # Skip 'self'
                     custom_action_handler.__signature__ = sig.replace(parameters=params)
                     custom_action_handler.__annotations__ = {
                         k: v for k, v in inspect.get_annotations(unbound_fn).items() if k != "self"
@@ -1875,6 +1894,8 @@ class BoltAPI:
 
             self._routes.append((method, full_path, handler_id, fn))
             self._handlers[handler_id] = fn
+            # A config decorator that runs after this one is above it, and has no effect.
+            mark_route_handler(fn)
 
             # Pre-compile parameter binder (handles parameter binding only)
             meta = self._compile_binder(fn, method, full_path)
@@ -4085,6 +4106,10 @@ class BoltAPI:
             api.include_router(users_router, prefix="/api/v1")
             # Results in: GET /api/v1/users, GET /api/v1/users/{user_id}
 
+        A router with a parent (`Router(parent=...)` or `Router.include_router`)
+        registers one time for each `prefix`, with the prefixes of its parents.
+        A call with the router and a call with its parent give the same route.
+
         Args:
             router: Router instance containing routes to include
             prefix: Additional URL prefix to prepend (combined with router's prefix)
@@ -4095,14 +4120,26 @@ class BoltAPI:
                 f"Use mount() for BoltAPI sub-applications."
             )
 
+        # A router with a parent registers one time for each prefix, with the
+        # prefixes of its parents. It is the same route if this call includes
+        # the router or its parent, and the order of the calls has no effect.
+        prefix = prefix.rstrip("/")
+        included = self._included_child_routers.setdefault(prefix, set())
+        if router in included:
+            return
+
         # Get all routes from router (including nested routers)
-        all_routes = router.get_all_routes()
+        all_routes = router.get_all_routes(skip=included)
+        included.update(router.child_routers())
+        if router._parent is not None:
+            included.add(router)
+            prefix += router.parent_prefix()
 
         for method, route_path, handler, meta in all_routes:
             route_meta = dict(meta)
 
             # Compute full path with optional prefix
-            full_path = prefix.rstrip("/") + route_path if prefix else route_path
+            full_path = prefix + route_path
 
             # Extract route-specific overrides from meta
             route_auth = route_meta.pop("auth", None)

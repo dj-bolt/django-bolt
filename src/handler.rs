@@ -36,7 +36,7 @@ use bolt_core::request_pipeline::{
 use bolt_core::response_builder;
 use bolt_core::response_meta::ResponseMeta;
 use bolt_core::responses;
-use bolt_core::router::{QueryParams, parse_query_string};
+use bolt_core::router::{QueryParams, normalize_request_path, parse_query_string};
 use bolt_core::state::{AppState, find_asgi_mount};
 use bolt_core::streaming::{StreamConfig, create_python_stream, create_sse_stream};
 use bolt_core::type_coercion::{
@@ -930,6 +930,10 @@ async fn route_request(
     let path = req.path();
 
     let router = &state.router;
+    // The router compares one form of each `%XX` escape. A path with no `%`
+    // stays borrowed.
+    let route_path = normalize_request_path(path);
+    let route_path = route_path.as_ref();
 
     // Find the route for the requested method and path.
     // RouteMatch enum allows us to skip path param processing for static routes.
@@ -937,7 +941,7 @@ async fn route_request(
     // clone_ref is deferred into the main dispatch GIL block — no extra
     // Python::attach per request just to clone the callable.
     let (route, path_params, handler_id) = {
-        if let Some(route_match) = router.find(method, path) {
+        if let Some(route_match) = router.find(method, route_path) {
             let handler_id = route_match.handler_id();
             let (route, path_params) = route_match.into_parts();
             (route, path_params, handler_id)
@@ -945,11 +949,11 @@ async fn route_request(
             // No route found - check for trailing slash redirect FIRST
             // This only runs when route doesn't match (minimal overhead)
             // Starlette-style: redirect to canonical URL if alternate path exists
-            if path != "/" {
-                let alternate_path = if path.ends_with('/') {
-                    path.trim_end_matches('/').to_string()
+            if route_path != "/" {
+                let alternate_path = if route_path.ends_with('/') {
+                    route_path.trim_end_matches('/').to_string()
                 } else {
-                    format!("{}/", path)
+                    format!("{}/", route_path)
                 };
 
                 // Try alternate path - if it matches, send 308 redirect
@@ -970,13 +974,13 @@ async fn route_request(
 
             // No explicit handler found - check for automatic OPTIONS
             if method == "OPTIONS" {
-                let available_methods = router.find_all_methods(path);
+                let available_methods = router.find_all_methods(route_path);
                 if !available_methods.is_empty() {
                     let allow_header = available_methods.join(", ");
                     // CORS headers will be added by CorsMiddleware
                     // The line of this answer has the filter of the first route of the path.
                     *access_log_route = router
-                        .find(&available_methods[0], path)
+                        .find(&available_methods[0], route_path)
                         .map(|found| found.handler_id());
                     return HttpResponse::NoContent()
                         .insert_header(("Allow", allow_header))
@@ -1025,11 +1029,11 @@ async fn route_request(
 
             // The path has routes, but none for this method: 405 with `Allow`
             // (RFC 9110 section 15.5.6). This lookup runs on a miss only.
-            let allowed_methods = router.find_all_methods(path);
+            let allowed_methods = router.find_all_methods(route_path);
             if !allowed_methods.is_empty() {
                 // The line of this answer has the filter of the first route of the path.
                 *access_log_route = router
-                    .find(&allowed_methods[0], path)
+                    .find(&allowed_methods[0], route_path)
                     .map(|found| found.handler_id());
                 return responses::error_405(&allowed_methods);
             }
