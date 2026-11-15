@@ -31,6 +31,7 @@ from django_bolt.openapi import (
     OpenAPIConfig,
     RapidocRenderPlugin,
     RedocRenderPlugin,
+    ScalarRenderPlugin,
     StoplightRenderPlugin,
     SwaggerRenderPlugin,
 )
@@ -189,6 +190,45 @@ def test_redoc_endpoint_uses_available_bundle(options, expected_url):
     assert f'<script src="{expected_url}" crossorigin></script>' in response.text
     assert "Redoc.init(" in response.text
     assert '"/items"' in response.text
+
+
+def test_docs_pages_escape_the_text_of_the_api():
+    """The title, a docstring and the Scalar options are text. They do not end a tag or a script of the page."""
+    api = BoltAPI(
+        openapi_config=OpenAPIConfig(
+            title="Tom & <b>Co</b> API",
+            version="1.0.0",
+            render_plugins=[
+                SwaggerRenderPlugin(path="/swagger"),
+                RedocRenderPlugin(path="/redoc"),
+                ScalarRenderPlugin(path="/scalar", options={"title": "Tom's API"}),
+                RapidocRenderPlugin(path="/rapidoc"),
+                StoplightRenderPlugin(path="/stoplight"),
+            ],
+        )
+    )
+
+    @api.get("/items")
+    async def get_items():
+        """Give the items as </script><script>alert(1)</script> shows them."""
+        return []
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        pages = {
+            name: client.get(f"/docs/{name}").text for name in ("swagger", "redoc", "scalar", "rapidoc", "stoplight")
+        }
+        description = client.get("/docs/openapi.json").json()["paths"]["/items"]["get"]["summary"]
+
+    assert description == "Give the items as </script><script>alert(1)</script> shows them."
+    for name, page in pages.items():
+        assert "<title>Tom &amp; &lt;b&gt;Co&lt;/b&gt; API</title>" in page, name
+        assert "<script>alert(1)</script>" not in page, name
+    # The page holds the docstring as JSON text that the browser reads back to the same string.
+    for name in ("swagger", "redoc"):
+        assert r"\u003c/script\u003e\u003cscript\u003ealert(1)\u003c/script\u003e" in pages[name], name
+    # The apostrophe does not end a JavaScript string.
+    assert """dataset.configuration = JSON.stringify({"title":"Tom's API"})""" in pages["scalar"]
 
 
 @pytest.mark.parametrize(
