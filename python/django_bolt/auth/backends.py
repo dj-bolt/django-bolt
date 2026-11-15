@@ -452,24 +452,29 @@ def _check_str_collection(value: Any, name: str, item_name: str) -> None:
             )
 
 
+# The scheme words that Rust removes from the value of the API key header.
+_API_KEY_SCHEMES = ("Bearer ", "ApiKey ")
+
+
 class APIKeyAuthentication(BaseAuthentication):
     """
     API key authentication.
 
     Validates API keys against a configured set of valid keys.
     Keys should be provided in the configured header (default: X-API-Key).
+    The header value is the key, or ``Bearer <key>``, or ``ApiKey <key>``.
 
     Args:
         api_keys: Set, list or tuple of valid API keys. Each key is a
-            non-empty str.
+            non-empty str that does not start with ``Bearer `` or ``ApiKey ``.
         header: Header name to extract API key from (default: "x-api-key")
         key_permissions: Optional mapping of API keys to permission sets.
             Each key must be in ``api_keys``.
 
     Raises:
         ImproperlyConfigured: ``api_keys`` or ``key_permissions`` has a
-            value of the wrong type, an empty key, or a key that is not in
-            ``api_keys``.
+            value of the wrong type, an empty key, a key that starts with a
+            scheme, or a key that is not in ``api_keys``.
     """
 
     def __init__(
@@ -484,6 +489,16 @@ class APIKeyAuthentication(BaseAuthentication):
             _check_str_collection(api_keys, "api_keys", "key in api_keys")
             if "" in api_keys:
                 raise ImproperlyConfigured("APIKeyAuthentication api_keys must not contain an empty key.")
+            # Rust removes one scheme word from the header value. Thus a key that
+            # starts with a scheme cannot authenticate as sent, and its header
+            # value can name another valid key.
+            for key in api_keys:
+                for scheme in _API_KEY_SCHEMES:
+                    if key[: len(scheme)].lower() == scheme.lower():
+                        raise ImproperlyConfigured(
+                            f"APIKeyAuthentication api_keys has the key {key!r}, "
+                            f"which starts with the scheme {scheme!r}."
+                        )
         if key_permissions is not None:
             if not isinstance(key_permissions, dict):
                 raise ImproperlyConfigured(

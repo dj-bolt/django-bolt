@@ -86,6 +86,13 @@ class TestAuthenticationClasses:
             ({"api_keys": b"sk-prod-123abc"}, "api_keys must be a set, list or tuple of str, not bytes"),
             ({"api_keys": (key for key in ["key-1"])}, "api_keys must be a set, list or tuple of str, not generator"),
             ({"api_keys": {b"key-1"}}, "each key in api_keys must be a str, not bytes"),
+            ({"api_keys": {"Bearer abc"}}, "api_keys has the key 'Bearer abc', which starts with the scheme 'Bearer '"),
+            (
+                {"api_keys": ["abc", "ApiKey xyz"]},
+                "api_keys has the key 'ApiKey xyz', which starts with the scheme 'ApiKey '",
+            ),
+            ({"api_keys": {"bearer abc"}}, "api_keys has the key 'bearer abc', which starts with the scheme 'Bearer '"),
+            ({"api_keys": {"APIKEY "}}, "api_keys has the key 'APIKEY ', which starts with the scheme 'ApiKey '"),
             ({"api_keys": [None]}, "each key in api_keys must be a str, not NoneType"),
             (
                 {"api_keys": {"key-1"}, "key_permissions": {"key-1": "read"}},

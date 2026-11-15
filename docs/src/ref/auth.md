@@ -127,7 +127,7 @@ APIKeyAuthentication(
 | `header`          | `str`      | `"x-api-key"` | Header containing key      |
 | `key_permissions` | `dict`     | `None`        | Key to permissions mapping |
 
-`api_keys` is a set, list or tuple of non-empty strings. Each value of `key_permissions` is a set, list or tuple of strings, and each of its keys must be in `api_keys`. A different value raises `ImproperlyConfigured`. For example, `api_keys="sk-123"` and `api_keys={os.environ.get("API_KEY", "")}` with no `API_KEY` raise.
+`api_keys` is a set, list or tuple of non-empty strings. A key must not start with `Bearer ` or `ApiKey ` (in any letter case): the header value can be `<key>`, `Bearer <key>` or `ApiKey <key>`, and Bolt removes the scheme. Each value of `key_permissions` is a set, list or tuple of strings, and each of its keys must be in `api_keys`. A different value raises `ImproperlyConfigured`. For example, `api_keys="sk-123"` and `api_keys={os.environ.get("API_KEY", "")}` with no `API_KEY` raise.
 
 ## Permission guards
 
