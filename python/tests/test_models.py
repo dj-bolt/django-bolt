@@ -143,6 +143,16 @@ class Document(models.Model):
         return self.title
 
 
+class Country(models.Model):
+    """Model with a primary key that the client supplies, for ViewSet create tests."""
+
+    code = models.CharField(max_length=2, primary_key=True)
+    name = models.CharField(max_length=100)
+
+    class Meta:
+        app_label = "django_bolt"
+
+
 class Release(models.Model):
     """Model with a composite primary key for cursor pagination tests."""
 
