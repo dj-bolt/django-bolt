@@ -442,6 +442,20 @@ def test_bool_key_dict_raises_at_registration(key):
             return {"id": 1, "name": "x"}
 
 
+@pytest.mark.parametrize("key", ["404", 404.0, None, (404,)], ids=["str", "float", "none", "tuple"])
+def test_a_key_that_is_not_an_int_or_ellipsis_raises_at_registration(key):
+    """A key such as "404" matched no status, so its schema had no effect. It now stops registration."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match="response_model has the key") as excinfo:
+
+        @api.get("/item", response_model={200: OkSchema, key: ErrorSchema})
+        async def handler():
+            return {"id": 1, "name": "x"}
+
+    assert str(excinfo.value) == (f"response_model has the key {key!r}. A key must be an integer status code or `...`.")
+
+
 # ============================================================================
 # Edge case: a dict with no 2xx code keeps the default status 200
 # ============================================================================
