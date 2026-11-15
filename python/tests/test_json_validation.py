@@ -209,6 +209,25 @@ class TestInvalidJSONParsing:
         with pytest.raises(msgspec.ValidationError):
             extractor(b"42")
 
+    def test_an_empty_body_gives_the_default_of_an_optional_body_parameter(self):
+        api = BoltAPI()
+
+        @api.post("/optional")
+        async def optional(user: UserWithDefaults | None = None):
+            return {"name": user.name if user else None}
+
+        @api.post("/required")
+        async def required(user: UserWithDefaults):
+            return {"name": user.name}
+
+        with TestClient(api) as client:
+            assert client.post("/optional").json() == {"name": None}
+            assert client.post("/optional", json={"name": "Ana"}).json() == {"name": "Ana"}
+            # A body that is present must still be valid JSON of the type.
+            assert client.post("/optional", content=b"{").status_code == 422
+            assert client.post("/optional", json={"name": 1}).status_code == 422
+            assert client.post("/required").status_code == 422
+
 
 class TestBodyOfNonStructType:
     """A body with a type that is not a Struct is decoded as the type, with the same errors."""

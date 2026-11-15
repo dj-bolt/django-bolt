@@ -218,6 +218,16 @@ async def create_user(user: CreateUser):
     return {"username": user.username}
 ```
 
+A request with no body gives a 422. To make the body optional, give the parameter a default:
+
+```python
+@api.post("/search")
+async def search(filters: CreateUser | None = None):
+    return {"filtered": filters is not None}
+```
+
+A request with no body then gives the default. A body that is present must be valid JSON of the type.
+
 ### Raw body access
 
 Access the raw body bytes:
