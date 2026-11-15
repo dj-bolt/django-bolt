@@ -192,7 +192,8 @@ class WebSocketTestClient:
         app_id = self._get_or_create_app_id()
 
         # Build headers list for Rust. Rust parses the subprotocols into the scope.
-        headers_list = list(self.headers.items())
+        # An HTTP server removes the spaces and tabs around a header value.
+        headers_list = [(name, value.strip(" \t")) for name, value in self.headers.items()]
         if self.subprotocols:
             headers_list.append(("sec-websocket-protocol", ", ".join(self.subprotocols)))
 
