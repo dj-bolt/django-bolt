@@ -858,6 +858,14 @@ def _bad_response_api(**api_kwargs) -> BoltAPI:
     def sync_bad() -> Item:
         return {"id": "not-an-int"}
 
+    @api.get("/async-missing")
+    async def async_missing() -> Item:
+        return {}
+
+    @api.get("/sync-missing")
+    def sync_missing() -> Item:
+        return {}
+
     return api
 
 
@@ -898,6 +906,36 @@ class TestResponseValidationDisclosure:
         errors = body["extra"]["validation_errors"]
         assert errors[0]["loc"][0] == "response"
         assert "Expected `int`, got `str`" in errors[0]["msg"]
+
+    @pytest.mark.parametrize("kind", ["async", "sync"])
+    @pytest.mark.parametrize(
+        ("case", "error"),
+        [
+            (
+                "bad",
+                {
+                    "loc": ["response", "id"],
+                    "msg": "Response validation failed for Item: Expected `int`, got `str`",
+                    "type": "validation_error",
+                },
+            ),
+            (
+                "missing",
+                {
+                    "loc": ["response", "id"],
+                    "msg": "Response validation failed for Item: Object missing required field `id`",
+                    "type": "missing_field",
+                },
+            ),
+        ],
+    )
+    def test_debug_on_gives_the_field_in_the_location_of_the_error(self, settings, kind, case, error):
+        settings.DEBUG = True
+        with TestClient(_bad_response_api()) as client:
+            response = client.get(f"/{kind}-{case}")
+
+        assert response.status_code == 500
+        assert response.json()["extra"]["validation_errors"] == [error]
 
     def test_formatter_gets_no_errors_when_debug_is_off(self, settings, caplog):
         """A formatter can show `error.errors` to the client, so Bolt leaves them out. The log keeps them."""

@@ -1003,7 +1003,8 @@ def _compile_struct_coercer(annotation: type) -> Callable[[Any], Any]:
         try:
             return msgspec.convert(value, annotation, from_attributes=True)
         except msgspec.ValidationError as e:
-            raise TypeError(f"Response validation failed for {name}: {e}") from e
+            # Keep the msgspec type. The error handler reads the path of the field from its message.
+            raise msgspec.ValidationError(f"Response validation failed for {name}: {e}") from e
 
     return coerce
 

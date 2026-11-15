@@ -318,7 +318,7 @@ def test_response_validation_500_reaches_the_formatter(recorded, caplog, setting
     assert data["detail"] == "Response validation error"
     assert data["exception"] == "ResponseValidationError"
     [error] = data["errors"]
-    assert error["loc"] == ["response"]
+    assert error["loc"] == ["response", "id"]
     assert error["type"] == "validation_error"
     records = [record for record in caplog.records if record.name == "django_bolt.error_handlers"]
     assert len(records) == 1

@@ -264,8 +264,9 @@ def test_dict_converts_to_the_struct(client):
 
 
 def test_invalid_dict_names_the_struct_and_the_field(client):
-    message = _validation_message(client.get("/struct/bad-dict"))
-    assert message == "Response validation failed for Item: Expected `int`, got `str` - at `$.id`"
+    response = client.get("/struct/bad-dict")
+    assert _validation_message(response) == "Response validation failed for Item: Expected `int`, got `str`"
+    assert response.json()["extra"]["validation_errors"][0]["loc"] == ["response", "id"]
 
 
 def test_object_converts_by_attribute(client):
@@ -318,8 +319,9 @@ def test_serializer_for_a_struct_is_dumped_then_validated(client, path, status_c
 
 @pytest.mark.parametrize("path", ["/json/bad", "/json/bad-sync", "/response/bad", "/response/bad-sync"])
 def test_invalid_json_or_response_content_names_the_cause(client, path):
-    message = _validation_message(client.get(path))
-    assert message == "Response validation failed for Item: Expected `int`, got `str` - at `$.id`"
+    response = client.get(path)
+    assert _validation_message(response) == "Response validation failed for Item: Expected `int`, got `str`"
+    assert response.json()["extra"]["validation_errors"][0]["loc"] == ["response", "id"]
 
 
 def test_response_content_is_validated_and_keeps_the_headers(client):
