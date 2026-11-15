@@ -157,7 +157,10 @@ def test_used_refresh_token_cannot_log_out_the_token_that_replaced_it(path):
         assert client.post("/auth/refresh", headers=NO_CSRF_ORIGIN).status_code == 200
         live = client.cookies.get("refresh_token")
 
-        assert _post_with_refresh(client, path, used).status_code == 401
+        rejected = _post_with_refresh(client, path, used)
+        assert rejected.status_code == 401
+        # The body is the same as for a token that the refresh route rejects.
+        assert rejected.json() == {"detail": "Invalid token"}
         assert _post_with_refresh(client, "/auth/refresh", live).status_code == 200
 
 
@@ -172,6 +175,8 @@ def test_refresh_token_from_before_logout_all_cannot_log_out_a_new_login():
 
         assert _post_with_refresh(client, "/auth/logout-all", old).status_code == 401
         assert _post_with_refresh(client, "/auth/refresh", new).status_code == 200
+        # The tokens of the new login have version 1. They are live, so they can log out.
+        assert client.post("/auth/logout", headers=NO_CSRF_ORIGIN).status_code == 200
 
 
 def test_logged_out_refresh_token_cannot_log_out_everywhere():
@@ -185,6 +190,20 @@ def test_logged_out_refresh_token_cannot_log_out_everywhere():
 
         assert _post_with_refresh(client, "/auth/logout-all", logged_out).status_code == 401
         assert _post_with_refresh(client, "/auth/refresh", other).status_code == 200
+
+
+def test_refresh_token_without_a_version_has_version_zero():
+    """The refresh route reads a token with no ``ver`` claim as version 0. The logout routes do the same."""
+    now = int(time.time())
+    claims = {"sub": "view-user", "typ": "refresh", "fam": "family-1", "iat": now, "exp": now + 600}
+    first, second = (jwt.encode({**claims, "jti": jti}, SECRET, algorithm="HS256") for jti in ("jti-1", "jti-2"))
+
+    with TestClient(_views_api()) as client:
+        # The user has version 0, so the token is live. This logout-all gives the user version 1.
+        assert _post_with_refresh(client, "/auth/logout-all", first).status_code == 200
+        # Version 0 is now old.
+        assert _post_with_refresh(client, "/auth/logout-all", second).status_code == 401
+        assert _post_with_refresh(client, "/auth/refresh", second).status_code == 401
 
 
 class RecordingBackend(ModelBackend):
