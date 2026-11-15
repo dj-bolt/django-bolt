@@ -310,6 +310,10 @@ api.mount("/api/v1", users_api)
 
 Routes from `users_api` are now available at `/api/v1/users`.
 
+An API cannot mount itself, and two APIs cannot mount each other. `mount()` raises `ValueError`.
+
+A mount path can have a parameter, such as `api.mount("/tenants/{tenant}", users_api)`. A handler of the mounted API reads the value from `request.params["tenant"]`. It cannot take `tenant` as an argument, because the mounted API compiled its routes without the mount path. `mount()` raises `ValueError` for such a handler. A `Router` with the prefix `/tenants/{tenant}` gives the value as an argument.
+
 ## ASGI mounts
 
 If you want to mount Django or other ASGI apps under path prefixes, see [ASGI Mounts](asgi-mounts.md).
