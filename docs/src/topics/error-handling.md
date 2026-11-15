@@ -463,6 +463,8 @@ def format_error(error: BoltError, request) -> Response:
 api = BoltAPI(error_formatter=format_error)
 ```
 
+The 401 and the 403 of a route with an auth backend and a guard show the same media type and schema. Without a formatter, their body is `{"detail": "<message>"}`.
+
 A formatter without `error_schema` gets a 422 with a description and no content. Bolt cannot know the media type or the shape of its body. A wrong media type or shape makes generated clients fail when they parse the error. A response with no content is valid OpenAPI and makes no claim about the body. `OpenAPIConfig(strict=True)` reports a formatter without `error_schema`.
 
 The formatter does not change the entries of `response_model`. For example, `response_model={409: Conflict}` keeps its `application/json` schema. This agrees with the response, because an `HTTPException` with a typed `body` skips the formatter.

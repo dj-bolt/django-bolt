@@ -59,7 +59,7 @@ class OpenAPIStrictError(ValueError):
     annotation / ``response_model``) and components that needed the
     ``module.qualname`` fallback because two types share a short name. An
     ``error_formatter`` without ``error_schema`` is an offender when a route
-    has a 422 response.
+    has a 422, 401 or 403 response.
     """
 
 
@@ -123,12 +123,32 @@ class ComponentNameCollisionError(ValueError):
         )
 
 
-# Mapping from auth backend scheme_name to OpenAPI security scheme identifier
-_SCHEME_NAME_MAP: dict[str, str] = {
-    "jwt": "BearerAuth",
-    "api_key": "ApiKeyAuth",
-    "session": "SessionAuth",
-}
+def _backend_security_scheme(backend: Any) -> tuple[str, SecurityScheme] | None:
+    """The OpenAPI security scheme of an auth backend, with its name in the document.
+
+    The scheme follows the place where Bolt reads the credential. The result
+    is None for a backend that Bolt does not know.
+    """
+    kind = backend.scheme_name
+    if kind == "jwt":
+        if backend.cookie:
+            # Bolt reads the token only from this cookie.
+            return "JWTCookieAuth", SecurityScheme(
+                type="apiKey", name=backend.cookie, security_scheme_in="cookie", description="A JWT"
+            )
+        if backend.header.lower() != "authorization":
+            # The "bearer" scheme is for the Authorization header only.
+            return "JWTHeaderAuth", SecurityScheme(
+                type="apiKey", name=backend.header, security_scheme_in="header", description="A JWT"
+            )
+        return "BearerAuth", SecurityScheme(type="http", scheme="bearer", bearer_format="JWT")
+    if kind == "api_key":
+        return "ApiKeyAuth", SecurityScheme(type="apiKey", name=backend.header, security_scheme_in="header")
+    if kind == "session":
+        return "SessionAuth", SecurityScheme(
+            type="apiKey", name=django_settings.SESSION_COOKIE_NAME, security_scheme_in="cookie"
+        )
+    return None
 
 
 _PATH_PARAM_RE = re.compile(r"{([^{}]+)}")
@@ -512,9 +532,10 @@ class SchemaGenerator:
         """
         openapi = self.config.to_openapi_schema()
 
-        # Track auth schemes seen during _extract_security calls
-        self._seen_schemes: set[str] = set()
-        self._api_key_header: str | None = None
+        # The security schemes of the auth backends, filled by _extract_security calls.
+        # The schemes of the config come first: a name of the user keeps its scheme.
+        self._user_security_schemes = dict(openapi.components.security_schemes or {})
+        self._security_schemes: dict[str, SecurityScheme] = {}
 
         # Generate path items from routes and collect tags
         paths: dict[str, PathItem] = {}
@@ -651,7 +672,7 @@ class SchemaGenerator:
                 formatter = self.api._error_formatter
                 name = getattr(formatter, "__name__", type(formatter).__name__)
                 problems.append(
-                    f"the error_formatter {name} has no error_schema, so the 422 responses have no body "
+                    f"the error_formatter {name} has no error_schema, so the error responses have no body "
                     "schema (decorate the formatter with error_schema)"
                 )
             raise OpenAPIStrictError("OpenAPI strict mode: " + "; ".join(problems))
@@ -694,6 +715,8 @@ class SchemaGenerator:
 
         # Extract security requirements
         security = self._extract_security(handler_id)
+        if self.config.include_error_responses:
+            self._add_auth_error_responses(responses, handler_id)
 
         # Prefer explicit tags over auto-extracted tags
         tags = meta.get("openapi_tags")
@@ -1234,52 +1257,38 @@ class SchemaGenerator:
         )
 
     def _register_security_schemes(self, openapi: OpenAPI) -> None:
-        """Auto-register SecurityScheme definitions from auth backends collected during generation.
+        """Put the security schemes of the auth backends into the components.
 
-        Uses backend info accumulated by _extract_security calls to register
-        the corresponding SecurityScheme in components.security_schemes,
-        preserving any user-defined schemes.
+        ``_extract_security`` collects the schemes. A scheme of the config
+        with the same name stays as the user wrote it.
         """
-        if not self._seen_schemes:
+        if not self._security_schemes:
             return
+        openapi.components.security_schemes = {**self._user_security_schemes, **self._security_schemes}
 
-        existing = openapi.components.security_schemes or {}
-        needs_jwt = "jwt" in self._seen_schemes and "BearerAuth" not in existing
-        needs_api_key = "api_key" in self._seen_schemes and "ApiKeyAuth" not in existing
-        needs_session = "session" in self._seen_schemes and "SessionAuth" not in existing
+    def _security_scheme_name(self, name: str, scheme: SecurityScheme) -> str:
+        """Return the name of ``scheme`` in the document, and record the scheme.
 
-        if not needs_jwt and not needs_api_key and not needs_session:
-            return
-
-        schemes = dict(existing)
-
-        if needs_jwt:
-            schemes["BearerAuth"] = SecurityScheme(
-                type="http",
-                scheme="bearer",
-                bearer_format="JWT",
-            )
-
-        if needs_api_key:
-            schemes["ApiKeyAuth"] = SecurityScheme(
-                type="apiKey",
-                name=self._api_key_header,
-                security_scheme_in="header",
-            )
-
-        if needs_session:
-            schemes["SessionAuth"] = SecurityScheme(
-                type="apiKey",
-                name=django_settings.SESSION_COOKIE_NAME,
-                security_scheme_in="cookie",
-            )
-
-        openapi.components.security_schemes = schemes
+        Two backends of one kind can read from different places, for example
+        two API key headers. Each place gets its own scheme: the second one
+        has the name with the suffix ``2``.
+        """
+        if name in self._user_security_schemes:
+            return name
+        candidate = name
+        number = 1
+        while self._security_schemes.get(candidate, scheme) != scheme:
+            number += 1
+            candidate = f"{name}{number}"
+        self._security_schemes[candidate] = scheme
+        return candidate
 
     def _extract_security(self, handler_id: int) -> list[dict[str, list[str]]] | None:
         """Extract security requirements from handler middleware.
 
-        Also accumulates seen scheme types for _register_security_schemes.
+        The list has one entry for each backend of the route. A request needs
+        only one of them. The call also records the scheme of each backend
+        for ``_register_security_schemes``.
 
         Args:
             handler_id: Handler ID.
@@ -1295,15 +1304,106 @@ class SchemaGenerator:
 
         security: list[dict[str, list[str]]] = []
         for backend in auth_config:
-            scheme = backend.scheme_name
-            openapi_name = _SCHEME_NAME_MAP.get(scheme)
-            if openapi_name:
-                security.append({openapi_name: []})
-                self._seen_schemes.add(scheme)
-                if scheme == "api_key" and self._api_key_header is None:
-                    self._api_key_header = backend.header
+            named_scheme = _backend_security_scheme(backend)
+            if named_scheme is None:
+                continue
+            requirement = {self._security_scheme_name(*named_scheme): []}
+            if requirement not in security:
+                security.append(requirement)
 
         return security or None
+
+    def _add_auth_error_responses(self, responses: dict[str, OpenAPIResponse], handler_id: int) -> None:
+        """Add the 401 and the 403 that the auth backends and the guards of a route can send.
+
+        A route with no auth backend gets none. The guards run in order, and
+        ``AllowAny`` stops them, as in Rust. ``IsAuthenticated`` and
+        ``Requires`` reject a request with no user: 401. ``Requires`` can deny
+        a user: 403. A session backend with ``login_url`` redirects a request
+        with no user to the login page: 302 in place of the 401.
+        """
+        middleware_meta = self.api._handler_middleware.get(handler_id, {})
+        backends = middleware_meta.get("_auth_backend_instances")
+        if not backends:
+            return
+
+        needs_user = can_deny = False
+        for guard in middleware_meta.get("guards", ()):
+            if guard["type"] == "allow_any":
+                break
+            needs_user = True
+            can_deny = can_deny or guard["type"] == "requires"
+        if not needs_user:
+            return
+
+        # Rust takes the first session backend of the route.
+        session = next((backend for backend in backends if backend.scheme_name == "session"), None)
+        if session is not None and session.login_url is not None:
+            responses.setdefault(
+                "302",
+                OpenAPIResponse(
+                    description="Found - Redirect to the login page",
+                    headers={"Location": OpenAPIHeader(schema=Schema(type="string"))},
+                ),
+            )
+        else:
+            challenge = OpenAPIHeader(
+                schema=Schema(type="string"), description="The authentication challenge of the route"
+            )
+            self._add_error_response(
+                responses,
+                "401",
+                "Unauthorized - The request has no valid credential",
+                headers={"WWW-Authenticate": challenge},
+            )
+        if can_deny:
+            self._add_error_response(responses, "403", "Forbidden - A guard of the route denies the user")
+
+    def _add_error_response(
+        self,
+        responses: dict[str, OpenAPIResponse],
+        status: str,
+        description: str,
+        *,
+        headers: dict[str, OpenAPIHeader] | None = None,
+    ) -> None:
+        """Add an error response of the Rust core, with the error body of the API.
+
+        A response that the route declares for this status keeps its
+        description. Its content shows the two bodies.
+        """
+        content = self._error_content()
+        declared = responses.get(status)
+        if declared is None:
+            responses[status] = OpenAPIResponse(description=description, headers=headers, content=content)
+            return
+        responses[status] = replace(
+            declared,
+            headers={**(headers or {}), **(declared.headers or {})} or None,
+            content=self._merge_content(declared.content, content),
+        )
+
+    def _error_content(self) -> dict[str, OpenAPIMediaType] | None:
+        """The content of an error response with no field errors, such as a 401 or a 403.
+
+        Without a formatter, the body is ``{"detail": "<message>"}``. A
+        formatter gives the body that it declares with ``error_schema``, or no
+        content when it declares none.
+        """
+        formatter = self.api._error_formatter
+        if formatter is None:
+            schema = Schema(
+                type="object",
+                properties={"detail": Schema(type="string", description="Error message")},
+                required=["detail"],
+            )
+            return {"application/json": OpenAPIMediaType(schema=schema)}
+        declared = getattr(formatter, "__bolt_error_schema__", None)
+        if declared is None:
+            self._untyped_errors = True
+            return None
+        schema = self._type_to_schema(declared.schema, register_component=True)
+        return {declared.media_type: OpenAPIMediaType(schema=schema)}
 
     def _extract_tags(self, handler: Any) -> list[str] | None:
         """Extract tags for grouping operations.

@@ -15,6 +15,8 @@ import pytest
 from django.contrib.auth import alogin
 from django.contrib.auth.models import User
 from django.test import override_settings
+from jsonschema import Draft202012Validator
+from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI, Request
 from django_bolt.auth import (
@@ -26,6 +28,7 @@ from django_bolt.auth import (
     SessionAuthentication,
 )
 from django_bolt.datastructures import UploadFile
+from django_bolt.error_handlers import ProblemDetails, problem_details
 from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, SwaggerRenderPlugin
 from django_bolt.openapi.spec import Components, SecurityScheme
 from django_bolt.params import File, Form
@@ -554,6 +557,252 @@ def test_openapi_security_schemes_preserve_user_defined():
         # User-defined scheme should be preserved, not overwritten
         assert schemes["BearerAuth"]["bearerFormat"] == "CustomJWT"
         assert schemes["BearerAuth"]["description"] == "My custom JWT scheme"
+
+
+# The body of a 401 or a 403 of the Rust core, with no error formatter.
+ERROR_DETAIL_SCHEMA = {
+    "type": "object",
+    "properties": {"detail": {"type": "string", "description": "Error message"}},
+    "required": ["detail"],
+}
+WWW_AUTHENTICATE_HEADER = {
+    "description": "The authentication challenge of the route",
+    "schema": {"type": "string"},
+    "required": False,
+    "deprecated": False,
+}
+
+
+def _auth_errors_api(**api_options) -> BoltAPI:
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Auth Test API", version="1.0.0"), **api_options)
+    api_key = APIKeyAuthentication(api_keys={"test-key"})
+
+    @api.get("/public")
+    async def public() -> dict:
+        return {}
+
+    @api.get("/user", auth=[api_key], guards=[IsAuthenticated()])
+    async def user_only() -> dict:
+        return {}
+
+    @api.get("/manage", auth=[api_key], guards=[Requires("role", "admin")])
+    async def admin_only() -> dict:
+        return {}
+
+    @api.get("/open", auth=[api_key], guards=[AllowAny()])
+    async def allow_any() -> dict:
+        return {}
+
+    # AllowAny lets each request in: the guard after it does not run.
+    @api.get("/open-first", auth=[api_key], guards=[AllowAny(), Requires("role", "admin")])
+    async def allow_any_first() -> dict:
+        return {}
+
+    @api.get("/no-guard", auth=[api_key])
+    async def no_guard() -> dict:
+        return {}
+
+    api._register_openapi_routes()
+    return api
+
+
+def _document(client: TestClient) -> dict:
+    response = client.get("/docs/openapi.json")
+    assert response.status_code == 200, response.text
+    document = response.json()
+    validate(document)
+    return document
+
+
+def test_openapi_documents_the_401_and_403_that_a_guarded_route_sends():
+    """A route with an auth backend and a guard documents the error responses that it sends."""
+    with TestClient(_auth_errors_api()) as client:
+        paths = _document(client)["paths"]
+        no_key = client.get("/user")
+        no_key_admin = client.get("/manage")
+        not_admin = client.get("/manage", headers={"x-api-key": "test-key"})
+        statuses = {path: client.get(path).status_code for path in ("/public", "/open", "/open-first", "/no-guard")}
+
+    responses = {path: paths[path]["get"]["responses"] for path in paths}
+    assert sorted(responses["/user"]) == ["200", "401"]
+    assert sorted(responses["/manage"]) == ["200", "401", "403"]
+    # These routes cannot send a 401 or a 403.
+    assert statuses == {"/public": 200, "/open": 200, "/open-first": 200, "/no-guard": 200}
+    for path in statuses:
+        assert sorted(responses[path]) == ["200"]
+
+    assert responses["/user"]["401"] == {
+        "description": "Unauthorized - The request has no valid credential",
+        "headers": {"WWW-Authenticate": WWW_AUTHENTICATE_HEADER},
+        "content": {"application/json": {"schema": ERROR_DETAIL_SCHEMA}},
+    }
+    assert responses["/manage"]["401"] == responses["/user"]["401"]
+    assert responses["/manage"]["403"] == {
+        "description": "Forbidden - A guard of the route denies the user",
+        "content": {"application/json": {"schema": ERROR_DETAIL_SCHEMA}},
+    }
+
+    # The document shows what the client gets.
+    for response in (no_key, no_key_admin):
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"] == "Bearer"
+        assert response.json() == {"detail": "Authentication required"}
+    assert not_admin.status_code == 403
+    assert not_admin.json() == {"detail": "Permission denied"}
+    for response in (no_key, not_admin):
+        Draft202012Validator(ERROR_DETAIL_SCHEMA).validate(response.json())
+
+
+def test_openapi_auth_errors_show_the_body_of_the_error_formatter():
+    problem = {"application/problem+json": {"schema": {"$ref": "#/components/schemas/ProblemDetails"}}}
+
+    with TestClient(_auth_errors_api(error_formatter=problem_details)) as client:
+        responses = _document(client)["paths"]["/manage"]["get"]["responses"]
+        no_key = client.get("/manage")
+        not_admin = client.get("/manage", headers={"x-api-key": "test-key"})
+
+    assert responses["401"]["content"] == problem
+    assert responses["401"]["headers"] == {"WWW-Authenticate": WWW_AUTHENTICATE_HEADER}
+    assert responses["403"]["content"] == problem
+    assert (no_key.status_code, not_admin.status_code) == (401, 403)
+    assert no_key.headers["www-authenticate"] == "Bearer"
+    for response in (no_key, not_admin):
+        assert response.headers["content-type"] == "application/problem+json"
+        msgspec.convert(response.json(), ProblemDetails)
+
+
+def test_openapi_auth_errors_follow_include_error_responses_and_a_declared_response():
+    class Locked(msgspec.Struct):
+        reason: str
+
+    api_key = APIKeyAuthentication(api_keys={"test-key"})
+    hidden = BoltAPI(
+        openapi_config=OpenAPIConfig(title="Auth Test API", version="1.0.0", include_error_responses=False)
+    )
+    declared = BoltAPI(openapi_config=OpenAPIConfig(title="Auth Test API", version="1.0.0"))
+
+    @hidden.get("/manage", auth=[api_key], guards=[Requires("role", "admin")])
+    async def hidden_admin() -> dict:
+        return {}
+
+    @declared.get(
+        "/manage", auth=[api_key], guards=[Requires("role", "admin")], response_model={200: dict, 403: Locked}
+    )
+    async def declared_admin():
+        return {}
+
+    hidden._register_openapi_routes()
+    declared._register_openapi_routes()
+    with TestClient(hidden) as client:
+        assert sorted(_document(client)["paths"]["/manage"]["get"]["responses"]) == ["200"]
+    with TestClient(declared) as client:
+        responses = _document(client)["paths"]["/manage"]["get"]["responses"]
+
+    # The route can send its own 403 body and the 403 of the guard.
+    assert responses["403"]["content"] == {
+        "application/json": {"schema": {"anyOf": [{"$ref": "#/components/schemas/Locked"}, ERROR_DETAIL_SCHEMA]}}
+    }
+    assert "401" in responses
+
+
+@pytest.mark.django_db
+def test_openapi_session_route_with_login_url_documents_the_redirect():
+    """A session backend with ``login_url`` redirects a request with no user. It does not send a 401."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Auth Test API", version="1.0.0"))
+
+    @api.get("/page", auth=[SessionAuthentication(login_url="/accounts/login/")], guards=[Requires("is_staff")])
+    async def page() -> dict:
+        return {}
+
+    @api.get("/data", auth=[SessionAuthentication()], guards=[IsAuthenticated()])
+    async def data() -> dict:
+        return {}
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        paths = _document(client)["paths"]
+        redirect = client.get("/page", follow_redirects=False)
+        rejected = client.get("/data")
+
+    assert sorted(paths["/page"]["get"]["responses"]) == ["200", "302", "403"]
+    assert paths["/page"]["get"]["responses"]["302"] == {
+        "description": "Found - Redirect to the login page",
+        "headers": {"Location": {"schema": {"type": "string"}, "required": False, "deprecated": False}},
+    }
+    assert (redirect.status_code, redirect.headers["location"]) == (302, "/accounts/login/?next=/page")
+    assert sorted(paths["/data"]["get"]["responses"]) == ["200", "401"]
+    assert rejected.status_code == 401
+
+
+def test_openapi_security_scheme_follows_the_place_of_the_credential():
+    """Each backend gets the scheme of the place where Bolt reads its credential."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Auth Test API", version="1.0.0"))
+    bearer = JWTAuthentication(secret="test-secret")
+    jwt_cookie = JWTAuthentication(secret="test-secret", cookie="access_token")
+    jwt_header = JWTAuthentication(secret="test-secret", header="X-Token")
+    api_key = APIKeyAuthentication(api_keys={"test-key"})
+    partner_key = APIKeyAuthentication(api_keys={"partner-key"}, header="X-Partner-Key")
+
+    @api.get("/public")
+    async def public() -> dict:
+        return {}
+
+    @api.get("/bearer", auth=[bearer], guards=[IsAuthenticated()])
+    async def by_bearer() -> dict:
+        return {}
+
+    @api.get("/cookie", auth=[jwt_cookie], guards=[IsAuthenticated()])
+    async def by_cookie() -> dict:
+        return {}
+
+    @api.get("/header", auth=[jwt_header], guards=[IsAuthenticated()])
+    async def by_header() -> dict:
+        return {}
+
+    @api.get("/key", auth=[api_key], guards=[IsAuthenticated()])
+    async def by_key() -> dict:
+        return {}
+
+    @api.get("/partner", auth=[partner_key], guards=[IsAuthenticated()])
+    async def by_partner_key() -> dict:
+        return {}
+
+    @api.get("/each", auth=[bearer, api_key, SessionAuthentication()], guards=[IsAuthenticated()])
+    async def by_each() -> dict:
+        return {}
+
+    api._register_openapi_routes()
+    token = jwt.encode({"sub": "1", "exp": int(time.time()) + 60}, "test-secret", algorithm="HS256")
+    with TestClient(api) as client:
+        document = _document(client)
+        # The requests that the schemes describe get a 200.
+        assert client.get("/bearer", headers={"authorization": f"Bearer {token}"}).status_code == 200
+        assert client.get("/cookie", headers={"cookie": f"access_token={token}"}).status_code == 200
+        assert client.get("/cookie", headers={"authorization": f"Bearer {token}"}).status_code == 401
+        assert client.get("/header", headers={"x-token": token}).status_code == 200
+        assert client.get("/key", headers={"x-api-key": "test-key"}).status_code == 200
+        assert client.get("/partner", headers={"x-partner-key": "partner-key"}).status_code == 200
+        assert client.get("/partner", headers={"x-api-key": "partner-key"}).status_code == 401
+
+    security = {path: item["get"].get("security") for path, item in document["paths"].items()}
+    assert security == {
+        "/public": None,
+        "/bearer": [{"BearerAuth": []}],
+        "/cookie": [{"JWTCookieAuth": []}],
+        "/header": [{"JWTHeaderAuth": []}],
+        "/key": [{"ApiKeyAuth": []}],
+        "/partner": [{"ApiKeyAuth2": []}],
+        # One entry for each backend: one of them is sufficient.
+        "/each": [{"BearerAuth": []}, {"ApiKeyAuth": []}, {"SessionAuth": []}],
+    }
+    assert document["components"]["securitySchemes"] == {
+        "BearerAuth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"},
+        "JWTCookieAuth": {"type": "apiKey", "in": "cookie", "name": "access_token", "description": "A JWT"},
+        "JWTHeaderAuth": {"type": "apiKey", "in": "header", "name": "X-Token", "description": "A JWT"},
+        "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "x-api-key"},
+        "ApiKeyAuth2": {"type": "apiKey", "in": "header", "name": "X-Partner-Key"},
+        "SessionAuth": {"type": "apiKey", "in": "cookie", "name": "sessionid"},
+    }
 
 
 def test_openapi_form_serializer_flattens_struct_fields():
