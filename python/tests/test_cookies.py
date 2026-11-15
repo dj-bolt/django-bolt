@@ -267,6 +267,49 @@ class TestCookieAttributesInSetCookieHeader:
         assert parts[0] == "session=abc123"
         assert not any(part.lower().startswith("samesite") for part in parts)
 
+    @pytest.mark.parametrize("samesite", ["bogus", " lax", "Lax; Secure"])
+    def test_unknown_samesite_raises_as_django_does(self, samesite):
+        """An unknown samesite value is an error, not a SameSite=Lax cookie."""
+        with pytest.raises(ValueError) as django_error:
+            HttpResponse().set_cookie("session", "abc123", samesite=samesite)
+        message = str(django_error.value)
+        assert message == 'samesite must be "lax", "none", or "strict".'
+
+        with pytest.raises(ValueError) as bolt_error:
+            Response({"ok": True}).set_cookie("session", "abc123", samesite=samesite)
+        assert str(bolt_error.value) == message
+        with pytest.raises(ValueError) as cookie_error:
+            Cookie("session", "abc123", samesite=samesite)
+        assert str(cookie_error.value) == message
+
+        api = BoltAPI()
+
+        @api.get("/cookie")
+        async def set_cookie():
+            return Response({"ok": True}).set_cookie("session", "abc123", samesite=samesite)
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.get("/cookie")
+        assert response.status_code == 500
+        assert "set-cookie" not in response.headers
+
+    @pytest.mark.parametrize(
+        ("samesite", "sent"),
+        [
+            ("lax", "Lax"),
+            ("LAX", "Lax"),
+            ("strict", "Strict"),
+            ("STRICT", "Strict"),
+            ("none", "None"),
+            ("NONE", "None"),
+        ],
+    )
+    def test_samesite_has_no_letter_case(self, samesite, sent):
+        """Each spelling that Django accepts gives the standard spelling in the header."""
+        HttpResponse().set_cookie("session", "abc123", samesite=samesite)
+        parts = self._set_cookie_parts(Cookie("session", "abc123", samesite=samesite))
+        assert f"SameSite={sent}" in parts
+
     def test_default_cookie_attributes(self):
         """A plain cookie has the path and SameSite=Lax only."""
         parts = self._set_cookie_parts(Cookie("session", "abc123"))
@@ -766,3 +809,31 @@ class TestCookiesReachTheResponse:
         assert response.headers["content-type"] == "application/json"
         assert response.headers["x-a"] == "1"
         assert response.headers["set-cookie"].startswith("k=v;")
+
+
+def test_set_cookie_and_delete_cookie_defaults():
+    """set_cookie sends an empty value with Lax. delete_cookie sends Path=/."""
+    api = BoltAPI()
+
+    @api.get("/set")
+    def set_default():
+        return Response({"ok": True}).set_cookie("a")
+
+    @api.get("/delete")
+    def delete_default():
+        return Response({"ok": True}).delete_cookie("a")
+
+    @api.get("/null")
+    def null_content():
+        return Response(None)
+
+    with TestClient(api) as client:
+        set_header = client.get("/set").headers["set-cookie"].split("; ")
+        delete_header = client.get("/delete").headers["set-cookie"].split("; ")
+        null_response = client.get("/null")
+
+    assert sorted(set_header) == ["Path=/", "SameSite=Lax", 'a=""']
+    assert "Path=/" in delete_header
+    assert "Max-Age=0" in delete_header
+    assert null_response.content == b"{}"
+    assert null_response.headers["content-type"] == "application/json"

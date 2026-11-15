@@ -67,6 +67,26 @@ fn is_client_gone(error: &PyErr) -> bool {
     })
 }
 
+/// The close that a handler asks for with a raised `WebSocketException`.
+///
+/// `WebSocketDisconnect` is a subclass, but it reports that the client left.
+/// It asks for no close.
+fn requested_close(error: &PyErr) -> Option<(u16, String)> {
+    Python::attach(|py| {
+        let module = py.import("django_bolt.websocket").ok()?;
+        let exception = module.getattr("WebSocketException").ok()?;
+        if !error.is_instance(py, &exception)
+            || error.is_instance(py, get_disconnect_class(py).ok()?.bind(py))
+        {
+            return None;
+        }
+        let value = error.value(py);
+        let code = value.getattr("code").ok()?.extract().ok()?;
+        let reason = value.getattr("reason").ok()?.extract().ok()?;
+        Some((code, reason))
+    })
+}
+
 /// The error of a send to a client that left. ASGI requires an `OSError`.
 fn client_gone() -> PyErr {
     pyo3::exceptions::PyConnectionResetError::new_err("WebSocket client disconnected")
@@ -821,7 +841,11 @@ pub async fn handle_websocket_upgrade(
                 {
                     match token_revoked(check, auth_ctx).await {
                         Ok(false) => {}
-                        Ok(true) => return Ok(bolt_core::responses::error_401()),
+                        Ok(true) => {
+                            return Ok(bolt_core::responses::error_401_challenge(
+                                route_meta.www_authenticate.as_ref(),
+                            ));
+                        }
                         Err(e) => {
                             eprintln!("[django-bolt] WebSocket revocation check error: {}", e);
                             return Ok(HttpResponse::InternalServerError()
@@ -833,7 +857,9 @@ pub async fn handle_websocket_upgrade(
             }
             // Registration refuses a session backend on a WebSocket route. Fail closed.
             AuthGuardResult::Deferred(_) | AuthGuardResult::Unauthorized => {
-                return Ok(bolt_core::responses::error_401());
+                return Ok(bolt_core::responses::error_401_challenge(
+                    route_meta.www_authenticate.as_ref(),
+                ));
             }
             AuthGuardResult::Forbidden(denial) => {
                 return Ok(bolt_core::responses::error_403_denial(denial.as_deref()));
@@ -957,7 +983,10 @@ fn refusal(status: StatusCode) -> HttpResponse {
 /// Run the Python handler on this thread's WorkerLoop.
 ///
 /// The handler decides the handshake. If it ends without a decision, the
-/// upgrade gets 403 on return and 500 on error, as in uvicorn.
+/// upgrade gets 403 on return and 500 on error, as in uvicorn. If it ends
+/// after accept with no close, the connection gets a close frame: 1000 on
+/// return and 1011 on error. A raised `WebSocketException` gives 403 before
+/// accept, and a close frame with its code and reason after accept.
 fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsTarget) {
     actix_web::rt::spawn(async move {
         // Wrap the entire handler execution in catch_unwind to handle panics
@@ -1033,14 +1062,25 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
                 Err(e) => Some(e),
             };
             match error {
-                None => ws_state.refuse(StatusCode::FORBIDDEN),
+                None => {
+                    ws_state.refuse(StatusCode::FORBIDDEN);
+                    // A handler that returns with no close ends the connection.
+                    close_accepted(&ws_state, 1000, "").await;
+                }
                 Some(e) => {
+                    // A raised WebSocketException is the close of the handler,
+                    // as in Starlette: 403 before accept, its code and reason after.
+                    if let Some((code, reason)) = requested_close(&e) {
+                        ws_state.refuse(StatusCode::FORBIDDEN);
+                        close_accepted(&ws_state, code, &reason).await;
+                        return;
+                    }
                     // A client that left is not an error of the handler.
                     if !is_client_gone(&e) {
                         eprintln!("[django-bolt] WebSocket handler error: {}", e);
                     }
                     ws_state.refuse(StatusCode::INTERNAL_SERVER_ERROR);
-                    close_with_error(&ws_state, "Internal error").await;
+                    close_accepted(&ws_state, 1011, "Internal error").await;
                 }
             }
         })
@@ -1050,17 +1090,20 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
         if result.is_err() {
             eprintln!("[django-bolt] WebSocket handler task panicked - closing connection");
             ws_state.refuse(StatusCode::INTERNAL_SERVER_ERROR);
-            close_with_error(&ws_state, "Internal server error").await;
+            close_accepted(&ws_state, 1011, "Internal server error").await;
         }
     });
 }
 
-/// Close an accepted connection with 1011. The actor stop releases the slot.
-async fn close_with_error(ws_state: &WsConnectionState, reason: &str) {
+/// Close an accepted connection when the handler ends. The actor stop releases the slot.
+///
+/// The actor of a connection that the handler or the client closed has
+/// stopped. The send then fails, and the client gets no second close frame.
+async fn close_accepted(ws_state: &WsConnectionState, code: u16, reason: &str) {
     if let Some(addr) = ws_state.actor_addr.get() {
         let _ = addr
             .send(SendToClient(WsMessage::Close {
-                code: 1011,
+                code,
                 reason: reason.to_string(),
             }))
             .await;
