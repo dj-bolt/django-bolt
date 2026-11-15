@@ -12,6 +12,7 @@ from typing import Annotated
 import jwt
 import msgspec
 import pytest
+import yaml
 from django.contrib.auth import alogin
 from django.contrib.auth.models import User
 from django.test import override_settings
@@ -27,7 +28,15 @@ from django_bolt.auth import (
 )
 from django_bolt.datastructures import UploadFile
 from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, SwaggerRenderPlugin
-from django_bolt.openapi.spec import Components, SecurityScheme
+from django_bolt.openapi.spec import (
+    Components,
+    Contact,
+    ExternalDocumentation,
+    License,
+    SecurityScheme,
+    Server,
+    Tag,
+)
 from django_bolt.params import File, Form
 from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
@@ -399,6 +408,80 @@ def _docs_api_with_login(**config) -> BoltAPI:
 
     api._register_openapi_routes()
     return api
+
+
+def test_openapi_yaml_endpoints_serve_the_same_document_as_json():
+    """Both YAML paths return 200, a YAML media type and the document of the JSON path."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/items")
+    async def list_items() -> list[Item]:
+        return []
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        document = client.get("/docs/openapi.json").json()
+        for path in ("/docs/openapi.yaml", "/docs/openapi.yml"):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert response.headers["content-type"] == "text/yaml; charset=utf-8", path
+            assert yaml.safe_load(response.text) == document, path
+
+
+def test_openapi_config_fields_reach_the_document():
+    """Info, servers, security and external docs of the config appear in the document."""
+    config = OpenAPIConfig(
+        title="Test API",
+        version="2.1.0",
+        description="Long text.",
+        summary="Short text.",
+        terms_of_service="https://example.com/terms",
+        contact=Contact(name="Team", email="team@example.com"),
+        license=License(name="MIT"),
+        servers=[Server(url="https://api.example.com")],
+        security=[{"BearerAuth": []}],
+        external_docs=ExternalDocumentation(url="https://example.com/docs"),
+        tags=[Tag(name="items", description="Item routes")],
+    )
+    api = BoltAPI(openapi_config=config)
+
+    @api.get("/items", tags=["items"])
+    async def list_items() -> list[Item]:
+        return []
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        document = client.get("/docs/openapi.json").json()
+
+    assert document["info"] == {
+        "title": "Test API",
+        "version": "2.1.0",
+        "description": "Long text.",
+        "summary": "Short text.",
+        "termsOfService": "https://example.com/terms",
+        "contact": {"name": "Team", "email": "team@example.com"},
+        "license": {"name": "MIT"},
+    }
+    assert document["servers"] == [{"url": "https://api.example.com"}]
+    assert document["security"] == [{"BearerAuth": []}]
+    assert document["externalDocs"] == {"url": "https://example.com/docs"}
+    assert {"name": "items", "description": "Item routes"} in document["tags"]
+
+
+def test_openapi_docs_ignore_the_prefix_of_the_api():
+    """The docs routes keep their absolute path when the API has a prefix."""
+    api = BoltAPI(prefix="/api", openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/items")
+    async def list_items() -> list[Item]:
+        return []
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        for path in ("/docs/openapi.json", "/docs/openapi.yaml", "/docs", "/docs/redoc"):
+            assert client.get(path).status_code == 200, path
+        assert client.get("/api/docs/openapi.json").status_code == 404
+        assert "/api/items" in client.get("/docs/openapi.json").json()["paths"]
 
 
 @pytest.mark.django_db(transaction=True)
