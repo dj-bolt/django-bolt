@@ -109,7 +109,7 @@ class APIView:
         return _current_request.get()
 
     @classmethod
-    def as_view(cls, method: str, action: str | None = None) -> Callable:
+    def as_view(cls, method: str, action: str | None = None, **initkwargs: Any) -> Callable:
         """
         Create a handler callable for a specific HTTP method.
 
@@ -124,6 +124,8 @@ class APIView:
         Args:
             method: HTTP method name (lowercase, e.g., "get", "post")
             action: Optional action name for DRF-style methods (e.g., "list", "retrieve")
+            **initkwargs: Attributes of the view instance of this handler. They
+                do not change the class.
 
         Returns:
             Handler function compatible with BoltAPI routing (sync or async)
@@ -168,7 +170,7 @@ class APIView:
 
         # Create single view instance at registration time (not per-request)
         # This eliminates the per-request instantiation overhead (~40% faster)
-        view_instance = cls()
+        view_instance = cls(**initkwargs)
 
         # Bind the method once to eliminate lookup overhead
         bound_method = method_handler.__get__(view_instance, cls)

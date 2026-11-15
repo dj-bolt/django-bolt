@@ -1410,7 +1410,10 @@ class BoltAPI:
                 defaults). An @action that sets ``status_code`` keeps its value.
             validate_response: Optional response validation switch for all routes.
                 An @action that sets ``validate_response`` keeps its value.
-            lookup_field: Field name for object lookup (default: "pk")
+            lookup_field: Field name for object lookup (default: "pk"). It names
+                the path parameter, and ``get_object()`` reads it. A value other
+                than "pk" has priority over the ``lookup_field`` class attribute.
+                It applies to the routes of this registration only.
             tags: Optional tags to apply to all routes. An @action that sets
                 ``tags`` keeps its value.
 
@@ -1427,6 +1430,12 @@ class BoltAPI:
             actual_lookup_field = lookup_field
             if actual_lookup_field == "pk" and hasattr(viewset_cls, "lookup_field"):
                 actual_lookup_field = viewset_cls.lookup_field
+
+            # The view instances of this registration get the decorator value.
+            # The class attribute stays, so a second registration is independent.
+            view_kwargs = (
+                {} if actual_lookup_field == viewset_cls.lookup_field else {"lookup_field": actual_lookup_field}
+            )
 
             # Reverse-name base for all generated routes. Both an explicit name and
             # the class-name fallback are used verbatim.
@@ -1461,7 +1470,7 @@ class BoltAPI:
                     continue
 
                 # Use action name (e.g., "list") not HTTP method name (e.g., "get")
-                handler = viewset_cls.as_view(http_method.lower(), action=action_name)
+                handler = viewset_cls.as_view(http_method.lower(), action=action_name, **view_kwargs)
 
                 # Merge guards and auth
                 merged_guards = guards
@@ -1552,6 +1561,7 @@ class BoltAPI:
                 include_in_schema=merged_include_in_schema,
                 base_name=vs_base,
                 base_name_explicit=name is not None,
+                view_kwargs=view_kwargs,
                 guards=guards,
                 auth=auth,
                 status_code=status_code,
@@ -1588,6 +1598,7 @@ class BoltAPI:
         base_name: str | None = None,
         base_name_explicit: bool = False,
         include_in_schema: bool | None = None,
+        view_kwargs: dict[str, Any] | None = None,
         guards: list[Any] | None = None,
         auth: list[Any] | None = None,
         status_code: int | None = None,
@@ -1607,12 +1618,14 @@ class BoltAPI:
             lookup_field: Lookup field name for detail actions (e.g., "id", "pk")
             base_name: Base URL-reverse name for the viewset.
             base_name_explicit: True when the user named the viewset directly
+            view_kwargs: Attributes of each view instance of this registration
             guards: Guards from the registration call
             auth: Auth backends from the registration call
             status_code: Default status code from the registration call
             validate_response: Response validation switch from the registration call
             tags: Tags from the registration call
         """
+        view_kwargs = view_kwargs or {}
 
         # Registration value first, then the class-level value (if any)
         class_auth = auth if auth is not None else getattr(view_cls, "auth", None)
@@ -1677,13 +1690,14 @@ class BoltAPI:
                             *args,
                             __unbound_fn=unbound_fn,
                             __view_cls=view_cls,
+                            __view_kwargs=view_kwargs,
                             _action=name,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
                             _current_action.set(_action)
                             _current_request.set(args[0])
-                            view_instance = __view_cls()
+                            view_instance = __view_cls(**__view_kwargs)
                             return await __unbound_fn(view_instance, *args, **kwargs)
                     else:
 
@@ -1691,13 +1705,14 @@ class BoltAPI:
                             *args,
                             __unbound_fn=unbound_fn,
                             __view_cls=view_cls,
+                            __view_kwargs=view_kwargs,
                             _action=name,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
                             _current_action.set(_action)
                             _current_request.set(args[0])
-                            view_instance = __view_cls()
+                            view_instance = __view_cls(**__view_kwargs)
                             return __unbound_fn(view_instance, *args, **kwargs)
 
                     # Preserve signature and annotations from original method
