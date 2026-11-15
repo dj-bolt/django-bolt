@@ -524,6 +524,23 @@ async def get_preferences(cookies: Annotated[SessionCookies, Cookie()]):
     return {"theme": cookies.theme, "language": cookies.language}
 ```
 
+### Unknown keys
+
+A parameter model ignores a key that it does not declare. To reject such a key, set `forbid_unknown_fields=True`:
+
+```python
+class StrictFilters(msgspec.Struct, forbid_unknown_fields=True):
+    page: int = 1
+
+@api.get("/strict")
+async def strict(filters: Annotated[StrictFilters, Query()], limit: int = 10):
+    return {"page": filters.page, "limit": limit}
+```
+
+`/strict?page=2&limit=5` passes, because `limit` is a parameter of the handler.
+`/strict?page=2&other=1` gives a 422 with the type `unknown_field` and the `loc` `["query", "other"]`.
+The keys of a dependency are not parameters of the handler, so the model rejects them.
+
 ### Benefits of parameter models
 
 | Feature | Individual params | Parameter models |

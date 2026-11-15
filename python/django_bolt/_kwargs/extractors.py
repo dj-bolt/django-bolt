@@ -171,7 +171,9 @@ def create_path_extractor(name: str, annotation: Any, alias: str | None = None) 
     return extract
 
 
-def create_query_extractor(name: str, annotation: Any, default: Any, alias: str | None = None) -> Callable:
+def create_query_extractor(
+    name: str, annotation: Any, default: Any, alias: str | None = None, other_keys: frozenset[str] = frozenset()
+) -> Callable:
     """Create a pre-compiled extractor for query parameters.
 
     Supports both individual fields and Struct/Serializer types.
@@ -184,7 +186,7 @@ def create_query_extractor(name: str, annotation: Any, default: Any, alias: str 
     # Check if annotation is a Struct/Serializer type
     unwrapped = unwrap_optional(annotation)
     if is_msgspec_struct(unwrapped):
-        return _create_param_struct_extractor(unwrapped, default, "query parameter")
+        return _create_param_struct_extractor(unwrapped, default, "query parameter", other_keys)
 
     # Individual field extraction
     key = alias or name
@@ -258,7 +260,9 @@ def create_header_extractor(name: str, annotation: Any, default: Any, alias: str
     return extract
 
 
-def create_cookie_extractor(name: str, annotation: Any, default: Any, alias: str | None = None) -> Callable:
+def create_cookie_extractor(
+    name: str, annotation: Any, default: Any, alias: str | None = None, other_keys: frozenset[str] = frozenset()
+) -> Callable:
     """Create a pre-compiled extractor for cookies.
 
     Supports both individual fields and Struct/Serializer types.
@@ -274,7 +278,7 @@ def create_cookie_extractor(name: str, annotation: Any, default: Any, alias: str
     # Check if annotation is a Struct/Serializer type
     unwrapped = unwrap_optional(annotation)
     if is_msgspec_struct(unwrapped):
-        return _create_param_struct_extractor(unwrapped, default, "cookie")
+        return _create_param_struct_extractor(unwrapped, default, "cookie", other_keys)
 
     # Individual field extraction
     key = alias or name
@@ -302,7 +306,9 @@ def create_cookie_extractor(name: str, annotation: Any, default: Any, alias: str
     return extract
 
 
-def create_form_extractor(name: str, annotation: Any, default: Any, alias: str | None = None) -> Callable:
+def create_form_extractor(
+    name: str, annotation: Any, default: Any, alias: str | None = None, other_keys: frozenset[str] = frozenset()
+) -> Callable:
     """Create a pre-compiled extractor for form fields.
 
     Supports both individual fields and Struct/Serializer types.
@@ -314,7 +320,7 @@ def create_form_extractor(name: str, annotation: Any, default: Any, alias: str |
     # Check if annotation is a Struct/Serializer type
     unwrapped = unwrap_optional(annotation)
     if is_msgspec_struct(unwrapped):
-        return _create_param_struct_extractor(unwrapped, default, "form field")
+        return _create_param_struct_extractor(unwrapped, default, "form field", other_keys)
 
     # Individual field extraction
     key = alias or name
@@ -443,7 +449,28 @@ def _collect_sequence_field_names(struct_type: type) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _create_param_struct_extractor(struct_type: type, default: Any, param_type: str) -> Callable:
+def _unknown_field_errors(
+    data: dict[str, Any], known: frozenset[str], param_type: str, source: str, files: Any = ()
+) -> list[dict[str, Any]]:
+    """Return one error for each key of ``data`` that is not a field of the struct.
+
+    The input of an uploaded file (a key of ``files``) is not put in the error.
+    """
+    return [
+        {
+            "type": "unknown_field",
+            "loc": (source, key),
+            "msg": f"Unknown {param_type}: {key}",
+            "input": None if key in files else value,
+        }
+        for key, value in data.items()
+        if key not in known
+    ]
+
+
+def _create_param_struct_extractor(
+    struct_type: type, default: Any, param_type: str, other_keys: frozenset[str] = frozenset()
+) -> Callable:
     """
     Create an extractor that builds and validates a msgspec Struct/Serializer from parameter data.
 
@@ -457,6 +484,7 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
         struct_type (type): msgspec struct/serializer type to produce.
         default (Any): Reserved for optional-struct support; not used by the extractor itself.
         param_type (str): The source name in error messages ("query parameter", "form field" or "cookie"). It also selects the source in `loc`.
+        other_keys (frozenset[str]): The keys that the other parameters of the handler read from the same source. A struct that forbids unknown fields does not get them. A key that no parameter declares gives a 422 with the type `unknown_field`.
 
     Returns:
         Callable: An extractor function that produces a validated instance of `struct_type` from incoming parameter data and raises RequestValidationError on validation errors.
@@ -467,6 +495,11 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
     has_upload_file_fields = any(is_upload_file_type(f.type) for f in msgspec.structs.fields(struct_type))
     # Pre-compute sequence field names — empty tuple means zero runtime overhead.
     _seq_field_names = _collect_sequence_field_names(struct_type)
+    # A struct that forbids unknown fields must not get the keys of other parameters.
+    # For any other struct, the set is empty and the request path does not change.
+    forbids_unknown = struct_type.__struct_config__.forbid_unknown_fields
+    known = frozenset(f.encode_name for f in msgspec.structs.fields(struct_type))
+    _other_keys = other_keys - known if forbids_unknown else frozenset()
 
     if has_upload_file_fields:
         _upload_field_names = [f.name for f in msgspec.structs.fields(struct_type) if is_upload_file_type(f.type)]
@@ -491,6 +524,8 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
             for k, v in files_map.items():
                 if k != "_upload_files":
                     merged[k] = v
+            for k in _other_keys:
+                merged.pop(k, None)
 
             # Wrap scalar values for list[T]-typed fields so a single
             # form occurrence still produces a one-element list.
@@ -503,6 +538,8 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
                 result = msgspec.convert(merged, struct_type, strict=False, dec_hook=_upload_file_dec_hook)
             except msgspec.ValidationError as e:
                 errors = _collect_struct_errors(struct_type, merged, param_type, source, has_files=True)
+                if not errors and forbids_unknown:
+                    errors = _unknown_field_errors(merged, known, param_type, source, files_map)
                 if errors:
                     raise RequestValidationError(errors=errors) from e
                 raise
@@ -548,10 +585,19 @@ def _create_param_struct_extractor(struct_type: type, default: Any, param_type: 
                         wrapped[name] = [value]
                 param_map = wrapped if wrapped is not None else param_map
 
+            if _other_keys:
+                # Only allocate a copy when the request has a key of another parameter.
+                for name in _other_keys:
+                    if name in param_map:
+                        param_map = {k: v for k, v in param_map.items() if k not in _other_keys}
+                        break
+
             try:
                 return msgspec.convert(param_map, struct_type, strict=False)
             except msgspec.ValidationError as e:
                 errors = _collect_struct_errors(struct_type, param_map, param_type, source)
+                if not errors and forbids_unknown:
+                    errors = _unknown_field_errors(param_map, known, param_type, source)
                 if errors:
                     raise RequestValidationError(errors=errors) from e
                 raise
@@ -825,7 +871,7 @@ def _build_body_extractor(annotation: Any) -> Callable:
     return extract
 
 
-def create_extractor_for_field(field: FieldDefinition) -> Callable | None:
+def create_extractor_for_field(field: FieldDefinition, other_keys: frozenset[str] = frozenset()) -> Callable | None:
     """
     Create a pre-compiled extractor function for a FieldDefinition.
 
@@ -835,6 +881,9 @@ def create_extractor_for_field(field: FieldDefinition) -> Callable | None:
 
     Args:
         field: FieldDefinition object
+        other_keys: The keys that the other parameters of the handler read from
+            the source of this field. A query, cookie or form struct that
+            forbids unknown fields does not get them.
 
     Returns:
         Extractor function, or None for 'request' and 'dependency' sources
@@ -852,13 +901,13 @@ def create_extractor_for_field(field: FieldDefinition) -> Callable | None:
     if source == "path":
         return create_path_extractor(name, annotation, alias)
     elif source == "query":
-        return create_query_extractor(name, annotation, default, alias)
+        return create_query_extractor(name, annotation, default, alias, other_keys)
     elif source == "header":
         return create_header_extractor(name, annotation, default, alias)
     elif source == "cookie":
-        return create_cookie_extractor(name, annotation, default, alias)
+        return create_cookie_extractor(name, annotation, default, alias, other_keys)
     elif source == "form":
-        return create_form_extractor(name, annotation, default, alias)
+        return create_form_extractor(name, annotation, default, alias, other_keys)
     elif source == "file":
         # Extract file constraints from Param if available
         max_size = None
