@@ -769,6 +769,58 @@ def test_async_dependencies_of_a_handler_run_at_the_same_time():
     assert response.json() == {"left": True, "right": True, "plain": True}
 
 
+# A dependency can be an object with ``async def __call__``.
+
+
+class AsyncCallable:
+    async def __call__(self, q: str = "x") -> str:
+        await asyncio.sleep(0)
+        return "value-" + q
+
+
+class SyncCallable:
+    def __call__(self, q: str = "x") -> str:
+        return "value-" + q
+
+
+async def wraps_async_callable(inner: str = Depends(AsyncCallable())) -> str:
+    return "nested-" + inner
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/async-handler?q=a", "value-a"),
+        ("/sync-handler?q=b", "value-b"),
+        ("/nested?q=c", "nested-value-c"),
+        ("/sync-callable?q=d", "value-d"),
+    ],
+)
+def test_a_callable_object_with_an_async_call_is_awaited(path, expected):
+    api = BoltAPI()
+
+    @api.get("/async-handler")
+    async def async_handler(dep=Depends(AsyncCallable())):
+        return {"dep": dep}
+
+    @api.get("/sync-handler")
+    def sync_handler(dep=Depends(AsyncCallable())):
+        return {"dep": dep}
+
+    @api.get("/nested")
+    async def nested(dep=Depends(wraps_async_callable)):
+        return {"dep": dep}
+
+    @api.get("/sync-callable")
+    def sync_callable(dep=Depends(SyncCallable())):
+        return {"dep": dep}
+
+    with TestClient(api) as client:
+        response = client.get(path)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"dep": expected}
+
+
 # A dependency can take the request with other parameters, keyword-only
 # parameters, and a form model that holds uploads.
 
@@ -787,6 +839,26 @@ def sync_keyword_only(*, page: Annotated[int, Query()] = 1, theme: Annotated[str
 
 async def async_keyword_only(*, page: Annotated[int, Query()] = 1, theme: Annotated[str, Cookie()] = "light") -> dict:
     return {"page": page, "theme": theme}
+
+
+def sync_positional_only(
+    page: Annotated[int, Query()] = 1,
+    ticket: int = Depends(sync_ticket),
+    /,
+    *,
+    theme: Annotated[str, Cookie()] = "light",
+) -> dict:
+    return {"page": page, "has_ticket": ticket > 0, "theme": theme}
+
+
+async def async_positional_only(
+    page: Annotated[int, Query()] = 1,
+    ticket: int = Depends(async_ticket),
+    /,
+    *,
+    theme: Annotated[str, Cookie()] = "light",
+) -> dict:
+    return {"page": page, "has_ticket": ticket > 0, "theme": theme}
 
 
 class UploadForm(msgspec.Struct):
@@ -822,6 +894,14 @@ def argument_client():
     def sync_keyword_route(values=Depends(sync_keyword_only)):
         return values
 
+    @api.get("/async/positional-only")
+    async def async_positional_route(values=Depends(async_positional_only)):
+        return values
+
+    @api.get("/sync/positional-only")
+    def sync_positional_route(values=Depends(sync_positional_only)):
+        return values
+
     @api.post("/async/upload-form")
     async def async_upload_form_route(values=Depends(async_upload_form)):
         return values
@@ -847,6 +927,15 @@ def test_a_dependency_gets_its_keyword_only_parameters(argument_client, mode):
     assert response.status_code == 200, response.text
     assert response.json() == {"page": 5, "theme": "dark"}
     assert argument_client.get(f"/{mode}/keyword-only").json() == {"page": 1, "theme": "light"}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_dependency_gets_its_positional_only_parameters(argument_client, mode):
+    """A positional-only parameter cannot go by keyword. A nested dependency in that position goes in order too."""
+    response = argument_client.get(f"/{mode}/positional-only?page=5", headers={"Cookie": "theme=dark"})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"page": 5, "has_ticket": True, "theme": "dark"}
+    assert argument_client.get(f"/{mode}/positional-only").json() == {"page": 1, "has_ticket": True, "theme": "light"}
 
 
 @pytest.mark.parametrize("mode", MODES)
