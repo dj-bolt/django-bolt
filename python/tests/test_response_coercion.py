@@ -516,6 +516,129 @@ def test_str_that_converts_to_the_declared_type_is_sent_as_json(settings, is_asy
         assert "Expected `str` of length <= 5" in _validation_message(scalar_client.get("/long"))
 
 
+@pytest.mark.parametrize("is_async", [True, False], ids=["async", "sync"])
+@pytest.mark.parametrize("value", [3, "abc", {"id": 1, "username": "a"}], ids=["int", "str", "dict"])
+def test_a_result_that_is_not_a_list_for_a_list_of_serializers_is_a_validation_error(settings, value, is_async):
+    settings.DEBUG = True
+    api = BoltAPI()
+    _scalar_route(api, "/bad", value, is_async=is_async, **{"return": list[PublicUser]})
+    _scalar_route(api, "/tuple", ({"id": 1, "username": "a"},), is_async=is_async, **{"return": list[PublicUser]})
+    _scalar_route(api, "/none", None, is_async=is_async, **{"return": list[PublicUser]})
+    api.get("/unvalidated", validate_response=False, response_model=list[PublicUser])(lambda: value)
+
+    with TestClient(api) as scalar_client:
+        message = _validation_message(scalar_client.get("/bad"))
+        assert message == (
+            f"Response type mismatch: expected list[PublicUser], but handler returned {type(value).__name__}. "
+            "Make sure your handler returns a list."
+        )
+        assert scalar_client.get("/tuple").json() == [{"id": 1, "username": "a"}]
+        # As for a list of Structs: None is the empty list.
+        assert scalar_client.get("/none").json() == []
+        # A route with no validation sends the result as before.
+        assert scalar_client.get("/unvalidated").status_code == 200
+
+
+def _mismatch_routes(api: BoltAPI, return_type: Any, value: Any, **route_options: Any) -> list[str]:
+    """Register one route for each executor that Bolt compiles. Each route returns ``value``."""
+
+    async def async_no_params():
+        return value
+
+    def sync_no_params():
+        return value
+
+    async def async_with_params(page: int = 1):
+        return value
+
+    def sync_with_params(page: int = 1):
+        return value
+
+    async def async_request_only(request):
+        return value
+
+    async def async_that_awaits():
+        await asyncio.sleep(0)
+        return value
+
+    handlers = (
+        async_no_params,
+        sync_no_params,
+        async_with_params,
+        sync_with_params,
+        async_request_only,
+        async_that_awaits,
+    )
+    for handler in handlers:
+        handler.__annotations__["return"] = return_type
+        api.get(f"/{handler.__name__}", **route_options)(handler)
+    return [f"/{handler.__name__}" for handler in handlers]
+
+
+@pytest.mark.parametrize(
+    ("return_type", "value", "expected"),
+    [
+        (dict, "abc", "expected dict, but handler returned str"),
+        (dict, b"abc", "expected dict, but handler returned bytes"),
+        (list, "abc", "expected list, but handler returned str"),
+        (list, bytearray(b"abc"), "expected list, but handler returned bytearray"),
+        (bytes, "abc", "expected bytes, but handler returned str"),
+        (str, b"abc", "expected str, but handler returned bytes"),
+    ],
+    ids=["dict-str", "dict-bytes", "list-str", "list-bytearray", "bytes-str", "str-bytes"],
+)
+def test_str_or_bytes_for_dict_or_list_is_a_validation_error_on_each_executor(settings, return_type, value, expected):
+    """The executor of a route with no parameters sent the JSON `"abc"`. The other executors sent text/plain."""
+    settings.DEBUG = True
+    api = BoltAPI()
+    paths = _mismatch_routes(api, return_type, value)
+
+    with TestClient(api) as scalar_client:
+        for path in paths:
+            assert expected in _validation_message(scalar_client.get(path)), path
+
+
+@pytest.mark.parametrize(
+    ("return_type", "value", "content_type"),
+    [
+        (dict, "abc", "text/plain; charset=utf-8"),
+        (dict, b"abc", "application/octet-stream"),
+        (dict[str, int], "abc", "text/plain; charset=utf-8"),
+        (list[int], b"abc", "application/octet-stream"),
+    ],
+    ids=["dict-str", "dict-bytes", "typed-dict-str", "typed-list-bytes"],
+)
+def test_str_or_bytes_of_a_route_with_no_validation_has_one_content_type_on_each_executor(
+    return_type, value, content_type
+):
+    api = BoltAPI()
+    paths = _mismatch_routes(api, return_type, value, validate_response=False)
+
+    with TestClient(api) as scalar_client:
+        for path in paths:
+            response = scalar_client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.headers["content-type"] == content_type, path
+            assert response.content == b"abc", path
+
+
+@pytest.mark.parametrize(
+    ("return_type", "value"),
+    [(dict, {"a": 1}), (list, [1, "a"]), (dict[str, int], {"a": 1}), (list[int], [1, 2])],
+    ids=["dict", "list", "typed-dict", "typed-list"],
+)
+@pytest.mark.parametrize("validate_response", [True, False], ids=["validated", "unvalidated"])
+def test_dict_or_list_result_is_json_on_each_executor(return_type, value, validate_response):
+    api = BoltAPI()
+    paths = _mismatch_routes(api, return_type, value, validate_response=validate_response)
+
+    with TestClient(api) as scalar_client:
+        for path in paths:
+            response = scalar_client.get(path)
+            assert response.headers["content-type"] == "application/json", path
+            assert response.json() == value, path
+
+
 def test_bare_list_accepts_any_item_and_names_its_item_type_in_a_mismatch(client):
     assert client.get("/list-bare/ok").json() == [1, "a"]
     message = _validation_message(client.get("/list-bare/dict"))

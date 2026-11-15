@@ -228,6 +228,18 @@ _JSON_SCALAR_TYPES = (
 )
 
 
+# The response types with no validator, for which a str or bytes result is a mismatch.
+_PLAIN_RESPONSE_TYPES = (dict, list, str, bytes, bytearray)
+
+
+def _raise_plain_type_mismatch(expected: type, result: Any) -> NoReturn:
+    _raise_response_validation_error(
+        TypeError(
+            f"Response type mismatch: expected {expected.__name__}, but handler returned {type(result).__name__}."
+        )
+    )
+
+
 def _raise_response_validation_error(exc: Exception) -> NoReturn:
     """Convert a low-level validation failure into ResponseValidationError.
 
@@ -514,15 +526,29 @@ def _compile_serializer_values_evaluators(serializer_cls: Any) -> tuple[Any, Any
 def _compile_serializer_response_handlers(serializer_cls: Any, many: bool, validate_dicts: bool) -> tuple[Any, Any]:
     """Compile normalizers that render model/queryset output via the serializer."""
     if many:
+        expected = f"list[{serializer_cls.__name__}]"
+
+        def not_a_list(value: Any) -> Any:
+            # A route with no validation sends the result as it is.
+            if not validate_dicts:
+                return value
+            # As for a list of Structs (see _compile_list_coercer).
+            if value is None:
+                return []
+            raise TypeError(
+                f"Response type mismatch: expected {expected}, "
+                f"but handler returned {type(value).__name__}. "
+                f"Make sure your handler returns a list."
+            )
 
         def normalize_sync(value: Any) -> Any:
             if not isinstance(value, (list, tuple)):
-                return value
+                return not_a_list(value)
             return _dump_many_sync(serializer_cls, value, validate_dicts)
 
         async def normalize_async(value: Any) -> Any:
             if not isinstance(value, (list, tuple)):
-                return value
+                return not_a_list(value)
             return await _dump_many_async(serializer_cls, value, validate_dicts)
 
         return normalize_sync, normalize_async
@@ -904,6 +930,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     validates = validator_sync is not None and meta["validate_response"]
     validate_text = validates and not _names_one_of(meta.get("response_type"), (str,))
     validate_bytes = validates and not _names_one_of(meta.get("response_type"), (bytes, bytearray))
+    # dict, list, str and bytes have no validator. A route that validates still
+    # refuses a str or bytes result that such a response type does not name.
+    plain_type = meta.get("response_type")
+    refuses = meta["validate_response"] and plain_type in _PLAIN_RESPONSE_TYPES
+    refuse_text = refuses and plain_type is not str
+    refuse_bytes = refuses and plain_type not in (bytes, bytearray)
 
     _serializer_cls, _serializer_many = _response_serializer_info(meta.get("response_type"))
     is_serializer_response = _serializer_cls is not None
@@ -963,10 +995,14 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, (bytes, bytearray)):
             if validate_bytes:
                 return _serialize_validated_raw(result, current_status, validator_sync)
+            if refuse_bytes:
+                _raise_plain_type_mismatch(plain_type, result)
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
             if validate_text:
                 return _serialize_validated_raw(result, current_status, validator_sync)
+            if refuse_text:
+                _raise_plain_type_mismatch(plain_type, result)
             return _wire_bytes(current_status, _RESPONSE_META_PLAINTEXT, result.encode())
 
         auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status, response_class)
@@ -1018,10 +1054,14 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, (bytes, bytearray)):
             if validate_bytes:
                 return _serialize_validated_raw(result, current_status, validator_sync)
+            if refuse_bytes:
+                _raise_plain_type_mismatch(plain_type, result)
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
             if validate_text:
                 return _serialize_validated_raw(result, current_status, validator_sync)
+            if refuse_text:
+                _raise_plain_type_mismatch(plain_type, result)
             return _wire_bytes(current_status, _RESPONSE_META_PLAINTEXT, result.encode())
 
         auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status, response_class)
