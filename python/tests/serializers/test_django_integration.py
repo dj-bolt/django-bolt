@@ -407,6 +407,19 @@ class TestUpdateInstanceWithDjango:
         original = Author.objects.get(id=author.id)
         assert original.name == "Original Name"
 
+    def test_update_instance_with_omit_defaults_keeps_the_fields_at_their_default(self):
+        """With omit_defaults=True, update_instance() sets only the fields that are not at their default."""
+
+        class AuthorPatch(Serializer, omit_defaults=True):
+            name: str = ""
+            email: str = ""
+            bio: str = ""
+
+        author = Author(name="Original", email="original@example.com", bio="Old bio")
+
+        assert AuthorPatch(email="new@example.com").update_instance(author) is author
+        assert (author.name, author.email, author.bio) == ("Original", "new@example.com", "Old bio")
+
     @pytest.mark.django_db
     def test_update_instance_and_save(self):
         """Test updating and saving model instance."""
