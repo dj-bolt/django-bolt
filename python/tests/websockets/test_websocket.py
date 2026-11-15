@@ -15,6 +15,7 @@ Tests the WebSocket functionality including:
 from __future__ import annotations
 
 import contextlib
+import functools
 import time
 from typing import Annotated
 
@@ -25,7 +26,7 @@ from django_bolt import BoltAPI, WebSocket
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, Requires
 from django_bolt.param_functions import Cookie, Header, Query
 from django_bolt.testing import ConnectionClosed, WebSocketTestClient
-from django_bolt.websocket import CloseCode
+from django_bolt.websocket import CloseCode, is_websocket_handler
 
 # Test secret for JWT tokens
 TEST_JWT_SECRET = "test-secret-key-for-websocket-tests"
@@ -842,6 +843,61 @@ async def test_websocket_parameter_may_be_annotated_or_a_subclass(kind):
 
     async with WebSocketTestClient(api, f"/ws/{kind}", query_string="room=blue") as ws:
         assert await ws.receive_text() == "blue"
+
+
+class _RoomHandlers:
+    """A callable object and a method, as WebSocket handlers."""
+
+    async def __call__(self, websocket: WebSocket, room: str):
+        await websocket.accept()
+        await websocket.send_text(f"call:{room}")
+
+    async def method(self, websocket: WebSocket, room: str):
+        await websocket.accept()
+        await websocket.send_text(f"method:{room}")
+
+
+class _SyncCallable:
+    def __call__(self, websocket: WebSocket):
+        """A sync `__call__` is not a WebSocket handler."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["call", "method"])
+async def test_websocket_handler_may_be_a_callable_object_or_a_bound_method(kind):
+    """The route registers the bound method, as an HTTP route does. The decorator returns the object."""
+    api = BoltAPI()
+    handlers = _RoomHandlers()
+    handler = handlers if kind == "call" else handlers.method
+
+    assert api.websocket("/ws/{room}")(handler) is handler
+    # The mark is on the method that the route registered.
+    assert is_websocket_handler(handlers.__call__ if kind == "call" else handler)
+
+    async with WebSocketTestClient(api, "/ws/blue") as ws:
+        assert await ws.receive_text() == f"{kind}:blue"
+
+
+def test_websocket_handler_that_is_a_partial_raises_a_clear_error():
+    async def handler(websocket: WebSocket, room: str = "lobby"):
+        await websocket.accept()
+
+    api = BoltAPI()
+    with pytest.raises(TypeError, match="A route handler cannot be a functools.partial"):
+        api.websocket("/ws/partial")(functools.partial(handler, room="blue"))
+
+
+@pytest.mark.parametrize(
+    ("handler", "message"),
+    [
+        ("handler", "A route handler must be callable, not str 'handler'"),
+        (_SyncCallable(), "WebSocket handler '_SyncCallable.__call__' must be an async function"),
+    ],
+)
+def test_websocket_handler_that_cannot_run_raises_a_clear_error(handler, message):
+    api = BoltAPI()
+    with pytest.raises(TypeError, match=message):
+        api.websocket("/ws/bad")(handler)
 
 
 @pytest.mark.asyncio
