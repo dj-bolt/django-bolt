@@ -1141,6 +1141,14 @@ impl
     }
 }
 
+/// Remove the one trailing slash of a WebSocket request path. The root path stays.
+fn without_trailing_slash(path: &str) -> &str {
+    match path.strip_suffix('/') {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => path,
+    }
+}
+
 /// Handler for WebSocket upgrade requests to non-existent paths
 /// Properly upgrades then closes with code 1000, avoiding client hangs
 async fn websocket_not_found_handler(
@@ -1148,14 +1156,20 @@ async fn websocket_not_found_handler(
     stream: web::Payload,
     state: web::Data<Arc<AppState>>,
 ) -> actix_web::Result<HttpResponse> {
-    // No WebSocket route matched. Try a mounted ASGI app, as the HTTP path does.
     let path = req.path();
-    let normalized_path = if path.len() > 1 && path.ends_with('/') {
-        &path[..path.len() - 1]
-    } else {
-        path
-    };
+    let normalized_path = without_trailing_slash(path);
 
+    // Actix has each WebSocket route path with no trailing slash. A request path
+    // with a trailing slash comes here. Find its route, as the test backend does.
+    let is_route = normalized_path.len() != path.len()
+        && GLOBAL_WEBSOCKET_ROUTER
+            .get()
+            .is_some_and(|ws_router| ws_router.find(normalized_path).is_some());
+    if is_route {
+        return websocket_upgrade_handler(req, stream, state).await;
+    }
+
+    // No WebSocket route matched. Try a mounted ASGI app, as the HTTP path does.
     if let Some(mount) = find_websocket_mount(state.get_ref(), normalized_path) {
         let app = Python::attach(|py| mount.app.clone_ref(py));
         let mount_prefix = mount.prefix.clone();
@@ -1175,6 +1189,15 @@ async fn websocket_not_found_handler(
 mod tests {
     use super::*;
     use std::net::IpAddr;
+
+    #[test]
+    fn without_trailing_slash_removes_one_slash_and_keeps_the_root() {
+        assert_eq!(without_trailing_slash("/ws/room/"), "/ws/room");
+        assert_eq!(without_trailing_slash("/ws/room"), "/ws/room");
+        assert_eq!(without_trailing_slash("/ws/room//"), "/ws/room/");
+        assert_eq!(without_trailing_slash("/"), "/");
+        assert_eq!(without_trailing_slash(""), "");
+    }
 
     fn bound_ip(host: &str) -> std::io::Result<IpAddr> {
         Ok(bind_listener(host, 0, false, 8)?.local_addr()?.ip())

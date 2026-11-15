@@ -2,6 +2,7 @@
 ///
 /// This module handles parsing Python metadata dicts into strongly-typed
 /// Rust enums at registration time, eliminating per-request GIL overhead.
+use actix_web::http::StatusCode;
 use actix_web::http::header::HeaderValue;
 use ahash::{AHashMap, AHashSet};
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -11,6 +12,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::access_log::AccessLogFilter;
 use crate::form_parsing::FileFieldConstraints;
 use crate::middleware::auth::{
     ApiKeys, AuthBackend, AuthContext, Claims, JwtKeySource, RefreshingJwks, StaticKey,
@@ -614,11 +616,14 @@ pub struct RouteMetadata {
     /// Route's default success status code. Used by the bare-bytes response
     /// fast path: sync executors may return just the encoded JSON body and
     /// Rust rebuilds the (status, JSON meta) envelope from this value.
-    pub default_status_code: u16,
+    pub default_status_code: StatusCode,
     /// WebSocket routes with a `revoked_token_handler`: an async Python
     /// callable that takes the auth context and returns True for a revoked
     /// token. The handshake awaits it before the upgrade.
     pub websocket_revocation_check: Option<Arc<Py<PyAny>>>,
+    /// Sampling and the slow-request threshold of the access log, from the
+    /// `LoggingConfig` of the API of the route.
+    pub access_log_filter: AccessLogFilter,
 }
 
 /// Read a byte size of the route metadata, or the default when the key is missing.
@@ -697,14 +702,16 @@ fn required_bool(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<bool> {
 
 /// Read a required HTTP status code of the route metadata.
 /// A value that is not an int from 0 to 65535 is a TypeError.
-fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<u16> {
+fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<StatusCode> {
     let value = required_item(py_meta, key)?;
     if value.is_instance_of::<PyBool>() {
         return Err(wrong_type(py_meta, key, "an int", &value));
     }
     value
         .extract::<u16>()
-        .map_err(|_| wrong_type(py_meta, key, "an int from 0 to 65535", &value))
+        .ok()
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .ok_or_else(|| wrong_type(py_meta, key, "an int from 100 to 999", &value))
 }
 
 impl RouteMetadata {
@@ -745,8 +752,10 @@ impl RouteMetadata {
                         cors_config = Some(config);
                     }
 
-                    // Parse rate_limit config separately for fast access
-                    if type_str == "rate_limit" && rate_limit_config.is_none() {
+                    // Parse rate_limit config separately for fast access. As for
+                    // CORS, the last (most specific) config wins: the limit of
+                    // the route replaces the limit of the router and of the API.
+                    if type_str == "rate_limit" {
                         rate_limit_config = Some(parse_rate_limit_config(&mw_dict, py)?);
                     }
                 }
@@ -914,6 +923,8 @@ impl RouteMetadata {
         // Default success status. Python route registration sets it.
         let default_status_code = required_status_code(py_meta, "default_status_code")?;
 
+        let access_log_filter = AccessLogFilter::from_python(py_meta)?;
+
         Ok(RouteMetadata {
             auth_backends,
             guards,
@@ -937,6 +948,7 @@ impl RouteMetadata {
             plan,
             default_status_code,
             websocket_revocation_check,
+            access_log_filter,
         })
     }
 }
@@ -2416,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_status_code_is_an_int_that_fits_a_u16() {
+    fn the_default_status_code_is_an_int_that_is_an_http_status() {
         assert_eq!(route("'default_status_code': 201").default_status_code, 201);
         assert_eq!(
             error_of(parse_route("'default_status_code': True")),
@@ -2425,13 +2437,15 @@ mod tests {
         for (value, name) in [
             ("65536", "int"),
             ("-1", "int"),
+            ("99", "int"),
+            ("1000", "int"),
             ("'200'", "str"),
             ("200.0", "float"),
         ] {
             assert_eq!(
                 error_of(parse_route(&format!("'default_status_code': {value}"))),
                 format!(
-                    "TypeError: Route metadata 'default_status_code' for GET /x must be an int from 0 to 65535, got {name}"
+                    "TypeError: Route metadata 'default_status_code' for GET /x must be an int from 100 to 999, got {name}"
                 ),
                 "{value}"
             );
@@ -2692,6 +2706,33 @@ mod tests {
     }
 
     #[test]
+    fn the_last_rate_limit_config_replaces_the_outer_one() {
+        let meta = route(
+            "'middleware': [{'type': 'rate_limit', 'rps': 100, 'key': 'X-Tenant'}, \
+             {'type': 'cors', 'origins': ['https://a.test']}, \
+             {'type': 'rate_limit', 'rps': 5, 'burst': 7}]",
+        );
+        let limit = meta.rate_limit_config.unwrap();
+        assert_eq!((limit.rps, limit.burst), (5, 7));
+        // No value comes from the outer config.
+        assert_eq!(limit.key, RateLimitKey::Ip);
+    }
+
+    #[test]
+    fn each_rate_limit_config_of_a_route_is_checked() {
+        for list in [
+            "{'type': 'rate_limit', 'rps': 0}, {'type': 'rate_limit', 'rps': 5}",
+            "{'type': 'rate_limit', 'rps': 5}, {'type': 'rate_limit', 'rps': 0}",
+        ] {
+            let result = parse_route(&format!("'middleware': [{list}]"));
+            assert_eq!(
+                error_of(result),
+                "TypeError: rate_limit rps must be an int of 1 or more, got int 0"
+            );
+        }
+    }
+
+    #[test]
     fn the_last_cors_config_replaces_the_outer_one() {
         let meta = route(
             "'middleware': [{'type': 'cors', 'origins': ['https://a.test'], 'max_age': 10}, \
@@ -2796,14 +2837,6 @@ mod tests {
         assert_eq!((limit.rps, limit.burst), (5, 9));
         assert_eq!(limit.key, RateLimitKey::Header("x-key".to_string()));
         assert_eq!(readings(meta.plan), only(8));
-    }
-
-    #[test]
-    fn the_first_rate_limit_wins() {
-        let meta = route(
-            "'middleware': [{'type': 'rate_limit', 'rps': 5}, {'type': 'rate_limit', 'rps': 50}]",
-        );
-        assert_eq!(meta.rate_limit_config.unwrap().rps, 5);
     }
 
     #[test]
