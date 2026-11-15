@@ -236,6 +236,42 @@ def test_viewset_decorator_arguments_apply_to_action_routes(api):
         assert paths["/dec/public"]["get"]["tags"] == ["own"]
 
 
+def test_viewset_class_status_code_applies_to_action_routes(api):
+    """The `status_code` attribute of the class covers the `@action` routes."""
+
+    @api.viewset("/accepted")
+    class AcceptedViewSet(ViewSet):
+        status_code = 202
+
+        async def list(self, request):
+            return [1]
+
+        @action(methods=["GET"], detail=False)
+        async def extra(self, request):
+            return {"extra": True}
+
+        @action(methods=["GET"], detail=False, status_code=201)
+        async def own(self, request):
+            return {"own": True}
+
+    @api.viewset("/decorated", status_code=203)
+    class DecoratedViewSet(ViewSet):
+        status_code = 202
+
+        @action(methods=["GET"], detail=False)
+        async def extra(self, request):
+            return {"extra": True}
+
+    with TestClient(api) as client:
+        assert client.get("/accepted").status_code == 202
+        response = client.get("/accepted/extra")
+        assert response.status_code == 202
+        assert response.json() == {"extra": True}
+        # The value of the action comes first, then the value of the decorator.
+        assert client.get("/accepted/own").status_code == 201
+        assert client.get("/decorated/extra").status_code == 203
+
+
 @pytest.mark.parametrize("view_class", [ViewSet, ModelViewSet])
 @pytest.mark.django_db(transaction=True)
 def test_viewset_sync_action_auth_override(api, view_class):

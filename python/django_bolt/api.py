@@ -1524,6 +1524,7 @@ class BoltAPI:
         class_validate_response = (
             validate_response if validate_response is not None else getattr(view_cls, "validate_response", None)
         )
+        class_status_code = status_code if status_code is not None else getattr(view_cls, "status_code", None)
 
         # Scan all attributes in the class
         for name in dir(view_cls):
@@ -1640,7 +1641,7 @@ class BoltAPI:
                         name=action_route_name,
                         _name_explicit=base_name_explicit or attr.name is not None,
                         response_model=attr.response_model,
-                        status_code=attr.status_code if attr.status_code is not None else status_code,
+                        status_code=attr.status_code if attr.status_code is not None else class_status_code,
                         validate_response=final_validate_response,
                         guards=final_guards,
                         auth=final_auth,

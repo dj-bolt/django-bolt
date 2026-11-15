@@ -285,7 +285,7 @@ class ArticleViewSet(ViewSet):
 | `summary`        | no       | Summary for OpenAPI documentation                                                        |
 | `description`    | no       | Detailed description for OpenAPI documentation                                           |
 
-An action with no `auth`, `guards`, `status_code`, `validate_response` or `tags` uses the value of `@api.viewset(...)`. For `auth`, `guards` and `validate_response`, the class attribute comes next.
+An action with no `auth`, `guards`, `status_code`, `validate_response` or `tags` uses the value of `@api.viewset(...)`. For `auth`, `guards`, `status_code` and `validate_response`, the class attribute comes next.
 
 ```python
 @api.viewset("/articles", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
