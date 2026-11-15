@@ -321,6 +321,34 @@ def test_page_number_pagination_with_ordering(sample_articles):
         assert data["items"][1]["title"] == "Article 10"
 
 
+@pytest.mark.django_db(transaction=True)
+def test_paginate_accepts_a_sync_handler(sample_articles):
+    """A sync handler under @paginate gives the same page as an async handler."""
+    api = BoltAPI()
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 10
+
+    @api.get("/sync")
+    @paginate(SmallPagePagination)
+    def list_sync(request):
+        return Article.objects.order_by("id")
+
+    @api.get("/async")
+    @paginate(SmallPagePagination)
+    async def list_async(request):
+        return Article.objects.order_by("id")
+
+    with TestClient(api) as client:
+        response = client.get("/sync?page=2")
+        assert response.status_code == 200
+
+        data = response.json()
+        assert (data["page"], data["total"]) == (2, 50)
+        assert [item["title"] for item in data["items"]] == [f"Article {i}" for i in range(11, 21)]
+        assert data == client.get("/async?page=2").json()
+
+
 # ============================================================================
 # LimitOffsetPagination Tests
 # ============================================================================
