@@ -161,6 +161,11 @@ await websocket.close()
 await websocket.close(code=1000, reason="Normal closure")
 ```
 
+A close frame holds a code and a reason of at most 123 bytes of UTF-8 (RFC 6455).
+Use a code from 1000 to 4999, but not 1005, 1006 or 1015. `close()` raises
+`ValueError` for a code or a reason that makes an invalid close frame. The
+connection stays open, and `WebSocketTestClient` raises the same error.
+
 ### Refuse the handshake
 
 Bolt sends the `101` response only when the handler calls `accept()`.

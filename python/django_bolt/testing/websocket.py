@@ -30,6 +30,7 @@ from typing import Any
 
 from django_bolt import BoltAPI, _core
 from django_bolt.websocket import CloseCode, WebSocket
+from django_bolt.websocket.close_codes import check_close_frame
 from django_bolt.websocket.handlers import build_websocket_request, get_websocket_param_name
 
 # Each WebSocketTestClient is one connection with its own test app. The
@@ -286,6 +287,8 @@ class WebSocketTestClient:
                 raise ConnectionResetError("WebSocket client disconnected")
 
         elif msg_type == "websocket.close":
+            # The server refuses a close that makes an invalid close frame.
+            check_close_frame(message.get("code", CloseCode.NORMAL), message.get("reason", ""))
             # Close before accept refuses the handshake with 403, as on the server.
             if not self._accepted:
                 self._decide(403)
