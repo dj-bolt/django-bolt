@@ -756,6 +756,80 @@ def test_builtin_custom_types_in_serializer_render_concrete_types():
     assert all(props[f]["type"] != "object" for f in ("email", "age", "site"))
 
 
+def test_read_only_field_is_not_in_the_request_body_schema():
+    """Input cannot set a read_only field. So only the response schema has it, as readOnly."""
+
+    class Owner(Serializer):
+        id: int = field(read_only=True, default=0)
+        name: str
+
+    class Pet(Serializer):
+        id: int = field(read_only=True, default=0)
+        name: str
+        created: str | None = None
+        owner: Owner | None = None
+
+        class Config:
+            read_only = {"created"}
+
+    class Plain(Serializer):
+        name: str
+
+    class BodyOnly(Serializer):
+        id: int = field(read_only=True, default=0)
+        name: str
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.post("/pets")
+    async def create_pet(body: Pet) -> Pet:
+        pass
+
+    @api.post("/plain")
+    async def create_plain(body: Plain) -> Plain:
+        pass
+
+    @api.post("/owners")
+    async def create_owner(body: BodyOnly) -> dict:
+        pass
+
+    spec = _get_schema(api)
+    validate(spec)
+    schemas = spec["components"]["schemas"]
+    operation = spec["paths"]["/pets"]["post"]
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/PetInput"
+    }
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Pet"
+    }
+
+    assert schemas["PetInput"]["title"] == "Pet"
+    assert list(schemas["PetInput"]["properties"]) == ["name", "owner"]
+    assert schemas["PetInput"]["required"] == ["name"]
+    # The nested serializer of a request body is an input schema too.
+    assert schemas["PetInput"]["properties"]["owner"]["anyOf"][0] == {"$ref": "#/components/schemas/OwnerInput"}
+    assert list(schemas["OwnerInput"]["properties"]) == ["name"]
+
+    assert schemas["Pet"]["properties"]["id"] == {"type": "integer", "default": 0, "readOnly": True}
+    assert schemas["Pet"]["properties"]["created"]["readOnly"] is True
+    assert "readOnly" not in schemas["Pet"]["properties"]["name"]
+    assert schemas["Pet"]["properties"]["owner"]["anyOf"][0] == {"$ref": "#/components/schemas/Owner"}
+    assert schemas["Owner"]["properties"]["id"]["readOnly"] is True
+
+    # A serializer that is only a request body keeps its name.
+    assert spec["paths"]["/owners"]["post"]["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/BodyOnly"
+    }
+    assert list(schemas["BodyOnly"]["properties"]) == ["name"]
+    assert "BodyOnlyInput" not in schemas
+
+    # A serializer with no read_only field has one schema.
+    plain = spec["paths"]["/plain"]["post"]
+    assert plain["requestBody"]["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/Plain"}
+    assert "PlainInput" not in schemas
+
+
 def test_documented_constrained_field_matches_msgspec_schema():
     """Bolt's component schema for documented custom types matches msgspec's own.
 
