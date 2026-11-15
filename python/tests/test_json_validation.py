@@ -9,8 +9,13 @@ Tests cover:
 - Type coercion and conversion
 """
 
+import dataclasses
+import datetime
+import decimal
+import enum
 import json
-from typing import Annotated
+import uuid
+from typing import Annotated, Any, Literal, TypedDict
 
 import msgspec
 import pytest
@@ -20,8 +25,18 @@ from django_bolt._kwargs import create_body_extractor, get_msgspec_decoder
 from django_bolt._kwargs.extractors import _DECODER_CACHE
 from django_bolt.error_handlers import handle_exception, msgspec_validation_error_to_dict
 from django_bolt.exceptions import RequestValidationError, parse_msgspec_decode_error
-from django_bolt.params import Body
+from django_bolt.params import Body, Cookie, Depends, File, Form, Header, Query
 from django_bolt.testing import TestClient
+
+
+@dataclasses.dataclass
+class Point:
+    x: int
+    y: int
+
+
+class Counts(TypedDict):
+    total: int
 
 
 class UserCreate(msgspec.Struct):
@@ -391,16 +406,206 @@ def test_a_dict_parameter_with_no_marker_is_the_json_body(method):
         assert "requestBody" not in operations["/numbers"][method]
 
 
-def test_a_dict_parameter_of_a_get_route_stays_a_query_parameter():
-    """A GET route has no body. Its registration does not fail for a dict parameter."""
-    api = BoltAPI()
+def _complex_query(api):
+    @api.get("/h")
+    async def handler(value: complex):
+        return {"value": repr(value)}
 
-    @api.get("/search")
-    async def search(filters: dict | None = None):
+
+def _dict_query_of_a_get_route(api):
+    @api.get("/h")
+    async def handler(filters: dict | None = None):
         return {"filters": filters}
 
+
+def _list_of_dicts_query_of_a_get_route(api):
+    @api.get("/h")
+    async def handler(rows: list[dict]):
+        return {"rows": rows}
+
+
+def _nested_list_query(api):
+    @api.get("/h")
+    async def handler(rows: Annotated[list[list[int]], Query()]):
+        return {"rows": rows}
+
+
+def _dataclass_query(api):
+    @api.get("/h")
+    async def handler(point: Annotated[Point, Query()]):
+        return {"point": repr(point)}
+
+
+def _complex_path(api):
+    @api.get("/h/{value}")
+    async def handler(value: complex):
+        return {"value": repr(value)}
+
+
+def _dict_header(api):
+    @api.get("/h")
+    async def handler(x_filters: Annotated[dict, Header()]):
+        return {"filters": x_filters}
+
+
+def _complex_cookie(api):
+    @api.get("/h")
+    async def handler(value: Annotated[complex, Cookie()]):
+        return {"value": repr(value)}
+
+
+def _dict_form(api):
+    @api.post("/h")
+    async def handler(filters: Annotated[dict, Form()]):
+        return {"filters": filters}
+
+
+def _str_file(api):
+    @api.post("/h")
+    async def handler(upload: Annotated[str, File()]):
+        return {"upload": upload}
+
+
+def _complex_in_a_dependency(api):
+    async def dependency(value: complex):
+        return value
+
+    @api.get("/h")
+    async def handler(value: Annotated[complex, Depends(dependency)]):
+        return {"value": repr(value)}
+
+
+@pytest.mark.parametrize(
+    ("register", "source", "name"),
+    [
+        (_complex_query, "query", "value"),
+        (_dict_query_of_a_get_route, "query", "filters"),
+        (_list_of_dicts_query_of_a_get_route, "query", "rows"),
+        (_nested_list_query, "query", "rows"),
+        (_dataclass_query, "query", "point"),
+        (_complex_path, "path", "value"),
+        (_dict_header, "header", "x_filters"),
+        (_complex_cookie, "cookie", "value"),
+        (_dict_form, "form", "filters"),
+        (_str_file, "file", "upload"),
+        (_complex_in_a_dependency, "query", "value"),
+    ],
+)
+def test_a_parameter_type_that_bolt_cannot_convert_stops_registration(register, source, name):
+    """The handler got the text of the request, or the file dict, with no error. Now the route does not register."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError) as error:
+        register(api)
+        # A dependency compiles with the injector of its route.
+        api._register_openapi_routes()
+
+    message = str(error.value)
+    assert f"{source} parameter {name!r}" in message
+    owner = "dependency" if register is _complex_in_a_dependency else "handler"
+    assert f"{register.__name__}.<locals>.{owner} " in message
+
+
+def test_each_parameter_type_that_converts_from_text_registers():
+    """The registration check refuses no type that a text value can give."""
+    api = BoltAPI()
+
+    class Color(enum.Enum):
+        RED = "red"
+
+    @api.get("/scalars/{item_id}")
+    async def scalars(
+        item_id: uuid.UUID,
+        untyped,
+        anything: Any,
+        thing: object,
+        flag: bool,
+        price: decimal.Decimal,
+        day: datetime.date,
+        colors: list[Color],
+        orders: tuple[Literal["asc", "desc"], ...],
+        waits: list[datetime.timedelta],
+        ratio: float | None = None,
+        tags: frozenset[str] = frozenset(),
+    ):
+        return {
+            "item_id": str(item_id),
+            "untyped": untyped,
+            "anything": anything,
+            "thing": thing,
+            "flag": flag,
+            "price": str(price),
+            "day": day.isoformat(),
+            "colors": [color.name for color in colors],
+            "orders": list(orders),
+            "waits": [wait.total_seconds() for wait in waits],
+            "ratio": ratio,
+            "tags": sorted(tags),
+        }
+
     with TestClient(api) as client:
-        assert client.get("/search").json() == {"filters": None}
+        response = client.get(
+            "/scalars/12345678-1234-5678-1234-567812345678?untyped=u&anything=a&thing=t&flag=true&price=1.50"
+            "&day=2026-01-02&colors=red&orders=asc&orders=desc&waits=PT90S&tags=b&tags=a"
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "item_id": "12345678-1234-5678-1234-567812345678",
+            "untyped": "u",
+            "anything": "a",
+            "thing": "t",
+            "flag": True,
+            "price": "1.50",
+            "day": "2026-01-02",
+            "colors": ["RED"],
+            "orders": ["asc", "desc"],
+            "waits": [90.0],
+            "ratio": None,
+            "tags": ["a", "b"],
+        }
+
+
+def test_a_json_only_parameter_with_no_marker_is_the_json_body():
+    """A list of dicts, a nested list and a TypedDict come only from JSON. `Any` stays a query parameter."""
+    api = BoltAPI()
+
+    @api.post("/rows")
+    async def rows(rows: list[dict]):
+        return {"rows": rows}
+
+    @api.post("/matrix")
+    async def matrix(matrix: list[list[int]]):
+        return {"matrix": matrix}
+
+    @api.post("/typed")
+    async def typed(counts: Counts, page: int = 1):
+        return {"counts": counts, "page": page}
+
+    @api.post("/any")
+    async def anything(value: Any):
+        return {"value": value}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        response = client.post("/rows", json=[{"a": 1}, {"b": [2]}])
+        assert response.status_code == 200, response.text
+        assert response.json() == {"rows": [{"a": 1}, {"b": [2]}]}
+        # A JSON object is not a list.
+        assert client.post("/rows", json={"a": 1}).status_code == 422
+
+        assert client.post("/matrix", json=[[1, 2], [3]]).json() == {"matrix": [[1, 2], [3]]}
+        assert client.post("/typed?page=2", json={"total": 3}).json() == {"counts": {"total": 3}, "page": 2}
+        assert client.post("/typed", json={"total": "x"}).status_code == 422
+
+        assert client.post("/any?value=x", json={"a": 1}).json() == {"value": "x"}
+
+        operations = client.get("/docs/openapi.json").json()["paths"]
+        rows_schema = operations["/rows"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        assert rows_schema == {"type": "array", "items": {"type": "object"}}
+        assert "parameters" not in operations["/rows"]["post"]
+        assert [parameter["name"] for parameter in operations["/any"]["post"]["parameters"]] == ["value"]
+        assert "requestBody" not in operations["/any"]["post"]
 
 
 class TestMsgspecStructValidation:

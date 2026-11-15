@@ -30,6 +30,7 @@ from ..typing import (
     HandlerPattern,
     is_msgspec_struct,
     is_upload_file_type,
+    reads_text_value,
     split_param_annotation,
     unwrap_optional,
 )
@@ -140,6 +141,44 @@ def classify_handler_pattern(
     return HandlerPattern.FULL
 
 
+# These sources give text. Rust or msgspec converts the text to the type of the parameter.
+_TEXT_SOURCES = frozenset({"path", "query", "header", "cookie", "form"})
+# A File() parameter gets an UploadFile, the content, or the file dict from Rust.
+_FILE_ITEM_TYPES = (bytes, dict, list, Any, inspect.Parameter.empty)
+
+
+def _check_field_type(fn: Callable, field: FieldDefinition) -> None:
+    """Raise TypeError for a parameter type that Bolt cannot build from its source.
+
+    Without this check the handler gets the text of the request, or the file
+    dict, in place of the declared type. A Struct parameter has its own extractor.
+    """
+    annotation = field.annotation
+    inner = unwrap_optional(annotation)
+    if field.source in _TEXT_SOURCES:
+        if is_msgspec_struct(inner) or reads_text_value(annotation):
+            return
+        hint = (
+            "Bolt converts text to str, int, float, bool, Decimal, UUID, date, datetime, time, "
+            "an Enum, a Literal, bytes, and to one list, set or tuple of them. "
+            "A dict or a list of dicts comes from the JSON body of a POST, PUT or PATCH route."
+        )
+    elif field.source == "file":
+        item = get_args(inner)[0] if get_origin(inner) is list and get_args(inner) else inner
+        item = unwrap_optional(item)
+        if is_upload_file_type(annotation) or item in _FILE_ITEM_TYPES or get_origin(item) is dict:
+            return
+        hint = "A File() parameter takes UploadFile, bytes, dict, or a list of one of them."
+    else:
+        return
+    # A dependency takes its parameters from the request too.
+    owner = getattr(fn, "__qualname__", None) or type(fn).__qualname__
+    raise TypeError(
+        f"The {field.source} parameter {field.name!r} of {owner} "
+        f"has the type {annotation!r}. Bolt cannot convert a value of the request to this type. {hint}"
+    )
+
+
 def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata:
     """
     Compile parameter binding metadata for a handler function.
@@ -160,7 +199,8 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         Metadata dictionary for parameter binding
 
     Raises:
-        TypeError: If GET/HEAD/DELETE/OPTIONS handlers have body parameters
+        TypeError: If GET/HEAD/DELETE/OPTIONS handlers have body parameters,
+            or a parameter has a type that Bolt cannot build from its source
     """
     sig = inspect.signature(fn)
     # Get the correct namespace for resolving string annotations (from __future__ import annotations)
@@ -208,6 +248,7 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
             http_method=http_method,
             explicit_marker=explicit_marker,
         )
+        _check_field_type(fn, field)
 
         # Attach pre-compiled extractor to field (performance optimization)
         # This allows the injector to call the extractor directly without source checking
@@ -355,6 +396,7 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
             http_method="GET",  # Use GET-like inference (no body)
             explicit_marker=explicit_marker,
         )
+        _check_field_type(fn, field)
 
         # Attach pre-compiled extractor to field
         extractor = create_extractor_for_field(field)

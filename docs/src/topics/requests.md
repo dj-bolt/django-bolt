@@ -199,6 +199,17 @@ async def user(user_id: UserId, page: Page = 1):
 The handler gets an `int`, and `/users/abc` gives a 422.
 A parameterized alias gets its arguments. With `type Pair[T] = list[T]`, a `Pair[int]` parameter converts as `list[int]`.
 
+### Types that Bolt cannot convert
+
+A path, query, header, cookie or form parameter gets text from the request.
+Bolt converts the text to `str`, `int`, `float`, `bool`, `Decimal`, `UUID`, `date`, `datetime`, `time`, an `Enum` and a `Literal`.
+It also builds one `list`, `set`, `frozenset` or `tuple` of these types.
+A parameter with no annotation, or of the type `Any`, gets the text.
+
+Text cannot give each other type, for example `complex`, `dict`, a dataclass or your own class.
+A parameter of such a type stops the registration with a `TypeError`. The error names the handler, the parameter and the type.
+A `File()` parameter takes `UploadFile`, `bytes`, `dict`, or a list of one of them. Each other type gets the same error.
+
 ## Request body
 
 ### JSON body
@@ -243,7 +254,12 @@ async def set_counters(counters: dict[str, int]):
     return {"total": sum(counters.values())}
 ```
 
-A `dict[K, V]` type validates the keys and the values. A body that is not a JSON object gets a 422. On a `GET`, `HEAD`, `DELETE` or `OPTIONS` route, a `dict` parameter is a query parameter, because the request has no body.
+A `dict[K, V]` type validates the keys and the values. A body that is not a JSON object gets a 422.
+
+Each other type that only JSON can give is the body too. Examples are `list[dict]`, `list[list[int]]` and a `TypedDict`.
+A parameter of the type `Any` stays a query parameter. Use `Body()` to read an `Any` value from the body.
+
+A `GET`, `HEAD`, `DELETE` or `OPTIONS` request has no body. On such a route, a parameter of one of these types stops the registration with a `TypeError`.
 
 ## Headers
 
