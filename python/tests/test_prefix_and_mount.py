@@ -342,6 +342,39 @@ class TestOpenAPIDocsWithPrefix:
             assert "/api/items" in paths, f"API routes should be in schema: {paths}"
 
 
+@pytest.mark.parametrize(
+    ("route", "url", "expected"),
+    [
+        ("/ü", "/%C3%BC", {"route": "/ü"}),
+        ("/a b", "/a%20b", {"route": "/a b"}),
+        ("/ü/{x}", "/%C3%BC/3", {"route": "/ü/{x}", "x": 3}),
+        ("/a b/{x}/ü", "/a%20b/3/%C3%BC", {"route": "/a b/{x}/ü", "x": 3}),
+        # A path that has the escapes already keeps them.
+        ("/%C3%A9", "/%C3%A9", {"route": "/%C3%A9"}),
+    ],
+)
+def test_a_route_path_with_a_character_that_a_url_escapes_matches_the_request(route, url, expected):
+    """A client sends such a character as a percent escape, and the route answers."""
+    api = BoltAPI()
+
+    if "{x}" in route:
+
+        @api.get(route)
+        async def handler(x: int):
+            return {"route": route, "x": x}
+
+    else:
+
+        @api.get(route)
+        async def handler():
+            return {"route": route}
+
+    with TestClient(api) as client:
+        response = client.get(url)
+        assert response.status_code == 200, response.text
+        assert response.json() == expected
+
+
 class TestEmptyRouteRegistration:
     """Tests for empty route ("") registration behavior."""
 
