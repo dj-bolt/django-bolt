@@ -78,6 +78,8 @@ async def list_articles(request) -> list[ArticleSerializer]:
     return Article.objects.all()
 ```
 
+Response includes `page_size`, `next_cursor`, `has_next`, `has_previous`. A cursor goes forward only: the response has no cursor for the page before. `has_previous` is true when the request has a valid cursor. To go back, keep the cursors that the client used.
+
 Query: `/articles?cursor=eyJ2IjoxMDB9`
 
 The `ordering` field does not have to be unique. Bolt also orders by the primary key, so rows with equal values keep their place across pages. The cursor holds the value and the primary key of the last row. For an index, add the primary key after the ordering field, for example `models.Index(fields=["-created_at", "-id"])`.
