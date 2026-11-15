@@ -2279,10 +2279,9 @@ class BoltAPI:
                                 try:
                                     return _encode(result)
                                 except TypeError:
-                                    # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                    if isinstance(result, QuerySet):
-                                        return _finish(result)
-                                    raise
+                                    # msgspec raises TypeError for a result that is not JSON data: a response
+                                    # object, or a QuerySet from a helper. The serializer handles each of them.
+                                    return _finish(result)
                         else:
 
                             def execute_trivial_async_sync(
@@ -2324,10 +2323,9 @@ class BoltAPI:
                                 try:
                                     return _encode(result)
                                 except TypeError:
-                                    # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                    if isinstance(result, QuerySet):
-                                        return _finish(result)
-                                    raise
+                                    # msgspec raises TypeError for a result that is not JSON data: a response
+                                    # object, or a QuerySet from a helper. The serializer handles each of them.
+                                    return _finish(result)
                         else:
 
                             def execute_trivial_async_sync(
@@ -2361,10 +2359,9 @@ class BoltAPI:
                             try:
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                if isinstance(result, QuerySet):
-                                    return await serialize_response(result, meta)
-                                raise
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
+                                return await serialize_response(result, meta)
                     else:
 
                         async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2384,10 +2381,9 @@ class BoltAPI:
                             try:
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                if isinstance(result, QuerySet):
-                                    return await serialize_response(result, meta)
-                                raise
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
+                                return await serialize_response(result, meta)
                     else:
 
                         async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2648,10 +2644,9 @@ class BoltAPI:
                             try:
                                 return _encode(result)
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                if isinstance(result, QuerySet):
-                                    return _finish(result)
-                                raise
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
+                                return _finish(result)
                     else:
 
                         def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2671,10 +2666,9 @@ class BoltAPI:
                             try:
                                 return _encode(result)
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                if isinstance(result, QuerySet):
-                                    return _finish(result)
-                                raise
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
+                                return _finish(result)
                     else:
 
                         def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2697,10 +2691,11 @@ class BoltAPI:
                             try:
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
                                 if isinstance(result, QuerySet):
                                     return await run_in_orm_executor(serialize_response_sync, result, meta)
-                                raise
+                                return serialize_response_sync(result, meta)
                     else:
 
                         async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2722,10 +2717,11 @@ class BoltAPI:
                             try:
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
                                 if isinstance(result, QuerySet):
                                     return await run_in_orm_executor(serialize_response_sync, result, meta)
-                                raise
+                                return serialize_response_sync(result, meta)
                     else:
 
                         async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:

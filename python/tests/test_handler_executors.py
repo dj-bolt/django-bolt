@@ -16,8 +16,9 @@ import msgspec
 import pytest
 from django.test import override_settings
 
-from django_bolt import BoltAPI, Depends
+from django_bolt import JSON, BoltAPI, Depends
 from django_bolt.middleware import Middleware
+from django_bolt.responses import Redirect
 from django_bolt.testing import TestClient
 from tests.test_models import Article
 
@@ -315,6 +316,43 @@ def test_the_async_executor_of_a_sync_handler_keeps_the_response(path, expected)
 
     assert response.status_code == 200, response.text
     assert response.json() == in_a_task(expected)
+
+
+@pytest.mark.parametrize("middleware", [[], [PassThrough]], ids=["sync-dispatch", "async-executor"])
+@pytest.mark.parametrize(
+    ("declared", "options"),
+    [(dict, {}), (list[Item], {"validate_response": False})],
+    ids=["dict", "list-no-validation"],
+)
+def test_a_route_with_a_json_type_can_return_a_response_object(middleware, declared, options):
+    """A route with the response type ``dict`` can answer with a response object, as a route with no type can."""
+    api = BoltAPI(middleware=middleware)
+
+    @api.get("/async", response_model=declared, **options)
+    async def async_no_params():
+        return JSON({"created": True}, status_code=201)
+
+    @api.get("/async/{item_id}", response_model=declared, **options)
+    async def async_with_params(item_id: int):
+        return Redirect(f"/items/{item_id}")
+
+    @api.get("/sync", response_model=declared, **options)
+    def sync_no_params():
+        return JSON({"created": True}, status_code=201)
+
+    @api.get("/sync/{item_id}", response_model=declared, **options)
+    def sync_with_params(item_id: int):
+        return Redirect(f"/items/{item_id}")
+
+    with TestClient(api) as client:
+        for path in ("/async", "/sync"):
+            response = client.get(path)
+            assert response.status_code == 201, response.text
+            assert response.json() == {"created": True}
+
+            response = client.get(f"{path}/7", follow_redirects=False)
+            assert response.status_code == 307, response.text
+            assert response.headers["location"] == "/items/7"
 
 
 def titles(prefix: str = ""):
