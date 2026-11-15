@@ -32,7 +32,7 @@ This endpoint:
 
 !!! warning "`auth` attempts, `guards` enforce"
 
-    `auth=[...]` alone does **not** reject unauthenticated requests — it only *attempts* to validate credentials. If the token is missing, expired, or has an invalid signature, the handler still runs with `request.context = None` and `request.user = AnonymousUser`. This is intentional so that endpoints can support optional authentication (e.g. personalize if logged in, otherwise public).
+    `auth=[...]` alone does **not** reject unauthenticated requests — it only *attempts* to validate credentials. If the token is missing, expired, or has an invalid signature, the handler still runs with `request.context = None` and `request.user = None`. `await request.auser()` gives `AnonymousUser` then. This is intentional so that endpoints can support optional authentication (e.g. personalize if logged in, otherwise public).
 
     To require a valid token, pair `auth` with a guard like `guards=[IsAuthenticated()]`. Without it, invalid credentials fall through silently.
 
@@ -41,7 +41,7 @@ This endpoint:
     @api.get("/profile", auth=[JWTAuthentication()])
     async def profile(request):
         print(request.context)  # None when token is invalid/missing
-        print(request.user)     # AnonymousUser
+        print(request.user)     # None
 
     # ✅ Protected — returns 401 when token is invalid/missing
     @api.get("/profile", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
@@ -148,6 +148,8 @@ def home(user: OptionalCurrentUser):
 ```
 
 `CurrentUser` answers 401 when the request has no authenticated user. `OptionalCurrentUser` gives `None` then. In an async handler, both load the user with `await request.auser()`. In a sync handler, both read `request.user`, so the handler keeps its sync dispatch. For the type of your user model, make your own alias: `Annotated[User, Depends(require_current_user)]`.
+
+A valid token can name a user that does not exist, for example a deleted user. Bolt loads the user at the first read, so `request.user` is not `None` then. It is a falsy object: `not request.user` is `True`, and `await request.auser()` gives `None`. The read of an attribute, such as `request.user.id`, answers 401, as `CurrentUser` does.
 
 An async handler can also read `request.user`. The read loads the user when it occurs, and the worker thread waits for that query. Use `await request.auser()` when the loop must serve other requests during the query, for example with a networked database. The query runs on that worker thread, or on the lane of a request with Django middleware. On the lane, it sees the thread-local state of the request, for example a tenant schema. With `DEBUG = True` or `runbolt --dev`, Bolt logs each such read that blocks the event loop for more than 50 ms, with its file and line.
 
