@@ -31,6 +31,7 @@ from django_bolt.openapi.spec import Components, SecurityScheme
 from django_bolt.params import File, Form
 from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
+from django_bolt.websocket.types import WebSocket
 
 
 class Item(msgspec.Struct):
@@ -283,6 +284,34 @@ def test_openapi_disabled_returns_404():
 
         response = client.get("/docs")
         assert response.status_code == 404, f"Disabled docs UI should return 404, got {response.status_code}"
+
+
+def test_openapi_exclude_paths_match_whole_path_segments():
+    """`/admin` hides `/admin` and `/admin/users`. It does not hide `/administrators`."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0", exclude_paths=["/admin", "/ws"]))
+
+    async def handler():
+        return {}
+
+    for path in ("/admin", "/admin/users", "/administrators", "/docs-archive", "/visible"):
+        api.get(path)(handler)
+
+    @api.websocket("/ws/internal")
+    async def internal_socket(websocket: WebSocket):
+        await websocket.accept()
+
+    @api.websocket("/wsx")
+    async def public_socket(websocket: WebSocket):
+        await websocket.accept()
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        paths = client.get("/docs/openapi.json").json()["paths"]
+        # The routes are not documented, but the server serves them.
+        assert client.get("/admin/users").status_code == 200
+
+    assert sorted(paths) == ["/administrators", "/docs-archive", "/visible", "/wsx"]
 
 
 def test_openapi_protected_without_auth_returns_401():

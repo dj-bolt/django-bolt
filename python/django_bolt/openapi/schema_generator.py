@@ -504,6 +504,18 @@ class SchemaGenerator:
 
         return field_name, field_schema, field_required
 
+    def _is_excluded(self, path: str) -> bool:
+        """True for a route below the docs path or below an ``exclude_paths`` entry.
+
+        An entry matches whole path segments. ``/admin`` matches ``/admin`` and
+        ``/admin/users``. It does not match ``/administrators``.
+        """
+        for prefix in (self.config.path, *self.config.exclude_paths):
+            prefix = prefix.rstrip("/")
+            if path == prefix or path.startswith(prefix + "/"):
+                return True
+        return False
+
     def generate(self) -> OpenAPI:
         """Generate complete OpenAPI schema.
 
@@ -530,18 +542,8 @@ class SchemaGenerator:
 
         # Process HTTP routes
         for method, path, handler_id, handler in self.api._routes:
-            # Skip OpenAPI docs routes (always excluded)
-            if path.startswith(self.config.path):
-                continue
-
-            # Skip paths based on exclude_paths configuration
-            should_exclude = False
-            for exclude_prefix in self.config.exclude_paths:
-                if path.startswith(exclude_prefix):
-                    should_exclude = True
-                    break
-
-            if should_exclude:
+            # Skip the OpenAPI docs routes (always excluded) and the exclude_paths configuration
+            if self._is_excluded(path):
                 continue
 
             # Get handler metadata
@@ -573,18 +575,8 @@ class SchemaGenerator:
 
         # Process WebSocket routes
         for ws_path, handler_id, handler in self.api._websocket_routes:
-            # Skip OpenAPI docs routes (always excluded)
-            if ws_path.startswith(self.config.path):
-                continue
-
-            # Skip paths based on exclude_paths configuration
-            should_exclude = False
-            for exclude_prefix in self.config.exclude_paths:
-                if ws_path.startswith(exclude_prefix):
-                    should_exclude = True
-                    break
-
-            if should_exclude:
+            # Skip the OpenAPI docs routes (always excluded) and the exclude_paths configuration
+            if self._is_excluded(ws_path):
                 continue
 
             # Get handler metadata
