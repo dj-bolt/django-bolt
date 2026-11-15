@@ -232,7 +232,8 @@ class PaginationBase(ABC):
         Serialize items using efficient batch serialization.
 
         Supports:
-        - Bolt Serializer: from_model() + dump_many() (fastest)
+        - Bolt Serializer: from_model() + dump_many() (fastest). A dict is
+          validated, as a ``list[Serializer]`` response type with no ``@paginate``
         - msgspec.Struct: one msgspec.convert() for the page, as a
           ``list[Struct]`` response type with no ``@paginate``
         - Fallback: _model_to_dict() for backwards compatibility
@@ -245,7 +246,8 @@ class PaginationBase(ABC):
             else a list of dictionaries. Both are ready for JSON serialization.
 
         Raises:
-            ResponseValidationError: An item does not fit the plain Struct item type.
+            ResponseValidationError: An item does not fit the Struct or the
+                Serializer item type.
         """
         if not items:
             return []
@@ -258,30 +260,8 @@ class PaginationBase(ABC):
         if convert_page is not None:
             return convert_page(items)
 
-        # Check if items are already dicts (e.g., from values() queryset)
-        # In this case, just extract the fields we need
-        first_item = items[0]
-        if isinstance(first_item, dict):
-            # Items are dicts - extract only the fields declared in serializer
-            if hasattr(self.serializer_class, "__struct_fields__"):
-                fields = self.serializer_class.__struct_fields__
-                return [{field: item.get(field) for field in fields} for item in items]
-            return items  # Return dicts as-is if no fields info
-
-        # Bolt Serializer - use from_model + dump_many for efficiency
         if getattr(self.serializer_class, "__is_bolt_serializer__", False):
-            serializer_class = self.serializer_class
-            serializer_class._ensure_from_model_ready()
-
-            try:
-                serializer_instances = [serializer_class.from_model(item) for item in items]
-            except UnloadedRelationError:
-                pass
-            else:
-                return serializer_class.dump_many(serializer_instances)
-
-            serializer_instances = list(await asyncio.gather(*(serializer_class.afrom_model(item) for item in items)))
-            return serializer_class.dump_many(serializer_instances)
+            return await _dump_serializer_page(self.serializer_class, items)
 
         # Fallback for unknown serializer types
         return [self._model_to_dict(item) for item in items]
@@ -729,6 +709,45 @@ class CursorPagination(PaginationBase):
             page_size=page_size,
             next_cursor=next_cursor,
         )
+
+
+def _to_serializer(serializer_class: Any, item: Any) -> Any:
+    """Make the Serializer instance of one item of a page, from the kind of that item."""
+    if isinstance(item, dict):
+        return msgspec.convert(item, serializer_class)
+    if getattr(item.__class__, "__is_bolt_serializer__", False):
+        return item
+    return serializer_class.from_model(item)
+
+
+async def _to_serializer_async(serializer_class: Any, item: Any) -> Any:
+    try:
+        return _to_serializer(serializer_class, item)
+    except UnloadedRelationError:
+        pass
+    return await serializer_class.afrom_model(item)
+
+
+async def _dump_serializer_page(serializer_class: Any, items: list[Any]) -> list[dict]:
+    """Dump one page for a Bolt Serializer item type.
+
+    Each item goes through the Serializer as the same route with no
+    ``@paginate`` sends it: a dict is validated, an instance stays, and each
+    other object is read by ``from_model()``. Thus the page has the same
+    items, and an item that does not fit gives the same response validation
+    error.
+    """
+    serializer_class._ensure_from_model_ready()
+    try:
+        try:
+            instances = [_to_serializer(serializer_class, item) for item in items]
+        except UnloadedRelationError:
+            instances = list(await asyncio.gather(*(_to_serializer_async(serializer_class, item) for item in items)))
+        return serializer_class.dump_many(instances)
+    except msgspec.ValidationError as exc:
+        raise ResponseValidationError([exc]) from exc
+    except Exception as exc:
+        raise ResponseValidationError([{"loc": ["response"], "msg": str(exc), "type": "validation_error"}]) from exc
 
 
 @cache

@@ -108,6 +108,8 @@ Both approaches work identically. The serializer automatically filters fields - 
 
 The item type can also be a plain `msgspec.Struct`. Bolt converts each page as it converts a `list[Struct]` response type with no `@paginate`. An item that does not fit the Struct gives a response validation error (status 500). `build_response()` then gets instances of the Struct as `items`.
 
+A page of a `Serializer` type sends each item as the same route with no `@paginate` sends it. Bolt validates a dict against the serializer, so a dict gets the defaults of the serializer. A serializer instance stays as it is. `from_model()` reads each other object. A page can mix these kinds. An item that does not fit the serializer gives a response validation error (status 500), not a `null`.
+
 ## ViewSet with Pagination
 
 ```python
