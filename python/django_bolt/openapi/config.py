@@ -110,6 +110,8 @@ class OpenAPIConfig:
     """Path prefixes to exclude from OpenAPI schema generation.
 
     By default excludes Django admin (/admin) and static files (/static).
+    An entry matches whole path segments. "/admin" excludes "/admin" and
+    "/admin/users". It does not exclude "/administrators".
     The OpenAPI docs path (self.path) is always excluded automatically.
     Set to empty list [] to include all routes, or customize as needed.
 
