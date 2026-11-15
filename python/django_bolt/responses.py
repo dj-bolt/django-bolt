@@ -56,7 +56,8 @@ class CookieMixin:
             domain: Cookie domain (default: None, current domain)
             secure: Require HTTPS (default: False)
             httponly: Prevent JavaScript access (default: False)
-            samesite: SameSite policy - "Strict", "Lax", "None", or False (default: "Lax")
+            samesite: SameSite policy - "Strict", "Lax", "None", or False (default: "Lax").
+                The letter case has no meaning. Another value raises ValueError.
 
         Returns:
             Self for method chaining
