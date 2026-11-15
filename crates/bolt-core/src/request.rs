@@ -465,6 +465,24 @@ impl PyRequest {
             .extract()
     }
 
+    /// The scheme of the request: "http" or "https" (Django-compatible).
+    ///
+    /// It is the scheme of `build_absolute_uri()`: the resolved scheme, unless
+    /// `SECURE_PROXY_SSL_HEADER` applies. Django's `HttpRequest.scheme` gives
+    /// it, in `django_bolt._absolute_uri`. Nothing runs before the first read.
+    #[getter]
+    fn scheme(&self, py: Python<'_>) -> PyResult<String> {
+        py.import("django_bolt._absolute_uri")?
+            .getattr("scheme")?
+            .call1((self.META(py)?, self.resolved_scheme()))?
+            .extract()
+    }
+
+    /// True when `scheme` is "https" (Django-compatible).
+    fn is_secure(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(self.scheme(py)? == "https")
+    }
+
     #[pyo3(signature = (key, /, default=None))]
     fn get<'py>(&self, py: Python<'py>, key: &str, default: Option<Py<PyAny>>) -> Py<PyAny> {
         match key {
