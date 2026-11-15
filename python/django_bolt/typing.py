@@ -396,6 +396,10 @@ def is_dataclass_type(annotation: Any) -> bool:
         return False
 
 
+# A parameter with one of these names gets the request, unless it is a path parameter or has a marker.
+REQUEST_PARAM_NAMES = frozenset({"request", "req"})
+
+
 def infer_param_source(name: str, annotation: Any, path_params: set[str], http_method: str) -> str:
     """
     Infer parameter source based on type and context.
@@ -404,7 +408,8 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     1. If name matches path parameter -> "path"
     2. If special name (request, req) -> "request"
     3. If simple type (str, int, float, bool) -> "query"
-    4. If msgspec.Struct or dataclass -> "body" (method validation happens later)
+    4. If msgspec.Struct or dataclass, or a sequence of them -> "body"
+       (method validation happens later)
     5. Default -> "query"
 
     Args:
@@ -421,7 +426,7 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
         return "path"
 
     # 2. Special request parameter
-    if name in {"request", "req"}:
+    if name in REQUEST_PARAM_NAMES:
         return "request"
 
     # Unwrap Optional and msgspec.Meta if present
@@ -442,7 +447,9 @@ def infer_param_source(name: str, annotation: Any, path_params: set[str], http_m
     # 5. Complex types (msgspec.Struct, dataclass) -> body
     # Method-appropriateness (rejecting bodies on GET/DELETE/HEAD) is enforced
     # later in the validation path, not here.
-    if is_msgspec_struct(unwrapped) or is_dataclass_type(unwrapped):
+    # A sequence of them is a JSON array. A query string cannot hold it.
+    item = get_args(unwrapped)[0] if is_sequence_type(unwrapped) and get_args(unwrapped) else unwrapped
+    if is_msgspec_struct(item) or is_dataclass_type(item):
         return "body"
 
     # 6. Default to query
