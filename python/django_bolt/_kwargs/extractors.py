@@ -8,7 +8,7 @@ extractor functions that avoid runtime type checking.
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Annotated, Any, get_args, get_origin
 
 import msgspec
@@ -649,10 +649,6 @@ def create_file_extractor(
     annotation: Any,
     default: Any,
     alias: str | None = None,
-    max_size: int | None = None,  # Validated in Rust
-    min_size: int | None = None,  # Validated in Rust
-    allowed_types: Sequence[str] | None = None,  # Validated in Rust
-    max_files: int | None = None,  # Validated in Rust
 ) -> Callable:
     """
     Create a pre-compiled extractor for file uploads with UploadFile support.
@@ -660,26 +656,19 @@ def create_file_extractor(
     Supports both the new UploadFile type and legacy dict annotations for
     backward compatibility.
 
-    Note: File validation (max_size, min_size, allowed_types, max_files) is now
-    handled in Rust at parse time. This function only creates UploadFile objects
-    from the pre-validated file data.
+    Note: Rust does the file validation (max_size, min_size, allowed_types,
+    max_files) at parse time, from the route metadata. This function only
+    creates UploadFile objects from the pre-validated file data.
 
     Args:
         name: Parameter name
         annotation: Type annotation (UploadFile, list[UploadFile], dict, list[dict])
         default: Default value
         alias: Alternative field name
-        max_size: Maximum file size in bytes (validated in Rust)
-        min_size: Minimum file size in bytes (validated in Rust)
-        allowed_types: Allowed MIME types (validated in Rust)
-        max_files: Maximum number of files (validated in Rust)
 
     Returns:
         Extractor function
     """
-    # Silence unused parameter warnings - these are passed to Rust via metadata
-    _ = max_size, min_size, allowed_types, max_files
-
     key = alias or name
     optional = default is not inspect.Parameter.empty or is_optional(annotation)
 
@@ -860,26 +849,8 @@ def create_extractor_for_field(field: FieldDefinition) -> Callable | None:
     elif source == "form":
         return create_form_extractor(name, annotation, default, alias)
     elif source == "file":
-        # Extract file constraints from Param if available
-        max_size = None
-        min_size = None
-        allowed_types = None
-        max_files = None
-        if field.param is not None:
-            max_size = getattr(field.param, "max_size", None)
-            min_size = getattr(field.param, "min_size", None)
-            allowed_types = getattr(field.param, "allowed_types", None)
-            max_files = getattr(field.param, "max_files", None)
-        return create_file_extractor(
-            name,
-            annotation,
-            default,
-            alias,
-            max_size=max_size,
-            min_size=min_size,
-            allowed_types=allowed_types,
-            max_files=max_files,
-        )
+        # Rust checks the file constraints of the Param from the route metadata.
+        return create_file_extractor(name, annotation, default, alias)
     elif source == "body":
         return create_body_extractor(name, annotation)
     elif source == "request":

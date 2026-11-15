@@ -136,11 +136,9 @@ class UploadFile:
         reading it into memory, preserving the disk spooling optimization.
         """
         if self._file is None:
-            if self._temp_path:
-                # Open Rust's temp file directly - no memory copy!
-                self._file = open(self._temp_path, "r+b")  # noqa: SIM115
-            else:
-                raise RuntimeError("UploadFile not properly initialized")
+            # Only a disk-spooled file has no open file, and it has a temp path.
+            # Open Rust's temp file directly - no memory copy!
+            self._file = open(self._temp_path, "r+b")  # noqa: SIM115
 
     @property
     def file(self) -> File:

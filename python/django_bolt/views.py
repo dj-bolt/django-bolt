@@ -199,9 +199,6 @@ class APIView:
         if cls.validate_response is not None:
             view_handler.__bolt_validate_response__ = cls.validate_response
 
-        if getattr(method_handler, "validate_response", None) is not None:
-            view_handler.validate_response = method_handler.validate_response
-
         _copy_route_middleware(method_handler, view_handler)
 
         # Copy pagination attributes from method handler (for @paginate decorator)
@@ -213,17 +210,6 @@ class APIView:
         view_handler.__original_handler__ = method_handler
 
         return view_handler
-
-    def initialize(self, request: dict[str, Any]) -> None:
-        """
-        Hook called before the method handler is invoked.
-
-        Override this to perform per-request initialization.
-
-        Args:
-            request: The request dictionary
-        """
-        pass
 
     @classmethod
     def get_allowed_methods(cls) -> set[str]:

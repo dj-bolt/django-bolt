@@ -176,7 +176,6 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
     meta: HandlerMetadata = {
         "sig": sig,
         "fields": [],
-        "path_params": path_params,
         "http_method": http_method,
         "path": path,
         "has_file_uploads": False,  # Default; overridden below if file params exist
@@ -298,7 +297,6 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
     meta: HandlerMetadata = {
         "sig": sig,
         "fields": [],
-        "path_params": path_params,
         "http_method": "WEBSOCKET",
         "path": path,
         "has_file_uploads": False,  # WebSocket never has file uploads

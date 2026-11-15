@@ -30,7 +30,7 @@ from typing import Any
 
 from django_bolt import BoltAPI, _core
 from django_bolt.websocket import CloseCode, WebSocket
-from django_bolt.websocket.handlers import build_websocket_request, get_websocket_param_name
+from django_bolt.websocket.handlers import build_websocket_request
 
 # Each WebSocketTestClient is one connection with its own test app. The
 # connections to one API share its rate-limit buckets, as the connections to
@@ -344,27 +344,21 @@ class WebSocketTestClient:
         # Use production code path for parameter injection
         # This ensures tests actually verify the injector implementation
 
-        # Get the pre-compiled injector from handler metadata (same as Rust does)
-        meta = self.api._handler_meta.get(handler_id)
+        # Each WebSocket route has a pre-compiled injector in its metadata (same as Rust uses)
+        meta = self.api._handler_meta[handler_id]
 
-        if meta and "injector" in meta:
-            # Build request dict from scope (same as Rust's build_websocket_request call)
-            request = build_websocket_request(scope)
+        # Build request dict from scope (same as Rust's build_websocket_request call)
+        request = build_websocket_request(scope)
 
-            # Call the pre-compiled injector to get (args, kwargs)
-            injector = meta["injector"]
-            if meta.get("injector_is_async", False):
-                args, kwargs = await injector(request)
-            else:
-                args, kwargs = injector(request)
-
-            # Prepend websocket to args (same as Rust does)
-            args = [ws] + list(args)
+        # Call the pre-compiled injector to get (args, kwargs)
+        injector = meta["injector"]
+        if meta.get("injector_is_async", False):
+            args, kwargs = await injector(request)
         else:
-            # Fallback for handlers without injector (simple websocket-only handlers)
-            ws_param_name = get_websocket_param_name(handler)
-            args = [ws] if ws_param_name else []
-            kwargs = {}
+            args, kwargs = injector(request)
+
+        # Prepend websocket to args (same as Rust does)
+        args = [ws] + list(args)
 
         await self._start_handler(handler, args, kwargs)
         return self

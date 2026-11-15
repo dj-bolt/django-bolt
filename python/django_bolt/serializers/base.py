@@ -415,8 +415,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __source_mapping__: ClassVar[dict[str, str]] = {}  # API field name -> source attribute
     __field_sets__: ClassVar[dict[str, list[str]]] = {}  # Named field sets for use() method
 
-    # _FieldMarker default resolution (populated by __init_subclass__)
-    __field_marker_defaults__: ClassVar[dict[str, Any]] = {}  # field_name -> actual default value
+    # Fields defined with field() (populated by __init_subclass__)
     __field_marker_fields__: ClassVar[tuple[str, ...]] = ()
 
     # Fast-path flags: Control which validation runs (set at class definition time)
@@ -428,9 +427,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
     __has_field_markers__: ClassVar[bool] = False  # Has fields defined with field()
     __field_configs_collected__: ClassVar[bool] = False  # Lazy config collection done
 
-    # Pre-computed default values mapping for dump() (populated lazily on first use)
-    # None = not cached yet, {} = cached (even if empty)
-    __default_values_map__: ClassVar[dict[str, Any] | None] = None
     # Fast-path flag for dump: True if dump can use simple/fast path
     __dump_fast_path__: ClassVar[bool] = True
     __orm_state_check_fields__: ClassVar[tuple[str, ...]] = ()
@@ -477,7 +473,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             (field_name, tuple(validators)) for field_name, validators in cls.__field_validators__.items()
         )
 
-        cls.__default_values_map__ = None
         # A subclass must rebuild its own specs even when the parent already
         # collected (otherwise it inherits ``True`` and dumps ``{}``).
         cls.__field_configs_collected__ = False
@@ -550,7 +545,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         # Initialize with Meta values (will be updated by _lazy_collect_field_configs)
         cls.__field_configs__ = {}
-        cls.__field_marker_defaults__ = {}
         cls.__field_marker_fields__ = ()
         cls.__read_only_fields__ = frozenset(read_only)
         cls.__write_only_fields__ = frozenset(write_only)
@@ -780,7 +774,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         cls._dump_field_spec_cache.clear()
         cls._computed_dump_spec_cache.clear()
         cls._serializer_view_cache.clear()
-        cls.__default_values_map__ = None
 
         # Mark as collected so we don't run again
         cls.__field_configs_collected__ = True
@@ -1914,9 +1907,6 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             "__annotations__": new_annotations,
             "__module__": cls.__module__,
             "__qualname__": class_name,
-            # Store reference to parent for from_parent()
-            "__parent_serializer__": cls,
-            "__subset_fields__": fields_set,
         }
 
         # Handle defaults: msgspec defaults are aligned from the END
