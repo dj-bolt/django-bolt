@@ -1764,6 +1764,39 @@ class TestCSRFMiddleware:
 _CSRF_SECRET = "abcdefghijklmnopqrstuvwxyz012345"
 
 
+class _RecordsUnsupportedHooks(MiddlewareMixin):
+    """Record the hooks that Bolt does not run. process_view is the one that it runs."""
+
+    calls: list = []
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        type(self).calls.append("process_view")
+
+    def process_exception(self, request, exception):
+        type(self).calls.append("process_exception")
+        return HttpResponse("handled", status=418)
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [lambda: DjangoMiddleware(_RecordsUnsupportedHooks), lambda: DjangoMiddlewareStack([_RecordsUnsupportedHooks])],
+    ids=["wrapper", "stack"],
+)
+def test_process_view_runs_and_process_exception_does_not(layout):
+    _RecordsUnsupportedHooks.calls = []
+    api = BoltAPI(middleware=[layout()])
+
+    @api.get("/boom")
+    async def boom():
+        raise ValueError("boom")
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/boom")
+
+    assert _RecordsUnsupportedHooks.calls == ["process_view"]
+    assert response.status_code == 500
+
+
 class _BlockInViewMiddleware(MiddlewareMixin):
     """Return a response from process_view, before the handler."""
 
