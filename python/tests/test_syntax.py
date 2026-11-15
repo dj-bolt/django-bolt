@@ -971,6 +971,36 @@ def test_wrong_method_on_the_other_slash_form_of_a_route_path_answers_405(traili
         assert client.request(method, "/no-route/").status_code == 404
 
 
+@pytest.mark.parametrize("path", ["/%c3%bc/", "/%C3%BC/", "/a%20b/%61/"])
+def test_wrong_method_on_the_other_slash_form_answers_405_for_each_form_of_an_escape(path):
+    """The 405 check uses the normalized path, for the path and for its other slash form."""
+    api = BoltAPI()
+
+    @api.get("/ü")
+    async def get_umlaut():
+        return {"ok": True}
+
+    @api.get("/a b/a")
+    async def get_space():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        response = client.post(path)
+        assert response.status_code == 405
+        assert response.headers["allow"] == "GET, OPTIONS"
+        assert response.json() == {"detail": "Method Not Allowed"}
+        # The path redirects for the method of its route, and the route answers.
+        redirect = client.get(path, follow_redirects=False)
+        assert redirect.status_code == 308
+        assert client.get(redirect.headers["location"]).status_code == 200
+        # The automatic OPTIONS answer is the same for this form of the path.
+        options = client.options(path)
+        assert options.status_code == 204
+        assert options.headers["allow"] == "GET, OPTIONS"
+        # A path with no route in either form is still a 404.
+        assert client.post("/%c3%b6/").status_code == 404
+
+
 def test_explicit_options_handler():
     """Test that explicit OPTIONS handler overrides automatic behavior"""
     api = BoltAPI()
