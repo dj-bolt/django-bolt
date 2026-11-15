@@ -8,6 +8,7 @@ No mocking - tests the full integration stack.
 import base64
 from collections import UserList
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Generic, TypeVar
 from urllib.parse import quote
 
@@ -1883,6 +1884,98 @@ def test_pagination_with_values(sample_articles):
         # values() returns dicts
         assert isinstance(data["items"][0], dict)
         assert "title" in data["items"][0]
+
+
+class ArticleWithExtra(msgspec.Struct):
+    id: int
+    title: str
+    not_on_the_model: str
+
+
+class ArticleWithDefault(msgspec.Struct, rename="camel"):
+    id: int
+    is_published: bool
+    word_count: int = 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_paginated_struct_items_convert_as_a_plain_list_response(sample_articles):
+    """A page of a plain Struct type has the items and the error of the same route with no @paginate."""
+    api = BoltAPI()
+
+    class SmallPagePagination(PageNumberPagination):
+        page_size = 2
+
+    def mixed_items():
+        # A Struct and a dict, in that order. Both fit the Struct.
+        return [ArticleListSchema(id=1, title="struct", author="a"), {"id": 7, "title": "dict", "author": "b"}]
+
+    def objects():
+        return [SimpleNamespace(id=1, is_published=True), SimpleNamespace(id=2, is_published=False, word_count=9)]
+
+    @api.get("/plain/mixed")
+    async def plain_mixed() -> list[ArticleListSchema]:
+        return mixed_items()
+
+    @api.get("/paged/mixed")
+    @paginate(SmallPagePagination)
+    async def paged_mixed(request) -> list[ArticleListSchema]:
+        return mixed_items()
+
+    @api.get("/plain/bad-dict")
+    async def plain_bad_dict() -> list[ArticleListSchema]:
+        return [{"id": 7, "title": "dict", "author": "b"}, {"id": 8}]
+
+    @api.get("/paged/bad-dict")
+    @paginate(SmallPagePagination)
+    async def paged_bad_dict(request) -> list[ArticleListSchema]:
+        return [{"id": 7, "title": "dict", "author": "b"}, {"id": 8}]
+
+    @api.get("/plain/default")
+    async def plain_default() -> list[ArticleWithDefault]:
+        return objects()
+
+    @api.get("/paged/default")
+    @paginate(SmallPagePagination)
+    async def paged_default(request) -> list[ArticleWithDefault]:
+        return objects()
+
+    @api.get("/plain/missing-field")
+    async def plain_missing_field() -> list[ArticleWithExtra]:
+        return objects()
+
+    @api.get("/paged/missing-field")
+    @paginate(SmallPagePagination)
+    async def paged_missing_field(request) -> list[ArticleWithExtra]:
+        return objects()
+
+    @api.get("/paged/missing-field-queryset")
+    @paginate(SmallPagePagination)
+    async def paged_missing_field_queryset(request) -> list[ArticleWithExtra]:
+        return Article.objects.order_by("id")
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        for name in ("mixed", "default"):
+            plain = client.get(f"/plain/{name}")
+            paged = client.get(f"/paged/{name}")
+            assert (plain.status_code, paged.status_code) == (200, 200), name
+            assert paged.json()["items"] == plain.json(), name
+        assert client.get("/paged/mixed").json()["items"][1] == {"id": 7, "title": "dict", "author": "b"}
+        # The default of the Struct and its wire names, not null under the Python names.
+        assert client.get("/paged/default").json()["items"] == [
+            {"id": 1, "isPublished": True, "wordCount": 0},
+            {"id": 2, "isPublished": False, "wordCount": 9},
+        ]
+
+        # A value that does not fit the Struct is a response validation error, not a null.
+        for name in ("bad-dict", "missing-field"):
+            plain = client.get(f"/plain/{name}")
+            paged = client.get(f"/paged/{name}")
+            assert (plain.status_code, paged.status_code) == (500, 500), name
+            assert paged.json() == plain.json(), name
+        from_queryset = client.get("/paged/missing-field-queryset")
+        assert from_queryset.status_code == 500
+        assert from_queryset.json() == client.get("/paged/missing-field").json()
 
 
 @pytest.mark.django_db(transaction=True)

@@ -26,7 +26,7 @@ import base64
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from functools import wraps
+from functools import cache, wraps
 from typing import Any, Generic, TypeVar, get_args, get_origin
 
 import msgspec
@@ -37,7 +37,7 @@ from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, Tuple
 
 from . import _json
 from .concurrency import run_in_orm_executor
-from .exceptions import UnloadedRelationError
+from .exceptions import ResponseValidationError, UnloadedRelationError
 from .middleware.middleware import note_config_decorator
 from .typing import REQUEST_PARAM_NAMES
 
@@ -285,20 +285,25 @@ class PaginationBase(ABC):
         else:
             return len(queryset)
 
-    async def _serialize_items(self, items: list[Any]) -> list[dict]:
+    async def _serialize_items(self, items: list[Any]) -> list[Any]:
         """
         Serialize items using efficient batch serialization.
 
         Supports:
         - Bolt Serializer: from_model() + dump_many() (fastest)
-        - msgspec.Struct: msgspec.structs.asdict() for each item
+        - msgspec.Struct: one msgspec.convert() for the page, as a
+          ``list[Struct]`` response type with no ``@paginate``
         - Fallback: _model_to_dict() for backwards compatibility
 
         Args:
-            items: List of raw items (Django models or dicts)
+            items: List of raw items (Django models, dicts or Structs)
 
         Returns:
-            List of dictionaries ready for JSON serialization
+            List of Struct instances for a plain msgspec.Struct item type,
+            else a list of dictionaries. Both are ready for JSON serialization.
+
+        Raises:
+            ResponseValidationError: An item does not fit the plain Struct item type.
         """
         if not items:
             return []
@@ -306,6 +311,10 @@ class PaginationBase(ABC):
         if self.serializer_class is None:
             # Backwards compatibility: use _model_to_dict fallback
             return [self._model_to_dict(item) for item in items]
+
+        convert_page = _struct_page_converter(self.serializer_class)
+        if convert_page is not None:
+            return convert_page(items)
 
         # Check if items are already dicts (e.g., from values() queryset)
         # In this case, just extract the fields we need
@@ -331,11 +340,6 @@ class PaginationBase(ABC):
 
             serializer_instances = list(await asyncio.gather(*(serializer_class.afrom_model(item) for item in items)))
             return serializer_class.dump_many(serializer_instances)
-
-        # Plain msgspec.Struct - extract fields from model instances
-        if hasattr(self.serializer_class, "__struct_fields__"):
-            fields = self.serializer_class.__struct_fields__
-            return [{field: getattr(item, field, None) for field in fields} for item in items]
 
         # Fallback for unknown serializer types
         return [self._model_to_dict(item) for item in items]
@@ -847,6 +851,30 @@ class CursorPagination(PaginationBase):
             page_size=page_size,
             next_cursor=next_cursor,
         )
+
+
+@cache
+def _struct_page_converter(item_type: type) -> Callable[[list[Any]], list[Any]] | None:
+    """The conversion of one page for a plain msgspec.Struct item type, else None. Built one time per type.
+
+    The conversion is that of a ``list[Struct]`` response type with no
+    ``@paginate``: msgspec reads a dict by key and each other object by
+    attribute. Thus the page has the same items, and a value that does not fit
+    the Struct gives the same response validation error.
+    """
+    if not (isinstance(item_type, type) and issubclass(item_type, msgspec.Struct)):
+        return None
+    if getattr(item_type, "__is_bolt_serializer__", False):
+        return None
+    page_type = list[item_type]
+
+    def convert_page(items: list[Any]) -> list[Any]:
+        try:
+            return msgspec.convert(items, page_type, from_attributes=True)
+        except msgspec.ValidationError as exc:
+            raise ResponseValidationError([exc]) from exc
+
+    return convert_page
 
 
 def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
