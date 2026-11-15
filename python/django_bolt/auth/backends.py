@@ -23,7 +23,7 @@ import logging
 import sys
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -97,6 +97,15 @@ class BaseAuthentication(ABC):
         """
         pass
 
+    @property
+    def challenge_scheme(self) -> str:
+        """Return the auth scheme that a 401 names in ``WWW-Authenticate`` for this backend.
+
+        Bolt reads it one time, at registration. Override it in a subclass to
+        name another scheme. The value is one token (RFC 9110 section 11.1).
+        """
+        return "Bearer"
+
     async def get_user(self, user_id: str | None, auth_context: dict[str, Any]) -> Any | None:
         """
         Resolve a User instance from the authentication context.
@@ -137,13 +146,16 @@ class JWTAuthentication(BaseAuthentication):
         algorithms: List of allowed JWT algorithms (default: ["HS256"]). The
             token's ``alg`` header must name one of these; all must share one
             key family.
-        header: Header name to extract token from (default: "authorization")
+        header: Header name to extract token from (default: "authorization").
+            An empty string raises ``ImproperlyConfigured``.
         cookie: Optional cookie name to extract the token from. When set, the
             token is read from the named cookie only (the header is ignored).
             The cookie value is the raw token (no "Bearer " prefix needed).
         audience: Optional JWT audience claim to validate. Required with
             ``jwks_url`` to prevent cross-application token substitution.
-        issuer: Optional JWT issuer claim to validate
+        issuer: Optional JWT issuer claim to validate. For ``cookie``,
+            ``audience``, ``issuer`` and ``token_type``, None means "not
+            set". An empty string raises ``ImproperlyConfigured``.
         revoked_token_handler: Async callable that returns True when a token is
             revoked. Bolt calls it for each authenticated request, with the
             ``jti`` of the token: ``handler(jti)``. A handler with two
@@ -155,7 +167,9 @@ class JWTAuthentication(BaseAuthentication):
             (which also works, for compatibility). Mutually exclusive with
             ``secret``.
         leeway: Clock-skew tolerance in seconds applied to ``exp``/``nbf``
-            validation (default: 60).
+            validation (default: 60). A ``revocation_store`` with a
+            ``leeway`` must have one that is not smaller, or the backend
+            raises ``ImproperlyConfigured``.
         token_type: Expected ``typ`` claim. When set (e.g. ``"refresh"`` for
             a token-rotation endpoint), tokens must carry exactly that
             ``typ``, and no other type claim that disagrees. When left as
@@ -278,8 +292,28 @@ class JWTAuthentication(BaseAuthentication):
                 )
         if leeway < 0:
             raise ImproperlyConfigured("JWTAuthentication leeway must be >= 0 seconds.")
+        # A store entry lives until ``exp`` plus the leeway of the store. A custom store can have no leeway.
+        store_leeway = getattr(revocation_store, "leeway", None)
+        if store_leeway is not None and store_leeway < leeway:
+            raise ImproperlyConfigured(
+                f"JWTAuthentication leeway is {leeway} seconds, but its revocation_store has a leeway of "
+                f"{store_leeway} seconds. A revoked token would be accepted again before it expires. "
+                f"Pass leeway={leeway} to the store."
+            )
         if secret == "":
             raise ImproperlyConfigured("JWTAuthentication secret must not be empty.")
+        # An empty string is not "not set". Rust would look for a header or a
+        # cookie with no name, or require a claim that is an empty string.
+        if header == "":
+            raise ImproperlyConfigured("JWTAuthentication header must not be empty.")
+        for option, value in (
+            ("cookie", cookie),
+            ("audience", audience),
+            ("issuer", issuer),
+            ("token_type", token_type),
+        ):
+            if value == "":
+                raise ImproperlyConfigured(f"JWTAuthentication {option} must not be empty. Use None for no value.")
         self._secret = secret
         self.public_key = public_key
         self.algorithms = ["HS256"] if algorithms is None else algorithms
@@ -325,6 +359,13 @@ class JWTAuthentication(BaseAuthentication):
     @property
     def scheme_name(self) -> str:
         return "jwt"
+
+    @property
+    def challenge_scheme(self) -> str:
+        # RFC 6750 defines Bearer for the Authorization header only.
+        if self.cookie is None and self.header.lower() == "authorization":
+            return "Bearer"
+        return "ApiKey"
 
     def _resolve_jwks(self) -> str | None:
         """Return the JWKS document as a JSON string, or None.
@@ -439,17 +480,42 @@ class JWTAuthentication(BaseAuthentication):
             return None
 
 
+def _check_str_collection(value: Any, name: str, item_name: str) -> None:
+    """Raise ``ImproperlyConfigured`` unless ``value`` is a collection of str, and not a str or bytes."""
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Collection):
+        raise ImproperlyConfigured(
+            f"APIKeyAuthentication {name} must be a set, list or tuple of str, not {type(value).__name__}."
+        )
+    for item in value:
+        if not isinstance(item, str):
+            raise ImproperlyConfigured(
+                f"APIKeyAuthentication each {item_name} must be a str, not {type(item).__name__}."
+            )
+
+
+# The scheme words that Rust removes from the value of the API key header.
+_API_KEY_SCHEMES = ("Bearer ", "ApiKey ")
+
+
 class APIKeyAuthentication(BaseAuthentication):
     """
     API key authentication.
 
     Validates API keys against a configured set of valid keys.
     Keys should be provided in the configured header (default: X-API-Key).
+    The header value is the key, or ``Bearer <key>``, or ``ApiKey <key>``.
 
     Args:
-        api_keys: Set of valid API keys
+        api_keys: Set, list or tuple of valid API keys. Each key is a
+            non-empty str that does not start with ``Bearer `` or ``ApiKey ``.
         header: Header name to extract API key from (default: "x-api-key")
-        key_permissions: Optional mapping of API keys to permission sets
+        key_permissions: Optional mapping of API keys to permission sets.
+            Each key must be in ``api_keys``.
+
+    Raises:
+        ImproperlyConfigured: ``api_keys`` or ``key_permissions`` has a
+            value of the wrong type, an empty key, a key that starts with a
+            scheme, or a key that is not in ``api_keys``.
     """
 
     def __init__(
@@ -458,13 +524,48 @@ class APIKeyAuthentication(BaseAuthentication):
         header: str = "x-api-key",
         key_permissions: dict[str, set[str]] | None = None,
     ):
+        # A str is a collection of its characters. Without this check, each
+        # character of a str is a valid key, and "" is a valid key too.
+        if api_keys is not None:
+            _check_str_collection(api_keys, "api_keys", "key in api_keys")
+            if "" in api_keys:
+                raise ImproperlyConfigured("APIKeyAuthentication api_keys must not contain an empty key.")
+            # Rust removes one scheme word from the header value. Thus a key that
+            # starts with a scheme cannot authenticate as sent, and its header
+            # value can name another valid key.
+            for key in api_keys:
+                for scheme in _API_KEY_SCHEMES:
+                    if key[: len(scheme)].lower() == scheme.lower():
+                        raise ImproperlyConfigured(
+                            f"APIKeyAuthentication api_keys has the key {key!r}, "
+                            f"which starts with the scheme {scheme!r}."
+                        )
+        if key_permissions is not None:
+            if not isinstance(key_permissions, dict):
+                raise ImproperlyConfigured(
+                    f"APIKeyAuthentication key_permissions must be a dict, not {type(key_permissions).__name__}."
+                )
+            for key, permissions in key_permissions.items():
+                name = f"key_permissions[{key!r}]"
+                _check_str_collection(permissions, name, f"permission in {name}")
+                if api_keys is None or key not in api_keys:
+                    raise ImproperlyConfigured(
+                        f"APIKeyAuthentication key_permissions has the key {key!r}, which is not in api_keys."
+                    )
         self.api_keys = api_keys or set()
         self.header = header
         self.key_permissions = key_permissions or {}
+        # Rust would look for a header with no name, and reject each request.
+        if header == "":
+            raise ImproperlyConfigured("APIKeyAuthentication header must not be empty.")
 
     @property
     def scheme_name(self) -> str:
         return "api_key"
+
+    @property
+    def challenge_scheme(self) -> str:
+        return "ApiKey"
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -509,6 +610,10 @@ class SessionAuthentication(BaseAuthentication):
     def scheme_name(self) -> str:
         return "session"
 
+    @property
+    def challenge_scheme(self) -> str:
+        return "ApiKey"
+
     def to_metadata(self) -> dict[str, Any]:
         return {
             "type": "session",
@@ -518,12 +623,26 @@ class SessionAuthentication(BaseAuthentication):
         }
 
 
-def get_default_authentication_classes() -> list[BaseAuthentication]:
-    """
-    Get default authentication classes from Django settings.
+def www_authenticate_challenge(backends: Sequence[BaseAuthentication]) -> str | None:
+    """Return the ``WWW-Authenticate`` value of a 401 for these backends, or None for no backend.
 
-    Looks for BOLT_AUTHENTICATION_CLASSES in settings. If not found,
-    returns an empty list (no authentication by default).
+    The value has one challenge for each different scheme, in the order of the
+    backends (RFC 9110 section 11.6.1). Bolt builds it one time, at registration.
+    """
+    schemes = dict.fromkeys(backend.challenge_scheme for backend in backends)
+    return ", ".join(schemes) or None
+
+
+def get_default_authentication_classes(*, needs_user: bool = False) -> list[BaseAuthentication]:
+    """
+    Get the default authentication classes of a route with no ``auth``.
+
+    Returns ``BOLT_AUTHENTICATION_CLASSES`` when the setting is there, also
+    when it is an empty list. Without the setting, the result follows the
+    guards of the route. ``needs_user`` says that a guard of the route needs
+    an authenticated user. Such a route gets ``[JWTAuthentication()]``, which
+    verifies an HS256 token with ``SECRET_KEY``. Each other route gets an
+    empty list (no authentication).
     """
     try:
         try:
@@ -535,4 +654,5 @@ def get_default_authentication_classes() -> list[BaseAuthentication]:
     except (ImportError, AttributeError):
         pass
 
-    return []
+    # With no backend, the guard would reject each request with a 401.
+    return [JWTAuthentication()] if needs_user else []

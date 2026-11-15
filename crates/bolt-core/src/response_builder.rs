@@ -83,6 +83,15 @@ pub fn build_rate_limit_response(
         .body(body)
 }
 
+/// Log a custom header that Bolt does not send, for example a value with a line break.
+/// The record has the name only. The value can hold private data.
+#[cold]
+fn log_dropped_header(name: &str) {
+    log::warn!(
+        "The response header '{name}' is not valid in an HTTP response. Bolt does not send it."
+    );
+}
+
 /// Convert ResponseMeta to a Vec of header tuples.
 /// Used for streaming responses that need headers but use a different builder path.
 #[inline]
@@ -161,6 +170,8 @@ where
                 && let Ok(val) = HeaderValue::try_from(v.as_str())
             {
                 builder.append_header((name, val));
+            } else {
+                log_dropped_header(k);
             }
         }
     }

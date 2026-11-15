@@ -10,6 +10,7 @@ This version uses async-native Rust testing infrastructure which provides:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import threading
 import warnings
@@ -27,6 +28,7 @@ from django_bolt.api import (
     _routes_and_native_routes,
     _validate_asgi_mount_conflicts,
     _validate_mcp_mount_conflicts,
+    run_lifespans,
 )
 from django_bolt.testing.dbshare import SharedConnections
 
@@ -113,7 +115,9 @@ class BoltTestTransport(httpx.BaseTransport):
 
     Args:
         app_id: Test app instance ID
-        raise_server_exceptions: If True, raise exceptions from handlers
+        raise_server_exceptions: If True, raise an error of the test backend, for example an
+            unsupported HTTP method. A handler exception still gives a 500 response.
+            If False, the backend error gives a 500 response too
     """
 
     def __init__(self, app_id: int, raise_server_exceptions: bool = True):
@@ -128,8 +132,8 @@ class BoltTestTransport(httpx.BaseTransport):
         path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
-        # Extract headers
-        headers = [(k.decode("utf-8"), v.decode("utf-8")) for k, v in request.headers.raw]
+        # Extract headers. An HTTP server removes the spaces and tabs around a value.
+        headers = [(k.decode("utf-8"), v.decode("utf-8").strip(" \t")) for k, v in request.headers.raw]
 
         # Get body
         if hasattr(request, "_content"):
@@ -181,7 +185,9 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
 
     Args:
         app_id: Test app instance ID
-        raise_server_exceptions: If True, raise exceptions from handlers
+        raise_server_exceptions: If True, raise an error of the test backend, for example an
+            unsupported HTTP method. A handler exception still gives a 500 response.
+            If False, the backend error gives a 500 response too
     """
 
     def __init__(self, app_id: int, raise_server_exceptions: bool = True):
@@ -196,8 +202,8 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
         path = url.raw_path.split(b"?", 1)[0].decode("ascii")
         query_string = url.query.decode("utf-8") if url.query else None
 
-        # Extract headers
-        headers = [(k.decode("utf-8"), v.decode("utf-8")) for k, v in request.headers.raw]
+        # Extract headers. An HTTP server removes the spaces and tabs around a value.
+        headers = [(k.decode("utf-8"), v.decode("utf-8").strip(" \t")) for k, v in request.headers.raw]
 
         # Get body
         if hasattr(request, "_content"):
@@ -325,7 +331,9 @@ class TestClient(httpx.Client):
         Args:
             api: BoltAPI instance to test
             base_url: Base URL for requests
-            raise_server_exceptions: If True, raise exceptions from handlers
+            raise_server_exceptions: If True, raise an error of the test backend, for example an
+                unsupported HTTP method. A handler exception still gives a 500 response.
+                If False, the backend error gives a 500 response too
             cors_allowed_origins: Global CORS allowed origins for this test. They
                                   replace the CORS settings. A "*" entry allows every origin.
             read_django_settings: If True (the default), read the CORS, static and media
@@ -428,7 +436,7 @@ class TestClient(httpx.Client):
             _warn_if_inside_atomic_block()
         if self.api._has_lifespan:
             loop = asyncio.new_event_loop()
-            cm = self.api._lifespan_context(self.api)
+            cm = run_lifespans(self.api._source_lifespans)
             try:
                 loop.run_until_complete(cm.__aenter__())
             except BaseException:
@@ -593,45 +601,37 @@ class TestClient(httpx.Client):
         Yields:
             Chunks of response content
         """
+        # A chunk can end inside a multi-byte character. The decoder keeps the part for the next chunk.
+        decoder = codecs.getincrementaldecoder("utf-8")() if decode_unicode else None
         pos = 0
         while pos < len(content):
             chunk = content[pos : pos + chunk_size]
             pos += chunk_size
 
-            if decode_unicode:
-                yield chunk.decode("utf-8")
-            else:
+            if decoder is None:
                 yield chunk
+            else:
+                text = decoder.decode(chunk, final=pos >= len(content))
+                if text:
+                    yield text
 
     @staticmethod
-    def _iter_response_lines(content: bytes, decode_unicode: bool = True) -> Iterator[str]:
+    def _iter_response_lines(content: bytes, decode_unicode: bool = True) -> Iterator[str | bytes]:
         """Iterate over response content line by line.
 
         Args:
             content: Full response content
-            decode_unicode: If True, decode bytes to string (default True)
+            decode_unicode: If True, decode each line to a string (default True). Otherwise give bytes.
 
         Yields:
             Lines from the response
         """
-        buffer = b"" if not decode_unicode else ""
-
-        for chunk in TestClient._iter_response_content(content, chunk_size=8192, decode_unicode=decode_unicode):
-            if chunk:
-                buffer += chunk
-
-                # Split on newlines
-                lines = buffer.split(b"\n") if isinstance(buffer, bytes) else buffer.split("\n")
-
-                # Yield all complete lines, keep incomplete line in buffer
-                for line in lines[:-1]:
-                    yield line if isinstance(line, str) else line.decode("utf-8")
-
-                buffer = lines[-1]
-
-        # Yield any remaining data in buffer
-        if buffer:
-            yield buffer if isinstance(buffer, str) else buffer.decode("utf-8")
+        # Split the bytes, then decode each line. A chunk border can fall inside a character.
+        lines = content.split(b"\n")
+        if not lines[-1]:
+            lines.pop()
+        for line in lines:
+            yield line.decode("utf-8") if decode_unicode else line
 
 
 class AsyncTestClient(httpx.AsyncClient):
@@ -673,7 +673,9 @@ class AsyncTestClient(httpx.AsyncClient):
         Args:
             api: BoltAPI instance to test
             base_url: Base URL for requests
-            raise_server_exceptions: If True, raise exceptions from handlers
+            raise_server_exceptions: If True, raise an error of the test backend, for example an
+                unsupported HTTP method. A handler exception still gives a 500 response.
+                If False, the backend error gives a 500 response too
             cors_allowed_origins: Global CORS allowed origins for this test. They
                                   replace the CORS settings. A "*" entry allows every origin.
             read_django_settings: If True (the default), read the CORS, static and media
@@ -765,7 +767,7 @@ class AsyncTestClient(httpx.AsyncClient):
         if self._lifespan is not None:
             raise RuntimeError("AsyncTestClient is already open. Enter it once.")
         if self.api._has_lifespan:
-            cm = self.api._lifespan_context(self.api)
+            cm = run_lifespans(self.api._source_lifespans)
             await cm.__aenter__()
             self._lifespan = cm
         try:

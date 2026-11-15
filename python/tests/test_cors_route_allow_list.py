@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 import pytest
+from django.core.exceptions import ImproperlyConfigured
 
 from django_bolt import BoltAPI, Router
 from django_bolt.middleware import cors, middleware
@@ -135,18 +136,96 @@ def test_a_string_origin_regexes_is_one_pattern(global_cors):
         assert _origin_headers(client, "/tenant", "https://attacker.evil") == (None, None)
 
 
-def test_route_with_only_invalid_patterns_does_not_take_the_global_list(global_cors):
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        # The Rust regex crate has no look-around, so this pattern does not compile.
+        (
+            {"origin_regexes": [r"^https://[a-z]+\.tenant\.test$", r"^https://(?!evil)[a-z]+\.tenant\.test$"]},
+            "cors origin_regexes holds a pattern that is not a valid regex: "
+            r'"^https://(?!evil)[a-z]+\\.tenant\\.test$"',
+        ),
+        (
+            {"origins": ["https://a.test"], "methods": ["GET", "PO\nST"]},
+            r'cors methods holds a value that is not valid in an HTTP header: "PO\nST"',
+        ),
+        (
+            {"origins": ["https://a.test"], "headers": ["X-A\r\nX-B: 1"]},
+            r'cors headers holds a value that is not valid in an HTTP header: "X-A\r\nX-B: 1"',
+        ),
+    ],
+    ids=["origin-regex", "method", "header"],
+)
+def test_a_route_cors_value_that_rust_cannot_use_stops_startup(kwargs, message):
+    # Before, Bolt dropped the pattern or the header, with no error.
     api = BoltAPI()
 
-    # The Rust regex crate has no look-around, so this pattern does not compile.
     @api.get("/tenant")
-    @cors(origin_regexes=[r"^https://(?!evil)[a-z]+\.tenant\.test$"], credentials=True)
+    @cors(**kwargs)
     async def tenant():
         return {}
 
-    with TestClient(api, use_http_layer=True) as client:
-        assert _origin_headers(client, "/tenant", "https://global.test") == (None, None)
-        assert _origin_headers(client, "/tenant", "https://shop.example.com") == (None, None)
+    with pytest.raises(ValueError, match=re.escape(message) + "$"), TestClient(api, read_django_settings=False):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        (
+            "CORS_ALLOWED_ORIGIN_REGEXES",
+            [r"^https://[a-z]+\.example\.com$", "(unclosed"],
+            'CORS_ALLOWED_ORIGIN_REGEXES holds a pattern that is not a valid regex: "(unclosed".',
+        ),
+        (
+            "CORS_ALLOW_METHODS",
+            ["GET", "PO\nST"],
+            r'CORS_ALLOW_METHODS holds a value that is not valid in an HTTP header: "PO\nST".',
+        ),
+        (
+            "CORS_ALLOW_HEADERS",
+            ["X-A\r\nX-B: 1"],
+            r'CORS_ALLOW_HEADERS holds a value that is not valid in an HTTP header: "X-A\r\nX-B: 1".',
+        ),
+        (
+            "CORS_EXPOSE_HEADERS",
+            ["X-Total", "X-\x7f"],
+            r'CORS_EXPOSE_HEADERS holds a value that is not valid in an HTTP header: "X-\u{7f}".',
+        ),
+    ],
+    ids=["origin-regex", "method", "header", "expose-header"],
+)
+def test_a_cors_setting_that_rust_cannot_use_stops_startup(settings, name, value, message):
+    # Before, Bolt dropped the pattern or the header, with no error.
+    settings.CORS_ALLOWED_ORIGINS = ["https://global.test"]
+    setattr(settings, name, value)
+    api = BoltAPI()
+
+    @api.get("/plain")
+    async def plain():
+        return {}
+
+    with pytest.raises(ImproperlyConfigured) as raised, TestClient(api):
+        pass
+
+    assert str(raised.value) == message
+
+
+def test_an_empty_pattern_in_the_cors_setting_stops_startup(settings):
+    # Before, the empty pattern matched each origin, so each origin got Access-Control-Allow-Origin.
+    settings.CORS_ALLOWED_ORIGINS = ["https://global.test"]
+    settings.CORS_ALLOWED_ORIGIN_REGEXES = [r"^https://[a-z]+\.example\.com$", ""]
+    settings.CORS_ALLOW_CREDENTIALS = True
+    api = BoltAPI()
+
+    @api.get("/plain")
+    async def plain():
+        return {}
+
+    with pytest.raises(ImproperlyConfigured) as raised, TestClient(api, use_http_layer=True) as client:
+        assert _origin_headers(client, "/plain", "https://attacker.evil") == (None, None)
+
+    assert str(raised.value) == "CORS_ALLOWED_ORIGIN_REGEXES holds an empty pattern, which matches every origin."
 
 
 def test_route_cors_wins_over_the_cors_of_the_api():

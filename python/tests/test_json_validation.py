@@ -209,6 +209,25 @@ class TestInvalidJSONParsing:
         with pytest.raises(msgspec.ValidationError):
             extractor(b"42")
 
+    def test_an_empty_body_gives_the_default_of_an_optional_body_parameter(self):
+        api = BoltAPI()
+
+        @api.post("/optional")
+        async def optional(user: UserWithDefaults | None = None):
+            return {"name": user.name if user else None}
+
+        @api.post("/required")
+        async def required(user: UserWithDefaults):
+            return {"name": user.name}
+
+        with TestClient(api) as client:
+            assert client.post("/optional").json() == {"name": None}
+            assert client.post("/optional", json={"name": "Ana"}).json() == {"name": "Ana"}
+            # A body that is present must still be valid JSON of the type.
+            assert client.post("/optional", content=b"{").status_code == 422
+            assert client.post("/optional", json={"name": 1}).status_code == 422
+            assert client.post("/required").status_code == 422
+
 
 class TestBodyOfNonStructType:
     """A body with a type that is not a Struct is decoded as the type, with the same errors."""
@@ -285,6 +304,26 @@ class TestBodyOfNonStructType:
             assert wrong.status_code == 422
             assert wrong.json()["detail"][0]["loc"] == ["body", "0"]
 
+    def test_two_body_parameters_each_decode_the_body_as_their_own_type(self):
+        api = BoltAPI()
+
+        @api.post("/both")
+        async def both(user: UserWithDefaults, strict: UserCreate):
+            return {"user": type(user).__name__, "strict": type(strict).__name__, "age": strict.age}
+
+        with TestClient(api) as client:
+            body = {"name": "Ana", "email": "ana@example.com", "age": 30}
+            assert client.post("/both", json=body).json() == {
+                "user": "UserWithDefaults",
+                "strict": "UserCreate",
+                "age": 30,
+            }
+
+            # The second type has a required field more than the first.
+            missing = client.post("/both", json={"name": "Ana"})
+            assert missing.status_code == 422
+            assert missing.json()["detail"][0]["loc"] == ["body", "email"]
+
 
 class TestParseMsgspecDecodeError:
     """Test the line and column of a JSON decode error."""
@@ -316,6 +355,13 @@ class TestParseMsgspecDecodeError:
         assert detail["ctx"]["byte_position"] == body.index(b"}")
         assert detail["msg"].endswith(f"\n  {text}\n  {' ' * text.index('}')}^")
 
+    def test_message_shows_only_the_error_line(self):
+        """Test that the message quotes the failing line, not the lines after it."""
+        body = b'{"a": 1,\n "b": oops,\n "c": 2,\n "d": 3}'
+        detail = self._parse(body)
+
+        assert detail["msg"].endswith('\n   "b": oops,\n        ^')
+
     def test_column_on_later_line_counts_characters(self):
         """Test the line number and the column after a newline."""
         line_before_error = '  "é€": '
@@ -331,6 +377,76 @@ class TestParseMsgspecDecodeError:
         detail = self._parse(body)
 
         assert detail["loc"] == ("body", 2, len('"b": ') + 1)
+
+
+@pytest.mark.parametrize("method", ["post", "put", "patch"])
+def test_a_dict_parameter_with_no_marker_is_the_json_body(method):
+    """A query string cannot hold a dict. A route whose method has a body reads the dict from the JSON body."""
+    api = BoltAPI()
+    route = getattr(api, method)
+
+    @route("/plain")
+    async def plain(data: dict):
+        return {"data": data}
+
+    @route("/typed/{item_id}")
+    async def typed(item_id: int, counts: dict[str, int], page: int = 1):
+        return {"item_id": item_id, "counts": counts, "page": page}
+
+    @route("/optional")
+    async def optional(data: dict | None = None):
+        return {"data": data}
+
+    # A list of simple values stays a repeated query parameter.
+    @route("/numbers")
+    async def numbers(ids: list[int]):
+        return {"ids": ids}
+
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        send = getattr(client, method)
+        response = send("/plain", json={"a": 1, "b": [2]})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"data": {"a": 1, "b": [2]}}
+
+        response = send("/typed/7?page=2", json={"a": 1})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"item_id": 7, "counts": {"a": 1}, "page": 2}
+
+        response = send("/typed/7", json={"a": "x"})
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"][0] == "body"
+
+        # A JSON array is not a dict.
+        assert send("/plain", json=[1]).status_code == 422
+
+        assert send("/optional", json={"a": 1}).json() == {"data": {"a": 1}}
+        assert send("/numbers?ids=1&ids=2").json() == {"ids": [1, 2]}
+
+        operations = client.get("/docs/openapi.json").json()["paths"]
+        plain_operation = operations["/plain"][method]
+        assert plain_operation["requestBody"]["content"]["application/json"]["schema"] == {"type": "object"}
+        assert "parameters" not in plain_operation
+        typed_operation = operations["/typed/{item_id}"][method]
+        assert typed_operation["requestBody"]["content"]["application/json"]["schema"] == {
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+        }
+        assert [parameter["name"] for parameter in typed_operation["parameters"]] == ["item_id", "page"]
+        assert "requestBody" not in operations["/numbers"][method]
+
+
+def test_a_dict_parameter_of_a_get_route_stays_a_query_parameter():
+    """A GET route has no body. Its registration does not fail for a dict parameter."""
+    api = BoltAPI()
+
+    @api.get("/search")
+    async def search(filters: dict | None = None):
+        return {"filters": filters}
+
+    with TestClient(api) as client:
+        assert client.get("/search").json() == {"filters": None}
 
 
 class TestMsgspecStructValidation:
