@@ -29,6 +29,11 @@ from typing import Annotated
 
 from msgspec import Meta
 
+# Python reads `$` as the end of the string, and also as the position before a
+# line break at the end. Each pattern ends with `$(?!\n)`, so a value with a
+# line break after it does not match. A JSON Schema validator (ECMA 262) reads
+# `$(?!\n)` as the end of the string.
+
 # =============================================================================
 # String Length Types (Django CharField equivalents)
 # =============================================================================
@@ -89,7 +94,7 @@ Email = Annotated[
     str,
     Meta(
         max_length=254,
-        pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$",
+        pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$(?!\n)",
         description="Valid email address",
         examples=["user@example.com"],
     ),
@@ -100,7 +105,7 @@ URL = Annotated[
     str,
     Meta(
         max_length=200,
-        pattern=r"^https?://[^\s/$.?#].[^\s]*$",
+        pattern=r"^https?://[^\s/$.?#].[^\s]*$(?!\n)",
         description="HTTP or HTTPS URL",
         examples=["https://example.com"],
     ),
@@ -111,7 +116,7 @@ HttpsURL = Annotated[
     str,
     Meta(
         max_length=200,
-        pattern=r"^https://[^\s/$.?#].[^\s]*$",
+        pattern=r"^https://[^\s/$.?#].[^\s]*$(?!\n)",
         description="HTTPS-only URL",
         examples=["https://example.com"],
     ),
@@ -122,7 +127,7 @@ Slug = Annotated[
     str,
     Meta(
         max_length=50,
-        pattern=r"^[-a-zA-Z0-9_]+$",
+        pattern=r"^[-a-zA-Z0-9_]+$(?!\n)",
         description="URL-safe identifier",
         examples=["my-blog-post", "article_123"],
     ),
@@ -133,7 +138,7 @@ Slug100 = Annotated[
     str,
     Meta(
         max_length=100,
-        pattern=r"^[-a-zA-Z0-9_]+$",
+        pattern=r"^[-a-zA-Z0-9_]+$(?!\n)",
         description="URL-safe identifier (100 chars)",
         examples=["my-long-blog-post-title"],
     ),
@@ -144,7 +149,7 @@ Slug200 = Annotated[
     str,
     Meta(
         max_length=200,
-        pattern=r"^[-a-zA-Z0-9_]+$",
+        pattern=r"^[-a-zA-Z0-9_]+$(?!\n)",
         description="URL-safe identifier (200 chars)",
         examples=["my-very-long-blog-post-title"],
     ),
@@ -154,7 +159,7 @@ Slug200 = Annotated[
 UUID = Annotated[
     str,
     Meta(
-        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$(?!\n)",
         description="UUID string format",
         examples=["550e8400-e29b-41d4-a716-446655440000"],
     ),
@@ -250,7 +255,7 @@ PositiveFloat = Annotated[
 IPv4 = Annotated[
     str,
     Meta(
-        pattern=r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$",
+        pattern=r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$(?!\n)",
         description="IPv4 address",
         examples=["192.168.1.1"],
     ),
@@ -261,7 +266,7 @@ IPv6 = Annotated[
     str,
     Meta(
         # Simplified pattern - allows common IPv6 formats
-        pattern=r"^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}$|^(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}$",
+        pattern=r"^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$(?!\n)|^::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}$(?!\n)|^(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}$(?!\n)",
         description="IPv6 address",
         examples=["::1", "2001:db8::1"],
     ),
@@ -271,7 +276,7 @@ IPv6 = Annotated[
 IP = Annotated[
     str,
     Meta(
-        pattern=r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$|^::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}$|^(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}$",
+        pattern=r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$(?!\n)|^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$(?!\n)|^::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}$(?!\n)|^(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}$(?!\n)",
         description="IPv4 or IPv6 address",
         examples=["192.168.1.1", "::1", "2001:db8::1"],
     ),
@@ -320,7 +325,7 @@ Username = Annotated[
     str,
     Meta(
         max_length=150,
-        pattern=r"^[\w.@+-]+$",
+        pattern=r"^[\w.@+-]+$(?!\n)",
         description="Username (Django auth compatible)",
         examples=["john_doe", "user@example"],
     ),
@@ -345,7 +350,7 @@ Phone = Annotated[
     str,
     Meta(
         max_length=20,
-        pattern=r"^\+?[1-9]\d{1,14}$",
+        pattern=r"^\+?[1-9]\d{1,14}$(?!\n)",
         description="Phone number (E.164 format)",
         examples=["+14155551234", "14155551234"],
     ),
@@ -355,7 +360,7 @@ Phone = Annotated[
 HexColor = Annotated[
     str,
     Meta(
-        pattern=r"^#[0-9a-fA-F]{6}$",
+        pattern=r"^#[0-9a-fA-F]{6}$(?!\n)",
         description="Hex color (#RRGGBB)",
         examples=["#FF5733", "#ffffff"],
     ),
@@ -367,7 +372,7 @@ CurrencyCode = Annotated[
     Meta(
         min_length=3,
         max_length=3,
-        pattern=r"^[A-Z]{3}$",
+        pattern=r"^[A-Z]{3}$(?!\n)",
         description="ISO 4217 currency code",
         examples=["USD", "EUR", "GBP"],
     ),
@@ -379,7 +384,7 @@ CountryCode = Annotated[
     Meta(
         min_length=2,
         max_length=2,
-        pattern=r"^[A-Z]{2}$",
+        pattern=r"^[A-Z]{2}$(?!\n)",
         description="ISO 3166-1 alpha-2 country code",
         examples=["US", "GB", "DE"],
     ),
@@ -391,7 +396,7 @@ LanguageCode = Annotated[
     Meta(
         min_length=2,
         max_length=5,
-        pattern=r"^[a-z]{2}(?:-[A-Z]{2})?$",
+        pattern=r"^[a-z]{2}(?:-[A-Z]{2})?$(?!\n)",
         description="Language code (ISO 639-1)",
         examples=["en", "en-US", "fr-FR"],
     ),
@@ -402,7 +407,7 @@ Timezone = Annotated[
     str,
     Meta(
         max_length=50,
-        pattern=r"^[A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?$|^UTC$",
+        pattern=r"^[A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?$(?!\n)|^UTC$(?!\n)",
         description="IANA timezone",
         examples=["America/New_York", "Europe/London", "UTC"],
     ),

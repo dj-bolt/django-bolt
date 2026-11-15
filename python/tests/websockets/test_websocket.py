@@ -15,6 +15,7 @@ Tests the WebSocket functionality including:
 from __future__ import annotations
 
 import contextlib
+import functools
 import time
 from typing import Annotated
 
@@ -24,8 +25,8 @@ import pytest
 from django_bolt import BoltAPI, WebSocket
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, Requires
 from django_bolt.param_functions import Cookie, Header, Query
-from django_bolt.testing import ConnectionClosed, WebSocketTestClient
-from django_bolt.websocket import CloseCode
+from django_bolt.testing import ConnectionClosed, TestClient, WebSocketTestClient
+from django_bolt.websocket import CloseCode, is_websocket_handler
 
 # Test secret for JWT tokens
 TEST_JWT_SECRET = "test-secret-key-for-websocket-tests"
@@ -211,7 +212,10 @@ def api():
     @api.websocket("/ws/slow")
     async def slow_handler(websocket: WebSocket):
         await websocket.accept()
-        # Don't send anything - client should timeout
+        # Send nothing and stay connected, so the client times out.
+        # A return here closes the connection with 1000.
+        async for _message in websocket.iter_text():
+            pass
 
     return api
 
@@ -285,6 +289,35 @@ async def test_websocket_binary(api):
         assert response[4:] == data
 
 
+@pytest.mark.asyncio
+async def test_websocket_route_has_the_api_prefix_and_documents_its_auth():
+    """A WebSocket route gets the prefix of the API. An explicit ``auth`` shows as the security of its operation."""
+    api = BoltAPI(prefix="/api")
+
+    @api.websocket("/ws/open")
+    async def open_route(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("open")
+
+    @api.websocket("/ws/private", auth=[JWTAuthentication(secret=TEST_JWT_SECRET)], guards=[IsAuthenticated()])
+    async def private_route(websocket: WebSocket):
+        await websocket.accept()
+
+    async with WebSocketTestClient(api, "/api/ws/open") as ws:
+        assert await ws.receive_text() == "open"
+
+    with pytest.raises(ValueError, match="No WebSocket handler found"):
+        async with WebSocketTestClient(api, "/ws/open"):
+            pass
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        paths = client.get("/docs/openapi.json").json()["paths"]
+
+    assert "security" not in paths["/api/ws/open"]["get"]
+    assert paths["/api/ws/private"]["get"]["security"] == [{"BearerAuth": []}]
+
+
 # --- Path Parameter Tests ---
 
 
@@ -353,6 +386,43 @@ async def test_websocket_route_path_with_a_character_that_a_url_escapes_matches(
         assert await ws.receive_text() == expected
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trailing_slash", ["strip", "append", "keep"])
+@pytest.mark.parametrize("mounted", [False, True])
+@pytest.mark.parametrize("route_path", ["/ws/room", "/ws/room/", "/ws/{name}", "/ws/{name}/"])
+async def test_websocket_route_with_trailing_slash_is_reachable(trailing_slash, mounted, route_path):
+    """Test a WebSocket route answers with and without a trailing slash, for each mode of the API.
+
+    The server test for the same rule is
+    integration/test_websocket_trailing_slash_server_integration.py.
+    """
+    api = BoltAPI(trailing_slash=trailing_slash)
+
+    if "{name}" in route_path:
+
+        @api.websocket(route_path)
+        async def named_room(websocket: WebSocket, name: str):
+            await websocket.accept()
+            await websocket.send_text("joined" if name == "room" else name)
+
+    else:
+
+        @api.websocket(route_path)
+        async def room(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("joined")
+
+    prefix = ""
+    if mounted:
+        parent = BoltAPI(trailing_slash=trailing_slash)
+        parent.mount("/chat", api)
+        api, prefix = parent, "/chat"
+
+    for url in (f"{prefix}/ws/room", f"{prefix}/ws/room/"):
+        async with WebSocketTestClient(api, url) as ws:
+            assert await ws.receive_text() == "joined"
+
+
 # --- Query Parameter Tests ---
 
 
@@ -404,6 +474,7 @@ async def test_websocket_server_close_normal(api):
             await ws.receive_text()
 
         assert exc_info.value.code == CloseCode.NORMAL
+        assert exc_info.value.reason == "done"
 
 
 @pytest.mark.asyncio
@@ -414,6 +485,30 @@ async def test_websocket_server_close_error(api):
             await ws.receive_text()
 
         assert exc_info.value.code == CloseCode.INTERNAL_ERROR
+        assert exc_info.value.reason == "something went wrong"
+
+
+@pytest.mark.asyncio
+async def test_websocket_server_close_reason_reaches_receive_bytes(api):
+    """The close reason of the handler is in the error of each receive method."""
+    async with WebSocketTestClient(api, "/ws/close-error") as ws:
+        with pytest.raises(ConnectionClosed) as exc_info:
+            await ws.receive_bytes()
+
+        assert exc_info.value.code == CloseCode.INTERNAL_ERROR
+        assert exc_info.value.reason == "something went wrong"
+
+
+@pytest.mark.asyncio
+async def test_websocket_handler_error_closes_with_the_reason_of_the_server(api):
+    """The server closes with 1011 and the reason "Internal error" when the handler raises after accept."""
+    with pytest.raises(ValueError, match="Test error"):
+        async with WebSocketTestClient(api, "/ws/error") as ws:
+            with pytest.raises(ConnectionClosed) as exc_info:
+                await ws.receive_text()
+
+            assert exc_info.value.code == CloseCode.INTERNAL_ERROR
+            assert exc_info.value.reason == "Internal error"
 
 
 # --- Type Coercion Tests ---
@@ -875,6 +970,61 @@ async def test_websocket_parameter_may_be_annotated_or_a_subclass(kind):
 
     async with WebSocketTestClient(api, f"/ws/{kind}", query_string="room=blue") as ws:
         assert await ws.receive_text() == "blue"
+
+
+class _RoomHandlers:
+    """A callable object and a method, as WebSocket handlers."""
+
+    async def __call__(self, websocket: WebSocket, room: str):
+        await websocket.accept()
+        await websocket.send_text(f"call:{room}")
+
+    async def method(self, websocket: WebSocket, room: str):
+        await websocket.accept()
+        await websocket.send_text(f"method:{room}")
+
+
+class _SyncCallable:
+    def __call__(self, websocket: WebSocket):
+        """A sync `__call__` is not a WebSocket handler."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["call", "method"])
+async def test_websocket_handler_may_be_a_callable_object_or_a_bound_method(kind):
+    """The route registers the bound method, as an HTTP route does. The decorator returns the object."""
+    api = BoltAPI()
+    handlers = _RoomHandlers()
+    handler = handlers if kind == "call" else handlers.method
+
+    assert api.websocket("/ws/{room}")(handler) is handler
+    # The mark is on the method that the route registered.
+    assert is_websocket_handler(handlers.__call__ if kind == "call" else handler)
+
+    async with WebSocketTestClient(api, "/ws/blue") as ws:
+        assert await ws.receive_text() == f"{kind}:blue"
+
+
+def test_websocket_handler_that_is_a_partial_raises_a_clear_error():
+    async def handler(websocket: WebSocket, room: str = "lobby"):
+        await websocket.accept()
+
+    api = BoltAPI()
+    with pytest.raises(TypeError, match="A route handler cannot be a functools.partial"):
+        api.websocket("/ws/partial")(functools.partial(handler, room="blue"))
+
+
+@pytest.mark.parametrize(
+    ("handler", "message"),
+    [
+        ("handler", "A route handler must be callable, not str 'handler'"),
+        (_SyncCallable(), "WebSocket handler '_SyncCallable.__call__' must be an async function"),
+    ],
+)
+def test_websocket_handler_that_cannot_run_raises_a_clear_error(handler, message):
+    api = BoltAPI()
+    with pytest.raises(TypeError, match=message):
+        api.websocket("/ws/bad")(handler)
 
 
 @pytest.mark.asyncio
