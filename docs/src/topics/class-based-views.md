@@ -30,6 +30,15 @@ This creates:
 - `GET /hello` - Calls the `get` method
 - `POST /hello` - Calls the `post` method
 
+Bolt passes the request to the parameter with the name `request` or `req`, at each position. `self.request` is the same request. A method with no such parameter can still read `self.request`:
+
+```python
+@api.view("/whoami")
+class WhoAmIView(APIView):
+    async def get(self):
+        return {"path": self.request.path}
+```
+
 ### Available methods
 
 Implement any of these methods:
@@ -137,6 +146,8 @@ This creates:
 | PATCH | `/items/{pk}` | `partial_update` |
 | DELETE | `/items/{pk}` | `destroy` |
 
+An action can be `async def` or `def`. Bolt registers only the actions that the class defines.
+
 Set `pagination_class` on a `ViewSet`, `ReadOnlyModelViewSet`, or `ModelViewSet`
 to have the `list()` action paginated automatically. Use `@paginate(...)` when
 you want per-method control instead.
@@ -167,6 +178,8 @@ class ArticleViewSet(ModelViewSet):
     pagination_class = PageNumberPagination
 ```
 
+The `create` action only inserts. A primary key or a unique value that a row already has answers 409 Conflict, and the row does not change. `perform_create()` saves with `force_insert=True`. If you override `perform_create()`, call `super().perform_create(obj)` or save with `force_insert=True` to keep this.
+
 ### Serializer output
 
 When `serializer_class` is a `Serializer`, generated `list` and `retrieve`
@@ -176,6 +189,25 @@ and nested serializers.
 
 Plain `msgspec.Struct` response models still use the faster `QuerySet.values()`
 projection path for raw column output.
+
+### Request body errors
+
+The generated `create`, `update` and `partial_update` actions validate the
+request body as a function route does for a body parameter of the same
+serializer. A bad body gives the same 422 response. The response reports the
+first error of the body:
+
+```json
+{
+    "detail": [
+        {
+            "loc": ["body", "title"],
+            "msg": "Object missing required field `title`",
+            "type": "missing_field"
+        }
+    ]
+}
+```
 
 ### get_queryset
 
@@ -202,6 +234,7 @@ async def retrieve(self, request):
 ```
 
 By default, `get_object()` reads the current lookup value from `self.request.params`.
+A value that the lookup field cannot hold, such as `abc` for an integer primary key, also raises 404.
 If you need to resolve an object manually, explicit lookups still work:
 
 ```python
@@ -222,6 +255,15 @@ class ArticleViewSet(ModelViewSet):
     async def retrieve(self, request):
         article = await self.get_object()
         return {"slug": article.slug}
+```
+
+You can also give the lookup field at registration. This value has priority over the class attribute and applies to this registration only:
+
+```python
+@api.viewset("/articles-by-slug", lookup_field="slug")
+class ArticleBySlugViewSet(ModelViewSet):
+    queryset = Article.objects.all()
+    serializer_class = ArticleSerializer
 ```
 
 ### Serializer Priority
@@ -450,6 +492,11 @@ Available mixins:
 | `UpdateMixin` | `update` | `/items/{pk}` | PUT |
 | `PartialUpdateMixin` | `partial_update` | `/items/{pk}` | PATCH |
 | `DestroyMixin` | `destroy` | `/items/{pk}` | DELETE |
+
+The write actions do not take each field from the request body:
+
+- `update` and `partial_update` write to the object that `get_object()` returns. They do not write the primary key, the lookup field or a `read_only` serializer field. Thus the body cannot move the write to a row outside `get_queryset()`.
+- `create` does not write a `read_only` serializer field. It does not write the primary key when the database gives the primary key (`AutoField`, `BigAutoField`).
 
 ## ReadOnlyModelViewSet
 

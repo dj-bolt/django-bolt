@@ -1,6 +1,6 @@
 import pytest
 
-from django_bolt import BoltAPI, ModelViewSet, ViewSet
+from django_bolt import BoltAPI, ModelViewSet, ViewSet, action
 from django_bolt._view_context import _current_request
 from django_bolt.pagination import PageNumberPagination, paginate
 from django_bolt.serializers import Serializer, field_validator
@@ -14,7 +14,7 @@ from django_bolt.views import (
     RetrieveMixin,
     UpdateMixin,
 )
-from tests.test_models import Article
+from tests.test_models import Article, Country
 
 
 @pytest.fixture
@@ -246,6 +246,50 @@ def test_create_mixin(api, view_classes: list[type]):
         assert Article.objects.filter(id=data["id"]).exists()
 
 
+@pytest.mark.django_db(transaction=True)
+def test_create_mixin_inserts_only(api):
+    """POST with the primary key of an existing row answers 409 and does not update the row."""
+
+    class CountrySchema(Serializer):
+        code: str
+        name: str
+
+    @api.viewset("/countries")
+    class CountryViewSet(ModelViewSet):
+        queryset = Country.objects.all()
+        serializer_class = CountrySchema
+
+    calls = []
+
+    @api.viewset("/hooked")
+    class HookedViewSet(CountryViewSet):
+        async def perform_create(self, obj):
+            calls.append(obj.code)
+            await super().perform_create(obj)
+
+    Country.objects.create(code="PK", name="Pakistan")
+
+    def rows():
+        return list(Country.objects.order_by("code").values_list("code", "name"))
+
+    with TestClient(api) as client:
+        response = client.post("/countries", json={"code": "FR", "name": "France"})
+        assert response.status_code == 201
+        assert response.json() == {"code": "FR", "name": "France"}
+
+        for prefix in ("/countries", "/hooked"):
+            response = client.post(prefix, json={"code": "PK", "name": "changed"})
+            assert response.status_code == 409
+            assert response.json() == {"detail": "The object conflicts with an existing object"}
+            assert rows() == [("FR", "France"), ("PK", "Pakistan")]
+
+        # The connection is usable after the conflict, and the hook override still creates.
+        response = client.post("/hooked", json={"code": "DE", "name": "Germany"})
+        assert response.status_code == 201
+        assert calls == ["PK", "DE"]
+        assert rows() == [("DE", "Germany"), ("FR", "France"), ("PK", "Pakistan")]
+
+
 @pytest.mark.parametrize(
     "view_classes",
     [
@@ -339,6 +383,73 @@ def test_partial_update_mixin_uses_validated_values(api, view_classes: list[type
 
         article.refresh_from_db()
         assert article.title == "Patched Title"
+
+
+class ArticleOmitDefaultsSchema(Serializer, omit_defaults=True):
+    title: str
+    content: str
+    author: str
+    is_published: bool = False
+
+
+@pytest.mark.django_db(transaction=True)
+def test_update_writes_the_default_values_of_an_omit_defaults_serializer(api):
+    """PUT is a full update. A field at its default value replaces the old value."""
+    article = Article.objects.create(title="Old Title", content="Old Content", author="Author 1", is_published=True)
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+        update_serializer_class = ArticleOmitDefaultsSchema
+
+    with TestClient(api) as client:
+        response = client.put(
+            f"/articles/{article.id}",
+            json={"title": "New Title", "content": "New Content", "author": "Author 2"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": article.id,
+        "title": "New Title",
+        "content": "New Content",
+        "author": "Author 2",
+        "is_published": False,
+    }
+    article.refresh_from_db()
+    assert (article.title, article.is_published) == ("New Title", False)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_write_actions_use_the_overrides_of_get_queryset_and_get_serializer_class(api):
+    """A viewset with no queryset attribute gets its model and its serializers from the two hooks."""
+    article = Article.objects.create(title="Old Title", content="Old Content", author="Author 1")
+
+    class ArticleTitleSchema(Serializer):
+        title: str
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ModelViewSet):
+        async def get_queryset(self):
+            return Article.objects.all()
+
+        def get_serializer_class(self, action: str | None = None):
+            # ArticleSchema needs an id, so it cannot validate the bodies below.
+            return {"create": ArticleCreateSchema, "update": ArticleTitleSchema}.get(action, ArticleSchema)
+
+    with TestClient(api) as client:
+        created = client.post("/articles", json={"title": "Created", "content": "Content", "author": "Author 2"})
+        updated = client.put(f"/articles/{article.id}", json={"title": "Updated"})
+        # The serializer of the update action has no content field, so PATCH ignores the content.
+        patched = client.patch(f"/articles/{article.id}", json={"title": "Patched", "content": "Ignored"})
+
+    assert (created.status_code, created.json()["title"]) == (201, "Created")
+    assert Article.objects.filter(id=created.json()["id"], author="Author 2").exists()
+    assert (updated.status_code, updated.json()["title"]) == (200, "Updated")
+    assert (patched.status_code, patched.json()["title"]) == (200, "Patched")
+    article.refresh_from_db()
+    assert (article.title, article.content) == ("Patched", "Old Content")
 
 
 @pytest.mark.parametrize(
@@ -449,6 +560,7 @@ def test_retrieve_by_custom_lookup_field(api, view_classes: list[type]):
         # Try to retrieve by non-existent title
         response = client.get("/articles/nonexistent")
         assert response.status_code == 404
+        assert response.json() == {"detail": "Not found"}
 
 
 @pytest.mark.asyncio
@@ -558,11 +670,17 @@ def test_list_queryset_reevaluation(api, view_classes: list[type]):
         queryset = Article.objects.all()
         serializer_class = ArticleSchema
 
+        @action(methods=["GET"], detail=False)
+        async def titles(self, request):
+            # The handler reads the queryset itself. A shared queryset keeps the rows of the first request.
+            return [article.title async for article in await self.get_queryset()]
+
     with TestClient(api) as client:
         # First request - empty
         response = client.get("/articles")
         assert response.status_code == 200
         assert len(response.json()) == 0
+        assert client.get("/articles/titles").json() == []
 
         # Create article outside the viewset
         article = Article.objects.create(
@@ -582,6 +700,8 @@ def test_list_queryset_reevaluation(api, view_classes: list[type]):
         response = client.get(f"/articles/{article.id}")
         assert response.status_code == 200
         assert response.json() == response_data[0]
+
+        assert client.get("/articles/titles").json() == ["Article 1"]
 
 
 @pytest.mark.parametrize(

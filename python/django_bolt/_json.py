@@ -2,7 +2,7 @@
 
 This module provides optimized JSON encoding/decoding using msgspec with:
 - Thread-local cached encoder/decoder instances (thread-safe buffer reuse)
-- Support for common non-JSON-native types (datetime, Path, Decimal, UUID, IP addresses)
+- Support for common non-JSON-native types (datetime, Path, Decimal, UUID, IP addresses, deque)
 - Automatic Serializer.dump() for write_only, computed_field support
 - Type-safe decoding with validation
 - Custom encoder/decoder hooks
@@ -12,10 +12,13 @@ Inspired by Litestar's serialization approach.
 
 from __future__ import annotations
 
+import re
+from collections import deque
 from collections.abc import Callable
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
+from fractions import Fraction
 from ipaddress import (
     IPv4Address,
     IPv4Interface,
@@ -25,12 +28,11 @@ from ipaddress import (
     IPv6Network,
 )
 from pathlib import Path, PurePath
-from typing import Any, TypeVar
+from types import GeneratorType
+from typing import Any
 from uuid import UUID
 
 import msgspec
-
-T = TypeVar("T")
 
 # Default type encoders for non-JSON-native types
 # Maps type -> encoder function
@@ -45,12 +47,23 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
     # Paths
     Path: str,
     PurePath: str,
-    # Dates/Times -> ISO format
-    datetime: lambda v: v.isoformat(),
+    # msgspec encodes an exact datetime, time or Decimal itself. Only a
+    # subclass comes here. Return the exact type, and msgspec encodes it as
+    # it encodes the base type: "Z" for UTC, a string for a Decimal.
+    datetime: lambda v: datetime(
+        v.year, v.month, v.day, v.hour, v.minute, v.second, v.microsecond, v.tzinfo, fold=v.fold
+    ),
     date: lambda v: v.isoformat(),
-    time: lambda v: v.isoformat(),
-    # Decimals -> int or float
-    Decimal: lambda v: int(v) if v.as_tuple().exponent >= 0 else float(v),
+    time: lambda v: time(v.hour, v.minute, v.second, v.microsecond, v.tzinfo, fold=v.fold),
+    Decimal: Decimal,
+    # The same rule for a subclass of int, float, bytes or timedelta.
+    # The base descriptor returns the exact type for each of the first three.
+    int: int.__int__,
+    float: float.__float__,
+    bytes: bytes.__bytes__,
+    # msgspec encodes an exact bytearray as base64 text. bytes() copies a subclass.
+    bytearray: bytes,
+    timedelta: lambda v: timedelta(days=v.days, seconds=v.seconds, microseconds=v.microseconds),
     # IP addresses
     IPv4Address: str,
     IPv4Interface: str,
@@ -60,6 +73,13 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
     IPv6Network: str,
     # UUID
     UUID: str,
+    # A deque or a generator is a JSON array. The items go through the encoder again.
+    deque: list,
+    GeneratorType: list,
+    # A Fraction is text, as a Decimal is: "1/3", or "2" for an integer value.
+    Fraction: str,
+    # A compiled regular expression is its pattern text.
+    re.Pattern: lambda v: v.pattern,
 }
 
 
@@ -125,33 +145,4 @@ def decode(value: bytes | str) -> Any:
     return _DECODER.decode(value)
 
 
-def decode_typed[T](
-    value: bytes | str,
-    target_type: type[T],
-    strict: bool = True,
-) -> T:
-    """Decode JSON with type validation and coercion.
-
-    Args:
-        value: JSON bytes or string
-        target_type: Expected type (e.g., msgspec.Struct subclass)
-        strict: If False, enables lenient type coercion (e.g., "123" -> 123)
-
-    Returns:
-        Decoded and validated object of target_type
-
-    Raises:
-        msgspec.DecodeError: If decoding or validation fails
-        msgspec.ValidationError: If type validation fails
-
-    Examples:
-        >>> class User(msgspec.Struct):
-        ...     id: int
-        ...     name: str
-        >>> decode_typed(b'{"id": 1, "name": "Alice"}', User)
-        User(id=1, name='Alice')
-    """
-    return msgspec.json.decode(value, type=target_type, strict=strict)
-
-
-__all__ = ["encode", "decode", "decode_typed", "DEFAULT_TYPE_ENCODERS", "default_serializer"]
+__all__ = ["encode", "decode", "DEFAULT_TYPE_ENCODERS", "default_serializer"]

@@ -344,7 +344,13 @@ class Request(Protocol):
 
         Returns:
             Django User model instance (wrapped in LazyUser proxy) if authentication context
-            exists, None if no authentication or user not found.
+            exists, None if no authentication.
+
+            Bolt does not load the user before the first read. Thus, for a valid
+            credential whose user does not exist, the value is a falsy LazyUser and
+            not None: ``not request.user`` is True, and ``await request.auser()``
+            gives None. The read of an attribute, such as ``request.user.id``,
+            raises ``Unauthorized``, and the client gets a 401.
 
         Performance:
             - Lazy-loaded: User is only queried from database when first accessed
