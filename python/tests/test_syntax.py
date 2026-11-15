@@ -923,6 +923,54 @@ def test_wrong_method_on_a_route_path_answers_405_with_allow(method, path, allow
         assert "allow" not in missing.headers
 
 
+@pytest.mark.parametrize(
+    ("trailing_slash", "method", "path", "allow"),
+    [
+        # The routes are /plain and /items/{item_id}.
+        ("strip", "POST", "/plain/", "GET, OPTIONS"),
+        ("strip", "HEAD", "/plain/", "GET, OPTIONS"),
+        ("strip", "PUT", "/items/3/", "GET, DELETE, OPTIONS"),
+        # The routes are /plain/ and /items/{item_id}/.
+        ("append", "POST", "/plain", "GET, OPTIONS"),
+        ("append", "PUT", "/items/3", "GET, DELETE, OPTIONS"),
+    ],
+)
+def test_wrong_method_on_the_other_slash_form_of_a_route_path_answers_405(trailing_slash, method, path, allow):
+    """A path that redirects for a method of its route answers 405 for each other method."""
+    api = BoltAPI(trailing_slash=trailing_slash)
+
+    @api.get("/plain")
+    async def get_plain():
+        return {"ok": True}
+
+    @api.get("/items/{item_id}")
+    async def get_item(item_id: int):
+        return {"item_id": item_id}
+
+    @api.delete("/items/{item_id}")
+    async def delete_item(item_id: int):
+        return {"item_id": item_id}
+
+    with TestClient(api) as client:
+        response = client.request(method, path)
+        assert response.status_code == 405
+        assert response.headers["allow"] == allow
+        if method != "HEAD":
+            assert response.json() == {"detail": "Method Not Allowed"}
+        # A method of the route still redirects to the route path.
+        canonical = path[:-1] if path.endswith("/") else path + "/"
+        redirect = client.get(path, follow_redirects=False)
+        assert redirect.status_code == 308
+        assert redirect.headers["location"] == canonical
+        # The automatic OPTIONS answer is the same for the two forms of the path.
+        options = client.options(path)
+        assert options.status_code == 204
+        assert options.headers["allow"] == allow
+        assert client.options(canonical).headers["allow"] == allow
+        # A path with no route in either form is still a 404.
+        assert client.request(method, "/no-route/").status_code == 404
+
+
 def test_explicit_options_handler():
     """Test that explicit OPTIONS handler overrides automatic behavior"""
     api = BoltAPI()

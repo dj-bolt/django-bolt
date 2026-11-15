@@ -54,6 +54,8 @@ async def list_reports():
 
 Bolt adds no HEAD route for a GET route. Thus `HEAD /reports` also gets 405. Add `@api.head()` to serve HEAD.
 
+The other slash form of a route path gets the same answer. `GET /reports/` redirects to `/reports`, and `POST /reports/` gets 405 with the `Allow` header of `/reports`.
+
 Example with all methods:
 
 ```python

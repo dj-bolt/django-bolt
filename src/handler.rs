@@ -949,27 +949,29 @@ async fn route_request(
             // No route found - check for trailing slash redirect FIRST
             // This only runs when route doesn't match (minimal overhead)
             // Starlette-style: redirect to canonical URL if alternate path exists
-            if route_path != "/" {
-                let alternate_path = if route_path.ends_with('/') {
-                    route_path.trim_end_matches('/').to_string()
-                } else {
-                    format!("{}/", route_path)
-                };
+            let alternate_path = if route_path == "/" {
+                None
+            } else if route_path.ends_with('/') {
+                Some(route_path.trim_end_matches('/').to_string())
+            } else {
+                Some(format!("{}/", route_path))
+            };
 
-                // Try alternate path - if it matches, send 308 redirect
-                if let Some(alternate) = router.find(method, &alternate_path) {
-                    // The line of the redirect has the filter of the route at the other form.
-                    *access_log_route = Some(alternate.handler_id());
-                    let query = req.query_string();
-                    let location = if query.is_empty() {
-                        alternate_path
-                    } else {
-                        format!("{}?{}", alternate_path, query)
-                    };
-                    return HttpResponse::PermanentRedirect() // 308
-                        .insert_header(("Location", location))
-                        .finish();
-                }
+            // Try alternate path - if it matches, send 308 redirect
+            if let Some(alternate_path) = &alternate_path
+                && let Some(alternate) = router.find(method, alternate_path)
+            {
+                // The line of the redirect has the filter of the route at the other form.
+                *access_log_route = Some(alternate.handler_id());
+                let query = req.query_string();
+                let location = if query.is_empty() {
+                    alternate_path.clone()
+                } else {
+                    format!("{}?{}", alternate_path, query)
+                };
+                return HttpResponse::PermanentRedirect() // 308
+                    .insert_header(("Location", location))
+                    .finish();
             }
 
             // No explicit handler found - check for automatic OPTIONS
@@ -1029,12 +1031,27 @@ async fn route_request(
 
             // The path has routes, but none for this method: 405 with `Allow`
             // (RFC 9110 section 15.5.6). This lookup runs on a miss only.
-            let allowed_methods = router.find_all_methods(route_path);
+            // The other slash form of the path gets the same check. That form
+            // redirects for a method of its routes, so the path is a route path.
+            let mut allowed_path = route_path;
+            let mut allowed_methods = router.find_all_methods(route_path);
+            let other_form = allowed_methods.is_empty();
+            if other_form && let Some(alternate_path) = &alternate_path {
+                allowed_path = alternate_path;
+                allowed_methods = router.find_all_methods(alternate_path);
+            }
             if !allowed_methods.is_empty() {
                 // The line of this answer has the filter of the first route of the path.
                 *access_log_route = router
-                    .find(&allowed_methods[0], route_path)
+                    .find(&allowed_methods[0], allowed_path)
                     .map(|found| found.handler_id());
+                // The automatic OPTIONS answer of the route path.
+                if other_form && method == "OPTIONS" {
+                    return HttpResponse::NoContent()
+                        .insert_header(("Allow", allowed_methods.join(", ")))
+                        .insert_header(("Content-Type", "application/json"))
+                        .finish();
+                }
                 return responses::error_405(&allowed_methods);
             }
 
