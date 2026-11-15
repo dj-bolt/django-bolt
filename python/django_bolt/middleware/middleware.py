@@ -106,7 +106,7 @@ def normalize_middleware_specs(
     Normalize and validate middleware specs.
 
     Allowed forms:
-    - Middleware classes (Django-style __init__(get_response))
+    - Middleware classes (Django-style __init__(get_response), with callable instances)
     - DjangoMiddleware / DjangoMiddlewareStack wrapper instances
     - Dict middleware metadata (Rust-handled middleware) with the type "cors" or "rate_limit"
     - FunctionMiddlewareSpec (route-level only)
@@ -148,6 +148,13 @@ def normalize_middleware_specs(
             continue
 
         if isinstance(spec, type):
+            # The chain calls the instance with the request. `type` gives each
+            # class a __call__ that builds an instance, so read the classes.
+            if not any("__call__" in vars(base) for base in spec.__mro__ if base is not object):
+                raise TypeError(
+                    f"{context} middleware class {spec.__name__} has no __call__. "
+                    "A middleware class takes get_response in __init__, and Bolt calls its instance with the request."
+                )
             normalized.append(spec)
             continue
 

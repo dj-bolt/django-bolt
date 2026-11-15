@@ -794,6 +794,29 @@ class TestModelValidateCollectsAllErrors:
             if tuple(err["loc"]) in {("body", "password"), ("body", "age")}:
                 assert err["type"] == "missing"
 
+    def test_each_value_that_the_conversion_rejects_is_in_the_error_list_with_its_full_loc(self):
+        class Signup(Serializer):
+            age: int
+            name: str
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Signup.model_validate({"age": "12", "name": 5})
+
+        assert exc_info.value.errors() == [
+            {"loc": ("body", "age"), "msg": "Expected `int`, got `str`", "type": "validation_error"},
+            {"loc": ("body", "name"), "msg": "Expected `str`, got `int`", "type": "validation_error"},
+        ]
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Signup.model_validate({"age": "12", "name": "x"})
+
+        assert [error["loc"] for error in exc_info.value.errors()] == [("body", "age")]
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            _Order.model_validate({"items": [{"city": "a", "zip": "1"}, {"city": 1, "zip": "2"}]})
+
+        assert [error["loc"] for error in exc_info.value.errors()] == [("body", "items", "1", "city")]
+
     def test_error_list_has_one_entry_for_each_bad_field_and_none_for_an_absent_optional_field(self):
         class Signup(Serializer):
             nickname: str = "anon"

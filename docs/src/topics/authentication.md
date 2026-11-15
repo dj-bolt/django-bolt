@@ -610,9 +610,9 @@ async def internal_endpoint(request):
     return {"status": "authorized"}
 ```
 
-API keys are sent in the `X-API-Key` header by default.
+API keys are sent in the `X-API-Key` header by default. The header value is the key. The value can also name a scheme: `Bearer <key>` or `ApiKey <key>`. Bolt removes the scheme before it compares the key.
 
-`api_keys` must be a set, list or tuple of non-empty strings. A str, such as `api_keys="sk-prod-123abc"`, or an empty key raises `ImproperlyConfigured`. Thus a missing environment variable in `api_keys={os.environ.get("API_KEY", "")}` stops startup.
+`api_keys` must be a set, list or tuple of non-empty strings. A str, such as `api_keys="sk-prod-123abc"`, or an empty key raises `ImproperlyConfigured`. A key that starts with `Bearer ` or `ApiKey ` (in any letter case) also raises, because Bolt reads these words as the scheme. Thus a missing environment variable in `api_keys={os.environ.get("API_KEY", "")}` stops startup.
 
 ### API key permissions (In Development)
 
@@ -642,6 +642,8 @@ APIKeyAuthentication(
     header="Authorization"  # Or any custom header
 )
 ```
+
+A client then sends `Authorization: Bearer <key>`, `Authorization: ApiKey <key>`, or the key alone.
 
 ## Session authentication
 

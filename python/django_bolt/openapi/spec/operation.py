@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .base import BaseSchemaObject
@@ -81,10 +81,11 @@ class Operation(BaseSchemaObject):
     initiated by the API provider and the expected responses.
     """
 
-    deprecated: bool = False
+    deprecated: bool = field(default=False, metadata={"omit_if": False})
     """Declares this operation to be deprecated.
 
     Consumers SHOULD refrain from usage of the declared operation. Default value is ``False``.
+    The document has this key only for a deprecated operation.
     """
 
     security: list[SecurityRequirement] | None = None

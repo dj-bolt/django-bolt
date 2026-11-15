@@ -27,7 +27,7 @@ Base class for all HTTP error responses.
 ```python
 HTTPException(
     status_code: int = 500,
-    detail: str = "",
+    detail: str | dict | list = "",
     headers: dict[str, str] = None,
     extra: dict | list = None,
 )
@@ -37,7 +37,7 @@ HTTPException(
 |-----------|------|-------------|
 | `status_code` | `int` | HTTP status code |
 | `detail` | `str` | Error message (defaults to HTTP phrase) |
-| `headers` | `dict` | Headers to include in response |
+| `headers` | `dict` | Headers to include in response. A number value, such as `{"Retry-After": 30}`, becomes a `str`. A value of another type raises `TypeError`. |
 | `extra` | `dict \| list` | Additional data in response |
 
 A `str` in the first position is the detail. Thus `NotFound("User not found")` is the same as `NotFound(detail="User not found")`, and `HTTPException("Storage is down")` is a 500.

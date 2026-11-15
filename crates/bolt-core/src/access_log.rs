@@ -1,23 +1,31 @@
-//! The access-log filter of a route: sampling and the slow-request threshold.
+//! The access-log filter of a route: sampling, the slow-request threshold, and
+//! the paths and status codes that write no line.
 //!
-//! Python gives the two values of `LoggingConfig` at route registration. The
+//! Python gives the values of `LoggingConfig` at route registration. The
 //! request path reads them from the route metadata, with no Python call.
 
+use ahash::AHashSet;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::time::Instant;
 
 /// Route metadata key of `LoggingConfig.sample_rate`.
 const SAMPLE_RATE_KEY: &str = "access_log_sample_rate";
 /// Route metadata key of `LoggingConfig.min_duration_ms`.
 const MIN_DURATION_KEY: &str = "access_log_min_duration_ms";
+/// Route metadata key of `LoggingConfig.skip_paths`.
+const SKIP_PATHS_KEY: &str = "access_log_skip_paths";
+/// Route metadata key of `LoggingConfig.skip_status_codes`.
+const SKIP_STATUS_CODES_KEY: &str = "access_log_skip_status_codes";
 
-/// Which 1xx to 3xx responses of a route write an access-log line.
-/// A 4xx or a 5xx response always writes its line.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// Which responses of a route write an access-log line.
+/// The sample rate and the threshold apply to a 1xx to 3xx response only.
+/// A skipped path or status code writes no line for each status class.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AccessLogFilter {
     /// The part of the 1xx to 3xx responses that write a line, from 0.0 to 1.0.
     sample_rate: Option<f64>,
@@ -25,6 +33,10 @@ pub struct AccessLogFilter {
     min_duration_ms: Option<f64>,
     /// `false` when the two values set no limit. The request path then makes one check.
     has_limit: bool,
+    /// A request with one of these paths writes no line. The match is exact.
+    skip_paths: AHashSet<String>,
+    /// A response with one of these status codes writes no line.
+    skip_status_codes: Vec<u16>,
 }
 
 impl AccessLogFilter {
@@ -33,7 +45,20 @@ impl AccessLogFilter {
             sample_rate,
             min_duration_ms,
             has_limit: sample_rate.is_some() || min_duration_ms.is_some(),
+            skip_paths: AHashSet::new(),
+            skip_status_codes: Vec::new(),
         }
+    }
+
+    /// Add the request paths and the status codes that write no line.
+    pub fn with_skips(
+        mut self,
+        paths: impl IntoIterator<Item = String>,
+        status_codes: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        self.skip_paths = paths.into_iter().collect();
+        self.skip_status_codes = status_codes.into_iter().collect();
+        self
     }
 
     /// Read the filter from the metadata dict of a route. A missing key or
@@ -57,7 +82,23 @@ impl AccessLogFilter {
                 "{MIN_DURATION_KEY} must be 0 or more"
             )));
         }
-        Ok(Self::new(sample_rate, min_duration_ms))
+        let skip_paths = match py_meta.get_item(SKIP_PATHS_KEY)? {
+            Some(value) if !value.is_none() => value.extract::<Vec<String>>()?,
+            _ => Vec::new(),
+        };
+        let skip_status_codes = match py_meta.get_item(SKIP_STATUS_CODES_KEY)? {
+            Some(value) if !value.is_none() => value.extract::<Vec<u16>>()?,
+            _ => Vec::new(),
+        };
+        Ok(Self::new(sample_rate, min_duration_ms).with_skips(skip_paths, skip_status_codes))
+    }
+
+    /// `true` when the config of the route skips this request path or this
+    /// status code. With no skip value, the cost is two length checks.
+    #[inline]
+    pub fn skips(&self, path: &str, status: u16) -> bool {
+        self.skip_status_codes.contains(&status)
+            || (!self.skip_paths.is_empty() && self.skip_paths.contains(path))
     }
 
     /// `true` when the response writes its access-log line.
@@ -107,11 +148,53 @@ fn random_unit() -> f64 {
     })
 }
 
+/// The limit of the access-log lines of 429 responses: one line for each second.
+/// The rate limiter has the same limit for its own line on stderr.
+#[derive(Debug, Default, PartialEq)]
+pub struct RejectionLineLimit {
+    /// The second of the last line plus one, or 0 before the first line.
+    after_line: u64,
+    /// The 429 responses since the last line that wrote none.
+    suppressed: u64,
+}
+
+impl RejectionLineLimit {
+    /// Decide if a 429 response in `second` writes its line. The first one of
+    /// each second does. The result is the number of 429 responses before it
+    /// that wrote no line, or `None` when this response writes no line. The
+    /// stored second never goes back, so a late response of an earlier second
+    /// only adds to the count.
+    pub fn line_in(&mut self, second: u64) -> Option<u64> {
+        if second < self.after_line {
+            self.suppressed += 1;
+            return None;
+        }
+        self.after_line = second + 1;
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+thread_local! {
+    /// The 429 line limit of this worker thread, and the time of its first 429 response.
+    static REJECTION_LINES: RefCell<Option<(Instant, RejectionLineLimit)>> =
+        const { RefCell::new(None) };
+}
+
+/// Decide if a 429 response at `now` writes its access-log line on this
+/// worker thread. See `RejectionLineLimit::line_in` for the result.
+pub fn rejection_line_at(now: Instant) -> Option<u64> {
+    REJECTION_LINES.with_borrow_mut(|state| {
+        let (first, limit) = state.get_or_insert_with(|| (now, RejectionLineLimit::default()));
+        limit.line_in(now.saturating_duration_since(*first).as_secs())
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AccessLogFilter, random_unit};
+    use super::{AccessLogFilter, RejectionLineLimit, random_unit, rejection_line_at};
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
+    use std::time::{Duration, Instant};
 
     fn no_random() -> f64 {
         panic!("the filter must not sample this response")
@@ -168,6 +251,34 @@ mod tests {
     }
 
     #[test]
+    fn a_skipped_path_matches_the_complete_request_path() {
+        let filter = AccessLogFilter::default().with_skips(["/health".to_string()], []);
+        assert!(filter.skips("/health", 200));
+        // A skipped path writes no line for an error.
+        assert!(filter.skips("/health", 503));
+        for path in ["/health/", "/healthy", "/api/health", "/", ""] {
+            assert!(!filter.skips(path, 200), "path {path}");
+        }
+    }
+
+    #[test]
+    fn a_skipped_status_code_applies_to_each_path() {
+        let filter = AccessLogFilter::default().with_skips([], [204, 404]);
+        assert!(filter.skips("/items", 204));
+        assert!(filter.skips("/gone", 404));
+        for status in [200, 205, 304, 403, 500] {
+            assert!(!filter.skips("/items", status), "status {status}");
+        }
+    }
+
+    #[test]
+    fn a_filter_with_no_skip_value_skips_nothing() {
+        let filter = AccessLogFilter::new(Some(0.0), Some(250.0));
+        assert!(!filter.skips("/health", 200));
+        assert!(!filter.skips("", 0));
+    }
+
+    #[test]
     fn the_generator_gives_an_even_spread_in_the_unit_range() {
         let total = 100_000;
         let mut below = 0;
@@ -199,11 +310,63 @@ mod tests {
                 AccessLogFilter::new(Some(0.05), Some(250.0))
             );
 
+            meta.set_item("access_log_skip_paths", ("/health", "/ready"))
+                .unwrap();
+            meta.set_item("access_log_skip_status_codes", (204, 304))
+                .unwrap();
+            assert_eq!(
+                AccessLogFilter::from_python(&meta).unwrap(),
+                AccessLogFilter::new(Some(0.05), Some(250.0))
+                    .with_skips(["/ready".to_string(), "/health".to_string()], [204, 304])
+            );
+            // A status code that is not a number from 0 to 65535 is an error.
+            meta.set_item("access_log_skip_status_codes", (-1,))
+                .unwrap();
+            assert!(AccessLogFilter::from_python(&meta).is_err());
+            meta.del_item("access_log_skip_status_codes").unwrap();
+
             meta.set_item("access_log_sample_rate", 1.5).unwrap();
             assert!(AccessLogFilter::from_python(&meta).is_err());
             meta.set_item("access_log_sample_rate", py.None()).unwrap();
             meta.set_item("access_log_min_duration_ms", -1).unwrap();
             assert!(AccessLogFilter::from_python(&meta).is_err());
         });
+    }
+
+    #[test]
+    fn the_first_429_of_each_second_writes_a_line_with_the_count_before_it() {
+        let mut limit = RejectionLineLimit::default();
+        assert_eq!(limit.line_in(0), Some(0));
+        assert_eq!(limit.line_in(0), None);
+        assert_eq!(limit.line_in(0), None);
+        assert_eq!(limit.line_in(1), Some(2));
+        // A second with no 429 response between two lines changes nothing.
+        assert_eq!(limit.line_in(5), Some(0));
+        assert_eq!(limit.line_in(5), None);
+        // A late response of an earlier second writes no line. The count has it.
+        assert_eq!(limit.line_in(3), None);
+        assert_eq!(limit.line_in(6), Some(2));
+    }
+
+    #[test]
+    fn each_thread_counts_its_seconds_from_its_first_429() {
+        std::thread::spawn(|| {
+            let start = Instant::now();
+            assert_eq!(rejection_line_at(start), Some(0));
+            assert_eq!(rejection_line_at(start + Duration::from_millis(999)), None);
+            assert_eq!(
+                rejection_line_at(start + Duration::from_millis(1000)),
+                Some(1)
+            );
+            // A time before the first response is in second 0.
+            assert_eq!(rejection_line_at(start - Duration::from_secs(9)), None);
+            assert_eq!(rejection_line_at(start + Duration::from_secs(2)), Some(1));
+        })
+        .join()
+        .unwrap();
+        // The state of the other thread is not here.
+        std::thread::spawn(|| assert_eq!(rejection_line_at(Instant::now()), Some(0)))
+            .join()
+            .unwrap();
     }
 }

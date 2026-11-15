@@ -351,6 +351,9 @@ def _compile_rust_arg_bindings(handler_meta: dict[str, Any]) -> list[dict[str, A
             return None
         if not field.is_simple_type:
             return None
+        # Rust gives text. The injector encodes it for a bytes parameter.
+        if field.unwrapped_annotation is bytes:
+            return None
         if field.origin is not None:
             return None
         if field.kind not in (
