@@ -57,8 +57,8 @@ async def lifespan(app):
 api = BoltAPI(lifespan=lifespan)
 
 @api.get("/cached")
-async def get_cached(request):
-    value = await request.app._redis.get("key")
+async def get_cached():
+    value = await api._redis.get("key")
     return {"value": value}
 ```
 
@@ -171,8 +171,8 @@ async def lifespan(app):
 api = BoltAPI(lifespan=lifespan)
 
 @api.get("/status")
-async def status(request):
-    return {"ready": request.app._cache.get("ready", False)}
+async def status():
+    return {"ready": api._cache.get("ready", False)}
 
 # Lifespan runs automatically
 with TestClient(api) as client:
