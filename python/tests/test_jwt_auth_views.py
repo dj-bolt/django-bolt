@@ -260,6 +260,25 @@ def test_logged_out_refresh_token_cannot_log_out_everywhere():
         assert _post_with_refresh(client, "/auth/refresh", other).status_code == 200
 
 
+@pytest.mark.parametrize("family", [{}, {"fam": ""}], ids=["no-fam", "empty-fam"])
+def test_refresh_token_without_a_family_cannot_log_out(family):
+    """The refresh route rejects a token with no family. This token must not end a live session."""
+    now = int(time.time())
+    claims = {"sub": "view-user", "typ": "refresh", "jti": "x1", "ver": 0, "iat": now, "exp": now + 600, **family}
+    no_family = jwt.encode(claims, SECRET, algorithm="HS256")
+
+    with TestClient(_views_api(secure_cookies=False)) as client:
+        client.post("/auth/login", json=LOGIN)
+        live = client.cookies.get("refresh_token")
+
+        paths = ("/auth/logout", "/auth/logout-all", "/auth/refresh")
+        responses = {path: _post_with_refresh(client, path, no_family) for path in paths}
+        assert {path: (r.status_code, r.json()) for path, r in responses.items()} == dict.fromkeys(
+            paths, (401, {"detail": "Invalid token"})
+        )
+        assert _post_with_refresh(client, "/auth/refresh", live).status_code == 200
+
+
 def test_refresh_token_without_a_version_has_version_zero():
     """The refresh route reads a token with no ``ver`` claim as version 0. The logout routes do the same."""
     now = int(time.time())
