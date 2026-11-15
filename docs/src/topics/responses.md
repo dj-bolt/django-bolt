@@ -507,6 +507,15 @@ return 200, {"id": 1, "name": "Alice"}   # documented as Item
 return 404, {"detail": "Not found"}       # documented as Error
 ```
 
+The status of the tuple must be an int from 200 to 599. A bool is not a status: `return True, data` gives a 500.
+
+The data of the tuple can be a response object. Bolt sends the response object with the status of the tuple. The body, the headers and the cookies come from the response object:
+
+```python
+return 404, JSON({"detail": "Not found"}, headers={"X-Reason": "missing"})  # sent as 404
+return 404, PlainText("gone")                                               # text/plain, sent as 404
+```
+
 **JSON() return** — `JSON(data, status_code=...)` also selects the schema:
 
 ```python

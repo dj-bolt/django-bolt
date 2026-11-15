@@ -98,6 +98,8 @@ from .serialization import (
     _infer_wire_response_type,
     _wire_bytes,
     compile_response_handlers,
+    is_response_class,
+    response_with_status,
     serialize_json_data,
     serialize_json_data_sync,
     serialize_response,
@@ -2141,6 +2143,9 @@ class BoltAPI:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
                             return await serialize_json_data(data, code)
+                        # A response object goes to the client with the status of the tuple.
+                        if is_response_class(data.__class__):
+                            return await entry["_response_type_handler"](response_with_status(data, code))
                         return await entry["_default_response_handler"](data, status_code=code)
 
                 # JSON() with explicit status: pick schema by its status_code.
@@ -2163,6 +2168,9 @@ class BoltAPI:
                             if isinstance(data, list):
                                 data = _convert_serializers(data)
                             return serialize_json_data_sync(data, code)
+                        # A response object goes to the client with the status of the tuple.
+                        if is_response_class(data.__class__):
+                            return entry["_response_type_handler_sync"](response_with_status(data, code))
                         return entry["_default_response_handler_sync"](data, status_code=code)
 
                 # JSON() with explicit status: pick schema by its status_code.

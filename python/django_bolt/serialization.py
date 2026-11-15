@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import mimetypes
 import types
@@ -1098,6 +1099,25 @@ def _response_base_class(result: Any) -> type:
             return cls
     # serialize_response sends only the response types, and Django's is the last of them.
     return DjangoHttpResponse
+
+
+@cache
+def is_response_class(cls: type) -> bool:
+    """Return True for a response type or a subclass of one. The cache has one entry for each class."""
+    return issubclass(cls, _RESPONSE_INSTANCE_TYPES)
+
+
+def response_with_status(response: Any, status_code: int) -> Any:
+    """Return the response object with the given status.
+
+    The response object of the handler keeps its own status. A handler can
+    return one shared response object from more than one route.
+    """
+    if response.status_code == status_code:
+        return response
+    response = copy.copy(response)
+    response.status_code = status_code
+    return response
 
 
 def serialize_response(result: Any, meta: HandlerMetadata | dict[str, Any]) -> Coroutine[Any, Any, ResponseWireV1]:
