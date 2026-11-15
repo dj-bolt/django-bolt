@@ -142,39 +142,136 @@ pub fn convert_path(path: &str) -> String {
     result
 }
 
-/// Write a route path as a client sends it. A client sends each byte that a
-/// URL path cannot hold, such as a space or a byte of a non-ASCII character, as
-/// a `%XX` escape, and the lookup gets the path with its escapes. A `{param}`
-/// stays as it is, and so does a `%`: the path can have escapes already.
-pub fn encode_route_path(path: &str) -> Cow<'_, str> {
-    // RFC 3986 `pchar`, and the `/` between segments.
-    fn is_path_char(ch: char) -> bool {
-        ch.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/%".contains(ch)
+/// A byte that a URL path holds with no escape: RFC 3986 `pchar`.
+/// The `/` between segments and the `%` of an escape are not in this set.
+#[inline]
+fn is_plain_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&byte)
+}
+
+/// The byte of the `%XX` escape at the start of `bytes`, if there is one.
+#[inline]
+fn escape_byte(bytes: &[u8]) -> Option<u8> {
+    if bytes.first() != Some(&b'%') {
+        return None;
     }
+    Some((hex_digit(bytes.get(1))? << 4) | hex_digit(bytes.get(2))?)
+}
+
+/// Write `byte` in the one form that the router compares: the byte itself if
+/// a path holds it with no escape, else a `%XX` escape with upper-case digits.
+#[inline]
+fn push_path_byte(path: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    if is_plain_path_byte(byte) {
+        path.push(byte as char);
+    } else {
+        path.push('%');
+        path.push(HEX[usize::from(byte >> 4)] as char);
+        path.push(HEX[usize::from(byte & 15)] as char);
+    }
+}
+
+/// Write a route path in the form that the router compares. A client sends
+/// each byte that a URL path cannot hold, such as a space or a byte of a
+/// non-ASCII character, as a `%XX` escape. Thus the route path gets these
+/// escapes. A `%` in the route path gets the form that
+/// `normalize_request_path` gives to a `%` in a request path. A `{param}`
+/// stays as it is.
+pub fn encode_route_path(path: &str) -> Cow<'_, str> {
     if path
-        .chars()
-        .all(|ch| is_path_char(ch) || ch == '{' || ch == '}')
+        .bytes()
+        .all(|byte| is_plain_path_byte(byte) || matches!(byte, b'/' | b'{' | b'}'))
     {
         return Cow::Borrowed(path);
     }
     let mut encoded = String::with_capacity(path.len() + 8);
     let mut in_param = false;
     let mut utf8 = [0u8; 4];
-    for ch in path.chars() {
+    let mut rest = path;
+    while let Some(ch) = rest.chars().next() {
         match ch {
             '{' => in_param = true,
             '}' => in_param = false,
-            _ if !in_param && !is_path_char(ch) => {
+            '%' if !in_param => {
+                // A `%` that starts no escape is a literal `%`.
+                let escape = escape_byte(rest.as_bytes());
+                push_path_byte(&mut encoded, escape.unwrap_or(b'%'));
+                rest = &rest[if escape.is_some() { 3 } else { 1 }..];
+                continue;
+            }
+            _ if !in_param && ch != '/' && !(ch.is_ascii() && is_plain_path_byte(ch as u8)) => {
                 for byte in ch.encode_utf8(&mut utf8).bytes() {
-                    encoded.push_str(&format!("%{byte:02X}"));
+                    push_path_byte(&mut encoded, byte);
                 }
+                rest = &rest[ch.len_utf8()..];
                 continue;
             }
             _ => {}
         }
         encoded.push(ch);
+        rest = &rest[ch.len_utf8()..];
     }
     Cow::Owned(encoded)
+}
+
+/// Write a request path in the form that the router compares.
+///
+/// RFC 3986 section 6.2.2.1: the letter case of the two digits of an escape
+/// has no meaning, so `%c3` becomes `%C3`. Section 6.2.2.2: an escape of an
+/// unreserved character is that character, so `%61` becomes `a`. Django
+/// decodes each escape before it matches a URL. Thus an escape of each other
+/// character that a path holds with no escape, such as `%3A`, becomes that
+/// character too. `%2F` and `%25` stay: an escaped `/` does not split a
+/// segment, and a path param decodes one time. A `%` that starts no escape is
+/// a literal `%`, as in Python `unquote`, and becomes `%25`. Thus each `%` of
+/// the result starts an escape, and a second call changes nothing.
+///
+/// A path with no `%` is the common case. It stays borrowed, and so does a
+/// path where each escape has this form already.
+#[inline]
+pub fn normalize_request_path(path: &str) -> Cow<'_, str> {
+    if memchr::memchr(b'%', path.as_bytes()).is_none() {
+        return Cow::Borrowed(path);
+    }
+    normalize_path_escapes(path)
+}
+
+/// Out of line, so that the `%` check of `normalize_request_path` inlines.
+#[inline(never)]
+fn normalize_path_escapes(path: &str) -> Cow<'_, str> {
+    let bytes = path.as_bytes();
+    let mut normalized: Option<String> = None;
+    // `path[..copied]` is in `normalized` in its new form.
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        let escape = escape_byte(&bytes[i..]);
+        let len = if escape.is_some() { 3 } else { 1 };
+        let in_form = escape.is_some_and(|byte| {
+            !is_plain_path_byte(byte)
+                && !bytes[i + 1].is_ascii_lowercase()
+                && !bytes[i + 2].is_ascii_lowercase()
+        });
+        if !in_form {
+            let out = normalized.get_or_insert_with(|| String::with_capacity(path.len() + 2));
+            out.push_str(&path[copied..i]);
+            push_path_byte(out, escape.unwrap_or(b'%'));
+            copied = i + len;
+        }
+        i += len;
+    }
+    match normalized {
+        Some(mut out) => {
+            out.push_str(&path[copied..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(path),
+    }
 }
 
 /// Per-method router combining static (O(1) HashMap) and dynamic (radix tree) routing
@@ -287,7 +384,7 @@ impl Router {
             }
         };
 
-        // The lookup gets the request path with its `%XX` escapes.
+        // The lookup gets the request path in the form of `normalize_request_path`.
         let path = &*encode_route_path(path);
 
         // Elysia-style optimization: Separate static routes from dynamic routes
@@ -329,6 +426,8 @@ impl Router {
     ///
     /// This optimization significantly improves performance for APIs
     /// where most routes are static (e.g., /users, /health, /api/items).
+    ///
+    /// `path` is the request path in the form of `normalize_request_path`.
     ///
     /// OPTIMIZATION: #[inline] on hot path - called on every request
     #[inline]
@@ -731,6 +830,82 @@ mod tests {
             Some((1, params(&[("id", "a b")])))
         );
         assert_eq!(lookup(&router, "GET", "/\u{fc} b"), None);
+    }
+
+    #[test]
+    fn normalize_request_path_gives_one_form_to_each_escape() {
+        // No `%`, or each escape in its form: the path stays borrowed.
+        for path in ["/", "/items/3", "/a+b:c", "/a%20b/%C3%BC/x%2Fy%2541"] {
+            assert!(
+                matches!(normalize_request_path(path), Cow::Borrowed(same) if same == path),
+                "{path}"
+            );
+        }
+        // The letter case of the digits.
+        assert_eq!(normalize_request_path("/%c3%bC/a%2fb"), "/%C3%BC/a%2Fb");
+        // An escape of a character that a path holds with no escape.
+        assert_eq!(normalize_request_path("/%61%2D%7e/%3a%40%2B"), "/a-~/:@+");
+        // `%2F` and `%25` stay, so a segment and a later decode do not change.
+        assert_eq!(normalize_request_path("/a%2Fb%2f%2541"), "/a%2Fb%2F%2541");
+        // A `%` that starts no escape is a literal `%`. It does not make an escape.
+        assert_eq!(normalize_request_path("/100%"), "/100%25");
+        assert_eq!(normalize_request_path("/%zz%4"), "/%25zz%254");
+        assert_eq!(normalize_request_path("/%%341"), "/%2541");
+        assert_eq!(normalize_request_path("/%\u{fc}"), "/%25\u{fc}");
+    }
+
+    #[test]
+    fn a_request_path_matches_for_each_form_of_an_escape() {
+        let router = router_with(&[
+            ("GET", "/\u{fc}"),
+            ("GET", "/a"),
+            ("GET", "/%c3%a9/%62"),
+            ("GET", "/a:b/{id}"),
+            ("GET", "/100%"),
+        ]);
+        let find = |path: &str| lookup(&router, "GET", &normalize_request_path(path));
+        assert_eq!(find("/%c3%bc"), Some((0, None)));
+        assert_eq!(find("/%C3%BC"), Some((0, None)));
+        assert_eq!(find("/%61"), Some((1, None)));
+        assert_eq!(find("/%C3%A9/b"), Some((2, None)));
+        assert_eq!(
+            find("/a%3ab/x%2fy%2541"),
+            Some((3, params(&[("id", "x/y%41")])))
+        );
+        assert_eq!(find("/100%25"), Some((4, None)));
+        assert_eq!(find("/100%"), Some((4, None)));
+        // An escaped `/` is data of one segment.
+        assert_eq!(find("/a:b%2Fx"), None);
+    }
+
+    proptest! {
+        /// The result has one form, and the bytes of the path do not change.
+        #[test]
+        fn normalize_request_path_keeps_the_decoded_path(
+            path in "(/|%|%[0-9a-fA-F]{2}|[a-zA-Z0-9._~:@+ -]|\\PC){0,24}",
+        ) {
+            let normalized = normalize_request_path(&path);
+            prop_assert_eq!(
+                urlencoding::decode_binary(normalized.as_bytes()),
+                urlencoding::decode_binary(path.as_bytes())
+            );
+            // A second call changes nothing and does not allocate.
+            prop_assert!(matches!(normalize_request_path(&normalized), Cow::Borrowed(_)));
+            // The `/` between segments does not change, and no escape gives one.
+            prop_assert_eq!(normalized.matches('/').count(), path.matches('/').count());
+            // A route path and a request path get the same form.
+            if !path.contains(['{', '}']) {
+                let route = encode_route_path(&path);
+                prop_assert_eq!(normalize_request_path(&route), route.as_ref());
+                prop_assert_eq!(
+                    urlencoding::decode_binary(route.as_bytes()),
+                    urlencoding::decode_binary(path.as_bytes())
+                );
+            }
+            if !path.contains('%') {
+                prop_assert!(matches!(normalized, Cow::Borrowed(_)));
+            }
+        }
     }
 
     #[test]
