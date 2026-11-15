@@ -122,6 +122,30 @@ class TestMountPathNormalization:
             )
             assert response.json() == {"message": "Hello from mounted API"}
 
+    @pytest.mark.parametrize("mount_path", ["/", "//", ""])
+    def test_mount_at_the_root_keeps_the_route_paths(self, mount_path):
+        """A mount at the root serves each route of the mounted API at its own path."""
+        main_api = BoltAPI()
+        sub_api = BoltAPI()
+
+        @sub_api.get("/hello")
+        async def hello():
+            return {"message": "hello"}
+
+        @sub_api.get("/")
+        async def root():
+            return {"message": "root"}
+
+        main_api.mount(mount_path, sub_api)
+
+        with TestClient(main_api) as client:
+            response = client.get("/hello")
+            assert response.status_code == 200
+            assert response.json() == {"message": "hello"}
+            response = client.get("/")
+            assert response.status_code == 200
+            assert response.json() == {"message": "root"}
+
 
 class TestOpenAPIDocsWithPrefix:
     """Tests for OpenAPI docs behavior when API has a prefix."""

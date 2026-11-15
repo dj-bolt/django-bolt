@@ -3592,8 +3592,10 @@ class BoltAPI:
                 "The mounted API sets a different error_formatter. Set the same error_formatter on both APIs, or on one."
             )
 
-        # Normalize path prefix: ensure leading slash, strip trailing slash
-        mount_path = "/" + path.strip("/") if path else ""
+        # Normalize path prefix: ensure leading slash, strip trailing slash.
+        # A path of only slashes is the root, as an empty path is.
+        stripped_path = path.strip("/")
+        mount_path = "/" + stripped_path if stripped_path else ""
 
         # Prepare MCP definitions before mutating the parent. A mounted child
         # is removed from global discovery below, so its MCP endpoints must be
