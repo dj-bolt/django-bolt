@@ -438,6 +438,10 @@ def middleware(*args, **kwargs):
     return decorator
 
 
+# The characters of a header name (RFC 9110, token).
+_HEADER_NAME = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+
 def _rate_limit_count(name: str, value: Any) -> int:
     """Return a count of @rate_limit. Raise for a value that is not an int of 1 or more."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -476,7 +480,8 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
 
     Raises:
         TypeError: rps or burst is not an int, or key is not a str.
-        ValueError: rps or burst is less than 1, or key is empty.
+        ValueError: rps or burst is less than 1, or key is empty or is not a
+            valid header name.
 
     Example:
         @api.get("/api/data")
@@ -493,6 +498,11 @@ def rate_limit(rps: int = 100, burst: int | None = None, key: str = "ip"):
         raise TypeError(f"rate_limit key must be a str, got {type(key).__name__} {key!r}")
     if not key:
         raise ValueError("rate_limit key must not be empty")
+    # Rust reads "ip", "user" and "api_key" in any letter case. Each other key
+    # is the name of a request header. No request has a header with another
+    # character in its name, so each caller would share one bucket.
+    if not _HEADER_NAME.fullmatch(key):
+        raise ValueError(f'rate_limit key must be "ip", "user", "api_key" or the name of a request header, got {key!r}')
 
     def decorator(func):
         if not hasattr(func, "__bolt_middleware__"):
