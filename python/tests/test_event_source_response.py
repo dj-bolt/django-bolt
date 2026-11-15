@@ -24,6 +24,10 @@ class TestFormatSSEEvent:
         result = format_sse_event(data_str="line1\nline2\nline3")
         assert result == b"data: line1\ndata: line2\ndata: line3\n\n"
 
+    def test_multiline_bytes_data(self):
+        """Bytes data with a line break gets one data line for each line, as str data does."""
+        assert format_sse_event(data_bytes=b"line1\nline2\r\nline3") == b"data: line1\ndata: line2\ndata: line3\n\n"
+
     def test_all_fields(self):
         result = format_sse_event(
             data_str="payload",

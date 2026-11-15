@@ -380,8 +380,18 @@ def format_sse_event(
     Pass ``data_bytes`` instead of ``data_str`` when the payload is already
     encoded (e.g. from msgspec) to avoid a decode/encode round-trip.
     """
-    # Fast path: data-only event with pre-encoded bytes (most common from auto-framing)
-    if data_bytes is not None and event is None and id is None and retry is None and comment is None:
+    # Fast path: data-only event with pre-encoded bytes (most common from auto-framing).
+    # JSON bytes have no line break. Data with a line break needs one data line for each line.
+    # The check for a byte value (10 is LF, 13 is CR) is a memchr, about 15 ns for each.
+    if (
+        data_bytes is not None
+        and event is None
+        and id is None
+        and retry is None
+        and comment is None
+        and 10 not in data_bytes
+        and 13 not in data_bytes
+    ):
         return b"data: " + data_bytes + b"\n\n"
 
     lines: list[str] = []
