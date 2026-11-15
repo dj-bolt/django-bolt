@@ -108,6 +108,32 @@ def test_plain_struct_viewset_keeps_values_projection(article):
 
 
 @pytest.mark.django_db(transaction=True)
+def test_get_serializer_class_can_read_self_action_at_registration(article):
+    """An override that reads `self.action` selects the response serializer of each route."""
+    api = BoltAPI()
+
+    @api.viewset("/articles")
+    class VS(ModelViewSet):
+        queryset = Article.objects.all()
+
+        def get_serializer_class(self, action=None):
+            return BaseArticle if self.action == "list" else ArticleOut
+
+    with TestClient(api) as client:
+        r = client.get("/articles")
+        assert r.status_code == 200, r.text
+        assert r.json() == [{"id": article.id, "title": "hello"}]
+
+        r = client.get(f"/articles/{article.id}")
+        assert r.status_code == 200, r.text
+        assert r.json() == {"id": article.id, "title": "hello", "content": "the body", "title_upper": "HELLO"}
+
+        r = client.patch(f"/articles/{article.id}", json={"title": "new"})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"id": article.id, "title": "new", "content": "the body", "title_upper": "NEW"}
+
+
+@pytest.mark.django_db(transaction=True)
 def test_nested_serializer_list_and_retrieve():
     api = BoltAPI()
     author = Author.objects.create(name="Ada", email="ada@x.io")
