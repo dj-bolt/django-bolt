@@ -191,7 +191,7 @@ raise ResponseValidationError(errors)
 
 Response validation errors indicate a server bug, so they return 500 Internal Server Error.
 
-The validation errors name the model, the fields and the types of your handler. With `DEBUG=False`, the body is only `{"detail": "Response validation error"}`. Bolt writes the validation errors to the server log. With `DEBUG=True`, the body also has `extra.validation_errors`.
+The validation errors name the model, the fields and the types of your handler. With `DEBUG=False`, the body is only `{"detail": "Response validation error"}`. Bolt writes the validation errors to the server log. With `DEBUG=True`, the body also has `extra.validation_errors`. The `loc` of each error has `response` and then the path of the field, for example `["response", "id"]`.
 
 ## Error handlers
 

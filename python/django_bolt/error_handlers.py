@@ -100,7 +100,8 @@ def http_exception_handler(exc: HTTPException) -> tuple[int, list[tuple[str, str
 
 # Pre-compiled regex patterns for validation error parsing
 _RE_AT_LOCATION = re.compile(r" - at `(.+?)`$")
-_RE_MISSING_FIELD = re.compile(r"Object missing required field `(.+)`")
+# A response error has the name of the struct before this text.
+_RE_MISSING_FIELD = re.compile(r"(?:^|: )Object missing required field `(.+)`$")
 _RE_PATH_SPLIT = re.compile(r"[.\[]")
 
 
@@ -145,7 +146,7 @@ def msgspec_validation_error_to_dict(error: msgspec.ValidationError, root: str =
         msg_part = error_msg
         loc_parts = [root]
 
-    missing_match = _RE_MISSING_FIELD.fullmatch(msg_part)
+    missing_match = _RE_MISSING_FIELD.search(msg_part)
     if missing_match:
         return [{"loc": [*loc_parts, missing_match.group(1)], "msg": msg_part, "type": "missing_field"}]
 
