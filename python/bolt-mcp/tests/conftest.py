@@ -17,7 +17,10 @@ from django.core.management import call_command
 # from request handlers, which run ORM through ``sync_to_async`` on a worker thread with
 # its own SQLite connection. ``:memory:`` is per-connection, so that connection would see
 # an empty database; a file is shared across connections/threads in the process.
-_DB_PATH = os.path.join(tempfile.gettempdir(), "bolt_mcp_test.sqlite3")
+# Each pytest-xdist worker is a process with its own file. With one file for all, a
+# worker removes the database that a different worker has open, and the tests of two
+# workers write the same rows.
+_DB_PATH = os.path.join(tempfile.gettempdir(), f"bolt_mcp_test_{os.environ.get('PYTEST_XDIST_WORKER', 'main')}.sqlite3")
 _TESTS_DIR = Path(__file__).resolve().parent
 
 if not settings.configured:

@@ -430,13 +430,39 @@ def test_ellipsis_only_dict_raises_at_registration():
             pass
 
 
+@pytest.mark.parametrize("key", [True, False])
+def test_bool_key_dict_raises_at_registration(key):
+    """A bool is not a status code. A bool key of response_model raises TypeError at registration."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match="response_model"):
+
+        @api.get("/item", response_model={key: OkSchema, 201: OkSchema})
+        async def handler():
+            return {"id": 1, "name": "x"}
+
+
+@pytest.mark.parametrize("key", ["404", 404.0, None, (404,)], ids=["str", "float", "none", "tuple"])
+def test_a_key_that_is_not_an_int_or_ellipsis_raises_at_registration(key):
+    """A key such as "404" matched no status, so its schema had no effect. It now stops registration."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match="response_model has the key") as excinfo:
+
+        @api.get("/item", response_model={200: OkSchema, key: ErrorSchema})
+        async def handler():
+            return {"id": 1, "name": "x"}
+
+    assert str(excinfo.value) == (f"response_model has the key {key!r}. A key must be an integer status code or `...`.")
+
+
 # ============================================================================
-# Edge case: non-2xx-only dict uses lowest int code as default
+# Edge case: a dict with no 2xx code keeps the default status 200
 # ============================================================================
 
 
-def test_non_2xx_only_dict_uses_lowest_code():
-    """response_model with only non-2xx codes defaults to lowest int code."""
+def test_non_2xx_only_dict_keeps_the_default_status_200():
+    """response_model with only non-2xx codes does not change the default status of the route."""
     api = BoltAPI()
 
     @api.get("/items", response_model={400: ErrorSchema, 500: ErrorSchema})
@@ -446,7 +472,7 @@ def test_non_2xx_only_dict_uses_lowest_code():
     _method, _path, handler_id, _handler = api._routes[0]
     meta = api._handler_meta[handler_id]
 
-    assert meta["default_status_code"] == 400
+    assert meta["default_status_code"] == 200
 
 
 # ============================================================================
@@ -832,8 +858,9 @@ def test_a_blocking_multi_response_handler_runs_with_its_dependencies_on_one_poo
     """A sync handler that uses the ORM runs on the pool. Its sync dependencies run on that thread too."""
     api = BoltAPI()
 
-    @api.get("/count", response_model={200: dict})
-    def count(*, label: str, dependency_thread: str = Depends(thread_name)):
+    @api.get("/labels/{label}", response_model={200: dict})
+    def count(label: str, *, dependency_thread: str = Depends(thread_name)):
+        # ``label`` is positional: the injector gives it apart from the dependency.
         return 200, {
             "count": Article.objects.count(),
             "label": label,
@@ -850,7 +877,7 @@ def test_a_blocking_multi_response_handler_runs_with_its_dependencies_on_one_poo
         }
 
     with TestClient(api) as client:
-        with_dependency = client.get("/count", params={"label": "all"}).json()
+        with_dependency = client.get("/labels/all").json()
         with_arguments = client.get("/count/5", params={"label": "five"}).json()
 
     assert (with_dependency["count"], with_dependency["label"]) == (0, "all")

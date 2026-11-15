@@ -8,9 +8,8 @@ import inspect
 import logging
 import os
 import re
-import sys
 import threading
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Sequence
 from contextlib import suppress
 from typing import Any, get_origin, get_type_hints
 
@@ -39,7 +38,7 @@ from ._kwargs import (
 )
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
-from .analysis import analyze_dependency_tree, analyze_handler
+from .analysis import analyze_dependency_tree, analyze_handler, annotation_globals
 from .auth import register_auth_backend
 from .auth.backends import revocation_takes_claims
 from .auth.session import auth_without_session, build_session_guard_check, session_middleware, uses_session
@@ -65,6 +64,7 @@ from .error_handlers import (
     render_core_error,
 )
 from .exceptions import HTTPException
+from .logging.config import access_log_filter_meta
 from .logging.middleware import LoggingMiddleware, create_logging_middleware
 from .middleware import CompressionConfig, DjangoMiddleware, DjangoMiddlewareStack
 from .middleware.compiler import (
@@ -73,8 +73,9 @@ from .middleware.compiler import (
     compile_middleware_meta,
     route_auth_backends,
 )
+from .middleware.compression import check_compression, compression_setting
 from .middleware.django_loader import load_django_middleware
-from .middleware.middleware import FunctionMiddlewareSpec, normalize_middleware_specs
+from .middleware.middleware import FunctionMiddlewareSpec, mark_route_handler, normalize_middleware_specs
 from .middleware_response import MiddlewareResponse
 from .openapi import (
     OpenAPIConfig,
@@ -87,7 +88,7 @@ from .openapi import (
 from .openapi.routes import OpenAPIRouteRegistrar
 from .pagination import extract_pagination_item_type, paginate
 from .responses import JSON as _JSONResponse
-from .router import Router
+from .router import Router, _leading_slash
 from .serialization import (
     _BODY_BYTES,
     _RESPONSE_META_EMPTY,
@@ -105,7 +106,7 @@ from .serialization import (
 )
 from .status_codes import HTTP_201_CREATED, HTTP_204_NO_CONTENT
 from .typing import HandlerMetadata, HandlerPattern
-from .views import APIView, ViewSet, _copy_route_middleware, _layer
+from .views import APIView, ViewSet, _copy_route_middleware, _layer, _plan_request_argument
 from .websocket import mark_websocket_handler
 
 logger = logging.getLogger(__name__)
@@ -114,12 +115,14 @@ logger = logging.getLogger(__name__)
 def _middleware_names(middleware: Any) -> frozenset[str]:
     """The names that @skip_middleware can give for a middleware class or function.
 
-    The names are ``__name__`` and the dotted path. A Django middleware class
-    can also be a dotted path string.
+    The names are ``__name__`` and the dotted path, in lower case as
+    @skip_middleware keeps them. A Django middleware class can also be a dotted
+    path string.
     """
     if isinstance(middleware, str):
+        middleware = middleware.lower()
         return frozenset({middleware, middleware.rpartition(".")[2]})
-    return frozenset({middleware.__name__, f"{middleware.__module__}.{middleware.__qualname__}"})
+    return frozenset({middleware.__name__.lower(), f"{middleware.__module__}.{middleware.__qualname__}".lower()})
 
 
 def _revocation_handlers(backends: list[Any]) -> tuple[tuple[Callable, bool] | None, ...] | None:
@@ -235,6 +238,78 @@ def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Cal
     return execute
 
 
+def _check_wrapper_takes_handler_arguments(fn: Callable) -> None:
+    """Refuse a decorated handler whose wrapper cannot take the arguments of the handler.
+
+    Bolt reads the parameters of the wrapped function and calls the wrapper with them.
+    A Django view decorator such as ``@csrf_exempt`` gives a wrapper with a
+    ``(request, *args, **kwargs)`` signature. Each call of that wrapper fails
+    when the handler takes no positional argument.
+    """
+    if not hasattr(fn, "__wrapped__"):
+        return
+    try:
+        wrapper_sig = inspect.signature(fn, follow_wrapped=False)
+    except ValueError:
+        # The wrapper is an object with no signature of its own. There is nothing to compare.
+        return
+    handler_sig = inspect.signature(fn)
+    positional = 0
+    keywords: dict[str, None] = {}
+    for param in handler_sig.parameters.values():
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            return
+        if param.kind is inspect.Parameter.KEYWORD_ONLY:
+            keywords[param.name] = None
+        else:
+            positional += 1
+    try:
+        wrapper_sig.bind(*(None,) * positional, **keywords)
+    except TypeError as exc:
+        raise TypeError(
+            f"Handler {fn.__name__}{handler_sig} has a decorator with a wrapper that takes {wrapper_sig}. "
+            f"Bolt calls the wrapper with the arguments of the handler, and that call fails: {exc}. "
+            f"For a Django view decorator such as @csrf_exempt, the handler must take `request` "
+            f"as its first parameter."
+        ) from exc
+
+
+def _route_handler(fn: Any) -> Callable:
+    """Return the callable that a route registers for `fn`.
+
+    Registration reads the name, the module, the type hints and the code of a
+    handler. A function or a method has them. An object with `__call__` gives
+    its bound `__call__` method. A `functools.partial` has none of them, and
+    its keyword arguments would become parameters that a request can set.
+    """
+    if isinstance(fn, functools.partial):
+        raise TypeError(f"A route handler cannot be a functools.partial ({fn!r}). Register a function that calls it.")
+    if inspect.isroutine(fn) or isinstance(fn, type):
+        return fn
+    if callable(fn):
+        return fn.__call__
+    raise TypeError(f"A route handler must be callable, not {type(fn).__name__} {fn!r}")
+
+
+def _defer_async_websocket_injector(handler: Callable, injector: Callable) -> tuple[Callable, Callable]:
+    """Return a handler and a sync injector that run ``injector`` in the handler coroutine.
+
+    The WebSocket handshake calls the injector of a route with no await. The
+    returned injector only passes the request on. The returned handler awaits
+    ``injector`` and then calls ``handler``.
+    """
+
+    @functools.wraps(handler)
+    async def handler_with_injector(websocket: Any, request: dict[str, Any]) -> Any:
+        args, kwargs = await injector(request)
+        return await handler(websocket, *args, **kwargs)
+
+    def pass_request(request: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        return (request,), {}
+
+    return handler_with_injector, pass_request
+
+
 def _normalize_path(path: str, trailing_slash: str = "strip") -> str:
     """Normalize a path based on trailing slash mode.
 
@@ -258,6 +333,16 @@ def _normalize_path(path: str, trailing_slash: str = "strip") -> str:
         return path if path.endswith("/") else path + "/"
     else:  # "keep"
         return path
+
+
+def _join_viewset_path(base: str, *segments: str) -> str:
+    """Add segments to the path of a viewset, with one slash between the parts.
+
+    The result ends with a slash if the viewset path does. The `trailing_slash`
+    mode of the API then normalizes it, and "keep" keeps it.
+    """
+    joined = "/".join((base.rstrip("/"), *segments))
+    return joined + "/" if base.endswith("/") and base != "/" else joined
 
 
 def _normalize_mount_prefix(path: str) -> str:
@@ -317,6 +402,43 @@ def _refuse_typed_native_path_params(path: str) -> None:
                 f"A native route does not check the type of {param.group(0)}. "
                 "Remove the type, and check the value in the handler."
             )
+
+
+_PATH_PARAM_NAME = re.compile(r"\{([^}:]+)")
+
+
+def _refuse_mount_path_arguments(path: str, app: BoltAPI) -> None:
+    """Refuse a mounted handler that takes a parameter of the mount path as an argument.
+
+    The mounted API compiled each route without the mount path. An argument
+    with the name of a mount path parameter thus reads the query, not the path.
+    """
+    names = set(_PATH_PARAM_NAME.findall(path))
+    if not names:
+        return
+    routes = [(f"{method} {route_path}", handler_id) for method, route_path, handler_id, _handler in app._routes]
+    routes.extend((f"WEBSOCKET {ws_path}", handler_id) for ws_path, handler_id, _handler in app._websocket_routes)
+    for route, handler_id in routes:
+        for field in app._handler_meta.get(handler_id, {}).get("fields", ()):
+            # A marker such as Query() says that the argument is not from the path.
+            if field.name in names and field.param is None and field.source not in ("path", "request", "dependency"):
+                raise ValueError(
+                    f"The handler of {route} takes the parameter {field.name!r} of the mount path {path!r} as an "
+                    f"argument, and the argument reads the {field.source}. A mounted route was compiled without "
+                    f"the mount path. Read the value from request.params[{field.name!r}], or use a Router "
+                    "with this prefix."
+                )
+
+
+def _refuse_repeated_path_params(path: str) -> None:
+    """Refuse a path that has one parameter name two times: the router keeps one value for each name."""
+    seen: set[str] = set()
+    for name in _PATH_PARAM_NAME.findall(path):
+        if name in seen:
+            raise ValueError(
+                f"The path {path!r} has the parameter {name!r} two times. Give each parameter of a path its own name."
+            )
+        seen.add(name)
 
 
 def _validate_mcp_mount_conflicts(
@@ -479,20 +601,29 @@ def _wire_from_error_parts(status: int, headers: list[tuple[str, str]], body: by
     return int(status), meta, _BODY_BYTES, body
 
 
+@contextlib.asynccontextmanager
+async def run_lifespans(source_lifespans: list[tuple[BoltAPI, Callable]]) -> AsyncIterator[None]:
+    """Enter every lifespan context in *source_lifespans*.
+
+    Each ``(api, lifespan_ctx)`` pair is entered in order; teardown runs in
+    reverse order (LIFO) via :class:`contextlib.AsyncExitStack`.
+    """
+    async with contextlib.AsyncExitStack() as stack:
+        for api, lifespan_ctx in source_lifespans:
+            await stack.enter_async_context(lifespan_ctx(api))
+        yield
+
+
 async def serve_with_lifespan(
     source_lifespans: list[tuple[BoltAPI, Callable]],
     server_fn: Callable,
 ) -> None:
     """Run *server_fn* inside every lifespan context in *source_lifespans*.
 
-    Each ``(api, lifespan_ctx)`` pair is entered in order; teardown runs in
-    reverse order (LIFO) via :class:`contextlib.AsyncExitStack`.
     *server_fn* is executed in a thread so the async event-loop stays free
     for lifespan teardown when the server stops.
     """
-    async with contextlib.AsyncExitStack() as stack:
-        for api, lifespan_ctx in source_lifespans:
-            await stack.enter_async_context(lifespan_ctx(api))
+    async with run_lifespans(source_lifespans):
         await asyncio.to_thread(server_fn)
 
 
@@ -537,7 +668,8 @@ class BoltAPI:
             compression: Compression configuration. Pass a `CompressionConfig`
                 to override defaults. Omit (or pass `None`) to apply the default
                 config. Pass `False` to disable compression entirely on this
-                `BoltAPI`. `settings.BOLT_COMPRESSION` takes precedence over
+                `BoltAPI`. Each other value raises `TypeError`.
+                `settings.BOLT_COMPRESSION` takes precedence over
                 this argument in production.
             openapi_config: OpenAPI documentation configuration
             validate_response: Default response validation policy for registered routes
@@ -551,6 +683,8 @@ class BoltAPI:
                 Rust or from Python. ``None`` keeps the ``{"detail": ...}`` body.
                 Use ``django_bolt.error_handlers.problem_details`` for RFC 9457.
         """
+        if trailing_slash not in ("strip", "append", "keep"):
+            raise ValueError(f'trailing_slash must be "strip", "append" or "keep", not {trailing_slash!r}')
         if error_formatter is not None:
             if not callable(error_formatter):
                 raise TypeError(f"error_formatter must be callable, not {type(error_formatter).__name__}")
@@ -570,7 +704,8 @@ class BoltAPI:
         self._handler_meta: dict[int, HandlerMetadata] = {}
         self._handler_middleware: dict[int, dict[str, Any]] = {}  # Middleware metadata per handler
         self._next_handler_id = 0
-        self.prefix = prefix.rstrip("/")  # Remove trailing slash from prefix
+        # Add the leading slash and remove the trailing slash.
+        self.prefix = _leading_slash(prefix.rstrip("/"))
         self.trailing_slash = trailing_slash  # Mode: "strip", "append", or "keep"
         self.namespace = namespace  # Opt-in reverse namespace; see django_bolt.urls
         self._validate_response_default = validate_response
@@ -604,6 +739,11 @@ class BoltAPI:
             else:
                 # Use default logging configuration
                 self._logging_middleware = create_logging_middleware()
+        # Sampling and the slow-request threshold of the Rust access log. Each
+        # route of this API carries them in its metadata.
+        self._access_log_filter_meta = (
+            access_log_filter_meta(self._logging_middleware.config) if self._logging_middleware else {}
+        )
 
         # Compression configuration.
         # - `compression=False` → explicitly disabled (no buffered or streaming
@@ -613,12 +753,10 @@ class BoltAPI:
         # - `compression=CompressionConfig(...)` → caller-provided config
         # `settings.BOLT_COMPRESSION` overrides this at server startup
         # (see `runbolt.py`) and is mirrored by `_rust_compression_config`.
-        if compression is False:
-            self._compression = None
-        elif compression is None:
+        if compression is None:
             self._compression = CompressionConfig()
         else:
-            self._compression = compression
+            self._compression = check_compression(compression, "compression")
 
         # OpenAPI configuration - enabled by default with sensible defaults
         if openapi_config is None:
@@ -656,6 +794,8 @@ class BoltAPI:
         # Django admin configuration (controlled by --no-admin flag)
         self._admin_routes_registered = False
         self._asgi_mounts: list[tuple[str, Callable[..., Any]]] = []
+        # Routers with a parent that include_router() registered, for each prefix of the call.
+        self._included_child_routers: dict[str, set[Router]] = {}
         # MCP mount definitions (dicts consumed by _core.register_mcp_mounts).
         # Populated by bolt_mcp.mount_mcp; empty for APIs without MCP.
         self._mcp_mounts: list[dict[str, Any]] = []
@@ -685,7 +825,9 @@ class BoltAPI:
         self._emit_signals = getattr(django_settings, "BOLT_EMIT_SIGNALS", False) if django_settings else False
         # Lifecycle: async context manager for startup/shutdown
         self._lifespan_context: Callable | None = lifespan
-        self._source_lifespans: list[tuple[BoltAPI, Callable]] | None = None
+        # The lifespans that a server of this API runs, in startup order: the
+        # lifespan of this API, then the lifespans of the APIs that it mounts.
+        self._source_lifespans: list[tuple[BoltAPI, Callable]] = [(self, lifespan)] if lifespan is not None else []
 
         # Signal support: wrap _dispatch when enabled
         # This is done at init time (not per-request) for zero overhead when disabled
@@ -700,8 +842,9 @@ class BoltAPI:
                         "type": "http",
                         "method": request.get("method", "GET"),
                         "path": request.get("path", "/"),
-                        "query_string": request.get("query_string", b""),
-                        "headers": request.get("headers", {}),
+                        # Rust keeps both for each route when signals are on.
+                        "query_string": request.get_full_path().partition("?")[2].encode(),
+                        "headers": request.headers,
                     },
                 )
                 try:
@@ -717,17 +860,16 @@ class BoltAPI:
         Resolution mirrors `runbolt.py` so `TestClient` / `AsyncTestClient` /
         `WebSocketTestClient` see the same compression behavior as production:
 
-        1. If `settings.BOLT_COMPRESSION` is defined and truthy, it wins.
+        1. If `settings.BOLT_COMPRESSION` is a `CompressionConfig`, it wins.
+           A value of a wrong type raises `ImproperlyConfigured`.
         2. If `settings.BOLT_COMPRESSION` is defined and `None`/`False`, that
            explicitly disables compression.
         3. Otherwise fall back to this `BoltAPI`'s own `_compression`.
         """
-        if django_settings is not None and hasattr(django_settings, "BOLT_COMPRESSION"):
-            bolt_compression = django_settings.BOLT_COMPRESSION
-            if bolt_compression is None or bolt_compression is False:
-                return None
-            return bolt_compression.to_rust_config()
-        return self._compression.to_rust_config() if self._compression else None
+        defined, config = compression_setting()
+        if not defined:
+            config = self._compression
+        return config.to_rust_config() if config else None
 
     def get(
         self,
@@ -744,6 +886,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "GET",
@@ -759,6 +902,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def post(
@@ -776,6 +920,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "POST",
@@ -791,6 +936,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def put(
@@ -808,6 +954,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "PUT",
@@ -823,6 +970,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def patch(
@@ -840,6 +988,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "PATCH",
@@ -855,6 +1004,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def delete(
@@ -872,6 +1022,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "DELETE",
@@ -887,6 +1038,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def head(
@@ -904,6 +1056,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "HEAD",
@@ -919,6 +1072,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def options(
@@ -936,6 +1090,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "OPTIONS",
@@ -951,6 +1106,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def query(
@@ -968,6 +1124,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         return self._route_decorator(
             "QUERY",
@@ -983,6 +1140,7 @@ class BoltAPI:
             description=description,
             response_class=response_class,
             include_in_schema=include_in_schema,
+            deprecated=deprecated,
         )
 
     def websocket(
@@ -1048,7 +1206,7 @@ class BoltAPI:
         def decorator(fn: Callable) -> Callable:
             # Ensure handler is async
             if not inspect.iscoroutinefunction(fn):
-                raise TypeError(f"WebSocket handler '{fn.__name__}' must be an async function")
+                raise TypeError(f"WebSocket handler '{fn.__qualname__}' must be an async function")
 
             # Mark as WebSocket handler
             fn = mark_websocket_handler(fn)
@@ -1057,12 +1215,15 @@ class BoltAPI:
             handler_id = self._next_handler_id
             self._next_handler_id += 1
 
-            # Build full path with prefix
-            full_path = f"{self.prefix}{path}" if self.prefix else path
+            # Build full path with prefix. The server removes the trailing slash
+            # of a WebSocket request path before the lookup, for each
+            # trailing_slash mode. Thus the route path has no trailing slash.
+            full_path = _normalize_path(f"{self.prefix}{_leading_slash(path)}", "strip")
+            _refuse_repeated_path_params(full_path)
 
-            # Store the route
-            self._websocket_routes.append((full_path, handler_id, fn))
             self._handlers[handler_id] = fn
+            # A config decorator that runs after this one is above it, and has no effect.
+            mark_route_handler(fn)
 
             # Compile parameter binder for WebSocket (reuses HTTP binding logic)
             # This enables injection of path params, query params, headers, cookies
@@ -1087,9 +1248,16 @@ class BoltAPI:
 
             # Compile optimized argument injector (same as HTTP handlers)
             injector = self._compile_argument_injector(meta)
+            route_handler = fn
+            if inspect.iscoroutinefunction(injector):
+                # An async dependency makes the injector async. The handshake
+                # calls the injector with no await.
+                route_handler, injector = _defer_async_websocket_injector(fn, injector)
             meta["injector"] = injector
-            meta["injector_is_async"] = inspect.iscoroutinefunction(injector)
+            meta["injector_is_async"] = False
 
+            # Store the route
+            self._websocket_routes.append((full_path, handler_id, route_handler))
             self._handler_meta[handler_id] = meta
 
             # Django middleware does not run on a WebSocket, so no code could
@@ -1116,7 +1284,8 @@ class BoltAPI:
 
             # The handshake awaits this check before the upgrade: a revoked
             # token gets 401, as on an HTTP route.
-            revocation_handlers = _revocation_handlers(route_auth_backends(ws_auth))
+            ws_auth_backends = route_auth_backends(ws_auth, guards)
+            revocation_handlers = _revocation_handlers(ws_auth_backends)
             if revocation_handlers is not None:
                 middleware_meta = middleware_meta or {}
                 middleware_meta["websocket_revocation_check"] = functools.partial(
@@ -1125,13 +1294,19 @@ class BoltAPI:
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
-                # Store auth backend instances for user resolution
-                if ws_auth is not None:
-                    middleware_meta["_auth_backend_instances"] = ws_auth
+                # Store the auth backend instances for user resolution and for the
+                # OpenAPI schema: the explicit ones, or the defaults that Rust gets.
+                if ws_auth_backends:
+                    middleware_meta["_auth_backend_instances"] = ws_auth_backends
 
             return fn
 
-        return decorator
+        def normalizing_decorator(fn: Callable):
+            # Register the normalized handler. Return the object that the caller gave.
+            decorator(_route_handler(fn))
+            return fn
+
+        return normalizing_decorator
 
     def view(
         self,
@@ -1145,6 +1320,7 @@ class BoltAPI:
         validate_response: bool | None = None,
         tags: list[str] | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         """
         Register a class-based view as a decorator.
@@ -1168,6 +1344,7 @@ class BoltAPI:
             auth: Optional per-route auth overrides (merged with class-level auth)
             status_code: Optional per-route status code override
             tags: Optional per-route tags override
+            deprecated: True marks each operation of the view as deprecated in the OpenAPI schema
 
         Returns:
             Decorator function that registers the view class
@@ -1190,6 +1367,11 @@ class BoltAPI:
                 methods_to_register = [m.lower() for m in available_methods]
             else:
                 # Validate requested methods are implemented
+                if not methods:
+                    raise ValueError(
+                        f"methods of @api.view() is empty, so {view_cls.__name__} would have no route. "
+                        "Leave out methods to register each method that the class implements."
+                    )
                 methods_to_register = [m.lower() for m in methods]
                 available_methods = {m.lower() for m in view_cls.get_allowed_methods()}
                 for method in methods_to_register:
@@ -1243,6 +1425,7 @@ class BoltAPI:
                     auth=merged_auth,
                     tags=tags,
                     include_in_schema=merged_include_in_schema,
+                    deprecated=deprecated,
                 )
 
                 # Apply decorator to register the handler
@@ -1275,6 +1458,7 @@ class BoltAPI:
         lookup_field: str = "pk",
         tags: list[str] | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
     ):
         """
         Register a ViewSet with automatic CRUD route generation as a decorator.
@@ -1312,11 +1496,22 @@ class BoltAPI:
                 ``UserViewSet`` yields "user-view-set-list", "user-view-set-retrieve",
                 etc. -- reverse() works without an explicit name (a derived base is
                 non-explicit, so it loses collisions to explicitly named routes).
-            guards: Optional guards to apply to all routes
-            auth: Optional auth backends to apply to all routes
-            status_code: Optional default status code (overrides action-specific defaults)
-            lookup_field: Field name for object lookup (default: "pk")
-            tags: Optional tags to apply to all routes
+            guards: Optional guards to apply to all routes. An @action that sets
+                ``guards`` keeps its value.
+            auth: Optional auth backends to apply to all routes. An @action that
+                sets ``auth`` keeps its value.
+            status_code: Optional default status code (overrides action-specific
+                defaults). An @action that sets ``status_code`` keeps its value.
+            validate_response: Optional response validation switch for all routes.
+                An @action that sets ``validate_response`` keeps its value.
+            lookup_field: Field name for object lookup (default: "pk"). It names
+                the path parameter, and ``get_object()`` reads it. A value other
+                than "pk" has priority over the ``lookup_field`` class attribute.
+                It applies to the routes of this registration only.
+            tags: Optional tags to apply to all routes. An @action that sets
+                ``tags`` keeps its value.
+            deprecated: True marks each operation of the viewset as deprecated in the
+                OpenAPI schema. This includes its @action routes.
 
         Returns:
             Decorator function that registers the viewset
@@ -1332,6 +1527,12 @@ class BoltAPI:
             if actual_lookup_field == "pk" and hasattr(viewset_cls, "lookup_field"):
                 actual_lookup_field = viewset_cls.lookup_field
 
+            # The view instances of this registration get the decorator value.
+            # The class attribute stays, so a second registration is independent.
+            view_kwargs = (
+                {} if actual_lookup_field == viewset_cls.lookup_field else {"lookup_field": actual_lookup_field}
+            )
+
             # Reverse-name base for all generated routes. Both an explicit name and
             # the class-name fallback are used verbatim.
             vs_base = name if name is not None else viewset_cls.__name__
@@ -1346,10 +1547,10 @@ class BoltAPI:
                 "list": ("GET", path, None),
                 "create": ("POST", path, HTTP_201_CREATED),
                 # Detail routes (with pk)
-                "retrieve": ("GET", f"{path}/{{{actual_lookup_field}}}", None),
-                "update": ("PUT", f"{path}/{{{actual_lookup_field}}}", None),
-                "partial_update": ("PATCH", f"{path}/{{{actual_lookup_field}}}", None),
-                "destroy": ("DELETE", f"{path}/{{{actual_lookup_field}}}", HTTP_204_NO_CONTENT),
+                "retrieve": ("GET", _join_viewset_path(path, f"{{{actual_lookup_field}}}"), None),
+                "update": ("PUT", _join_viewset_path(path, f"{{{actual_lookup_field}}}"), None),
+                "partial_update": ("PATCH", _join_viewset_path(path, f"{{{actual_lookup_field}}}"), None),
+                "destroy": ("DELETE", _join_viewset_path(path, f"{{{actual_lookup_field}}}"), HTTP_204_NO_CONTENT),
             }
 
             # Register routes for each implemented action
@@ -1358,12 +1559,14 @@ class BoltAPI:
                 if not hasattr(viewset_cls, action_name):
                     continue
 
+                # A sync action is a route too, as a sync APIView method is. An
+                # attribute that is not a function, such as ``destroy = None``, is not.
                 action_method = getattr(viewset_cls, action_name)
-                if not inspect.iscoroutinefunction(action_method):
+                if not inspect.isfunction(action_method):
                     continue
 
                 # Use action name (e.g., "list") not HTTP method name (e.g., "get")
-                handler = viewset_cls.as_view(http_method.lower(), action=action_name)
+                handler = viewset_cls.as_view(http_method.lower(), action=action_name, **view_kwargs)
 
                 # Merge guards and auth
                 merged_guards = guards
@@ -1390,7 +1593,7 @@ class BoltAPI:
 
                 # Extract response model from type hints if not already determined
                 if method_response_model is _RESPONSE_MODEL_UNSET:
-                    globalns = sys.modules.get(handler.__module__, {}).__dict__ if handler.__module__ else {}
+                    globalns = annotation_globals(handler)
                     type_hints = get_type_hints(handler, globalns=globalns, include_extras=True)
                     method_response_model = type_hints.get("return", _RESPONSE_MODEL_UNSET)
 
@@ -1443,6 +1646,7 @@ class BoltAPI:
                     auth=merged_auth,
                     tags=tags,
                     include_in_schema=merged_include_in_schema,
+                    deprecated=deprecated,
                 )
                 route_decorator(handler)
 
@@ -1452,8 +1656,15 @@ class BoltAPI:
                 base_path=path,
                 lookup_field=actual_lookup_field,
                 include_in_schema=merged_include_in_schema,
+                deprecated=deprecated,
                 base_name=vs_base,
                 base_name_explicit=name is not None,
+                view_kwargs=view_kwargs,
+                guards=guards,
+                auth=auth,
+                status_code=status_code,
+                validate_response=validate_response,
+                tags=tags,
             )
 
             return viewset_cls
@@ -1464,14 +1675,18 @@ class BoltAPI:
         """
         Best-effort serializer inference for unannotated viewset actions.
 
-        Called at registration time (no request context), so ``self.action``
-        is unavailable. We pass *action_name* explicitly instead.
+        Called at registration time (no request context). We pass *action_name*
+        explicitly, and ``self.action`` has the same value during the call, so
+        an override can read either of them. ``self.request`` is not available.
         """
+        token = _current_action.set(action_name)
         try:
             view_instance = viewset_cls()
             return view_instance.get_serializer_class(action_name)
         except (AttributeError, TypeError, ValueError):
             return _RESPONSE_MODEL_UNSET
+        finally:
+            _current_action.reset(token)
 
     def _register_custom_actions(
         self,
@@ -1481,11 +1696,20 @@ class BoltAPI:
         base_name: str | None = None,
         base_name_explicit: bool = False,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
+        view_kwargs: dict[str, Any] | None = None,
+        guards: list[Any] | None = None,
+        auth: list[Any] | None = None,
+        status_code: int | None = None,
+        validate_response: bool | None = None,
+        tags: list[str] | None = None,
     ):
         """
         Scan a ViewSet class for custom action methods and register them.
 
-        Custom actions are methods decorated with @action decorator.
+        Custom actions are methods decorated with @action decorator. For each
+        option, the @action value comes first, then the registration value, then
+        the class attribute.
 
         Args:
             view_cls: The ViewSet class to scan
@@ -1493,12 +1717,22 @@ class BoltAPI:
             lookup_field: Lookup field name for detail actions (e.g., "id", "pk")
             base_name: Base URL-reverse name for the viewset.
             base_name_explicit: True when the user named the viewset directly
+            view_kwargs: Attributes of each view instance of this registration
+            guards: Guards from the registration call
+            auth: Auth backends from the registration call
+            status_code: Default status code from the registration call
+            validate_response: Response validation switch from the registration call
+            tags: Tags from the registration call
         """
+        view_kwargs = view_kwargs or {}
 
-        # Get class-level auth and guards (if any)
-        class_auth = getattr(view_cls, "auth", None)
-        class_guards = getattr(view_cls, "guards", None)
-        class_validate_response = getattr(view_cls, "validate_response", None)
+        # Registration value first, then the class-level value (if any)
+        class_auth = auth if auth is not None else getattr(view_cls, "auth", None)
+        class_guards = guards if guards is not None else getattr(view_cls, "guards", None)
+        class_validate_response = (
+            validate_response if validate_response is not None else getattr(view_cls, "validate_response", None)
+        )
+        class_status_code = status_code if status_code is not None else getattr(view_cls, "status_code", None)
 
         # Scan all attributes in the class
         for name in dir(view_cls):
@@ -1539,11 +1773,18 @@ class BoltAPI:
                 if attr.detail:
                     # Instance-level action: /base_path/{lookup_field}/action_name
                     # Example: /users/{id}/activate
-                    action_path = f"{base_path}/{{{lookup_field}}}/{attr.path}"
+                    action_path = _join_viewset_path(base_path, f"{{{lookup_field}}}", attr.path)
                 else:
                     # Collection-level action: /base_path/action_name
                     # Example: /users/active
-                    action_path = f"{base_path}/{attr.path}"
+                    action_path = _join_viewset_path(base_path, attr.path)
+
+                # Decide one time where the request is. A method with no request
+                # parameter gets one in the handler signature, for `self.request`.
+                sig = inspect.signature(unbound_fn)
+                params, request_index, request_name, skip = _plan_request_argument(
+                    list(sig.parameters.values())[1:]  # Skip 'self'
+                )
 
                 # Register route for each HTTP method
                 for http_method in attr.methods:
@@ -1556,32 +1797,42 @@ class BoltAPI:
                             *args,
                             __unbound_fn=unbound_fn,
                             __view_cls=view_cls,
+                            __view_kwargs=view_kwargs,
                             _action=name,
+                            _request_index=request_index,
+                            _request_name=request_name,
+                            _skip=skip,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
                             _current_action.set(_action)
-                            _current_request.set(args[0])
-                            view_instance = __view_cls()
-                            return await __unbound_fn(view_instance, *args, **kwargs)
+                            _current_request.set(
+                                args[_request_index] if _request_name is None else kwargs[_request_name]
+                            )
+                            view_instance = __view_cls(**__view_kwargs)
+                            return await __unbound_fn(view_instance, *args[_skip:], **kwargs)
                     else:
 
                         def custom_action_handler(
                             *args,
                             __unbound_fn=unbound_fn,
                             __view_cls=view_cls,
+                            __view_kwargs=view_kwargs,
                             _action=name,
+                            _request_index=request_index,
+                            _request_name=request_name,
+                            _skip=skip,
                             **kwargs,
                         ):
                             """Wrapper for custom action method."""
                             _current_action.set(_action)
-                            _current_request.set(args[0])
-                            view_instance = __view_cls()
-                            return __unbound_fn(view_instance, *args, **kwargs)
+                            _current_request.set(
+                                args[_request_index] if _request_name is None else kwargs[_request_name]
+                            )
+                            view_instance = __view_cls(**__view_kwargs)
+                            return __unbound_fn(view_instance, *args[_skip:], **kwargs)
 
                     # Preserve signature and annotations from original method
-                    sig = inspect.signature(unbound_fn)
-                    params = list(sig.parameters.values())[1:]  # Skip 'self'
                     custom_action_handler.__signature__ = sig.replace(parameters=params)
                     custom_action_handler.__annotations__ = {
                         k: v for k, v in inspect.get_annotations(unbound_fn).items() if k != "self"
@@ -1615,14 +1866,15 @@ class BoltAPI:
                         name=action_route_name,
                         _name_explicit=base_name_explicit or attr.name is not None,
                         response_model=attr.response_model,
-                        status_code=attr.status_code,
+                        status_code=attr.status_code if attr.status_code is not None else class_status_code,
                         validate_response=final_validate_response,
                         guards=final_guards,
                         auth=final_auth,
-                        tags=attr.tags,
+                        tags=attr.tags if attr.tags is not None else tags,
                         summary=attr.summary,
                         description=attr.description,
                         include_in_schema=include_in_schema,
+                        deprecated=attr.deprecated or deprecated,
                     )
                     decorator(custom_action_handler)
 
@@ -1642,6 +1894,7 @@ class BoltAPI:
         description: str | None = None,
         response_class: type | None = None,
         include_in_schema: bool | None = None,
+        deprecated: bool = False,
         _name_explicit: bool = True,
         _skip_prefix: bool = False,
         _router_middleware: list[Any] | None = None,
@@ -1651,6 +1904,8 @@ class BoltAPI:
             raise ValueError(f"The status_code of {method} {path} must be an int from 200 to 599, got {status_code}")
 
         def decorator(fn: Callable):
+            _check_wrapper_takes_handler_arguments(fn)
+
             # Detect if handler is async or sync
             is_async = inspect.iscoroutinefunction(fn)
 
@@ -1659,8 +1914,9 @@ class BoltAPI:
 
             # Normalize path (following Starlette conventions):
             # - Empty "" becomes "/"
+            # - A path with no leading slash gets one
             # - Trailing slashes are stripped (except for root "/")
-            normalized_path = path if path else "/"
+            normalized_path = _leading_slash(path) or "/"
 
             # Apply prefix to path (conversion happens in Rust)
             # _skip_prefix is used internally for OpenAPI routes that should be at absolute paths
@@ -1673,9 +1929,12 @@ class BoltAPI:
 
             # Normalize trailing slash based on setting
             full_path = _normalize_path(full_path, self.trailing_slash)
+            _refuse_repeated_path_params(full_path)
 
             self._routes.append((method, full_path, handler_id, fn))
             self._handlers[handler_id] = fn
+            # A config decorator that runs after this one is above it, and has no effect.
+            mark_route_handler(fn)
 
             # Pre-compile parameter binder (handles parameter binding only)
             meta = self._compile_binder(fn, method, full_path)
@@ -1748,7 +2007,7 @@ class BoltAPI:
             # Resolve the auth backends once (explicit > defaults), in the
             # order Rust gets them. A session backend needs Django's session
             # and auth middleware. Add the missing ones before the router middleware.
-            effective_auth_backends = route_auth_backends(auth)
+            effective_auth_backends = route_auth_backends(auth, guards)
             if uses_session(effective_auth_backends):
                 router_middleware = [
                     *session_middleware(
@@ -1784,6 +2043,13 @@ class BoltAPI:
                     final_response_type = None
                 elif isinstance(response_model, dict):
                     # Dict mode: per-status-code response schemas
+                    # A bool is an int in Python, but it is not a status code.
+                    # A key of another type, such as "404", matches no status.
+                    for code in response_model:
+                        if code is not ... and (isinstance(code, bool) or not isinstance(code, int)):
+                            raise TypeError(
+                                f"response_model has the key {code!r}. A key must be an integer status code or `...`."
+                            )
                     int_codes = sorted(c for c in response_model if isinstance(c, int))
                     if not int_codes:
                         raise ValueError(
@@ -1812,8 +2078,10 @@ class BoltAPI:
                         if success_codes:
                             effective_status = success_codes[0]
 
-                    # Set response_type to default code's type (backward compat)
-                    default_code = effective_status if effective_status is not None else int_codes[0]
+                    # Set response_type to default code's type (backward compat).
+                    # A map with no 2xx code keeps the default status 200: a map of
+                    # error types does not make an error status the default.
+                    default_code = effective_status if effective_status is not None else 200
                     default_type = response_model.get(default_code)
                     if default_type is not None:
                         final_response_type = default_type
@@ -1825,7 +2093,7 @@ class BoltAPI:
                 # No response_model - check for return annotation
                 meta["is_multi_response"] = False
                 # Need to resolve string annotations (from __future__ import annotations)
-                globalns = sys.modules.get(fn.__module__, {}).__dict__ if fn.__module__ else {}
+                globalns = annotation_globals(fn)
                 type_hints = get_type_hints(fn, globalns=globalns, include_extras=True)
                 final_response_type = type_hints.get("return", None)
 
@@ -1869,6 +2137,9 @@ class BoltAPI:
                 meta["openapi_summary"] = summary
             if description is not None:
                 meta["openapi_description"] = description
+            # Only the schema generator reads this key.
+            if deprecated:
+                meta["openapi_deprecated"] = True
 
             # Pre-compute per-status-code mini-metas at registration time.
             # Only store the 3-4 keys actually read by the serialization hot path,
@@ -2026,10 +2297,16 @@ class BoltAPI:
                 middleware_meta["needs_headers"] = True
                 middleware_meta["needs_query"] = True
                 middleware_meta["needs_body"] = True
+            elif self._emit_signals:
+                # The scope of request_started has the query string and the headers.
+                middleware_meta["needs_headers"] = True
+                middleware_meta["needs_query"] = True
             elif "rust_arg_bindings" in middleware_meta:
                 # Rust binds every argument from its own request maps, so the
                 # Python source dicts have no reader. Rust then does not build them.
                 middleware_meta["prebind_only"] = True
+
+            middleware_meta.update(self._access_log_filter_meta)
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
@@ -2040,7 +2317,12 @@ class BoltAPI:
 
             return fn
 
-        return decorator
+        def normalizing_decorator(fn: Callable):
+            # Register the normalized handler. Return the object that the caller gave.
+            decorator(_route_handler(fn))
+            return fn
+
+        return normalizing_decorator
 
     def _compile_binder(self, fn: Callable, http_method: str = "", path: str = "") -> HandlerMetadata:
         """Delegate to compile_binder in api_compilation module."""
@@ -2283,10 +2565,9 @@ class BoltAPI:
                                 try:
                                     return _encode(result)
                                 except TypeError:
-                                    # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                    if isinstance(result, QuerySet):
-                                        return _finish(result)
-                                    raise
+                                    # msgspec raises TypeError for a result that is not JSON data: a response
+                                    # object, or a QuerySet from a helper. The serializer handles each of them.
+                                    return _finish(result)
                         else:
 
                             def execute_trivial_async_sync(
@@ -2328,10 +2609,9 @@ class BoltAPI:
                                 try:
                                     return _encode(result)
                                 except TypeError:
-                                    # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                    if isinstance(result, QuerySet):
-                                        return _finish(result)
-                                    raise
+                                    # msgspec raises TypeError for a result that is not JSON data: a response
+                                    # object, or a QuerySet from a helper. The serializer handles each of them.
+                                    return _finish(result)
                         else:
 
                             def execute_trivial_async_sync(
@@ -2365,10 +2645,9 @@ class BoltAPI:
                             try:
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                if isinstance(result, QuerySet):
-                                    return await serialize_response(result, meta)
-                                raise
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
+                                return await serialize_response(result, meta)
                     else:
 
                         async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2388,10 +2667,9 @@ class BoltAPI:
                             try:
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                if isinstance(result, QuerySet):
-                                    return await serialize_response(result, meta)
-                                raise
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
+                                return await serialize_response(result, meta)
                     else:
 
                         async def execute_async_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2652,10 +2930,9 @@ class BoltAPI:
                             try:
                                 return _encode(result)
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                if isinstance(result, QuerySet):
-                                    return _finish(result)
-                                raise
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
+                                return _finish(result)
                     else:
 
                         def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2675,10 +2952,9 @@ class BoltAPI:
                             try:
                                 return _encode(result)
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
-                                if isinstance(result, QuerySet):
-                                    return _finish(result)
-                                raise
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
+                                return _finish(result)
                     else:
 
                         def execute_sync_dict_fast_plain(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2701,10 +2977,11 @@ class BoltAPI:
                             try:
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
                                 if isinstance(result, QuerySet):
                                     return await run_in_orm_executor(serialize_response_sync, result, meta)
-                                raise
+                                return serialize_response_sync(result, meta)
                     else:
 
                         async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -2726,10 +3003,11 @@ class BoltAPI:
                             try:
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             except TypeError:
-                                # msgspec raises TypeError for a QuerySet from a helper. It loads on the ORM pool.
+                                # msgspec raises TypeError for a result that is not JSON data: a response
+                                # object, or a QuerySet from a helper. The serializer handles each of them.
                                 if isinstance(result, QuerySet):
                                     return await run_in_orm_executor(serialize_response_sync, result, meta)
-                                raise
+                                return serialize_response_sync(result, meta)
                     else:
 
                         async def execute_sync_dict_fast(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
@@ -3057,7 +3335,7 @@ class BoltAPI:
 
         ``skip`` holds the names of @skip_middleware. A name selects a middleware
         class, a function middleware or a Django middleware class by its
-        ``__name__`` or its dotted path. "*" selects each Python middleware of Bolt,
+        ``__name__`` or its dotted path, in lower case. "*" selects each Python middleware of Bolt,
         but no Django middleware: a ``DjangoMiddleware`` or a class of a
         ``DjangoMiddlewareStack`` runs until a name selects it. Thus "*" cannot
         remove a CSRF check. Dict specs stay, because the compiler removes them.
@@ -3225,6 +3503,9 @@ class BoltAPI:
             async def execute_handler(req):
                 rejection = await check_session_guards(req)
                 if rejection is not None:
+                    if isinstance(rejection, HTTPException):
+                        # The error format of the API, as for an HTTPException of the handler.
+                        return MiddlewareResponse.from_tuple(self._handle_http_exception(rejection, req))
                     return rejection
                 return await self._execute_handler_as_middleware_response(handler, req, meta)
 
@@ -3303,10 +3584,9 @@ class BoltAPI:
             return middleware_response.to_tuple()
         if isinstance(middleware_response, tuple):
             return MiddlewareResponse.from_tuple(middleware_response).to_tuple()
-        raise TypeError(
-            f"Middleware chain returned unsupported response type: {type(middleware_response).__name__}. "
-            "Expected MiddlewareResponse or ResponseWireV1 tuple."
-        )
+        # A middleware answered with what a handler can return, for example a
+        # response object or a dict. The serializer of the route handles it.
+        return await serialize_response(middleware_response, meta)
 
     async def _check_revocation(
         self,
@@ -3336,6 +3616,7 @@ class BoltAPI:
             # pragma: no mutate end
         revoked = await handler(jti, claims) if takes_claims else await handler(jti)
         if revoked:
+            # Rust adds the challenge of the auth backends of the route to this 401.
             raise HTTPException(status_code=401, detail="Token has been revoked")
 
     async def _websocket_token_revoked(
@@ -3541,9 +3822,10 @@ class BoltAPI:
         method = method.upper()
         if method not in _HTTP_METHODS:
             raise ValueError(f"Unsupported HTTP method for a native route: {method}")
-        path = path or "/"
+        path = _leading_slash(path) or "/"
         full_path = _normalize_path(f"{self.prefix}{path}" if self.prefix else path, self.trailing_slash)
         _refuse_typed_native_path_params(full_path)
+        _refuse_repeated_path_params(full_path)
         # Check the capsule now, so a bad capsule stops startup before runbolt
         # starts its worker processes.
         _core.check_native_capsule(capsule)
@@ -3554,7 +3836,10 @@ class BoltAPI:
         Mount a sub-application at a given path (FastAPI-style).
 
         The mounted app's routes are copied to this app with the path prefix prepended.
+        The ``prefix`` of this app comes before the mount path.
         Each sub-app maintains its own middleware, auth, and configuration.
+        The lifespan of the mounted app runs with this app. It starts after
+        the lifespan of this app, and it stops before it.
 
         Usage:
             # Create a sub-application with its own middleware
@@ -3577,6 +3862,12 @@ class BoltAPI:
             path: URL prefix for all routes in the sub-app (e.g., "/api/v2")
             app: BoltAPI instance to mount
 
+        Raises:
+            ValueError: ``app`` is this API, or ``app`` already has the routes
+                of this API. Also when a handler of ``app`` takes a parameter
+                of ``path`` as an argument: a mounted route reads such a
+                parameter from ``request.params``.
+
         Note:
             Unlike include_router(), mount() preserves the sub-app's middleware
             and configuration independently. This is similar to FastAPI's mount()
@@ -3587,6 +3878,12 @@ class BoltAPI:
                 f"mount() expects a BoltAPI instance, got {type(app).__name__}. "
                 f"Use include_router() for Router instances."
             )
+        # mount() copies the routes of ``app``. For this API, the copy never ends.
+        if app is self:
+            raise ValueError("An API cannot mount itself.")
+        if any(owner is self for owner in app._handler_api_map.values()):
+            raise ValueError("The mounted API already has the routes of this API (a mount cycle).")
+        _refuse_mount_path_arguments(path, app)
 
         # The server has one error formatter, as in ``runbolt``. This API takes the
         # formatter of the mounted API, and two different formatters are an error.
@@ -3596,8 +3893,15 @@ class BoltAPI:
                 "The mounted API sets a different error_formatter. Set the same error_formatter on both APIs, or on one."
             )
 
-        # Normalize path prefix: ensure leading slash, strip trailing slash
-        mount_path = "/" + path.strip("/") if path else ""
+        # The prefix of this API applies to the mounted endpoints, as to each
+        # route, native route and ASGI mount of this API.
+        if self.prefix:
+            path = f"{self.prefix}/{path.strip('/')}"
+
+        # Normalize path prefix: ensure leading slash, strip trailing slash.
+        # A path of only slashes is the root, as an empty path is.
+        stripped_path = path.strip("/")
+        mount_path = "/" + stripped_path if stripped_path else ""
 
         # Prepare MCP definitions before mutating the parent. A mounted child
         # is removed from global discovery below, so its MCP endpoints must be
@@ -3617,6 +3921,12 @@ class BoltAPI:
                 raise ValueError(f"An MCP server is already mounted at {child_definition['path']!r} on this API")
             existing_mcp_paths.add(child_definition["path"])
             child_mcp_mounts.append(child_definition)
+
+        # Check each combined path before this API changes.
+        mounted_paths = [route_path for _method, route_path, *_rest in app._routes + app._native_routes]
+        mounted_paths.extend(ws_path for ws_path, _handler_id, _handler in app._websocket_routes)
+        for mounted_path in mounted_paths:
+            _refuse_repeated_path_params(mount_path + mounted_path)
 
         # Copy routes from sub-app to this app with path prefix
         for method, route_path, handler_id, handler in app._routes:
@@ -3658,8 +3968,8 @@ class BoltAPI:
 
         # Copy WebSocket routes
         for ws_path, handler_id, handler in app._websocket_routes:
-            # Compute new path with mount prefix and normalize using parent's trailing_slash setting
-            new_path = _normalize_path(mount_path + ws_path, self.trailing_slash)
+            # A WebSocket route path has no trailing slash: see _websocket_decorator.
+            new_path = _normalize_path(mount_path + ws_path, "strip")
 
             new_handler_id = self._next_handler_id
             self._next_handler_id += 1
@@ -3699,6 +4009,11 @@ class BoltAPI:
             self._asgi_mounts.append((new_asgi_prefix, asgi_app))
 
         self._mcp_mounts.extend(child_mcp_mounts)
+        # A server of this API also runs the lifespans of the mounted API. An
+        # API that is mounted two times still starts one time.
+        for source_lifespan in app._source_lifespans:
+            if source_lifespan not in self._source_lifespans:
+                self._source_lifespans.append(source_lifespan)
         # Last, so that a mount that raises does not change the formatter.
         if child_formatter is not None:
             self._error_formatter = child_formatter
@@ -3831,6 +4146,10 @@ class BoltAPI:
             api.include_router(users_router, prefix="/api/v1")
             # Results in: GET /api/v1/users, GET /api/v1/users/{user_id}
 
+        A router with a parent (`Router(parent=...)` or `Router.include_router`)
+        registers one time for each `prefix`, with the prefixes of its parents.
+        A call with the router and a call with its parent give the same route.
+
         Args:
             router: Router instance containing routes to include
             prefix: Additional URL prefix to prepend (combined with router's prefix)
@@ -3841,14 +4160,26 @@ class BoltAPI:
                 f"Use mount() for BoltAPI sub-applications."
             )
 
+        # A router with a parent registers one time for each prefix, with the
+        # prefixes of its parents. It is the same route if this call includes
+        # the router or its parent, and the order of the calls has no effect.
+        prefix = prefix.rstrip("/")
+        included = self._included_child_routers.setdefault(prefix, set())
+        if router in included:
+            return
+
         # Get all routes from router (including nested routers)
-        all_routes = router.get_all_routes()
+        all_routes = router.get_all_routes(skip=included)
+        included.update(router.child_routers())
+        if router._parent is not None:
+            included.add(router)
+            prefix += router.parent_prefix()
 
         for method, route_path, handler, meta in all_routes:
             route_meta = dict(meta)
 
             # Compute full path with optional prefix
-            full_path = prefix.rstrip("/") + route_path if prefix else route_path
+            full_path = prefix + route_path
 
             # Extract route-specific overrides from meta
             route_auth = route_meta.pop("auth", None)
@@ -3875,5 +4206,5 @@ class BoltAPI:
 
     @property
     def _has_lifespan(self) -> bool:
-        """Check if this API has a lifespan context manager."""
-        return self._lifespan_context is not None
+        """Check if this API, or an API that it mounts, has a lifespan context manager."""
+        return bool(self._source_lifespans)
