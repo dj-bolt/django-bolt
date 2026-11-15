@@ -874,8 +874,8 @@ fn try_jwt_auth(
         None => Cow::Borrowed(headers.get(header_name)?.as_str()),
     };
 
-    // Remove "Bearer " prefix if present
-    let token = raw_token.strip_prefix("Bearer ").unwrap_or(&raw_token);
+    // Remove the "Bearer" scheme if present
+    let token = strip_scheme(&raw_token, "Bearer").unwrap_or(&raw_token);
 
     let claims = decode_and_validate(
         token, keys, algorithms, audience, issuer, leeway, token_type,
@@ -885,6 +885,25 @@ fn try_jwt_auth(
         return None;
     }
     Some(AuthContext::from_jwt_claims(claims, "jwt", cookie_csrf))
+}
+
+/// Remove an auth scheme and the space after it from a header value.
+///
+/// The name of an auth scheme is case-insensitive (RFC 9110 section 11.1).
+/// `scheme` is ASCII. The comparison reads bytes and does not allocate.
+#[inline]
+fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
+    let bytes = value.as_bytes();
+    let len = scheme.len();
+    if bytes.len() > len
+        && bytes[len] == b' '
+        && bytes[..len].eq_ignore_ascii_case(scheme.as_bytes())
+    {
+        // The bytes before `len + 1` are ASCII, so this is a char boundary.
+        Some(&value[len + 1..])
+    } else {
+        None
+    }
 }
 
 fn try_api_key_auth(
@@ -901,10 +920,9 @@ fn try_api_key_auth(
     // Get API key from header
     let api_key_header = headers.get(header_name)?;
 
-    // Extract key (remove "Bearer " or "ApiKey " prefix if present)
-    let api_key = api_key_header
-        .strip_prefix("Bearer ")
-        .or_else(|| api_key_header.strip_prefix("ApiKey "))
+    // Extract key (remove the "Bearer" or "ApiKey" scheme if present)
+    let api_key = strip_scheme(api_key_header, "Bearer")
+        .or_else(|| strip_scheme(api_key_header, "ApiKey"))
         .unwrap_or(api_key_header);
 
     // Check if the key is valid. See `ApiKeys::find` for the timing.
@@ -1843,6 +1861,70 @@ mod tests {
     }
 
     #[test]
+    fn the_auth_scheme_of_a_credential_has_no_case() {
+        // RFC 9110 section 11.1: the name of an auth scheme is case-insensitive.
+        let token = bearer_headers(SECRET)["authorization"]
+            .strip_prefix("Bearer ")
+            .unwrap()
+            .to_string();
+        let jwt = [hs256_backend(SECRET)];
+        for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+            let headers =
+                AHashMap::from_iter([("authorization".to_string(), format!("{scheme} {token}"))]);
+            let ctx = authenticate(&headers, &jwt);
+            assert_eq!(ctx.unwrap().user_id.as_deref(), Some("42"), "{scheme}");
+        }
+        // The scheme ends with one space, and another scheme stays in the token.
+        for value in [format!("bearer{token}"), format!("basic {token}")] {
+            let headers = AHashMap::from_iter([("authorization".to_string(), value.clone())]);
+            assert!(authenticate(&headers, &jwt).is_none(), "{value}");
+        }
+
+        let api_key = [AuthBackend::APIKey {
+            api_keys: ["key-one".to_string()].into_iter().collect(),
+            header: "x-api-key".to_string(),
+            key_permissions: HashMap::new(),
+        }];
+        for value in [
+            "bearer key-one",
+            "BEARER key-one",
+            "apikey key-one",
+            "APIKEY key-one",
+        ] {
+            let headers = AHashMap::from_iter([("x-api-key".to_string(), value.to_string())]);
+            let ctx = authenticate(&headers, &api_key);
+            assert_eq!(
+                ctx.unwrap().user_id.as_deref(),
+                Some("apikey:key-one"),
+                "{value}"
+            );
+        }
+        for value in [
+            "bearerkey-one",
+            "apikeykey-one",
+            "bearér key-one",
+            "bearer  key-one",
+        ] {
+            let headers = AHashMap::from_iter([("x-api-key".to_string(), value.to_string())]);
+            assert!(authenticate(&headers, &api_key).is_none(), "{value}");
+        }
+    }
+
+    #[test]
+    fn strip_scheme_removes_the_scheme_and_one_space() {
+        assert_eq!(strip_scheme("Bearer abc", "Bearer"), Some("abc"));
+        assert_eq!(strip_scheme("bEARER abc", "Bearer"), Some("abc"));
+        assert_eq!(strip_scheme("Bearer ", "Bearer"), Some(""));
+        assert_eq!(strip_scheme("Bearer", "Bearer"), None);
+        assert_eq!(strip_scheme("Bearerabc", "Bearer"), None);
+        assert_eq!(strip_scheme("Bear", "Bearer"), None);
+        assert_eq!(strip_scheme("", "Bearer"), None);
+        // A multi-byte character at the place of the space is not a char boundary.
+        assert_eq!(strip_scheme("Beareré abc", "Bearer"), None);
+        assert_eq!(strip_scheme("Bearé abc", "Bearer"), None);
+    }
+
+    #[test]
     fn authenticate_records_the_position_of_an_api_key_backend() {
         let backends = [
             hs256_backend("secret-a"),
@@ -1954,6 +2036,50 @@ mod tests {
             assert!(due.select(Some("a")).is_some());
             wait_for_refresh(py, &due);
             assert_eq!(calls.len().unwrap(), 1);
+        });
+    }
+
+    /// The log is the only sign that the provider fails.
+    #[test]
+    fn a_failed_refresh_logs_a_warning_and_keeps_the_last_keys() {
+        Python::initialize();
+        Python::attach(|py| {
+            let code = "import logging\n\
+                records = []\n\
+                class Keep(logging.Handler):\n    \
+                    def emit(self, record):\n        \
+                        records.append((record.levelname, record.getMessage()))\n\
+                logging.getLogger('django_bolt.auth').addHandler(Keep())\n\
+                def refresh():\n    \
+                    raise RuntimeError('provider 7391 is down')\n";
+            let module = PyModule::from_code(
+                py,
+                &std::ffi::CString::new(code).unwrap(),
+                c"failing_jwks_refresh.py",
+                c"failing_jwks_refresh",
+            )
+            .unwrap();
+            let key = DecodingKey::from_secret(SECRET.as_bytes());
+            let keys = HashMap::from([("a".to_string(), key)]);
+            let refresh = module.getattr("refresh").unwrap().unbind();
+            let jwks = Arc::new(RefreshingJwks::new(
+                keys,
+                refresh,
+                Duration::from_secs(3600),
+            ));
+
+            jwks.fetch();
+
+            assert!(jwks.select(Some("a")).is_some());
+            let records: Vec<(String, String)> =
+                module.getattr("records").unwrap().extract().unwrap();
+            let expected = (
+                "WARNING".to_string(),
+                "JWKS refresh failed: the refresh callback raised RuntimeError: \
+                 provider 7391 is down. Bolt keeps the last keys."
+                    .to_string(),
+            );
+            assert!(records.contains(&expected), "{records:?}");
         });
     }
 

@@ -2,6 +2,7 @@
 Test parameter validation and inference system.
 """
 
+from dataclasses import dataclass
 from typing import Annotated
 
 import msgspec
@@ -9,9 +10,16 @@ import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.params import Body, Param, Query
+from django_bolt.testing import TestClient
 
 
 class UserCreate(msgspec.Struct):
+    name: str
+    email: str
+
+
+@dataclass
+class UserCreateDataclass:
     name: str
     email: str
 
@@ -32,11 +40,16 @@ def test_get_with_body_param_raises_error():
     assert "Change HTTP method to POST/PUT/PATCH" in error_msg
 
 
-def test_head_with_body_param_raises_error():
-    """Test that HEAD endpoints cannot have body parameters."""
-    # Note: BoltAPI doesn't have @api.head() decorator yet, but we test the principle
-    # This would be the expected behavior if we add HEAD support
-    pass
+@pytest.mark.parametrize("method", ["head", "options"])
+def test_head_or_options_with_body_param_raises_error(method):
+    """Test that HEAD and OPTIONS endpoints cannot have body parameters."""
+    api = BoltAPI()
+
+    with pytest.raises(TypeError, match=f"{method.upper()} /users cannot have body parameters"):
+
+        @getattr(api, method)("/users")
+        async def create_user(user: UserCreate):
+            return {"id": 1}
 
 
 def test_delete_with_body_param_raises_error():
@@ -111,6 +124,25 @@ def test_post_with_struct_inferred_as_body():
 
     user_field = next(f for f in meta["fields"] if f.name == "user")
     assert user_field.source == "body"
+
+
+@pytest.mark.parametrize("item_type", [UserCreate, UserCreateDataclass], ids=["struct", "dataclass"])
+def test_post_with_struct_list_inferred_as_body(item_type):
+    """A list of msgspec.Struct or dataclass items with no marker is the JSON body, as one item is."""
+    api = BoltAPI()
+
+    @api.post("/users/bulk")
+    async def create_users(users: list[item_type]):
+        return {"names": [user.name for user in users]}
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/users/bulk",
+            json=[{"name": "Ann", "email": "ann@example.com"}, {"name": "Bob", "email": "bob@example.com"}],
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"names": ["Ann", "Bob"]}
 
 
 def test_path_params_inferred_correctly():

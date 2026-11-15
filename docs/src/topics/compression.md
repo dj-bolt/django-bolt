@@ -53,6 +53,8 @@ api = BoltAPI(compression=False)
 (`compression=None` and omitting the kwarg both mean "use the default
 `CompressionConfig()`".)
 
+Each other value, for example `compression=True` or a dict, raises `TypeError` when the API is made.
+
 `StreamingResponse` / `EventSourceResponse` don't take a `compress=`
 kwarg — the decision is always made per-request from the global
 `CompressionConfig` plus the client's `Accept-Encoding`.

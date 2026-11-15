@@ -140,25 +140,46 @@ POST /api/upload - body: "<binary data, 1024 bytes>"
 
 ## Production settings
 
-For production, use sampling and duration thresholds to reduce log volume:
+For production, use sampling and a duration threshold to make the access log of `runbolt` smaller.
+Give the config to the API:
 
 ```python
+from django_bolt import BoltAPI
+from django_bolt.logging import LoggingConfig
+
 config = LoggingConfig(
     # Only log 5% of successful requests
     sample_rate=0.05,
 
-    # Only log requests taking longer than 250ms
+    # Only log requests taking 250ms or longer
     min_duration_ms=250,
 )
+api = BoltAPI(logging_config=config)
 ```
+
+The two options apply to each route of that API, also after `mount()` and in a project with more than one API.
+Bolt reads them once, when the API registers its routes. The Rust server applies them without a call to Python.
+A response must pass the two checks to get its line.
 
 **Important**: Errors (4xx, 5xx) are always logged regardless of sampling or duration settings.
 
+An API with no `logging_config` takes the two values from the Django settings:
+
+```python
+# settings.py
+DJANGO_BOLT_LOG_SAMPLE = 0.05   # sample_rate
+DJANGO_BOLT_LOG_SLOW_MS = 250   # min_duration_ms
+```
+
+Without the settings, the access log has no limit.
+A `sample_rate` out of 0.0 to 1.0, or a negative `min_duration_ms`, stops startup.
+The level of the `django.server` logger applies first. See [Access log](#access-log).
+
 ### Sample rate
 
-`sample_rate` controls what percentage of 2xx/3xx responses are logged:
+`sample_rate` controls what percentage of 1xx to 3xx responses are logged:
 
-- `1.0` = Log all requests (default)
+- `1.0` or `None` = Log all requests (default)
 - `0.1` = Log 10% of successful requests
 - `0.0` = Don't log any successful requests
 
@@ -172,7 +193,7 @@ config = LoggingConfig(sample_rate=0.05)
 `min_duration_ms` skips logging fast successful requests:
 
 ```python
-# Only log requests taking > 250ms
+# Only log requests taking 250ms or longer
 config = LoggingConfig(min_duration_ms=250)
 ```
 
@@ -351,6 +372,13 @@ The Rust server writes one line for each response from a matched route to the `d
 GET /items/7 200 0.4ms
 ```
 
+This includes a response that Bolt gives before the handler runs.
+Examples are a 401 or a 403 from authentication or a guard, a 429 from a rate limit, and a 422 or a 400 from request validation.
+Bolt also writes a line for two answers about a route path: the 308 redirect to the other slash form, and the automatic `OPTIONS` answer.
+With an `error_formatter`, the line has the status of the formatted response.
+
+Bolt writes no line for a request with no route (404), for a mounted ASGI app or MCP server, for a static or media file, and for a [native route](native-routes.md).
+
 The log level follows the status code, the same as Django's `runserver`:
 
 | Status | Level |
@@ -360,6 +388,8 @@ The log level follows the status code, the same as Django's `runserver`:
 | 5xx | `ERROR` |
 
 Set `django.server` to `WARNING` to keep only the 4xx and 5xx lines. Set it above `WARNING` to turn the access log off. The check runs once at startup. When the log is off, the request path has no logging code.
+
+`sample_rate` and `min_duration_ms` remove lines of 1xx to 3xx responses. See [Production settings](#production-settings).
 
 ## Example: Complete production setup
 
