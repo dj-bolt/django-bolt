@@ -11,7 +11,7 @@ import datetime
 import decimal
 import enum
 import uuid
-from typing import Any, List  # noqa: UP035 - the test needs the bare typing.List
+from typing import Annotated, Any, List  # noqa: UP035 - the test needs the bare typing.List
 
 import msgspec
 import pytest
@@ -444,6 +444,76 @@ def test_declared_json_scalar_type_is_validated(settings, return_type, value, ex
 
     with TestClient(api) as scalar_client:
         assert expected in _validation_message(scalar_client.get("/bad"))
+
+
+@pytest.mark.parametrize("is_async", [True, False], ids=["async", "sync"])
+@pytest.mark.parametrize(
+    ("return_type", "value", "expected"),
+    [
+        (int, "abc", "Expected `int`, got `str`"),
+        (decimal.Decimal, "abc", "Invalid decimal string"),
+        (Item, "abc", "Expected `object`, got `str`"),
+        (int | None, "abc", "Expected `int | null`, got `str`"),
+        (int, b"abc", "Expected `int`, got `bytes`"),
+        (Item, bytearray(b"abc"), "Expected `object`, got `bytes`"),
+    ],
+)
+def test_str_or_bytes_for_a_type_that_does_not_allow_it_is_a_validation_error(
+    settings, return_type, value, expected, is_async
+):
+    settings.DEBUG = True
+    api = BoltAPI()
+    _scalar_route(api, "/bad", value, is_async=is_async, **{"return": return_type})
+    api.get("/unvalidated", validate_response=False, response_model=return_type)(lambda: value)
+
+    with TestClient(api) as scalar_client:
+        assert expected in _validation_message(scalar_client.get("/bad"))
+        # A route with no validation sends the result as before.
+        assert scalar_client.get("/unvalidated").content == b"abc"
+
+
+_SHORT_TEXT = Annotated[str, msgspec.Meta(max_length=5)]
+
+
+@pytest.mark.parametrize("is_async", [True, False], ids=["async", "sync"])
+@pytest.mark.parametrize(
+    ("return_type", "value", "content_type"),
+    [
+        (str, "abc", "text/plain; charset=utf-8"),
+        (str | None, "abc", "text/plain; charset=utf-8"),
+        (str | Item, "abc", "text/plain; charset=utf-8"),
+        (Any, "abc", "text/plain; charset=utf-8"),
+        (_SHORT_TEXT, "abc", "text/plain; charset=utf-8"),
+        (bytes, b"abc", "application/octet-stream"),
+        (bytes | None, b"abc", "application/octet-stream"),
+        (bytes | Item, bytearray(b"abc"), "application/octet-stream"),
+    ],
+)
+def test_str_or_bytes_for_a_type_that_allows_it_keeps_its_content_type(return_type, value, content_type, is_async):
+    api = BoltAPI()
+    _scalar_route(api, "/declared", value, is_async=is_async, **{"return": return_type})
+    _scalar_route(api, "/bare", value, is_async=is_async)
+
+    with TestClient(api) as scalar_client:
+        for path in ("/declared", "/bare"):
+            response = scalar_client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.headers["content-type"] == content_type
+            assert response.content == b"abc"
+
+
+@pytest.mark.parametrize("is_async", [True, False], ids=["async", "sync"])
+def test_str_that_converts_to_the_declared_type_is_sent_as_json(settings, is_async):
+    settings.DEBUG = True
+    api = BoltAPI()
+    _scalar_route(api, "/uuid", str(uuid.UUID(int=1)), is_async=is_async, **{"return": uuid.UUID})
+    _scalar_route(api, "/long", "abcdef", is_async=is_async, **{"return": _SHORT_TEXT})
+
+    with TestClient(api) as scalar_client:
+        response = scalar_client.get("/uuid")
+        assert response.headers["content-type"] == "application/json"
+        assert response.content == b'"00000000-0000-0000-0000-000000000001"'
+        assert "Expected `str` of length <= 5" in _validation_message(scalar_client.get("/long"))
 
 
 def test_bare_list_accepts_any_item_and_names_its_item_type_in_a_mismatch(client):

@@ -346,6 +346,13 @@ def _allows_none(annotation: Any) -> bool:
     return get_origin(annotation) in (Union, types.UnionType) and type(None) in get_args(annotation)
 
 
+def _names_one_of(annotation: Any, kinds: tuple[type, ...]) -> bool:
+    """Return True when the response type is one of ``kinds`` or a union that names one of them."""
+    if annotation in kinds:
+        return True
+    return get_origin(annotation) in (Union, types.UnionType) and any(arg in kinds for arg in get_args(annotation))
+
+
 def _strip_optional(annotation: Any) -> Any:
     origin = get_origin(annotation)
     if origin in (Union, types.UnionType):
@@ -891,6 +898,13 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     # A None result with no such response type is an error: the handler has no return.
     none_is_json = _allows_none(meta.get("response_type"))
 
+    # A str is text/plain and bytes are application/octet-stream, with no check,
+    # when the response type names them (-> str, -> str | None, -> bytes | Item)
+    # or when the route does not validate. Each other response type validates them.
+    validates = validator_sync is not None and meta["validate_response"]
+    validate_text = validates and not _names_one_of(meta.get("response_type"), (str,))
+    validate_bytes = validates and not _names_one_of(meta.get("response_type"), (bytes, bytearray))
+
     _serializer_cls, _serializer_many = _response_serializer_info(meta.get("response_type"))
     is_serializer_response = _serializer_cls is not None
     # list[Serializer] routes returning a QuerySet: pre-load what the serializer
@@ -947,8 +961,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 return await _serialize_json_payload_async(result, current_status, validator_async)
             return _serialize_json_payload_sync(_convert_serializers(result), current_status, validator_sync)
         if isinstance(result, (bytes, bytearray)):
+            if validate_bytes:
+                return _serialize_validated_raw(result, current_status, validator_sync)
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
+            if validate_text:
+                return _serialize_validated_raw(result, current_status, validator_sync)
             return _wire_bytes(current_status, _RESPONSE_META_PLAINTEXT, result.encode())
 
         auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status, response_class)
@@ -998,8 +1016,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 result = _convert_serializers(result)
             return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, (bytes, bytearray)):
+            if validate_bytes:
+                return _serialize_validated_raw(result, current_status, validator_sync)
             return _wire_bytes(current_status, _RESPONSE_META_OCTETSTREAM, bytes(result))
         if isinstance(result, str):
+            if validate_text:
+                return _serialize_validated_raw(result, current_status, validator_sync)
             return _wire_bytes(current_status, _RESPONSE_META_PLAINTEXT, result.encode())
 
         auto_stream = _build_auto_streaming_response(result, stream_info, meta, current_status, response_class)
@@ -1177,6 +1199,26 @@ def _serialize_json_payload_sync(
         except Exception as exc:
             _raise_response_validation_error(exc)
     return _wire_bytes(status_code, _RESPONSE_META_JSON, _json.encode(result))
+
+
+def _serialize_validated_raw(result: Any, status_code: int, validator: Any) -> ResponseWireV1:
+    """Validate a str or bytes result against a response type that does not name it.
+
+    A value that stays a str is text/plain, such as a ``Literal`` member.
+    Bytes stay application/octet-stream. A value that the validation
+    converts, such as a str to a ``UUID``, is JSON.
+    """
+    try:
+        validated = validator(result)
+    except ResponseValidationError:
+        raise
+    except Exception as exc:
+        _raise_response_validation_error(exc)
+    if isinstance(validated, str):
+        return _wire_bytes(status_code, _RESPONSE_META_PLAINTEXT, validated.encode())
+    if isinstance(validated, (bytes, bytearray)):
+        return _wire_bytes(status_code, _RESPONSE_META_OCTETSTREAM, bytes(validated))
+    return _wire_bytes(status_code, _RESPONSE_META_JSON, _json.encode(validated))
 
 
 def serialize_plaintext_response(result: PlainText) -> ResponseWireV1:
