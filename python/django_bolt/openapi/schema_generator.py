@@ -133,6 +133,10 @@ _SCHEME_NAME_MAP: dict[str, str] = {
 
 _PATH_PARAM_RE = re.compile(r"{([^{}]+)}")
 
+# The sources of a route field that Bolt validates. A value that fails gives a 422.
+_PARAMETER_SOURCES = frozenset({"path", "query", "header", "cookie"})
+_FORM_SOURCES = frozenset({"form", "file"})
+
 
 def _extract_path_param_names(path: str) -> list[str]:
     """Return path parameter names declared in a route path (e.g. {pk} → "pk")."""
@@ -1126,14 +1130,15 @@ class SchemaGenerator:
 
         # Add common error responses if enabled in config
         if self.config.include_error_responses:
-            # Check if request body is present (for 422 validation errors)
-            has_request_body = meta.get("body_struct_param") or any(
-                f.source in ("body", "form", "file") for f in self._route_fields(meta)
-            )
+            # Bolt validates each parameter and the request body, so each of them can give a 422.
+            sources = {f.source for f in self._route_fields(meta)}
+            has_parameters = not sources.isdisjoint(_PARAMETER_SOURCES)
+            has_form = not sources.isdisjoint(_FORM_SOURCES)
+            has_request_body = bool(meta.get("body_struct_param")) or has_form or "body" in sources
 
-            if has_request_body:
+            if has_request_body or has_parameters:
                 # 422 Unprocessable Entity - validation errors
-                content = self._validation_error_content()
+                content = self._validation_error_content(text_detail=has_parameters or has_form)
                 declared = responses.get("422")
                 if declared is None:
                     responses["422"] = OpenAPIResponse(
@@ -1165,10 +1170,12 @@ class SchemaGenerator:
                 merged[media_type] = replace(existing, schema=Schema(any_of=[existing.schema, media.schema]))
         return merged or None
 
-    def _validation_error_content(self) -> dict[str, OpenAPIMediaType] | None:
+    def _validation_error_content(self, *, text_detail: bool = False) -> dict[str, OpenAPIMediaType] | None:
         """The content of a 422 response, as the error formatter of the API sends it.
 
-        Without a formatter, the body is the default ``{"detail": [...]}``. A
+        Without a formatter, the body is the default ``{"detail": [...]}``. With
+        ``text_detail``, the detail can also be a text: Bolt sends a text for a
+        parameter of the wrong type and for a missing parameter or form field. A
         formatter can declare its body with ``error_schema``. For a formatter
         with no declaration, the result is None. Bolt cannot know the media type
         or the shape of its body. A generated client parses the body that a
@@ -1176,7 +1183,12 @@ class SchemaGenerator:
         """
         formatter = self.api._error_formatter
         if formatter is None:
-            return {"application/json": OpenAPIMediaType(schema=self._get_validation_error_schema())}
+            schema = self._get_validation_error_schema()
+            if text_detail:
+                errors = schema.properties["detail"]
+                text = Schema(type="string", description="Validation error message")
+                schema = replace(schema, properties={"detail": Schema(any_of=[errors, text])})
+            return {"application/json": OpenAPIMediaType(schema=schema)}
         declared = getattr(formatter, "__bolt_error_schema__", None)
         if declared is None:
             self._untyped_errors = True
