@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import UnionType
@@ -55,10 +54,6 @@ from .decorators import (
 from .fields import FieldConfig, _FieldMarker
 from .loading import LoadingPlan, build_loading_plan
 from .nested import resolve_nested_config, validate_nested_field
-
-# Regex to extract field path from msgspec error messages (e.g., "at `$.field_name`")
-# Borrowed from Litestar's approach
-ERR_RE = re.compile(r"`\$\.(.+)`$")
 
 logger = logging.getLogger(__name__)
 
@@ -1112,8 +1107,9 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
             try:
                 field_type = annotations.get(field_name, Any)
-                # Validate this field individually
-                msgspec.convert(data[data_key], type=field_type, strict=False)
+                # Validate this field individually, as strictly as the conversion
+                # of the whole object that failed.
+                msgspec.convert(data[data_key], type=field_type)
             except MsgspecValidationError as e:
                 # msgspec names the parent of a missing field in the path. The loc
                 # of a missing field ends with its name, as for a top-level field.
@@ -1122,20 +1118,16 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                     errors.append({"loc": ("body", *entries[0]["loc"]), "msg": entries[0]["msg"], "type": "missing"})
                     continue
 
-                # Extract field path from error message if present
-                error_msg = str(e)
-                match = ERR_RE.search(error_msg)
-                if match:
-                    # Nested field path like "address.city"
-                    nested_path = match.group(1)
-                    loc = ["body", data_key, *nested_path.split(".")]
-                else:
-                    loc = ["body", data_key]
+                # The validators of a nested serializer give one entry for each error.
+                if isinstance(e.__cause__, RequestValidationError):
+                    errors.extend({**entry, "loc": ("body", *entry["loc"])} for entry in entries)
+                    continue
 
+                # The loc has one item for each step of the path, also for a list index.
                 errors.append(
                     {
-                        "loc": tuple(loc),
-                        "msg": error_msg,
+                        "loc": ("body", *entries[0]["loc"]),
+                        "msg": str(e),
                         "type": "validation_error",
                     }
                 )
