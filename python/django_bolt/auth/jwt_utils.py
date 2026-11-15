@@ -157,7 +157,8 @@ async def require_current_user(request: Request) -> Any:
     """Dependency that gives the authenticated user, or answers 401 when there is none."""
     user = await get_current_user(request)
     if user is None:
-        raise Unauthorized(detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
+        # Rust adds the challenge of the auth backends of the route to this 401.
+        raise Unauthorized(detail="Authentication required")
     return user
 
 
@@ -165,7 +166,8 @@ def require_current_user_sync(request: Request) -> Any:
     """Sync form of :func:`require_current_user`."""
     user = get_current_user_sync(request)
     if user is None:
-        raise Unauthorized(detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
+        # Rust adds the challenge of the auth backends of the route to this 401.
+        raise Unauthorized(detail="Authentication required")
     return user
 
 
