@@ -8,6 +8,7 @@ from django_bolt.serializers import (
     Serializer,
     SerializerView,
     computed_field,
+    field,
 )
 
 
@@ -33,6 +34,22 @@ class TestFieldFunction:
         assert "id" in result
         assert "name" in result
         assert "internal_id" not in result
+
+    def test_field_default_default_factory_and_exclude(self):
+        """field() gives the default of a field, and exclude=True keeps the field out of dump()."""
+
+        class Member(Serializer):
+            name: str
+            internal: str = field(exclude=True, default="x")
+            role: str = field(default="user")
+            tags: list[str] = field(default_factory=list)
+
+        first, second = Member(name="a"), Member(name="b")
+
+        assert (first.role, first.tags, first.internal) == ("user", [], "x")
+        assert first.tags is not second.tags
+        assert first.dump() == {"name": "a", "role": "user", "tags": []}
+        assert Member.dump_many([first]) == [{"name": "a", "role": "user", "tags": []}]
 
     def test_field_write_only_meta(self):
         """Test write_only fields via Meta class."""
