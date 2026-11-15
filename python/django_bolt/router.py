@@ -53,7 +53,6 @@ class Router:
     __slots__ = (
         "prefix",
         "tags",
-        "dependencies",
         "middleware",
         "auth",
         "guards",
@@ -66,7 +65,6 @@ class Router:
         self,
         prefix: str = "",
         tags: list[str] | None = None,
-        dependencies: list[Any] | None = None,
         middleware: list["MiddlewareType"] | None = None,
         auth: list["AuthenticationBackend"] | None = None,
         guards: list["Guard"] | None = None,
@@ -78,7 +76,6 @@ class Router:
         Args:
             prefix: URL prefix for all routes (e.g., "/api/v1")
             tags: OpenAPI tags for documentation
-            dependencies: Shared dependencies for all routes
             middleware: Router-level middleware (inherits from parent)
             auth: Default authentication backends (can be overridden per-route)
             guards: Default guards/permissions (can be overridden per-route)
@@ -86,7 +83,6 @@ class Router:
         """
         self.prefix = prefix.rstrip("/")
         self.tags = tags or []
-        self.dependencies = dependencies or []
         self.middleware = normalize_middleware_specs(middleware, context="router")
         self.auth = auth
         self.guards = guards
