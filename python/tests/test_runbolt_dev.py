@@ -133,6 +133,26 @@ def test_runbolt_stops_for_an_option_value_out_of_range(argv, message):
     assert str(error.value) == message
 
 
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--port", "65535", "--backlog", "-1"], "--backlog must be at least 0, got -1"),
+        (["--workers", "512", "--backlog", "-1"], "--backlog must be at least 0, got -1"),
+    ],
+)
+def test_runbolt_accepts_the_highest_value_of_an_option(argv, message):
+    """The highest value of a range is a permitted value.
+
+    The second option is out of range, so the command stops before it starts
+    a server. Its check comes after the check of the first option. Thus its
+    message shows that the first option passed.
+    """
+    with pytest.raises(CommandError) as error:
+        call_command("runbolt", *argv)
+
+    assert str(error.value) == message
+
+
 def test_collapse_watch_paths_deduplicates_nested_directories(tmp_path):
     root = tmp_path / "project"
     nested = root / "app"
