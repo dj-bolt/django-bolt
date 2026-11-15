@@ -319,6 +319,32 @@ def _refuse_typed_native_path_params(path: str) -> None:
             )
 
 
+_PATH_PARAM_NAME = re.compile(r"\{([^}:]+)")
+
+
+def _refuse_mount_path_arguments(path: str, app: BoltAPI) -> None:
+    """Refuse a mounted handler that takes a parameter of the mount path as an argument.
+
+    The mounted API compiled each route without the mount path. An argument
+    with the name of a mount path parameter thus reads the query, not the path.
+    """
+    names = set(_PATH_PARAM_NAME.findall(path))
+    if not names:
+        return
+    routes = [(f"{method} {route_path}", handler_id) for method, route_path, handler_id, _handler in app._routes]
+    routes.extend((f"WEBSOCKET {ws_path}", handler_id) for ws_path, handler_id, _handler in app._websocket_routes)
+    for route, handler_id in routes:
+        for field in app._handler_meta.get(handler_id, {}).get("fields", ()):
+            # A marker such as Query() says that the argument is not from the path.
+            if field.name in names and field.param is None and field.source not in ("path", "request", "dependency"):
+                raise ValueError(
+                    f"The handler of {route} takes the parameter {field.name!r} of the mount path {path!r} as an "
+                    f"argument, and the argument reads the {field.source}. A mounted route was compiled without "
+                    f"the mount path. Read the value from request.params[{field.name!r}], or use a Router "
+                    "with this prefix."
+                )
+
+
 def _validate_mcp_mount_conflicts(
     routes: list[tuple[Any, ...]],
     asgi_mounts: list[tuple[str, Any]],
@@ -3573,6 +3599,12 @@ class BoltAPI:
             path: URL prefix for all routes in the sub-app (e.g., "/api/v2")
             app: BoltAPI instance to mount
 
+        Raises:
+            ValueError: ``app`` is this API, or ``app`` already has the routes
+                of this API. Also when a handler of ``app`` takes a parameter
+                of ``path`` as an argument: a mounted route reads such a
+                parameter from ``request.params``.
+
         Note:
             Unlike include_router(), mount() preserves the sub-app's middleware
             and configuration independently. This is similar to FastAPI's mount()
@@ -3583,6 +3615,12 @@ class BoltAPI:
                 f"mount() expects a BoltAPI instance, got {type(app).__name__}. "
                 f"Use include_router() for Router instances."
             )
+        # mount() copies the routes of ``app``. For this API, the copy never ends.
+        if app is self:
+            raise ValueError("An API cannot mount itself.")
+        if any(owner is self for owner in app._handler_api_map.values()):
+            raise ValueError("The mounted API already has the routes of this API (a mount cycle).")
+        _refuse_mount_path_arguments(path, app)
 
         # The server has one error formatter, as in ``runbolt``. This API takes the
         # formatter of the mounted API, and two different formatters are an error.

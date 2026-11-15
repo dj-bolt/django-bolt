@@ -7,12 +7,14 @@ These tests verify:
 """
 
 import asyncio
+from typing import Annotated
 
 import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import Middleware
 from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
+from django_bolt.params import Query
 from django_bolt.testing import TestClient
 
 
@@ -121,6 +123,64 @@ class TestMountPathNormalization:
                 f"Mounted route should be accessible at /sub/hello, got {response.status_code}"
             )
             assert response.json() == {"message": "Hello from mounted API"}
+
+
+def test_an_api_cannot_mount_itself():
+    """mount() copies the routes of the mounted API. For the API itself, the copy never ends."""
+    api = BoltAPI()
+
+    @api.get("/a")
+    async def handler():
+        return {"ok": True}
+
+    with pytest.raises(ValueError, match="An API cannot mount itself"):
+        api.mount("/s", api)
+    assert [path for _method, path, _id, _handler in api._routes] == ["/a"]
+
+
+def test_an_api_cannot_mount_an_api_that_has_its_routes():
+    first = BoltAPI()
+    second = BoltAPI()
+
+    @first.get("/a")
+    async def handler():
+        return {"ok": True}
+
+    second.mount("/first", first)
+    with pytest.raises(ValueError, match="mount cycle"):
+        first.mount("/second", second)
+
+
+def test_a_mounted_handler_cannot_take_a_mount_path_parameter_as_an_argument():
+    """The mounted route was compiled without the mount path, so the argument reads the query."""
+    api = BoltAPI()
+    child = BoltAPI()
+
+    @child.get("/c")
+    async def handler(x: int):
+        return {"x": x}
+
+    with pytest.raises(ValueError, match=r"GET /c takes the parameter 'x' of the mount path '/t/\{x\}'"):
+        api.mount("/t/{x}", child)
+    assert api._routes == []
+
+
+def test_a_mounted_handler_reads_a_mount_path_parameter_from_the_request():
+    api = BoltAPI()
+    child = BoltAPI()
+
+    @child.get("/c")
+    async def from_request(request):
+        return {"x": request.params["x"]}
+
+    @child.get("/items/{item_id}")
+    async def own_parameter(item_id: int, x: Annotated[int, Query()] = 0):
+        return {"item_id": item_id, "x": x}
+
+    api.mount("/t/{x:int}", child)
+    with TestClient(api) as client:
+        assert client.get("/t/5/c").json() == {"x": "5"}
+        assert client.get("/t/5/items/7?x=9").json() == {"item_id": 7, "x": 9}
 
 
 class TestOpenAPIDocsWithPrefix:
