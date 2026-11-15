@@ -1746,7 +1746,7 @@ class BoltAPI:
             # Resolve the auth backends once (explicit > defaults), in the
             # order Rust gets them. A session backend needs Django's session
             # and auth middleware. Add the missing ones before the router middleware.
-            effective_auth_backends = route_auth_backends(auth)
+            effective_auth_backends = route_auth_backends(auth, guards)
             if uses_session(effective_auth_backends):
                 router_middleware = [
                     *session_middleware(
