@@ -178,22 +178,25 @@ async def rotate_refresh_token(
 
     ``refresh_claims`` is the already cryptographically-validated claim dict
     from ``request["context"]["auth_claims"]`` — the Rust layer verified the
-    signature, expiry, and ``typ:"refresh"`` before this runs. This function
-    performs the *stateful* checks:
+    signature and expiry before this runs. With ``token_type="refresh"`` on
+    the backend, it also verified ``typ:"refresh"``. This function performs
+    the remaining checks:
 
-    1. ``jti`` must be present (refresh tokens without one cannot be revoked).
-    2. The token, and its ``fam``, must not be revoked. Replaying a
+    1. ``typ`` must be ``"refresh"``. Thus a route without
+       ``token_type="refresh"`` cannot rotate an access token.
+    2. ``jti`` must be present (refresh tokens without one cannot be revoked).
+    3. The token, and its ``fam``, must not be revoked. Replaying a
        rotated-out token (``rotate=True``) is reuse: the whole family is
        revoked and the call fails.
-    3. If ``max_session_lifetime`` is set, ``oat`` must be present (a token
+    4. If ``max_session_lifetime`` is set, ``oat`` must be present (a token
        without one fails closed — it cannot prove its session age) and
        ``now - oat`` must be within the cap. The new access token's expiry
        is clamped to the session's remaining lifetime so it cannot outlive
        the cap.
-    4. The token's ``ver`` must equal the store's current user version — a
+    5. The token's ``ver`` must equal the store's current user version — a
        version bumped by ``bump_user_version`` ("log out everywhere")
        invalidates every earlier refresh token here.
-    5. On success: issue a new pair (Mode A / ``rotate=True``) and revoke the
+    6. On success: issue a new pair (Mode A / ``rotate=True``) and revoke the
        old ``jti``, or issue only a new access token (Mode B /
        ``rotate=False``) leaving the refresh token in place.
 
@@ -213,6 +216,9 @@ async def rotate_refresh_token(
     callers should return a uniform 401 to avoid an oracle).
     """
     _check_reserved(claims)
+    if refresh_claims.get("typ") != "refresh":
+        raise TokenRotationError("Refresh token has wrong type")
+
     jti = refresh_claims.get("jti")
     if not isinstance(jti, str) or not jti:
         raise TokenRotationError("Refresh token missing jti")

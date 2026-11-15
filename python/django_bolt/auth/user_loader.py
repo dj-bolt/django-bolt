@@ -40,6 +40,7 @@ from django.contrib.auth import get_user_model
 from django.utils.functional import SimpleLazyObject, empty
 
 from ..concurrency import run_in_orm_executor, run_orm_blocking
+from ..exceptions import Unauthorized
 from .backends import BaseAuthentication, JWTAuthentication
 from .pk_loader import load_user_by_pk_sync
 
@@ -79,6 +80,11 @@ class LazyUser(SimpleLazyObject):
     Sync access forces the user on the calling thread, as ``SimpleLazyObject``
     does. ``await request.auser()`` calls :meth:`aload`, which awaits the
     async loader and does not block the event loop. Both share one result.
+
+    The object is never None itself, because Bolt does not load the user
+    before the first read. When the user ID has no row, the object is falsy,
+    :meth:`aload` gives None, and the read of an attribute raises
+    ``Unauthorized`` (401).
     """
 
     def __init__(self, loaders: UserLoaders, user_id: str, auth_context: dict | None) -> None:
@@ -89,6 +95,17 @@ class LazyUser(SimpleLazyObject):
         state["_setupfunc"] = partial(loaders[0], user_id, auth_context)
         state["_wrapped"] = empty
         state["_aloader"] = loaders[1]
+
+    def __getattr__(self, name: str) -> Any:
+        # As LazyObject.__getattr__, with one more case: a user ID with no row
+        # loads as None. The credential is valid, but its user does not exist.
+        # Without this case, ``request.user.id`` raises AttributeError, a 500.
+        if self._wrapped is empty:
+            self._setup()
+        user = self._wrapped
+        if user is None:
+            raise Unauthorized(detail="Authentication required", headers={"WWW-Authenticate": "Bearer"})
+        return getattr(user, name)
 
     def __repr__(self) -> str:
         # The arguments of the loader hold the auth context with the token claims.

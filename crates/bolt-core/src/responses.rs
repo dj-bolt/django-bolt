@@ -16,6 +16,7 @@ use std::borrow::Cow;
 pub static ERROR_BODY_401: &[u8] = br#"{"detail":"Authentication required"}"#;
 pub static ERROR_BODY_403: &[u8] = br#"{"detail":"Permission denied"}"#;
 pub static ERROR_BODY_404: &[u8] = br#"{"detail":"Not Found"}"#;
+pub static ERROR_BODY_405: &[u8] = br#"{"detail":"Method Not Allowed"}"#;
 pub static ERROR_BODY_400_HEADERS: &[u8] = br#"{"detail":"Too many headers"}"#;
 pub static ERROR_BODY_413: &[u8] = br#"{"detail":"Payload too large"}"#;
 
@@ -119,6 +120,19 @@ pub fn error_404() -> HttpResponse {
         .content_type("application/json")
         .body(ERROR_BODY_404);
     with_error_info(response, || ErrorInfo::core("not_found", "Not Found"))
+}
+
+/// A 405 for a path that has routes, but none for the method of the request.
+///
+/// RFC 9110 section 15.5.6: the `Allow` header lists the methods of the path.
+pub fn error_405(allowed_methods: &[String]) -> HttpResponse {
+    let response = HttpResponse::MethodNotAllowed()
+        .content_type("application/json")
+        .insert_header(("Allow", allowed_methods.join(", ")))
+        .body(ERROR_BODY_405);
+    with_error_info(response, || {
+        ErrorInfo::core("method_not_allowed", "Method Not Allowed")
+    })
 }
 
 #[inline]
@@ -228,6 +242,26 @@ mod tests {
             response.status(),
             actix_web::http::StatusCode::PAYLOAD_TOO_LARGE
         );
+    }
+
+    #[test]
+    fn error_405_lists_the_methods_in_allow() {
+        use actix_web::body::MessageBody;
+
+        crate::error::enable_error_info();
+        let response = error_405(&["GET".to_string(), "OPTIONS".to_string()]);
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(response.headers().get("Allow").unwrap(), "GET, OPTIONS");
+        assert_eq!(
+            core_info(&response),
+            ("method_not_allowed", "Method Not Allowed".to_string(), None)
+        );
+        let body = response.into_body().try_into_bytes().unwrap();
+        assert_eq!(&body[..], ERROR_BODY_405);
+        assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_405).is_ok());
     }
 
     #[test]
