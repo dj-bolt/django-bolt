@@ -1646,6 +1646,10 @@ class BoltAPI:
         _skip_prefix: bool = False,
         _router_middleware: list[Any] | None = None,
     ):
+        # RFC 9110 section 15: a final status is from 200 to 599. A 1xx status is interim.
+        if status_code is not None and not 200 <= int(status_code) <= 599:
+            raise ValueError(f"The status_code of {method} {path} must be an int from 200 to 599, got {status_code}")
+
         def decorator(fn: Callable):
             # Detect if handler is async or sync
             is_async = inspect.iscoroutinefunction(fn)

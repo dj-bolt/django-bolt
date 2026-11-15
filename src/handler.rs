@@ -340,14 +340,11 @@ struct ParsedResponseWire {
 
 /// Read the status of a response wire.
 ///
-/// A value that is not an HTTP status is an error. It must not become a success.
+/// A value that is not a final HTTP status (200 to 599) is an error. It must
+/// not become a success, and it must not go to the client as it is.
 #[inline]
 fn parse_wire_status(item: &Bound<'_, PyAny>) -> PyResult<StatusCode> {
-    match item
-        .extract::<u16>()
-        .ok()
-        .and_then(|code| StatusCode::from_u16(code).ok())
-    {
+    match item.extract::<u16>().ok().and_then(responses::final_status) {
         Some(status) => Ok(status),
         None => Err(invalid_wire_status(item)),
     }
@@ -361,10 +358,10 @@ fn invalid_wire_status(item: &Bound<'_, PyAny>) -> PyErr {
         .unwrap_or_else(|_| "?".to_string());
     // The client gets no detail of a 500 when DEBUG is off, so the log names the status.
     log::error!(
-        "The response status must be an int from 100 to 999, got {value}. Bolt sends a 500."
+        "The response status must be an int from 200 to 599, got {value}. Bolt sends a 500."
     );
     pyo3::exceptions::PyValueError::new_err(format!(
-        "The response status must be an int from 100 to 999, got {value}"
+        "The response status must be an int from 200 to 599, got {value}"
     ))
 }
 

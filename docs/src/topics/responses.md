@@ -572,6 +572,8 @@ async def create_user():
 
 OpenAPI documents this status code even when the handler has no response annotation.
 
+A response status must be an int from 200 to 599 ([RFC 9110, section 15](https://www.rfc-editor.org/rfc/rfc9110#section-15)). A 1xx status is interim and cannot be the status of a response. A `status_code=` of a route outside this range raises `ValueError` at the decorator. A status outside this range from a handler, for example `JSON(data, status_code=700)` or `HTTPException(status_code=100)`, gives a 500, and the log names the status.
+
 ## Returning strings and bytes
 
 Returning a string creates a plain text response:

@@ -5,6 +5,7 @@
 use crate::error::{ErrorInfo, with_error_info};
 use crate::permissions::GuardDenial;
 use actix_web::HttpResponse;
+use actix_web::http::StatusCode;
 use bytes::Bytes;
 use std::borrow::Cow;
 
@@ -34,6 +35,19 @@ pub fn get_rate_limit_body(retry_after: u64) -> Bytes {
         retry_after, retry_after
     )
     .into()
+}
+
+/// The status of a final response, or None for a code that cannot be one.
+///
+/// RFC 9110 section 15: a final status is from 200 to 599. A 1xx status is
+/// interim, and no status from 600 has a meaning.
+#[inline]
+pub fn final_status(code: u16) -> Option<StatusCode> {
+    if (200..600).contains(&code) {
+        StatusCode::from_u16(code).ok()
+    } else {
+        None
+    }
 }
 
 /// Create error responses using static bodies
@@ -188,6 +202,16 @@ mod tests {
         assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_404).is_ok());
         assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_400_HEADERS).is_ok());
         assert!(serde_json::from_slice::<serde_json::Value>(ERROR_BODY_413).is_ok());
+    }
+
+    #[test]
+    fn a_final_status_is_from_200_to_599() {
+        for code in [200, 201, 204, 304, 404, 418, 500, 599] {
+            assert_eq!(final_status(code).map(|status| status.as_u16()), Some(code));
+        }
+        for code in [0, 99, 100, 101, 199, 600, 700, 999, 1000, u16::MAX] {
+            assert_eq!(final_status(code), None, "{code}");
+        }
     }
 
     #[test]
