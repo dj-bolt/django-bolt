@@ -211,7 +211,6 @@ _VALIDATION_NOOP_TYPES = {
     str,
     bytes,
     bytearray,
-    type(None),
 }
 # The scalar results that Bolt sends as JSON. A bool is an int. A str is
 # text/plain and bytes are application/octet-stream. None is JSON only when
@@ -1035,14 +1034,21 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     # JSON or Response with another status (a 400 error map, a 202 receipt)
     # carries a different body, so Bolt encodes it as-is. Per-status schemas
     # come from ``response_model={code: type}``.
+    # A -> None route does not validate the body of a JSON or Response object,
+    # so a handler that builds each response can use -> None.
+    if meta.get("response_type") is type(None):
+        content_validator_sync = content_validator_async = None
+    else:
+        content_validator_sync, content_validator_async = validator_sync, validator_async
+
     async def response_type_handler(result: Any) -> ResponseWireV1:
         # The lookup gives an exact response type its own class. This check only skips it.
         if (cls := result.__class__) is not JSON and cls not in _RESPONSE_CLASSES:  # pragma: no mutate
             cls = _response_base_class(result)
         if cls is JSON:
-            if validator_async is not None and result.status_code == default_status_code:
+            if content_validator_async is not None and result.status_code == default_status_code:
                 try:
-                    validated = await validator_async(result.data)
+                    validated = await content_validator_async(result.data)
                 except ResponseValidationError:
                     raise
                 except Exception as exc:
@@ -1056,12 +1062,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
             if (
-                validator_async is not None
+                content_validator_async is not None
                 and result.status_code == default_status_code
                 and not isinstance(result.content, (bytes, bytearray, memoryview))
             ):
                 try:
-                    validated = await validator_async(result.content)
+                    validated = await content_validator_async(result.content)
                 except ResponseValidationError:
                     raise
                 except Exception as exc:
@@ -1079,9 +1085,9 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if (cls := result.__class__) is not JSON and cls not in _RESPONSE_CLASSES:  # pragma: no mutate
             cls = _response_base_class(result)
         if cls is JSON:
-            if validator_sync is not None and result.status_code == default_status_code:
+            if content_validator_sync is not None and result.status_code == default_status_code:
                 try:
-                    validated = validator_sync(result.data)
+                    validated = content_validator_sync(result.data)
                 except ResponseValidationError:
                     raise
                 except Exception as exc:
@@ -1095,12 +1101,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
             if (
-                validator_sync is not None
+                content_validator_sync is not None
                 and result.status_code == default_status_code
                 and not isinstance(result.content, (bytes, bytearray, memoryview))
             ):
                 try:
-                    validated = validator_sync(result.content)
+                    validated = content_validator_sync(result.content)
                 except ResponseValidationError:
                     raise
                 except Exception as exc:

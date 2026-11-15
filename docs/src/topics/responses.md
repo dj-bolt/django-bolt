@@ -28,7 +28,7 @@ async def count() -> int:
     return 3  # Body: 3, Content-Type: application/json
 ```
 
-`None` is the JSON `null` when the response type allows it, such as `-> None` or `-> int | None`. With no such response type, a `None` result is an error, because the handler has no `return`. A `str` and `bytes` are not JSON, see [Returning strings and bytes](#returning-strings-and-bytes).
+`None` is the JSON `null` when the response type allows it, such as `-> None` or `-> int | None`. With no such response type, a `None` result is an error, because the handler has no `return`. A `-> None` route validates its result: a result that is not `None` is a response validation error. A response object, such as `JSON(...)` or `Response(...)`, has its own body and is not validated on a `-> None` route. A `str` and `bytes` are not JSON, see [Returning strings and bytes](#returning-strings-and-bytes).
 
 ### Custom status codes and headers
 
