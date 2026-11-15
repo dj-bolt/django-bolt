@@ -412,6 +412,8 @@ The order does not depend on the order of the definitions:
 
 After validators of a parent class run before those of a subclass. Before validators of a subclass run before those of a parent class. This is the order of pydantic.
 
+A subclass can define a validator again under the same name. Then only the definition of the subclass runs, at the position of the parent definition. A validator with a new name adds to those of the parent.
+
 Notes:
 
 - Before validators get raw values for a JSON request body, `model_validate()` and `model_validate_json()`, also in a nested serializer. A field validator with `mode="before"` runs only if the input has the field. The keys of the raw data are the names in the input (the names after `rename=`).

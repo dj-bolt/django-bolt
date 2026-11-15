@@ -312,16 +312,24 @@ def model_validator(
 
 
 def _collect_marked(cls: type[Serializer], marker: str, *, allow_classmethod: bool) -> list[Any]:
-    """The marked validators of a class and its bases: parent before subclass, in definition order."""
-    found: list[Any] = []
+    """
+    The marked validators of a class and its bases: parent before subclass, in definition order.
+
+    A name has one entry. A subclass that defines the name again replaces the
+    definition of the parent, at the position of the parent definition (the
+    rule of pydantic). A new definition that is not such a validator removes it.
+    """
+    found: dict[str, Any] = {}
     for base in reversed(cls.__mro__):
         if not hasattr(base, "__dict__"):
             continue
-        for raw in base.__dict__.values():
+        for name, raw in base.__dict__.items():
             value = _marked_validator(raw, marker, allow_classmethod=allow_classmethod)
             if value is not None:
-                found.append(value)
-    return found
+                found[name] = value
+            else:
+                found.pop(name, None)
+    return list(found.values())
 
 
 def _in_run_order(validators: list[Any], mode: ValidatorMode) -> list[Any]:
@@ -345,6 +353,8 @@ def collect_field_validators(
     ``mode``, each list has the validators of that mode in the order that they
     run. With no ``mode``, each list has all the validators in definition
     order, those of a parent class first. ``subset()`` copies them in that order.
+    A validator that a subclass defines again under the same name is in the
+    list one time: the definition of the subclass.
     """
     marked: list[Any] = _collect_marked(cls, "__validator_field__", allow_classmethod=True)
     if mode is not None:
