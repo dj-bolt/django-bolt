@@ -29,7 +29,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from django_bolt import BoltAPI, _core
-from django_bolt.websocket import CloseCode, WebSocket
+from django_bolt.websocket import CloseCode, WebSocket, WebSocketDisconnect, WebSocketException
 from django_bolt.websocket.handlers import build_websocket_request, get_websocket_param_name
 
 # Each WebSocketTestClient is one connection with its own test app. The
@@ -389,22 +389,18 @@ class WebSocketTestClient:
         """Run the handler, recording any error as an internal-error close."""
         try:
             await handler(*args, **kwargs)
-        except Exception as e:
+        except WebSocketDisconnect as e:
+            # It reports that the client left. It asks for no close.
+            await self._handler_failed(e)
+        except WebSocketException as e:
             if not self._accepted:
-                # An error before accept fails the handshake, as the server answers 500.
-                self._decide(e)
-                return
-            self._handler_exception = e
-            # Send disconnect on error
-            if not self._closed:
-                await self._server_to_client.put(
-                    {
-                        "type": "websocket.close",
-                        "code": CloseCode.INTERNAL_ERROR,
-                    }
-                )
-                self._closed = True
-                self._close_code = CloseCode.INTERNAL_ERROR
+                # A raised WebSocketException refuses the handshake with 403, as on the server.
+                self._decide(403)
+            elif not self._closed:
+                # After accept, it closes the connection with its code and reason.
+                await self._server_to_client.put({"type": "websocket.close", "code": e.code, "reason": e.reason})
+        except Exception as e:
+            await self._handler_failed(e)
         else:
             # A return before accept refuses the handshake with 403.
             self._decide(403)
@@ -412,6 +408,24 @@ class WebSocketTestClient:
             # The client is closed when it reads this message, after the messages before it.
             if self._accepted and not self._closed:
                 await self._server_to_client.put({"type": "websocket.close", "code": CloseCode.NORMAL})
+
+    async def _handler_failed(self, error: Exception) -> None:
+        """Record an error of the handler: a failed handshake, or a close with 1011."""
+        if not self._accepted:
+            # An error before accept fails the handshake, as the server answers 500.
+            self._decide(error)
+            return
+        self._handler_exception = error
+        # Send disconnect on error
+        if not self._closed:
+            await self._server_to_client.put(
+                {
+                    "type": "websocket.close",
+                    "code": CloseCode.INTERNAL_ERROR,
+                }
+            )
+            self._closed = True
+            self._close_code = CloseCode.INTERNAL_ERROR
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Exit async context - close connection and cleanup."""

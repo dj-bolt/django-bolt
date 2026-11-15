@@ -67,6 +67,26 @@ fn is_client_gone(error: &PyErr) -> bool {
     })
 }
 
+/// The close that a handler asks for with a raised `WebSocketException`.
+///
+/// `WebSocketDisconnect` is a subclass, but it reports that the client left.
+/// It asks for no close.
+fn requested_close(error: &PyErr) -> Option<(u16, String)> {
+    Python::attach(|py| {
+        let module = py.import("django_bolt.websocket").ok()?;
+        let exception = module.getattr("WebSocketException").ok()?;
+        if !error.is_instance(py, &exception)
+            || error.is_instance(py, get_disconnect_class(py).ok()?.bind(py))
+        {
+            return None;
+        }
+        let value = error.value(py);
+        let code = value.getattr("code").ok()?.extract().ok()?;
+        let reason = value.getattr("reason").ok()?.extract().ok()?;
+        Some((code, reason))
+    })
+}
+
 /// The error of a send to a client that left. ASGI requires an `OSError`.
 fn client_gone() -> PyErr {
     pyo3::exceptions::PyConnectionResetError::new_err("WebSocket client disconnected")
@@ -926,7 +946,8 @@ fn refusal(status: StatusCode) -> HttpResponse {
 /// The handler decides the handshake. If it ends without a decision, the
 /// upgrade gets 403 on return and 500 on error, as in uvicorn. If it ends
 /// after accept with no close, the connection gets a close frame: 1000 on
-/// return and 1011 on error.
+/// return and 1011 on error. A raised `WebSocketException` gives 403 before
+/// accept, and a close frame with its code and reason after accept.
 fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsTarget) {
     actix_web::rt::spawn(async move {
         // Wrap the entire handler execution in catch_unwind to handle panics
@@ -1008,6 +1029,13 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
                     close_accepted(&ws_state, 1000, "").await;
                 }
                 Some(e) => {
+                    // A raised WebSocketException is the close of the handler,
+                    // as in Starlette: 403 before accept, its code and reason after.
+                    if let Some((code, reason)) = requested_close(&e) {
+                        ws_state.refuse(StatusCode::FORBIDDEN);
+                        close_accepted(&ws_state, code, &reason).await;
+                        return;
+                    }
                     // A client that left is not an error of the handler.
                     if !is_client_gone(&e) {
                         eprintln!("[django-bolt] WebSocket handler error: {}", e);

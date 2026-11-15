@@ -96,6 +96,37 @@ async def test_return_after_accept_closes_the_connection_with_1000(path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "close"),
+    [
+        ("/ws/exception", {"type": "websocket.close", "code": 4001, "reason": "nope"}),
+        ("/ws/close-exception", {"type": "websocket.close", "code": 4002, "reason": "done"}),
+    ],
+)
+async def test_websocket_exception_closes_the_connection_with_its_code_and_reason(path, close):
+    """The same app runs on the server in test_websocket_handler_end_server_integration.py."""
+    async with WebSocketTestClient(handler_end_api, path) as ws:
+        messages = [message async for message in ws.iter_text()]
+        assert ws.close_code == close["code"]
+    # The exit does not raise the exception again: it is the close of the handler.
+    assert messages == (["bye"] if path == "/ws/exception" else [])
+
+    async with WebSocketTestClient(handler_end_api, path) as ws:
+        message = await ws.receive()
+        while message["type"] != "websocket.close":
+            message = await ws.receive()
+        assert message == close
+
+
+@pytest.mark.asyncio
+async def test_websocket_exception_before_accept_refuses_the_handshake_with_403():
+    with pytest.raises(HandshakeRejected) as rejected:
+        async with WebSocketTestClient(handler_end_api, "/ws/exception-before-accept"):
+            pass
+    assert rejected.value.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_close_of_the_handler_is_the_only_close():
     async with WebSocketTestClient(handler_end_api, "/ws/close-then-return") as ws:
         with pytest.raises(ConnectionClosed) as closed:
