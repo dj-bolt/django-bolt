@@ -734,6 +734,11 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     The decorated handler should return a Django QuerySet or list.
     The decorator will automatically apply pagination and return a PaginatedResponse.
 
+    The handler can be async or sync. Bolt calls a sync handler on the event loop.
+    Thus a sync handler must return a lazy QuerySet or a list. If it runs a query,
+    Django raises ``SynchronousOnlyOperation``. The pagination runs the queries of
+    the QuerySet on the ORM executor.
+
     When used with response_model or return type annotation like list[UserSerializer],
     the serializer will be used for efficient batch serialization via dump_many().
 
@@ -762,6 +767,8 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
     """
 
     def decorator(handler: Callable) -> Callable:
+        # The route decorator uses the same test for is_async.
+        handler_is_async = inspect.iscoroutinefunction(handler)
         # Store original handler for introspection
         original_handler = handler
         request_getter = _compile_request_getter(original_handler)
@@ -790,7 +797,9 @@ def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):
 
             # Call original handler to get queryset
             # Pass all args along (including self for methods)
-            queryset = await handler(*args, **kwargs)
+            queryset = handler(*args, **kwargs)
+            if handler_is_async:
+                queryset = await queryset
 
             # Apply pagination using dict version
             paginated = await cached_paginator.paginate_queryset(queryset, request)
