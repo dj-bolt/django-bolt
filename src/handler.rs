@@ -805,17 +805,64 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
     payload: web::Payload,
     state: web::Data<Arc<AppState>>,
 ) -> HttpResponse {
-    // Without an error formatter, this is the whole cost: one Option check.
-    if state.error_renderer.is_none() {
-        return route_request::<ACCESS_LOG>(req, payload, state).await;
+    // Without the access log and an error formatter, this is the whole cost: one Option check.
+    if !ACCESS_LOG && state.error_renderer.is_none() {
+        return route_request(req, payload, state, &mut false).await;
     }
-    let error_req = req.clone();
-    let error_state = state.clone();
-    let response = route_request::<ACCESS_LOG>(req, payload, state).await;
-    if response.status().as_u16() < 400 {
-        return response;
+    // ACCESS_LOG: the compiler removes the timer when ACCESS_LOG=false (const generic).
+    let access_log_start = if ACCESS_LOG {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let kept_req = req.clone();
+    let kept_state = state.clone();
+    let mut route_answered = false;
+    let mut response = route_request(req, payload, state, &mut route_answered).await;
+    if kept_state.error_renderer.is_some() && response.status().as_u16() >= 400 {
+        response = crate::error_formatter::format_error_response(response, &kept_req, &kept_state);
     }
-    crate::error_formatter::format_error_response(response, &error_req, &error_state)
+    if let Some(start) = access_log_start
+        && route_answered
+    {
+        write_access_log(&kept_state, &kept_req, response.status().as_u16(), start);
+    }
+    response
+}
+
+/// The level bit and the logger method for the access-log line of `status`.
+/// The bits are those of `AppState::access_log_levels`.
+#[inline]
+fn access_log_level(status: u16) -> (u8, &'static str) {
+    if status >= 500 {
+        (4, "error")
+    } else if status >= 400 {
+        (2, "warning")
+    } else {
+        (1, "info")
+    }
+}
+
+/// Write the access-log line of one response to the `django.server` logger.
+fn write_access_log(state: &AppState, req: &HttpRequest, status: u16, start: std::time::Instant) {
+    let (bit, level) = access_log_level(status);
+    if state.access_log_levels & bit == 0 {
+        return;
+    }
+    let Some(logger) = state.access_logger.as_ref() else {
+        return;
+    };
+    let dur_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let msg = format!(
+        "{} {} {} {:.1}ms",
+        req.method().as_str(),
+        req.path(),
+        status,
+        dur_ms
+    );
+    Python::attach(|py| {
+        let _ = logger.call_method1(py, level, (msg,));
+    });
 }
 
 /// The error formatter does not change the responses of an MCP or an ASGI mount.
@@ -828,21 +875,20 @@ fn without_error_info(mut response: HttpResponse, state: &AppState) -> HttpRespo
     response
 }
 
-async fn route_request<const ACCESS_LOG: bool>(
+/// Route one request. `route_answered` becomes `true` when the response is for
+/// a Bolt route: each response after the route match, the redirect to the other
+/// slash form of a route path, and the automatic OPTIONS answer. `handle_request`
+/// writes the access-log line for these. A native route, a mount and a path with
+/// no route leave it `false`.
+async fn route_request(
     req: HttpRequest,
     mut payload: web::Payload,
     state: web::Data<Arc<AppState>>,
+    route_answered: &mut bool,
 ) -> HttpResponse {
     // Keep as &str - no allocation, only clone on error paths
     let method = req.method().as_str();
     let path = req.path();
-
-    // ACCESS_LOG: compiler eliminates this entirely when ACCESS_LOG=false (const generic)
-    let access_log_start = if ACCESS_LOG {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
 
     let router = &state.router;
 
@@ -875,6 +921,7 @@ async fn route_request<const ACCESS_LOG: bool>(
                     } else {
                         format!("{}?{}", alternate_path, query)
                     };
+                    *route_answered = true;
                     return HttpResponse::PermanentRedirect() // 308
                         .insert_header(("Location", location))
                         .finish();
@@ -887,6 +934,7 @@ async fn route_request<const ACCESS_LOG: bool>(
                 if !available_methods.is_empty() {
                     let allow_header = available_methods.join(", ");
                     // CORS headers will be added by CorsMiddleware
+                    *route_answered = true;
                     return HttpResponse::NoContent()
                         .insert_header(("Allow", allow_header))
                         .insert_header(("Content-Type", "application/json"))
@@ -959,6 +1007,7 @@ async fn route_request<const ACCESS_LOG: bool>(
         ))
         .await;
     }
+    *route_answered = true;
 
     // Method maps to a static str (known fixed set — no per-request alloc);
     // path is dynamic and must be owned for PyRequest.
@@ -1573,7 +1622,7 @@ async fn route_request<const ACCESS_LOG: bool>(
         }
     });
 
-    let response = match dispatch_result {
+    match dispatch_result {
         Ok(DispatchOutcome::Ready(response)) => response,
         // Sync dispatch completed but body needs async post-processing (stream/file).
         // Already parsed — no duplicate GIL acquire or wire re-parse.
@@ -1623,29 +1672,29 @@ async fn route_request<const ACCESS_LOG: bool>(
         Err(e) => Python::attach(|py| {
             handle_python_error(py, e, req.path(), req.method().as_str(), state.debug)
         }),
-    };
+    }
+}
 
-    if ACCESS_LOG {
-        let status = response.status().as_u16();
-        let (bit, level) = if status >= 500 {
-            (4, "error")
-        } else if status >= 400 {
-            (2, "warning")
-        } else {
-            (1, "info")
-        };
-        if state.access_log_levels & bit != 0 {
-            let dur_ms = access_log_start.unwrap().elapsed().as_secs_f64() * 1000.0;
-            let msg = format!("{} {} {} {:.1}ms", method, path, status, dur_ms);
-            Python::attach(|py| {
-                let _ = state
-                    .access_logger
-                    .as_ref()
-                    .unwrap()
-                    .call_method1(py, level, (msg,));
-            });
+#[cfg(test)]
+mod tests {
+    use super::access_log_level;
+
+    #[test]
+    fn the_access_log_level_follows_the_status_class() {
+        // The bits are INFO = 1, WARNING = 2 and ERROR = 4.
+        for (status, expected) in [
+            (200, (1, "info")),
+            (204, (1, "info")),
+            (308, (1, "info")),
+            (399, (1, "info")),
+            (400, (2, "warning")),
+            (401, (2, "warning")),
+            (429, (2, "warning")),
+            (499, (2, "warning")),
+            (500, (4, "error")),
+            (503, (4, "error")),
+        ] {
+            assert_eq!(access_log_level(status), expected, "status {status}");
         }
     }
-
-    response
 }
