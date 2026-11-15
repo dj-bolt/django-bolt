@@ -437,6 +437,11 @@ Available mixins:
 | `PartialUpdateMixin` | `partial_update` | `/items/{pk}` | PATCH |
 | `DestroyMixin` | `destroy` | `/items/{pk}` | DELETE |
 
+The write actions do not take each field from the request body:
+
+- `update` and `partial_update` write to the object that `get_object()` returns. They do not write the primary key, the lookup field or a `read_only` serializer field. Thus the body cannot move the write to a row outside `get_queryset()`.
+- `create` does not write a `read_only` serializer field. It does not write the primary key when the database gives the primary key (`AutoField`, `BigAutoField`).
+
 ## ReadOnlyModelViewSet
 
 A convenient shortcut for read-only access:
