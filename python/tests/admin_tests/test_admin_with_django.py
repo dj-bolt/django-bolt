@@ -47,6 +47,50 @@ def test_admin_root_redirect():
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("urlconf", "login_path"),
+    [
+        ("tests.admin_tests.urls_regex_prefix", "/manage/login/"),
+        ("tests.admin_tests.urls_include_before_admin", "/backoffice/login/"),
+        ("tests.admin_tests.urls_nested_include", "/portal/internal/staff/login/"),
+        ("tests.admin_tests.urls_custom_site", "/office/login/"),
+    ],
+)
+def test_admin_mount_uses_the_prefix_of_the_admin_site(settings, urlconf, login_path):
+    """The admin answers at the prefix of its URL pattern, also for a regex pattern or a later pattern."""
+    settings.ROOT_URLCONF = urlconf
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        response = client.get(login_path)
+
+    assert response.status_code == 200
+    assert "csrfmiddlewaretoken" in response.text
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_at_the_root_path_leaves_the_bolt_routes(settings, capsys):
+    """With the admin site at "", Django answers each path that has no Bolt route."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_root_admin"
+    api = BoltAPI()
+
+    @api.get("/items/{item_id}")
+    async def item(item_id: int):
+        return {"item_id": item_id}
+
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    assert "Django answers each path that has no Bolt route" in capsys.readouterr().err
+    with TestClient(api, use_http_layer=True) as client:
+        assert client.get("/items/7").json() == {"item_id": 7}
+        response = client.get("/login/")
+
+    assert response.status_code == 200
+    assert "csrfmiddlewaretoken" in response.text
+
+
+@pytest.mark.django_db(transaction=True)
 def test_admin_login_page():
     """Test /admin/login/ returns HTML page (not empty body) via TestClient."""
     from django_bolt.admin.admin_detection import should_enable_admin  # noqa: PLC0415
@@ -88,3 +132,20 @@ def test_admin_login_page():
         # Should contain login form
         body_text = response.text.lower()
         assert "login" in body_text or "django" in body_text, f"Expected login content, got: {body_text[:200]}"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_mount_serves_only_the_admin_prefix(settings):
+    """The admin mount gives Django the admin prefix, not each path of the URLconf."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_site_page"
+    api = BoltAPI()
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(api, use_http_layer=True) as client:
+        admin_response = client.get("/admin/login/")
+        site_response = client.get("/site/")
+
+    assert admin_response.status_code == 200
+    assert "csrfmiddlewaretoken" in admin_response.text
+    assert site_response.status_code == 404
+    assert "a page of Django" not in site_response.text
