@@ -727,6 +727,22 @@ async def upload_multiple(
     }
 ```
 
+### File content as bytes
+
+Use `bytes` when the handler needs only the content of the file. Use `list[bytes]` for the content of each file:
+
+```python
+@api.post("/checksum")
+async def checksum(data: Annotated[bytes, File(max_size=FileSize.MB_5)]):
+    return {"size": len(data)}
+
+@api.post("/checksums")
+async def checksums(parts: Annotated[list[bytes], File(max_files=5)]):
+    return {"sizes": [len(part) for part in parts]}
+```
+
+Bolt reads the complete file into memory for a `bytes` parameter. Set `max_size`. Use `UploadFile` for a large file, or when you need the filename or the content type.
+
 ### Saving to Django FileField / ImageField
 
 When a multipart request arrives, Django-Bolt parses it in Rust for performance — extracting file content, filename, content type, and size. The result is wrapped in an `UploadFile` object on the Python side, which gives you async read/write methods and automatic cleanup.
