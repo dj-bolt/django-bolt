@@ -78,6 +78,33 @@ def test_mount_asgi_scope_root_path_and_subpath():
     assert captured[1]["query_string"] == b"next=%2Fadmin%2F"
 
 
+def test_mount_asgi_scope_path_is_percent_decoded():
+    """``path`` is percent-decoded and ``raw_path`` keeps the request bytes, so Django matches the decoded path."""
+    api = BoltAPI()
+    captured = []
+
+    async def asgi_app(scope, receive, send):
+        await receive()
+        captured.append(scope)
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    api.mount_asgi("/plain", asgi_app)
+    api.mount_django("/django", app=asgi_app)
+
+    with TestClient(api) as client:
+        assert client.get("/plain/caf%C3%A9/a%20b").status_code == 204
+        assert client.get("/django/caf%C3%A9/a%20b").status_code == 204
+
+    plain_scope, django_scope = captured
+    assert plain_scope["path"] == "/café/a b"
+    assert bytes(plain_scope["raw_path"]) == b"/caf%C3%A9/a%20b"
+
+    assert django_scope["path"] == "/django/café/a b"
+    assert bytes(django_scope["raw_path"]) == b"/django/caf%C3%A9/a%20b"
+    assert ASGIRequest(django_scope, io.BytesIO()).path_info == "/café/a b"
+
+
 @pytest.mark.parametrize(
     ("trusted_proxies", "proxy_ssl_header", "scheme", "port", "is_secure"),
     [
