@@ -498,6 +498,12 @@ A route with the return type `str` shows `text/plain`. A route with the return
 type `bytes` shows `application/octet-stream`. Bolt sends these values as they
 are, not as JSON.
 
+A union shows one media type for each kind of result. For example,
+`-> str | None` shows `text/plain` for the string and `application/json` for
+`null`, and `-> str | Item` shows `text/plain` and `application/json` with the
+schema of `Item`. An entry of a `response_model` dict follows the same rules:
+`{200: str, 404: Error}` shows `text/plain` for the status 200.
+
 Each parametrization of a generic response model gets its own component name.
 This is the same as msgspec. `Page[UserRead]` becomes the component
 `Page_UserRead_`. Its title is `Page[UserRead]`.
