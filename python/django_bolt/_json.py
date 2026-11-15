@@ -45,12 +45,15 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
     # Paths
     Path: str,
     PurePath: str,
-    # Dates/Times -> ISO format
-    datetime: lambda v: v.isoformat(),
+    # msgspec encodes an exact datetime, time or Decimal itself. Only a
+    # subclass comes here. Return the exact type, and msgspec encodes it as
+    # it encodes the base type: "Z" for UTC, a string for a Decimal.
+    datetime: lambda v: datetime(
+        v.year, v.month, v.day, v.hour, v.minute, v.second, v.microsecond, v.tzinfo, fold=v.fold
+    ),
     date: lambda v: v.isoformat(),
-    time: lambda v: v.isoformat(),
-    # Decimals -> int or float
-    Decimal: lambda v: int(v) if v.as_tuple().exponent >= 0 else float(v),
+    time: lambda v: time(v.hour, v.minute, v.second, v.microsecond, v.tzinfo, fold=v.fold),
+    Decimal: Decimal,
     # IP addresses
     IPv4Address: str,
     IPv4Interface: str,
