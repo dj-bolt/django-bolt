@@ -24,6 +24,7 @@ from django_bolt.auth import (
 )
 from django_bolt.auth.session import auth_without_session
 from django_bolt.concurrency import in_lane_mode
+from django_bolt.error_handlers import problem_details
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.testing import TestClient, WebSocketTestClient
@@ -105,6 +106,53 @@ def test_requires_is_staff_checks_the_django_user():
         _login(staff_client, "session_staff")
         assert member.get("/staff").status_code == 403
         assert staff_client.get("/staff").status_code == 200
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("error_formatter", [None, problem_details], ids=["default", "problem-details"])
+def test_a_session_rejection_is_the_same_response_as_a_rejection_in_rust(error_formatter):
+    """Python rejects a request with a session cookie. A client gets the response that Rust sends."""
+    api = BoltAPI(error_formatter=error_formatter)
+    _add_login(api)
+
+    @api.get("/me", auth=[SessionAuthentication()], guards=[IsAuthenticated()])
+    async def me():
+        return {"ok": True}
+
+    # Rust checks the guards of a token request, and Python those of a session request.
+    @api.get(
+        "/staff",
+        auth=[JWTAuthentication(), SessionAuthentication()],
+        guards=[Requires("is_staff", True, message="Staff only")],
+    )
+    async def staff():
+        return {"ok": True}
+
+    user = User.objects.create_user(username="session_member", password="pw-for-tests")
+    with TestClient(api) as client:
+        rust_401 = client.get("/me")
+        python_401 = client.get("/me", headers={"cookie": "sessionid=not-a-session"})
+        token = create_jwt_for_user(user)
+        rust_403 = client.get("/staff", headers={"authorization": f"Bearer {token}"})
+        _login(client, "session_member")
+        python_403 = client.get("/staff")
+
+    def seen(response):
+        return (
+            response.status_code,
+            response.headers["content-type"],
+            response.json(),
+            response.headers.get("www-authenticate"),
+        )
+
+    assert seen(python_401) == seen(rust_401)
+    assert seen(python_403) == seen(rust_403)
+    if error_formatter is None:
+        assert seen(python_401) == (401, "application/json", {"detail": "Authentication required"}, "Bearer")
+        assert seen(python_403) == (403, "application/json", {"detail": "Staff only"}, None)
+    else:
+        assert python_401.headers["content-type"] == "application/problem+json"
+        assert python_403.json()["detail"] == "Staff only"
 
 
 @pytest.mark.django_db(transaction=True)
