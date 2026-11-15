@@ -199,6 +199,23 @@ async def user(user_id: UserId, page: Page = 1):
 The handler gets an `int`, and `/users/abc` gives a 422.
 A parameterized alias gets its arguments. With `type Pair[T] = list[T]`, a `Pair[int]` parameter converts as `list[int]`.
 
+### bytes parameters
+
+A `bytes` parameter gets the UTF-8 bytes of the text value:
+
+```python
+@api.get("/echo")
+async def echo(token: bytes):
+    return {"length": len(token)}
+```
+
+`GET /echo?token=abc` gives the handler `b"abc"`. Bolt does not decode base64.
+This rule applies to a path, query, header, cookie and form parameter.
+It also applies to `bytearray`, and to a sequence such as `list[bytes]`.
+A `msgspec.Meta` constraint such as `max_length` counts the bytes.
+
+A `bytes` field of a [parameter model](#parameter-models) is different: msgspec reads its text as base64.
+
 ## Request body
 
 ### JSON body

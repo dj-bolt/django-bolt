@@ -86,6 +86,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     inner = unwrap_optional(base)
     # A bare `set` has no origin. msgspec reads it as set[Any].
     is_sequence = (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
+    if _holds_bytes(inner, is_sequence):
+        return _bytes_param_converter(target, loc, key, is_sequence=is_sequence, wrap=is_sequence and one_item)
     constrained = get_origin(target) is Annotated and any(
         getattr(extra, name, None) is not None
         for extra in get_args(target)[1:]
@@ -109,6 +111,64 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
             value = [value]
         try:
             return msgspec.convert((value,), holder, strict=False).value
+        except msgspec.ValidationError as error:
+            # Remove the position of the value in the holder from the error path.
+            msg = str(error).replace(" - at `$[0]`", "").replace("`$[0]", "`$")
+            raise RequestValidationError(
+                errors=[{"type": "validation_error", "loc": (loc, key), "msg": msg, "input": value}]
+            ) from None
+
+    return convert
+
+
+# A text parameter of one of these types gets the UTF-8 bytes of the text.
+_BYTES_TYPES = (bytes, bytearray, memoryview)
+
+
+def _holds_bytes(inner: Any, is_sequence: bool) -> bool:
+    """Return True for a bytes type, or for a sequence with one item type that is a bytes type."""
+    if not is_sequence:
+        return inner in _BYTES_TYPES
+    item_types = [arg for arg in get_args(inner) if arg is not Ellipsis]
+    if len(item_types) != 1:
+        return False
+    item_type = item_types[0]
+    return (get_args(item_type)[0] if get_origin(item_type) is Annotated else item_type) in _BYTES_TYPES
+
+
+def _bytes_param_converter(target: Any, loc: str, key: str, *, is_sequence: bool, wrap: bool) -> Callable:
+    """Build the conversion of a text parameter to ``bytes``, or to a sequence of ``bytes``.
+
+    Rust gives the value of a path segment, a query key, a header, a cookie or
+    a form field as text. The parameter gets the UTF-8 bytes of that text.
+    msgspec reads a str for a ``bytes`` type as base64. Thus this conversion
+    encodes the text first. Then msgspec builds the sequence or the
+    ``bytearray`` and checks the ``msgspec.Meta`` constraints.
+
+    Rust gives each value of a repeated form key as a list. A parameter that is
+    not a sequence keeps the last value, as for a repeated query key.
+    """
+    if target is bytes:
+        # Plain bytes: msgspec has nothing to build and nothing to check.
+        def encode(value: Any) -> bytes:
+            return (value[-1] if type(value) is list else value).encode()
+
+        return encode
+
+    if wrap and loc in _SINGLE_VALUE_SOURCES and not _holds_one_item(target):
+        raise TypeError(
+            f"The {loc} parameter {key!r} gets one value, but its type {target!r} cannot hold one item. "
+            "Use list[T], set[T], tuple[T] or tuple[T, ...]."
+        )
+    holder = msgspec.defstruct("ParamValue", [("value", target)], array_like=True)
+
+    def convert(value: Any) -> Any:
+        if type(value) is list:
+            encoded = [item.encode() for item in value] if is_sequence else value[-1].encode()
+        else:
+            encoded = [value.encode()] if wrap else value.encode()
+        try:
+            return msgspec.convert((encoded,), holder).value
         except msgspec.ValidationError as error:
             # Remove the position of the value in the holder from the error path.
             msg = str(error).replace(" - at `$[0]`", "").replace("`$[0]", "`$")
