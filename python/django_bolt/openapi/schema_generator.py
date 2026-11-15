@@ -905,7 +905,8 @@ class SchemaGenerator:
             schema = self._type_to_schema(annotation)
             # A path, a header or a cookie gives one value, so its array holds exactly one item.
             if param_in != "query" and isinstance(schema, Schema) and schema.type == "array":
-                schema = replace(schema, min_items=1, max_items=1)
+                # An empty default must stay valid for the schema, so it sets no minimum.
+                schema = replace(schema, min_items=None if default == [] else 1, max_items=1)
             if default not in (inspect.Parameter.empty, None):
                 schema = replace(schema, default=default)
 
