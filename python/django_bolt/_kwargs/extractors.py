@@ -15,6 +15,7 @@ from typing import Annotated, Any, Literal, get_args, get_origin
 import msgspec
 from django.db.models import QuerySet
 
+from .._serializer_before import RAW_VALIDATED, before_plan, run_before_validators
 from ..concurrency import run_in_orm_executor
 from ..datastructures import UploadFile
 from ..exceptions import HTTPException, RequestValidationError, parse_msgspec_decode_error
@@ -890,7 +891,34 @@ def _with_empty_body_default(extractor: Callable, default_value: Any) -> Callabl
     return extract_or_default
 
 
+def _build_before_body_extractor(annotation: Any, plan: Callable) -> Callable:
+    """The body extractor of a type that holds a serializer with a mode="before" validator."""
+
+    def extract(body_bytes: bytes) -> Any:
+        try:
+            raw = msgspec.json.decode(body_bytes)
+        except msgspec.DecodeError as e:
+            raise RequestValidationError(
+                errors=[parse_msgspec_decode_error(e, body_bytes)],
+                body=body_bytes,
+            ) from e
+        data = run_before_validators(plan, raw)
+        token = RAW_VALIDATED.set(True)
+        try:
+            # str_keys: the keys of a JSON object are strings.
+            return msgspec.convert(data, annotation, str_keys=True)
+        finally:
+            RAW_VALIDATED.reset(token)
+
+    return extract
+
+
 def _build_body_extractor(annotation: Any) -> Callable:
+    # Only a type with a before validator leaves the direct msgspec decode.
+    plan = before_plan(annotation)
+    if plan is not None:
+        return _build_before_body_extractor(annotation, plan)
+
     if is_msgspec_struct(annotation):
         decoder = get_msgspec_decoder(annotation)
 

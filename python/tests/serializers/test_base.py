@@ -5,8 +5,10 @@ from __future__ import annotations
 import msgspec
 import pytest
 
+from django_bolt import BoltAPI
 from django_bolt.exceptions import RequestValidationError
 from django_bolt.serializers import Email, Serializer, field_validator, model_validator
+from django_bolt.testing import TestClient
 
 
 class TestSerializerBasics:
@@ -247,6 +249,254 @@ class TestValidatorExecution:
         # Field validator should run before model validator
         assert execution_order[0] == "field"
         assert execution_order[1] == "model"
+
+
+_MODE_CALLS: list[tuple[str, object]] = []
+
+
+class ModeOrder(Serializer):
+    """The validators are not in the order of their modes."""
+
+    v: int
+
+    @field_validator("v", mode="after")
+    @classmethod
+    def after_1(cls, value):
+        _MODE_CALLS.append(("after_1", value))
+        return value
+
+    @field_validator("v", mode="before")
+    @classmethod
+    def before_1(cls, value):
+        _MODE_CALLS.append(("before_1", value))
+        return value
+
+    @field_validator("v")
+    @classmethod
+    def after_2(cls, value):
+        _MODE_CALLS.append(("after_2", value))
+        return value
+
+    @field_validator("v", mode="before")
+    @classmethod
+    def before_2(cls, value):
+        _MODE_CALLS.append(("before_2", value))
+        return int(value) if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def model_after_1(self):
+        _MODE_CALLS.append(("model_after_1", self.v))
+
+    @model_validator(mode="before")
+    @classmethod
+    def model_before_1(cls, data):
+        _MODE_CALLS.append(("model_before_1", dict(data)))
+        return data
+
+    @model_validator
+    def model_after_2(self):
+        _MODE_CALLS.append(("model_after_2", self.v))
+
+    @model_validator(mode="before")
+    @classmethod
+    def model_before_2(cls, data):
+        _MODE_CALLS.append(("model_before_2", dict(data)))
+        return data
+
+
+class ModeOrderChild(ModeOrder):
+    @field_validator("v", mode="before")
+    @classmethod
+    def child_before(cls, value):
+        _MODE_CALLS.append(("child_before", value))
+        return value
+
+    @field_validator("v")
+    @classmethod
+    def child_after(cls, value):
+        _MODE_CALLS.append(("child_after", value))
+        return value
+
+
+class BeforeLine(Serializer):
+    qty: int
+    note: str | None = None
+
+    @field_validator("qty", mode="before")
+    @classmethod
+    def parse_qty(cls, value):
+        if isinstance(value, str):
+            if not value.strip().isdigit():
+                raise ValueError("qty is not a number")
+            return int(value)
+        return value
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def empty_note_is_none(cls, value):
+        return None if value == "" else value
+
+
+class BeforeOrder(Serializer, rename="camel"):
+    order_id: int
+    tags: list[str] = []
+    lines: list[BeforeLine] = []
+    first: BeforeLine | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_old_key(cls, data):
+        if isinstance(data, dict) and "id" in data:
+            data = {**data, "orderId": data["id"]}
+            del data["id"]
+        return data
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def split_tags(cls, value):
+        return value.split(",") if isinstance(value, str) else value
+
+
+class BeforeOuter(Serializer):
+    """Has no before validator, but its nested serializer has."""
+
+    order: BeforeOrder
+
+
+class TestValidatorModes:
+    """mode="before" gets the raw input value, mode="after" gets the converted value."""
+
+    # The order that pydantic 2 gives for the same class.
+    EXPECTED_ORDER = [
+        ("model_before_2", {"v": "5"}),
+        ("model_before_1", {"v": "5"}),
+        ("before_2", "5"),
+        ("before_1", 5),
+        ("after_1", 5),
+        ("after_2", 5),
+        ("model_after_1", 5),
+        ("model_after_2", 5),
+    ]
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            lambda: ModeOrder.model_validate({"v": "5"}),
+            lambda: ModeOrder.model_validate_json(b'{"v": "5"}'),
+            lambda: ModeOrder(v="5"),
+        ],
+        ids=["model_validate", "model_validate_json", "construction"],
+    )
+    def test_before_validators_run_first_whatever_the_definition_order(self, build):
+        _MODE_CALLS.clear()
+        assert build().v == 5
+        assert _MODE_CALLS == self.EXPECTED_ORDER
+
+    def test_validators_of_a_subclass(self):
+        """Before: subclass, then parent. After: parent, then subclass."""
+        _MODE_CALLS.clear()
+        ModeOrderChild.model_validate({"v": "5"})
+        assert [name for name, _ in _MODE_CALLS] == [
+            "model_before_2",
+            "model_before_1",
+            "child_before",
+            "before_2",
+            "before_1",
+            "after_1",
+            "after_2",
+            "child_after",
+            "model_after_1",
+            "model_after_2",
+        ]
+
+    def test_before_validators_get_the_raw_input_at_each_depth(self):
+        data = {
+            "order": {
+                "id": 7,
+                "tags": "a,b",
+                "lines": [{"qty": "3", "note": ""}, {"qty": 4, "note": "n"}],
+                "first": {"qty": " 9 "},
+            }
+        }
+        for outer in (BeforeOuter.model_validate(data), BeforeOuter.model_validate_json(msgspec.json.encode(data))):
+            order = outer.order
+            assert order.order_id == 7
+            assert order.tags == ["a", "b"]
+            assert [(line.qty, line.note) for line in order.lines] == [(3, None), (4, "n")]
+            assert order.first.qty == 9
+        # The input of the caller is not changed.
+        assert data["order"]["tags"] == "a,b"
+
+    def test_value_of_a_before_validator_is_validated_by_the_field_type(self):
+        """The type of the field rejects a wrong value from a before validator."""
+
+        class Wrong(Serializer):
+            v: int
+
+            @field_validator("v", mode="before")
+            @classmethod
+            def to_text(cls, value):
+                return "text"
+
+        with pytest.raises(RequestValidationError, match="Expected `int`, got `str`"):
+            Wrong.model_validate({"v": 1})
+        with pytest.raises(RequestValidationError, match="Expected `int`, got `str`"):
+            Wrong.model_validate_json(b'{"v": 1}')
+
+    def test_before_validator_does_not_run_for_an_absent_field(self):
+        assert BeforeLine.model_validate({"qty": 1}).note is None
+        with pytest.raises(RequestValidationError) as exc_info:
+            BeforeOuter.model_validate({"order": {"orderId": 1, "lines": [{"qty": 1}, {"qty": "x"}]}})
+        assert exc_info.value.errors() == [
+            {"loc": ["body", "order", "lines", 1, "qty"], "msg": "qty is not a number", "type": "value_error"}
+        ]
+
+    def test_before_validators_of_a_json_request_body(self):
+        api = BoltAPI()
+
+        @api.post("/orders")
+        async def create_order(body: BeforeOuter) -> dict:
+            order = body.order
+            return {"id": order.order_id, "tags": order.tags, "qty": [line.qty for line in order.lines]}
+
+        with TestClient(api) as client:
+            response = client.post("/orders", json={"order": {"id": 7, "tags": "a,b", "lines": [{"qty": "3"}]}})
+            assert response.status_code == 200
+            assert response.json() == {"id": 7, "tags": ["a", "b"], "qty": [3]}
+
+            response = client.post("/orders", json={"order": {"id": 7, "lines": [{"qty": "x"}]}})
+            assert response.status_code == 422
+            assert response.json()["detail"] == [
+                {"loc": ["body", "order", "lines", 0, "qty"], "msg": "qty is not a number", "type": "value_error"}
+            ]
+            # The type of the field still checks the value.
+            response = client.post("/orders", json={"order": {"id": "seven"}})
+            assert response.status_code == 422
+            assert (
+                client.post("/orders", content=b"{not json", headers={"content-type": "application/json"}).status_code
+                == 422
+            )
+
+    @pytest.mark.parametrize("mode", ["wrap", "plain", "middle"])
+    def test_mode_that_is_not_supported_raises_at_class_creation(self, mode):
+        with pytest.raises(ValueError, match=f"mode={mode!r} is not supported"):
+
+            class WithFieldValidator(Serializer):
+                v: int
+
+                @field_validator("v", mode=mode)
+                @classmethod
+                def check(cls, value):
+                    return value
+
+        with pytest.raises(ValueError, match=f"mode={mode!r} is not supported"):
+
+            class WithModelValidator(Serializer):
+                v: int
+
+                @model_validator(mode=mode)
+                def check(self):
+                    return self
 
 
 class TestOptionalFields:
