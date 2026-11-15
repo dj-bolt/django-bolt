@@ -142,6 +142,41 @@ pub fn convert_path(path: &str) -> String {
     result
 }
 
+/// Write a route path as a client sends it. A client sends each byte that a
+/// URL path cannot hold, such as a space or a byte of a non-ASCII character, as
+/// a `%XX` escape, and the lookup gets the path with its escapes. A `{param}`
+/// stays as it is, and so does a `%`: the path can have escapes already.
+pub fn encode_route_path(path: &str) -> Cow<'_, str> {
+    // RFC 3986 `pchar`, and the `/` between segments.
+    fn is_path_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || "-._~!$&'()*+,;=:@/%".contains(ch)
+    }
+    if path
+        .chars()
+        .all(|ch| is_path_char(ch) || ch == '{' || ch == '}')
+    {
+        return Cow::Borrowed(path);
+    }
+    let mut encoded = String::with_capacity(path.len() + 8);
+    let mut in_param = false;
+    let mut utf8 = [0u8; 4];
+    for ch in path.chars() {
+        match ch {
+            '{' => in_param = true,
+            '}' => in_param = false,
+            _ if !in_param && !is_path_char(ch) => {
+                for byte in ch.encode_utf8(&mut utf8).bytes() {
+                    encoded.push_str(&format!("%{byte:02X}"));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        encoded.push(ch);
+    }
+    Cow::Owned(encoded)
+}
+
 /// Per-method router combining static (O(1) HashMap) and dynamic (radix tree) routing
 /// Inspired by Elysia's router optimization that separates static from dynamic routes
 struct MethodRouter {
@@ -210,11 +245,10 @@ impl Router {
             handler_id,
             native: None,
         };
-        self.insert(method, path, route, false)
+        self.insert(method, path, route)
     }
 
-    /// Register a native route. Unlike a Python route, a native route that has
-    /// the same method and path as another route is an error.
+    /// Register a native route.
     pub fn register_native(
         &mut self,
         py: Python<'_>,
@@ -230,10 +264,12 @@ impl Router {
             handler_id: NATIVE_HANDLER_ID,
             native: Some(native),
         };
-        self.insert(method, path, route, true)
+        self.insert(method, path, route)
     }
 
-    fn insert(&mut self, method: &str, path: &str, route: Route, unique: bool) -> PyResult<()> {
+    /// Add a route. A route that has the method and path of another route is an
+    /// error: the second handler would replace the first with no sign.
+    fn insert(&mut self, method: &str, path: &str, route: Route) -> PyResult<()> {
         let method_router = match method {
             "GET" => &mut self.get,
             "POST" => &mut self.post,
@@ -251,11 +287,14 @@ impl Router {
             }
         };
 
+        // The lookup gets the request path with its `%XX` escapes.
+        let path = &*encode_route_path(path);
+
         // Elysia-style optimization: Separate static routes from dynamic routes
         // Static routes use O(1) HashMap lookup, dynamic routes use radix tree
         if is_static_path(path) {
             // Static route: store in HashMap for O(1) lookup
-            if unique && method_router.static_routes.contains_key(path) {
+            if method_router.static_routes.contains_key(path) {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Failed to register route: {} {} is already registered",
                     method, path
@@ -577,6 +616,22 @@ mod tests {
         )
     }
 
+    /// A Python route is unique too. The second insert is an error and the first route stays.
+    #[test]
+    fn a_python_route_does_not_replace_an_earlier_route_of_the_same_static_path() {
+        let mut router = router_with(&[("GET", "/items")]);
+        Python::attach(|py| {
+            let error = router
+                .register("GET", "/items", 1, py.None(), py.None(), py.None())
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "ValueError: Failed to register route: GET /items is already registered"
+            );
+        });
+        assert_eq!(lookup(&router, "GET", "/items"), Some((0, None)));
+    }
+
     #[test]
     fn each_method_finds_only_its_own_routes() {
         let routes: Vec<(&str, &str)> = METHODS
@@ -651,6 +706,34 @@ mod tests {
     }
 
     #[test]
+    fn encode_route_path_escapes_what_a_url_path_cannot_hold() {
+        assert!(matches!(
+            encode_route_path("/items/{id}/a-b_c.d~e:f@g"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(encode_route_path("/a b"), "/a%20b");
+        assert_eq!(encode_route_path("/\u{fc}"), "/%C3%BC");
+        assert_eq!(encode_route_path("/\u{20ac}/x?y#z"), "/%E2%82%AC/x%3Fy%23z");
+        // A parameter keeps its name, and an escape stays as it is.
+        assert_eq!(
+            encode_route_path("/\u{fc}/{n\u{e4}me}/{rest:path}"),
+            "/%C3%BC/{n\u{e4}me}/{rest:path}"
+        );
+        assert_eq!(encode_route_path("/%C3%BC b"), "/%C3%BC%20b");
+    }
+
+    #[test]
+    fn a_route_path_matches_the_escaped_request_path() {
+        let router = router_with(&[("GET", "/\u{fc} b"), ("GET", "/\u{fc} b/{id}")]);
+        assert_eq!(lookup(&router, "GET", "/%C3%BC%20b"), Some((0, None)));
+        assert_eq!(
+            lookup(&router, "GET", "/%C3%BC%20b/a%20b"),
+            Some((1, params(&[("id", "a b")])))
+        );
+        assert_eq!(lookup(&router, "GET", "/\u{fc} b"), None);
+    }
+
+    #[test]
     fn a_path_param_decodes_once() {
         let router = router_with(&[("GET", "/items/{id}")]);
         let (_, params) = router.find("GET", "/items/a%252Fb").unwrap().into_parts();
@@ -674,6 +757,23 @@ mod tests {
             lookup(&router, "GET", "/items/1"),
             Some((0, params(&[("id", "1")])))
         );
+    }
+
+    #[test]
+    fn a_second_static_route_does_not_replace_the_first() {
+        let mut router = router_with(&[("GET", "/items"), ("POST", "/items")]);
+        Python::attach(|py| {
+            let error = router
+                .register("GET", "/items", 2, py.None(), py.None(), py.None())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "ValueError: Failed to register route: GET /items is already registered"
+            );
+        });
+        assert_eq!(lookup(&router, "GET", "/items"), Some((0, None)));
+        assert_eq!(lookup(&router, "POST", "/items"), Some((1, None)));
     }
 
     #[test]

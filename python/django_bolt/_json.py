@@ -25,12 +25,10 @@ from ipaddress import (
     IPv6Network,
 )
 from pathlib import Path, PurePath
-from typing import Any, TypeVar
+from typing import Any
 from uuid import UUID
 
 import msgspec
-
-T = TypeVar("T")
 
 # Default type encoders for non-JSON-native types
 # Maps type -> encoder function
@@ -134,33 +132,4 @@ def decode(value: bytes | str) -> Any:
     return _DECODER.decode(value)
 
 
-def decode_typed[T](
-    value: bytes | str,
-    target_type: type[T],
-    strict: bool = True,
-) -> T:
-    """Decode JSON with type validation and coercion.
-
-    Args:
-        value: JSON bytes or string
-        target_type: Expected type (e.g., msgspec.Struct subclass)
-        strict: If False, enables lenient type coercion (e.g., "123" -> 123)
-
-    Returns:
-        Decoded and validated object of target_type
-
-    Raises:
-        msgspec.DecodeError: If decoding or validation fails
-        msgspec.ValidationError: If type validation fails
-
-    Examples:
-        >>> class User(msgspec.Struct):
-        ...     id: int
-        ...     name: str
-        >>> decode_typed(b'{"id": 1, "name": "Alice"}', User)
-        User(id=1, name='Alice')
-    """
-    return msgspec.json.decode(value, type=target_type, strict=strict)
-
-
-__all__ = ["encode", "decode", "decode_typed", "DEFAULT_TYPE_ENCODERS", "default_serializer"]
+__all__ = ["encode", "decode", "DEFAULT_TYPE_ENCODERS", "default_serializer"]
