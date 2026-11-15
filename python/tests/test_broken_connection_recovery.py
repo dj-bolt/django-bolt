@@ -39,7 +39,7 @@ import jwt
 import pytest
 from asgiref.sync import async_to_sync, sync_to_async
 from django.contrib.auth.models import User
-from django.db import DatabaseError, connection, connections
+from django.db import DatabaseError, connection, connections, transaction
 from django.db.backends.signals import connection_created
 from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteWrapper
 
@@ -402,6 +402,51 @@ def test_one_event_makes_one_reconnect_wave(monkeypatch):
             shutdown_closing_connections(pool)
 
     assert len(opened_on_c) == 1, "thread C reconnected again after the second report of the same event"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_connection_inside_an_atomic_block_reconnects_after_the_block(monkeypatch):
+    """A reconnect leaves a connection inside an open ``atomic`` block alone: the block owns it.
+
+    Thread A finds a dead connection. Thread B is inside a block at its next
+    call, so it keeps its older connection. B must not record the reconnect
+    as done: its first call after the block closes that connection.
+    """
+    monkeypatch.setattr(SQLiteWrapper, "is_usable", _sqlite_is_usable)
+    _isolate_generations(monkeypatch)
+    a, b = _orm_pool(1), _orm_pool(1)
+    opened_on_b: list[object] = []
+
+    def count_on_b(sender, connection, **kwargs) -> None:
+        if threading.get_ident() == b_thread:
+            opened_on_b.append(connection)
+
+    def select_inside_a_block() -> bool:
+        with transaction.atomic():
+            raw = connection.connection
+            concurrency._call_guarded(_select_one)
+            return connection.connection is raw
+
+    try:
+        for pool in (a, b):
+            assert pool.submit(concurrency._call_guarded, _select_one).result() == 1
+        b_thread = b.submit(threading.get_ident).result()
+        a.submit(_kill_silently).result()
+        with pytest.raises(DatabaseError):
+            a.submit(concurrency._call_guarded, _select_one).result()
+
+        connection_created.connect(count_on_b)
+        try:
+            assert b.submit(select_inside_a_block).result(), "the call inside the block replaced its connection"
+            assert opened_on_b == []
+            assert b.submit(concurrency._call_guarded, _select_one).result() == 1
+        finally:
+            connection_created.disconnect(count_on_b)
+    finally:
+        for pool in (a, b):
+            shutdown_closing_connections(pool)
+
+    assert len(opened_on_b) == 1, "thread B kept its older connection after the block"
 
 
 # --- The user-loading path and the _check_before_call gate ------------------
