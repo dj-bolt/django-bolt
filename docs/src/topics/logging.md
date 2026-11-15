@@ -390,6 +390,7 @@ The log level follows the status code, the same as Django's `runserver`:
 Set `django.server` to `WARNING` to keep only the 4xx and 5xx lines. Set it above `WARNING` to turn the access log off. The check runs once at startup. When the log is off, the request path has no logging code.
 
 `sample_rate` and `min_duration_ms` remove lines of 1xx to 3xx responses. See [Production settings](#production-settings).
+This includes the 308 redirect and the automatic `OPTIONS` answer of a route path. They use the values of the API of that route.
 
 ## Example: Complete production setup
 

@@ -55,6 +55,28 @@ def test_access_log_applies_the_sample_rate_of_a_logging_config(make_server_proj
 
 
 @pytest.mark.server_integration
+def test_access_log_filters_the_redirect_and_the_options_answer_of_a_route(make_server_project):
+    project = make_server_project(
+        api_module=app_module("access_log_filters"),
+        settings_extra=_LOGGING,
+    )
+    with project.start(startup_path="/health") as server:
+        # Rust gives these answers before the handler runs.
+        assert server.request("GET", "/sampled/ok/", follow_redirects=False).status_code == 308
+        assert server.request("OPTIONS", "/sampled/ok").status_code == 204
+        assert server.request("GET", "/fast/", follow_redirects=False).status_code == 308
+        assert server.request("OPTIONS", "/fast").status_code == 204
+        assert server.request("GET", "/sampled/gone").status_code == 404
+    lines = project.path("access.log").read_text().splitlines()
+    # The API with sample_rate=0.0 writes no line for its 308 and its 204.
+    assert [line.rsplit(" ", 1)[0] for line in lines if "/health" not in line] == [
+        "INFO GET /fast/ 308",
+        "INFO OPTIONS /fast 204",
+        "WARNING GET /sampled/gone 404",
+    ]
+
+
+@pytest.mark.server_integration
 def test_access_log_applies_the_slow_request_setting(make_server_project):
     lines = _run(make_server_project, "DJANGO_BOLT_LOG_SLOW_MS = 200\n")
     assert lines == [

@@ -883,6 +883,15 @@ fn write_access_log(
     });
 }
 
+/// The access-log filter of the route `handler_id`. A route with no metadata has no limit.
+#[inline]
+fn route_access_log_filter(state: &AppState, handler_id: usize) -> AccessLogFilter {
+    state
+        .route_metadata
+        .get(handler_id)
+        .map_or_else(AccessLogFilter::default, |meta| meta.access_log_filter)
+}
+
 /// The error formatter does not change the responses of an MCP or an ASGI mount.
 /// Some of their errors come from shared builders, so remove the `ErrorInfo` here.
 #[inline]
@@ -932,14 +941,16 @@ async fn route_request(
                 };
 
                 // Try alternate path - if it matches, send 308 redirect
-                if router.find(method, &alternate_path).is_some() {
+                if let Some(alternate) = router.find(method, &alternate_path) {
+                    // The line of the redirect has the filter of the route at the other form.
+                    *access_log_filter =
+                        Some(route_access_log_filter(&state, alternate.handler_id()));
                     let query = req.query_string();
                     let location = if query.is_empty() {
                         alternate_path
                     } else {
                         format!("{}?{}", alternate_path, query)
                     };
-                    *access_log_filter = Some(AccessLogFilter::default());
                     return HttpResponse::PermanentRedirect() // 308
                         .insert_header(("Location", location))
                         .finish();
@@ -952,7 +963,14 @@ async fn route_request(
                 if !available_methods.is_empty() {
                     let allow_header = available_methods.join(", ");
                     // CORS headers will be added by CorsMiddleware
-                    *access_log_filter = Some(AccessLogFilter::default());
+                    // The line of this answer has the filter of the first route of the path.
+                    *access_log_filter = Some(
+                        router
+                            .find(&available_methods[0], path)
+                            .map_or_else(AccessLogFilter::default, |found| {
+                                route_access_log_filter(&state, found.handler_id())
+                            }),
+                    );
                     return HttpResponse::NoContent()
                         .insert_header(("Allow", allow_header))
                         .insert_header(("Content-Type", "application/json"))
