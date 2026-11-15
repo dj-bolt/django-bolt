@@ -37,6 +37,15 @@ _SOURCE_IDS = {
 }
 
 
+def is_async_dependency(dep_fn: Callable) -> bool:
+    """Whether a call of ``dep_fn`` gives a coroutine.
+
+    This is true for an ``async def`` function, and for an object whose class
+    has ``async def __call__``. Call this at registration.
+    """
+    return inspect.iscoroutinefunction(dep_fn) or inspect.iscoroutinefunction(type(dep_fn).__call__)
+
+
 def compile_dependency(
     dep_fn: Callable,
     handler_meta: dict[Any, dict[str, Any]],
@@ -98,7 +107,7 @@ def _compile_dep_arg_plan(
                 compile_dependency(sync_marker.dependency, handler_meta, compile_binder, http_method, path),
             )
         )
-    dep_meta["_is_async_dep"] = inspect.iscoroutinefunction(dep_fn)
+    dep_meta["_is_async_dep"] = is_async_dependency(dep_fn)
     dep_meta["_is_request_only_dep"] = dep_meta.get("mode") == "request_only"
     dep_meta["_dep_nested"] = nested
     dep_meta["_dep_nested_sync"] = nested_sync
@@ -134,7 +143,7 @@ def dependency_needs_event_loop(
     sync handler, a nested dependency counts in its sync form, as
     :func:`resolve_dependency_sync` resolves it.
     """
-    if inspect.iscoroutinefunction(dep_fn):
+    if is_async_dependency(dep_fn):
         return True
     dep_meta = compile_dependency(dep_fn, handler_meta, compile_binder, http_method, path)
     nested = dep_meta["_dep_nested_sync"] if sync_handler else dep_meta["_dep_nested"]
