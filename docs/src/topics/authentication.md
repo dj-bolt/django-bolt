@@ -624,7 +624,7 @@ Django does the session work:
 1. Bolt adds Django's `SessionMiddleware` and `AuthenticationMiddleware` to each route that uses the backend. When the middleware of the API, router or route already has both, Bolt adds nothing. When it has only one of them, startup fails, because a second `SessionMiddleware` would load and save the session again.
 2. Rust rejects a request with no session cookie with 401. No Python runs.
 3. For a request with the cookie, Django loads the session and the user.
-4. Bolt checks the guards of the route against `request.user`, before the handler.
+4. Bolt checks the guards of the route against `request.user`, before the handler. A rejection is the same 401 or 403 as for a token. It has the `WWW-Authenticate` header of a 401, and the `error_formatter` of the API formats it.
 
 A guard can read `is_staff`, `is_superuser` and `permissions` of the Django user. `Requires("permissions", "app.perm")` uses the permissions of the user and of its groups. A `Requires` on another claim rejects a session request with 403. A `none_of` guard on another claim is an error at startup, because it would let every session user in. Startup also fails when a guard reads a field that your user model does not have.
 
@@ -812,6 +812,37 @@ async def get_data(request):
 ```
 
 Django-Bolt tries each backend in order until one succeeds. `SessionAuthentication` comes last in any order, because Rust can verify a token but not a session.
+
+### The challenge of a 401
+
+A 401 has a `WWW-Authenticate` header ([RFC 9110, section 15.5.2](https://www.rfc-editor.org/rfc/rfc9110#section-15.5.2)). Its value names the auth scheme of each backend of the route:
+
+| Backend | Scheme |
+|---------|--------|
+| `JWTAuthentication()`, with the token in the `Authorization` header | `Bearer` |
+| `JWTAuthentication(header="X-Token")` or `JWTAuthentication(cookie="name")` | `ApiKey` |
+| `APIKeyAuthentication()` | `ApiKey` |
+| `SessionAuthentication()` | `ApiKey` |
+
+`Bearer` is the scheme of RFC 6750, for a token in the `Authorization` header. A key in another header or in a cookie has no registered scheme. Bolt names it `ApiKey`, as the OpenAPI document calls it an `apiKey`.
+
+A route with more than one backend gets one challenge for each different scheme, in the order of the backends. The route above answers a request with no credential with:
+
+```http
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer, ApiKey
+```
+
+Bolt builds the value one time, when it registers the route. A 401 that a handler, a dependency or a middleware raises on the route gets the same header. A `WWW-Authenticate` header that your code sets stays as it is. A route with no auth backend has no challenge, so Bolt adds no header to a 401 of its handler.
+
+To name another scheme, override `challenge_scheme` in a subclass of the backend:
+
+```python
+class TokenAuthentication(APIKeyAuthentication):
+    @property
+    def challenge_scheme(self) -> str:
+        return "Token"
+```
 
 ## Authentication context
 

@@ -3221,6 +3221,9 @@ class BoltAPI:
             async def execute_handler(req):
                 rejection = await check_session_guards(req)
                 if rejection is not None:
+                    if isinstance(rejection, HTTPException):
+                        # The error format of the API, as for an HTTPException of the handler.
+                        return MiddlewareResponse.from_tuple(self._handle_http_exception(rejection, req))
                     return rejection
                 return await self._execute_handler_as_middleware_response(handler, req, meta)
 
