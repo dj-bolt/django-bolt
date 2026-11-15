@@ -423,6 +423,10 @@ async def report():
     return File("/srv/report.csv")
 ```
 
+A route with the return type `str` shows `text/plain`. A route with the return
+type `bytes` shows `application/octet-stream`. Bolt sends these values as they
+are, not as JSON.
+
 Each parametrization of a generic response model gets its own component name.
 This is the same as msgspec. `Page[UserRead]` becomes the component
 `Page_UserRead_`. Its title is `Page[UserRead]`.
