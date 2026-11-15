@@ -176,6 +176,22 @@ def _iter_field_defaults(cls: type) -> list[tuple[str, Any]]:
     return result
 
 
+def _names_in_code(func: Any) -> frozenset[str]:
+    """Return each name that the code of ``func`` uses, such as ``low`` for ``self.low``.
+
+    The names of a lambda or of a nested function in ``func`` count too. A
+    callable with no Python code gives no name.
+    """
+    code = getattr(inspect.unwrap(func), "__code__", None)
+    names: set[str] = set()
+    pending = [code] if code is not None else []
+    while pending:
+        current = pending.pop()
+        names.update(current.co_names)
+        pending.extend(const for const in current.co_consts if inspect.iscode(const))
+    return frozenset(names)
+
+
 def _build_rename_map(cls: type[msgspec.Struct]) -> dict[str, str]:
     """
     Build field name -> encoded name mapping for msgspec rename support.
@@ -2246,8 +2262,10 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             - The subset inherits validators for included fields
             - The subset keeps the rename, omit_defaults, forbid_unknown_fields and frozen
               options of the parent. It does not keep the tag
-            - Model validators are not copied. They can read a field that the subset
-              does not have
+            - The subset inherits a model validator when it has each field that the
+              validator names (``self.low``). A model validator that names a field
+              outside the subset does not run for the subset. The same applies to
+              a method or a class variable of the parent that is not in the subset
             - Always define subsets at module level, not inside view functions
         """
         fields_set = frozenset(fields)
@@ -2329,6 +2347,20 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if hasattr(parent_meta, "read_only"):
                 Config.read_only = parent_meta.read_only & fields_set  # type: ignore
             class_dict["Config"] = Config
+
+        # Copy each model validator that the subset can run. A validator that
+        # names a parent attribute outside the subset reads an attribute that
+        # the subset does not have, so it stays out. Such an attribute is a
+        # field, a method or a class variable of the parent.
+        for validator in cls.__model_validators__:
+            if not any(
+                hasattr(cls, name)
+                and name not in fields_set
+                and name not in class_dict
+                and not hasattr(Serializer, name)
+                for name in _names_in_code(validator)
+            ):
+                class_dict[validator.__name__] = validator
 
         # Create the new Serializer subclass. We intentionally do NOT inherit
         # the parent's tag — a subset is a distinct schema (different fields)

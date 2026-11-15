@@ -638,6 +638,11 @@ UserMiniSerializer = UserSerializer.subset("id", "name")
 user = UserMiniSerializer(id=1, name="John")
 ```
 
+The subset keeps the field validators of its fields.
+It keeps a model validator when it has each field that the validator names, such as `self.name`.
+A model validator that names a field outside the subset does not run for the subset.
+A model validator that names a method or a class variable of the parent does not run for the subset either.
+
 ### The fields() method
 
 Create subsets from field_sets:

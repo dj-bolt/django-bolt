@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, ClassVar
 
 import msgspec
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 
 from django_bolt import BoltAPI
+from django_bolt.exceptions import RequestValidationError
 from django_bolt.param_functions import Body, Cookie, Form, Header, Query
 from django_bolt.serializers import (
     Serializer,
@@ -16,6 +17,7 @@ from django_bolt.serializers import (
     computed_field,
     field,
     field_validator,
+    model_validator,
 )
 from django_bolt.testing import TestClient
 
@@ -1005,6 +1007,92 @@ class TestSubsetMethod:
         assert result["first_name"] == "John"
         assert result["last_name"] == "Doe"
         assert result["full_name"] == "John Doe"
+
+    def test_subset_keeps_a_model_validator_whose_fields_it_has(self):
+        """A subset ran no model validator. Thus `low > high` passed for the subset and failed for the parent."""
+
+        class RangeSerializer(Serializer):
+            low: int
+            high: int
+            note: str = ""
+
+            @model_validator
+            def check_order(self):
+                if self.low > self.high:
+                    raise ValueError("low is above high")
+                return self
+
+            @model_validator
+            def check_note(self):
+                if self.note == "forbidden":
+                    raise ValueError("note is forbidden")
+                return self
+
+        Bounds = RangeSerializer.subset("low", "high", name="Bounds")
+        # This subset has no `high` field, so `check_order` cannot run.
+        LowWithNote = RangeSerializer.subset("low", "note", name="LowWithNote")
+
+        api = BoltAPI()
+
+        async def bounds(data):
+            return {"low": data.low, "high": data.high}
+
+        async def low(data):
+            return {"low": data.low, "note": data.note}
+
+        # This module has postponed annotations, and the subsets are local names.
+        bounds.__annotations__["data"] = Bounds
+        low.__annotations__["data"] = LowWithNote
+        api.post("/bounds")(bounds)
+        api.post("/low")(low)
+
+        with TestClient(api) as client:
+            assert client.post("/bounds", json={"low": 1, "high": 5}).json() == {"low": 1, "high": 5}
+            response = client.post("/bounds", json={"low": 5, "high": 1})
+            assert response.status_code == 422
+            assert "low is above high" in response.text
+
+            assert client.post("/low", json={"low": 5}).json() == {"low": 5, "note": ""}
+            response = client.post("/low", json={"low": 5, "note": "forbidden"})
+            assert response.status_code == 422
+            assert "note is forbidden" in response.text
+
+        assert [validator.__name__ for validator in Bounds.__model_validators__] == ["check_order"]
+        assert [validator.__name__ for validator in LowWithNote.__model_validators__] == ["check_note"]
+
+    def test_subset_leaves_out_a_model_validator_that_calls_a_parent_method(self):
+        """The subset does not have the methods and class variables of the parent."""
+
+        class LimitSerializer(Serializer):
+            LIMIT: ClassVar[int] = 3
+            low: int
+            name: str = ""
+
+            def _low_is_small(self):
+                return self.low <= 5
+
+            @model_validator
+            def check_low(self):
+                if not self._low_is_small():
+                    raise ValueError("low is too large")
+
+            @model_validator
+            def check_name(self):
+                if len(self.name) > self.LIMIT:
+                    raise ValueError("name is too long")
+
+            @model_validator
+            def check_sign(self):
+                if self.low < 0:
+                    raise ValueError("low is below zero")
+
+        Sub = LimitSerializer.subset("low", "name", name="LimitSub")
+
+        assert [validator.__name__ for validator in Sub.__model_validators__] == ["check_sign"]
+        # Before, the copied validators raised AttributeError for each instance.
+        assert Sub(low=9, name="a long name").low == 9
+        with pytest.raises(RequestValidationError):
+            Sub(low=-1)
 
     def test_subset_from_parent(self):
         """Test creating subset instance from parent instance."""
