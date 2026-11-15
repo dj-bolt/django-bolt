@@ -111,6 +111,7 @@ def build_mount_definition(
     secret_key: str,
     max_body_bytes: int,
     auth_metadata: list[dict[str, Any]] | None,
+    auth_challenge: str | None,
     guards_metadata: list[dict[str, Any]],
     verify_token: Any | None,
     www_authenticate: str | None,
@@ -144,6 +145,7 @@ def build_mount_definition(
         # Rust sends the request `_meta` and the principal only to middleware.
         "resource_middleware": bool(mcp._resource_middleware),
         "prompt_middleware": bool(mcp._prompt_middleware),
+        "auth_challenge": auth_challenge,
         "verify_token": verify_token,
         "www_authenticate": www_authenticate,
         "state_key": derive_state_key(secret_key),

@@ -22,7 +22,7 @@ from django.db import connection
 from django.utils.deprecation import MiddlewareMixin
 
 from django_bolt import BoltAPI, CurrentUser, Depends, OptionalCurrentUser, Request, get_current_user
-from django_bolt.auth import JWTAuthentication
+from django_bolt.auth import APIKeyAuthentication, JWTAuthentication
 from django_bolt.concurrency import in_lane_mode
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack
 from django_bolt.testing import TestClient
@@ -177,9 +177,46 @@ def test_current_user_rejects_a_request_with_no_user(handler_is_async):
         rejected = client.get("/required")
         assert rejected.status_code == 401
         assert rejected.json() == {"detail": "Authentication required"}
+        # A route with no auth backend has no scheme to name in a challenge.
+        assert "www-authenticate" not in rejected.headers
         response = client.get("/optional")
         assert response.status_code == 200, response.text
         assert response.json() == {"user": None}
+
+
+@pytest.mark.parametrize("handler_is_async", [True, False], ids=["async", "sync"])
+@pytest.mark.parametrize(
+    ("backends", "challenge"),
+    [
+        ([APIKeyAuthentication(api_keys={"key1"})], "ApiKey"),
+        ([JWTAuthentication(secret="current-user-challenge-secret-32-b")], "Bearer"),
+        (
+            [JWTAuthentication(secret="current-user-challenge-secret-32-b"), APIKeyAuthentication(api_keys={"key1"})],
+            "Bearer, ApiKey",
+        ),
+    ],
+    ids=["api-key", "jwt", "jwt-and-api-key"],
+)
+def test_the_401_of_current_user_names_the_scheme_of_the_route_backends(backends, challenge, handler_is_async):
+    """``CurrentUser`` sends the challenge of the auth backends of the route, not a fixed ``Bearer``."""
+    api = BoltAPI()
+
+    if handler_is_async:
+
+        @api.get("/required", auth=backends)
+        async def required(user: CurrentUser):
+            return {"username": user.username}
+    else:
+
+        @api.get("/required", auth=backends)
+        def required(user: CurrentUser):
+            return {"username": user.username}
+
+    with TestClient(api) as client:
+        rejected = client.get("/required")
+        assert rejected.status_code == 401
+        assert rejected.json() == {"detail": "Authentication required"}
+        assert rejected.headers["www-authenticate"] == challenge
 
 
 def _sync_dependency(request: Request) -> str:
