@@ -1377,6 +1377,38 @@ def test_pagination_max_page_size_enforcement(sample_articles):
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    ("scheme", "size_field", "query"),
+    [
+        (PageNumberPagination, "page_size", ""),
+        (PageNumberPagination, "page_size", "?page_size=0"),
+        (LimitOffsetPagination, "limit", ""),
+        (LimitOffsetPagination, "limit", "?limit=abc"),
+        (CursorPagination, "page_size", ""),
+    ],
+)
+def test_max_page_size_limits_the_default_page_size(sample_articles, scheme, size_field, query):
+    """A subclass that sets only max_page_size keeps the default page_size of 100. The limit applies to it too."""
+    api = BoltAPI()
+
+    class LimitedPagination(scheme):
+        max_page_size = 2
+
+    @api.get("/articles")
+    @paginate(LimitedPagination)
+    async def list_articles(request):
+        return Article.objects.all()
+
+    with TestClient(api) as client:
+        response = client.get(f"/articles{query}")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data[size_field] == 2
+    assert len(data["items"]) == 2
+
+
+@pytest.mark.django_db(transaction=True)
 def test_pagination_invalid_page_defaults_to_first(sample_articles):
     """Test that invalid page number defaults to page 1"""
     api = BoltAPI()
