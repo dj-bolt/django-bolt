@@ -536,7 +536,7 @@ def read_size_setting(name: str, default: int) -> int:
         try:
             size = operator.index(value)
         except TypeError:
-            size = -1
+            size = -1  # pragma: no mutate (each negative number fails the check below)
         if size >= 0:
             return size
     raise ImproperlyConfigured(f"{name} must be an int of 0 or more, got {type(value).__name__} {value!r}.")
@@ -638,7 +638,10 @@ def get_trusted_proxies() -> list[str]:
                 f"expected a string, got {type(entry).__name__}."
             )
         try:
-            network = ipaddress.ip_network(entry, strict=False)
+            network = ipaddress.ip_network(
+                entry,
+                strict=False,  # pragma: no mutate (None is also false)
+            )
         except (TypeError, ValueError) as e:
             raise ImproperlyConfigured(
                 f"BOLT_TRUSTED_PROXIES entry {entry!r} is not an address or CIDR block: {e}"

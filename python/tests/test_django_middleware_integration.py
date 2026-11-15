@@ -3453,6 +3453,13 @@ def _answers_with(make_response) -> type[Middleware]:
     return AnswersWithResponseObject
 
 
+class _TeapotJSON(JSON):
+    """A subclass of a Bolt response type, with its own default status."""
+
+    def __init__(self, data):
+        super().__init__(data, status_code=418)
+
+
 _BOLT_RESPONSE_CASES = {
     "html": (
         lambda: HTML("<p>x</p>", status_code=202, headers={"X-Own": "1"}),
@@ -3461,10 +3468,16 @@ _BOLT_RESPONSE_CASES = {
         b"<p>x</p>",
     ),
     "plain": (lambda: PlainText("hi", status_code=201), 201, "text/plain; charset=utf-8", b"hi"),
-    "json": (lambda: JSON({"a": 1}, status_code=201), 201, "application/json", b'{"a":1}'),
+    "json": (
+        lambda: JSON({"a": 1}, status_code=201, headers={"X-Own": "1"}),
+        201,
+        "application/json",
+        b'{"a":1}',
+    ),
+    "json-subclass": (lambda: _TeapotJSON({"a": 1}), 418, "application/json", b'{"a":1}'),
     "media-type": (
-        lambda: Response("<b>2</b>", media_type="application/xml", headers={"X-Own": "1"}),
-        200,
+        lambda: Response("<b>2</b>", status_code=203, media_type="application/xml", headers={"X-Own": "1"}),
+        203,
         "application/xml",
         b"<b>2</b>",
     ),
@@ -3503,15 +3516,23 @@ def test_django_middleware_keeps_a_bolt_response_of_a_middleware(wrapper, case):
     assert response.content == body
     if case == "redirect":
         assert response.headers.get("location") == "/elsewhere"
-    if case in {"html", "media-type", "redirect"}:
+    if case in {"html", "json", "media-type", "redirect"}:
         assert response.headers.get("x-own") == "1"
 
 
 @pytest.mark.parametrize("wrapper", _DJANGO_MIDDLEWARE_WRAPPERS)
-def test_django_middleware_keeps_the_cookies_of_a_bolt_response(wrapper):
+@pytest.mark.parametrize(
+    ("make_response", "content_type"),
+    [
+        pytest.param(lambda: HTML("x"), "text/html; charset=utf-8", id="html"),
+        pytest.param(lambda: JSON({"a": 1}), "application/json", id="json"),
+        pytest.param(lambda: Response("x", media_type="application/xml"), "application/xml", id="response"),
+    ],
+)
+def test_django_middleware_keeps_the_cookies_of_a_bolt_response(wrapper, make_response, content_type):
     """A cookie on a Bolt response object reaches the client behind Django middleware."""
     api = BoltAPI(
-        middleware=[wrapper(), _answers_with(lambda: HTML("x").set_cookie("sid", "abc", httponly=True))],
+        middleware=[wrapper(), _answers_with(lambda: make_response().set_cookie("sid", "abc", httponly=True))],
     )
 
     @api.get("/page")
@@ -3522,7 +3543,7 @@ def test_django_middleware_keeps_the_cookies_of_a_bolt_response(wrapper):
         response = client.get("/page")
 
     assert response.headers.get("x-seen") == "yes"
-    assert response.headers.get("content-type") == "text/html; charset=utf-8"
+    assert response.headers.get("content-type") == content_type
     assert response.cookies.get("sid") == "abc"
     assert "httponly" in response.headers["set-cookie"].lower()
 
