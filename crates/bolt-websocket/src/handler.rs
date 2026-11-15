@@ -953,7 +953,9 @@ fn refusal(status: StatusCode) -> HttpResponse {
 /// Run the Python handler on this thread's WorkerLoop.
 ///
 /// The handler decides the handshake. If it ends without a decision, the
-/// upgrade gets 403 on return and 500 on error, as in uvicorn.
+/// upgrade gets 403 on return and 500 on error, as in uvicorn. If it ends
+/// after accept with no close, the connection gets a close frame: 1000 on
+/// return and 1011 on error.
 fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsTarget) {
     actix_web::rt::spawn(async move {
         // Wrap the entire handler execution in catch_unwind to handle panics
@@ -1029,14 +1031,18 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
                 Err(e) => Some(e),
             };
             match error {
-                None => ws_state.refuse(StatusCode::FORBIDDEN),
+                None => {
+                    ws_state.refuse(StatusCode::FORBIDDEN);
+                    // A handler that returns with no close ends the connection.
+                    close_accepted(&ws_state, 1000, "").await;
+                }
                 Some(e) => {
                     // A client that left is not an error of the handler.
                     if !is_client_gone(&e) {
                         eprintln!("[django-bolt] WebSocket handler error: {}", e);
                     }
                     ws_state.refuse(StatusCode::INTERNAL_SERVER_ERROR);
-                    close_with_error(&ws_state, "Internal error").await;
+                    close_accepted(&ws_state, 1011, "Internal error").await;
                 }
             }
         })
@@ -1046,17 +1052,20 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
         if result.is_err() {
             eprintln!("[django-bolt] WebSocket handler task panicked - closing connection");
             ws_state.refuse(StatusCode::INTERNAL_SERVER_ERROR);
-            close_with_error(&ws_state, "Internal server error").await;
+            close_accepted(&ws_state, 1011, "Internal server error").await;
         }
     });
 }
 
-/// Close an accepted connection with 1011. The actor stop releases the slot.
-async fn close_with_error(ws_state: &WsConnectionState, reason: &str) {
+/// Close an accepted connection when the handler ends. The actor stop releases the slot.
+///
+/// The actor of a connection that the handler or the client closed has
+/// stopped. The send then fails, and the client gets no second close frame.
+async fn close_accepted(ws_state: &WsConnectionState, code: u16, reason: &str) {
     if let Some(addr) = ws_state.actor_addr.get() {
         let _ = addr
             .send(SendToClient(WsMessage::Close {
-                code: 1011,
+                code,
                 reason: reason.to_string(),
             }))
             .await;

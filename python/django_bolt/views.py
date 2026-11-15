@@ -21,6 +21,7 @@ from contextlib import suppress
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
+from django.core.exceptions import ValidationError
 from django.db.models import AutoField, Model, ObjectDoesNotExist, QuerySet
 
 from ._json import decode
@@ -464,7 +465,8 @@ class ViewSet[T: Model](APIView):
             Model instance
 
         Raises:
-            HTTPException: If object not found (404)
+            HTTPException: If object not found (404). A lookup value that the
+                field cannot hold is also not found.
         """
         queryset = await self.get_queryset()
         queryset = await self._apply_filter_queryset(queryset)
@@ -479,8 +481,17 @@ class ViewSet[T: Model](APIView):
                 raise HTTPException(status_code=400, detail=f"Missing lookup field: {self.lookup_field}")
             lookup_kwargs = {self.lookup_field: params[self.lookup_field]}
         try:
+            # The filter does no database call. The field rejects a value of the
+            # wrong type here, for example "abc" for an integer primary key.
+            queryset = queryset.filter(**lookup_kwargs)
+        except (ValueError, TypeError, ValidationError) as e:
+            if queryset.query.is_sliced:
+                # Not a bad value: Django does not filter a sliced QuerySet.
+                raise
+            raise HTTPException(status_code=404, detail="Not found") from e
+        try:
             # Use aget for async retrieval
-            obj = await queryset.aget(**lookup_kwargs)
+            obj = await queryset.aget()
             return obj
         except ObjectDoesNotExist as e:
             # Django raises DoesNotExist, but we convert to HTTPException

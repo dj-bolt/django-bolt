@@ -382,6 +382,32 @@ BOLT_LOG_QUEUE_SIZE = 10000
 
 **Default:** `10000`
 
+### DJANGO_BOLT_LOG_SAMPLE
+
+The part of the 1xx to 3xx responses that write a line to the access log of `runbolt`, from `0.0` to `1.0`.
+A 4xx or a 5xx response always writes its line.
+The setting applies to each API with no `logging_config`. It is the `sample_rate` of `LoggingConfig`.
+
+```python
+DJANGO_BOLT_LOG_SAMPLE = 0.05
+```
+
+**Default:** not set (each response writes its line)
+
+### DJANGO_BOLT_LOG_SLOW_MS
+
+A 1xx to 3xx response writes a line to the access log only when it took this number of milliseconds or more.
+A 4xx or a 5xx response always writes its line.
+The setting applies to each API with no `logging_config`. It is the `min_duration_ms` of `LoggingConfig`.
+
+```python
+DJANGO_BOLT_LOG_SLOW_MS = 250
+```
+
+**Default:** not set (each response writes its line)
+
+A value out of range raises `ImproperlyConfigured` at startup. See [Production settings](../topics/logging.md#production-settings).
+
 ## Django signals settings
 
 ### BOLT_EMIT_SIGNALS
@@ -548,6 +574,8 @@ api = BoltAPI(
 | `BOLT_STATIC_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for static (`public`) |
 | `BOLT_MEDIA_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for media (`private`) |
 | `BOLT_LOG_QUEUE_SIZE` | `int` | `10000` | Max depth of the non-blocking log queue (records dropped when full) |
+| `DJANGO_BOLT_LOG_SAMPLE` | `float` | `None` | Part of the 1xx to 3xx responses in the access log (0.0 to 1.0) |
+| `DJANGO_BOLT_LOG_SLOW_MS` | `float` | `None` | Minimum duration of a 1xx to 3xx response in the access log (milliseconds) |
 | `BOLT_EMIT_SIGNALS` | `bool` | `False` | Enable Django request signals |
 | `BOLT_DEV_FORCE_POLLING` | `bool` | `False` | Force `--dev` reloader to use polling instead of native file events |
 | `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |

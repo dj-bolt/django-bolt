@@ -204,6 +204,7 @@ async def retrieve(self, request):
 ```
 
 By default, `get_object()` reads the current lookup value from `self.request.params`.
+A value that the lookup field cannot hold, such as `abc` for an integer primary key, also raises 404.
 If you need to resolve an object manually, explicit lookups still work:
 
 ```python

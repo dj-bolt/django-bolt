@@ -13,6 +13,7 @@ from django_bolt.websocket import (
     CloseCode,
     WebSocketDisconnect,
 )
+from tests.integration.apps.websocket_handler_end import api as handler_end_api
 
 
 @pytest.mark.asyncio
@@ -85,6 +86,29 @@ async def test_accept_after_refusal_does_not_reopen_the_connection():
             pass
 
     assert seen == ["WebSocket is closed: accept() cannot open it again", "DISCONNECTED"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/ws/return", "/raw/return"])
+async def test_return_after_accept_closes_the_connection_with_1000(path):
+    """The same app runs on the server in test_websocket_handler_end_server_integration.py."""
+    async with WebSocketTestClient(handler_end_api, path) as ws:
+        # The iterator gives the messages before the close, and then it stops.
+        assert [message async for message in ws.iter_text()] == ["bye"]
+        assert ws.closed
+        assert ws.close_code == 1000
+
+
+@pytest.mark.asyncio
+async def test_close_of_the_handler_is_the_only_close():
+    async with WebSocketTestClient(handler_end_api, "/ws/close-then-return") as ws:
+        with pytest.raises(ConnectionClosed) as closed:
+            await ws.receive_text()
+        assert closed.value.code == 4001
+        # No second close message is in the queue. A closed client with an empty queue raises at once.
+        with pytest.raises(ConnectionClosed) as again:
+            await ws.receive(timeout=0.05)
+        assert again.value.code == 4001
 
 
 @pytest.mark.asyncio

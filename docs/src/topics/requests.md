@@ -567,6 +567,20 @@ async def get_preferences(cookies: Annotated[SessionCookies, Cookie()]):
     return {"theme": cookies.theme, "language": cookies.language}
 ```
 
+### Optional models
+
+Give the parameter a default to make the model optional:
+
+```python
+@api.get("/items/search")
+async def search_items(params: Annotated[FilterParams | None, Query()] = None):
+    return {"filtered": params is not None}
+```
+
+A request with none of the keys of the model gives the default.
+A request with one of the keys validates the model, so a missing required field gives a 422.
+This applies to `Query()`, `Header()`, `Cookie()` and `Form()` models.
+
 ### Unknown keys
 
 A parameter model ignores a key that it does not declare. To reject such a key, set `forbid_unknown_fields=True`:

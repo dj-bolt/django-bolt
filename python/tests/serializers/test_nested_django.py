@@ -18,7 +18,7 @@ import pytest
 from msgspec import Meta
 
 from django_bolt.exceptions import RequestValidationError, SerializationError
-from django_bolt.serializers import Serializer, field_validator
+from django_bolt.serializers import Serializer, field, field_validator
 from tests.test_models import Author, BlogPost, Comment, Tag
 
 
@@ -650,6 +650,23 @@ class TestEdgeCases:
 
         assert serializer.tags == []
         assert serializer.comments == []
+
+    def test_annotated_nested_serializer_is_a_nested_field(self):
+        """Annotated[...] around a serializer type keeps the field a nested serializer."""
+
+        class Owner(Serializer):
+            name: str
+            password: str = field(write_only=True, default="")
+
+        class Car(Serializer):
+            owner: Annotated[Owner, Meta(description="The owner")]
+            drivers: list[Annotated[Owner, Meta(description="A driver")]] = []
+
+        car = Car(owner={"name": "a", "password": "p"}, drivers=[{"name": "b", "password": "p"}])
+
+        assert isinstance(car.owner, Owner)
+        assert isinstance(car.drivers[0], Owner)
+        assert car.dump() == {"owner": {"name": "a"}, "drivers": [{"name": "b"}]}
 
     def test_optional_nested_field(self):
         """Test optional nested field with None."""

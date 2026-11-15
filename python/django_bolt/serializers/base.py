@@ -70,6 +70,8 @@ _MISSING = object()
 _USE_DEFAULT = object()
 _STRUCT_META = type(msgspec.Struct)
 _MODEL_VALUE_NOOP_TYPES = (str, int, float, bool, bytes, type(None))
+# msgspec keeps a mutable default ([], {} or default_factory=...) as an object of this type.
+_MSGSPEC_FACTORY = type(msgspec.defstruct("_FactoryProbe", [("value", list, [])]).__struct_defaults__[0])
 
 
 @dataclass(frozen=True)
@@ -189,6 +191,8 @@ def _resolve_dump_default(default_value: Any) -> Any:
     """Resolve msgspec/_FieldMarker defaults into their runtime value."""
     if isinstance(default_value, _FieldMarker) and default_value.config.has_default():
         return default_value.config.get_default()
+    if isinstance(default_value, _MSGSPEC_FACTORY):
+        return default_value.factory()
     return default_value
 
 

@@ -36,6 +36,22 @@ class TestFieldFunction:
         assert "name" in result
         assert "internal_id" not in result
 
+    def test_field_default_default_factory_and_exclude(self):
+        """field() gives the default of a field, and exclude=True keeps the field out of dump()."""
+
+        class Member(Serializer):
+            name: str
+            internal: str = field(exclude=True, default="x")
+            role: str = field(default="user")
+            tags: list[str] = field(default_factory=list)
+
+        first, second = Member(name="a"), Member(name="b")
+
+        assert (first.role, first.tags, first.internal) == ("user", [], "x")
+        assert first.tags is not second.tags
+        assert first.dump() == {"name": "a", "role": "user", "tags": []}
+        assert Member.dump_many([first]) == [{"name": "a", "role": "user", "tags": []}]
+
     def test_write_only_field_is_dropped_and_the_fields_after_it_stay(self):
         """A write-only field does not hide the fields that follow it, also in a subset."""
 
@@ -365,6 +381,23 @@ class TestDumpMethods:
         # With exclude_defaults - default values are excluded
         result_filtered = user.dump(exclude_defaults=True)
         assert result_filtered == {"name": "John"}
+
+    def test_dump_exclude_defaults_with_a_mutable_default(self):
+        """An empty list or dict default is a default value, as a default_factory is."""
+
+        class Post(Serializer):
+            title: str
+            tags: list[str] = []
+            meta: dict[str, str] = {}
+            authors: list[str] = field(default_factory=list)
+
+        assert Post(title="a").dump(exclude_defaults=True) == {"title": "a"}
+        assert Post(title="a", tags=["x"], meta={"k": "v"}, authors=["me"]).dump(exclude_defaults=True) == {
+            "title": "a",
+            "tags": ["x"],
+            "meta": {"k": "v"},
+            "authors": ["me"],
+        }
 
     @pytest.mark.parametrize(
         ("option", "expected_tag", "expected_post"),

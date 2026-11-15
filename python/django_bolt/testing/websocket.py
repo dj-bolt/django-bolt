@@ -402,6 +402,10 @@ class WebSocketTestClient:
         else:
             # A return before accept refuses the handshake with 403.
             self._decide(403)
+            # A return after accept with no close ends the connection with 1000, as on the server.
+            # The client is closed when it reads this message, after the messages before it.
+            if self._accepted and not self._closed:
+                await self._server_to_client.put({"type": "websocket.close", "code": CloseCode.NORMAL})
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Exit async context - close connection and cleanup."""
