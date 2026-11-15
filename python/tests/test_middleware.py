@@ -84,6 +84,9 @@ def _counting(injector, calls: dict):
     return counting_injector
 
 
+_BAD_KEY = 'rate_limit key must be "ip", "user", "api_key" or the name of a request header, got {}'
+
+
 class TestMiddlewareDecorators:
     """Test middleware decorator functionality"""
 
@@ -125,6 +128,13 @@ class TestMiddlewareDecorators:
             ({"rps": 10, "burst": 0}, ValueError, "rate_limit burst must be 1 or more, got 0"),
             ({"key": 5}, TypeError, "rate_limit key must be a str, got int 5"),
             ({"key": ""}, ValueError, "rate_limit key must not be empty"),
+            ({"key": " "}, ValueError, _BAD_KEY.format("' '")),
+            ({"key": "x\ny"}, ValueError, _BAD_KEY.format("'x\\ny'")),
+            ({"key": "X-Tenant\n"}, ValueError, _BAD_KEY.format("'X-Tenant\\n'")),
+            ({"key": "X-A B"}, ValueError, _BAD_KEY.format("'X-A B'")),
+            ({"key": " ip"}, ValueError, _BAD_KEY.format("' ip'")),
+            ({"key": "X-Tenant:"}, ValueError, _BAD_KEY.format("'X-Tenant:'")),
+            ({"key": "X-Ténant"}, ValueError, _BAD_KEY.format("'X-Ténant'")),
         ],
         ids=[
             "rps-float",
@@ -136,6 +146,13 @@ class TestMiddlewareDecorators:
             "burst-zero",
             "key-int",
             "key-empty",
+            "key-space",
+            "key-line-break",
+            "key-line-break-at-end",
+            "key-space-inside",
+            "key-space-at-start",
+            "key-colon",
+            "key-not-ascii",
         ],
     )
     def test_rate_limit_decorator_rejects_a_bad_value(self, kwargs, error, message):
