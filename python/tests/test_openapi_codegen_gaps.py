@@ -159,9 +159,12 @@ def test_paginated_route_documents_the_envelope_not_a_bare_list():
     @api.get("/users")
     @paginate(PageNumberPagination)
     async def list_users(request) -> list[UserRead]:
+        """List the users."""
         return [UserRead(id=1, name="a")]
 
     schema = _get_schema(api)
+    # The paginated handler keeps its docstring.
+    assert schema["paths"]["/users"]["get"]["summary"] == "List the users."
     body = _ok_response(schema, "/users")["content"]["application/json"]["schema"]
     assert body == {"$ref": "#/components/schemas/PaginatedResponse_UserRead_"}
 
