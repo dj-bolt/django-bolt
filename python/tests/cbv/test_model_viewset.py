@@ -7,7 +7,7 @@ to Django REST Framework's ModelViewSet, where you just set queryset and seriali
 
 import pytest
 
-from django_bolt import BoltAPI, ModelViewSet, ReadOnlyModelViewSet
+from django_bolt import BoltAPI, ModelViewSet, ReadOnlyModelViewSet, action
 from django_bolt.serializers import Serializer
 from django_bolt.testing import TestClient
 from tests.test_models import Article
@@ -131,6 +131,53 @@ def test_model_viewset_crud(api):
         # Verify deletion
         response = client.get(f"/articles/{article_id}")
         assert response.status_code == 404
+
+
+@pytest.mark.django_db(transaction=True)
+def test_viewset_decorator_lookup_field_reaches_get_object(api):
+    """`@api.viewset(..., lookup_field=)` selects the lookup of the detail actions."""
+
+    class ArticleViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleSchema
+
+        @action(methods=["GET"], detail=True)
+        async def summary(self, request):
+            article = await self.get_object()
+            return {"id": article.id, "lookup_field": self.lookup_field}
+
+    # One class, two registrations with different lookup fields.
+    api.viewset("/by-title", lookup_field="title")(ArticleViewSet)
+    api.viewset("/by-pk")(ArticleViewSet)
+
+    first = Article.objects.create(title="t1", content="c", author="a")
+    second = Article.objects.create(title="t2", content="c", author="a")
+
+    with TestClient(api) as client:
+        response = client.get("/by-title/t2")
+        assert response.status_code == 200
+        assert response.json()["id"] == second.id
+
+        response = client.patch("/by-title/t2", json={"content": "new"})
+        assert response.status_code == 200
+        assert response.json()["content"] == "new"
+
+        response = client.get("/by-title/t1/summary")
+        assert response.status_code == 200
+        assert response.json() == {"id": first.id, "lookup_field": "title"}
+
+        assert client.delete("/by-title/t1").status_code == 204
+        assert client.get("/by-title/t1").status_code == 404
+
+        # The other registration of the same class still uses the primary key.
+        response = client.get(f"/by-pk/{second.id}")
+        assert response.status_code == 200
+        assert response.json()["title"] == "t2"
+        response = client.get(f"/by-pk/{second.id}/summary")
+        assert response.status_code == 200
+        assert response.json() == {"id": second.id, "lookup_field": "pk"}
+
+    assert ArticleViewSet.lookup_field == "pk"
 
 
 @pytest.mark.django_db(transaction=True)

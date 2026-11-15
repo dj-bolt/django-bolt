@@ -224,6 +224,15 @@ class ArticleViewSet(ModelViewSet):
         return {"slug": article.slug}
 ```
 
+You can also give the lookup field at registration. This value has priority over the class attribute and applies to this registration only:
+
+```python
+@api.viewset("/articles-by-slug", lookup_field="slug")
+class ArticleBySlugViewSet(ModelViewSet):
+    queryset = Article.objects.all()
+    serializer_class = ArticleSerializer
+```
+
 ### Serializer Priority
 
 | Action                      | Validation                                                                                | Response                                            |
