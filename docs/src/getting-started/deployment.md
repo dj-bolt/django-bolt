@@ -39,9 +39,9 @@ python manage.py runbolt --processes 4 \
 | `--max-rss <MiB>` | Recycle a worker once its resident set size exceeds this many MiB (checked about once per second). Set it well above your baseline per-worker RSS. `0` disables (default). |
 | `--workers-lifetime <seconds>` | Recycle each worker after this much uptime. `0` disables (default). |
 | `--respawn-failed-workers` | Fork a replacement when a worker exits unexpectedly (crash, OOM kill) instead of letting the fleet shrink. |
-| `--workers-kill-timeout <seconds>` | How long a worker gets to shut down gracefully before it is SIGKILLed (default: 30). |
+| `--workers-kill-timeout <seconds>` | How long a worker gets to shut down gracefully (default: 30). After this time, the server closes the connections that are still open, and the supervisor sends SIGKILL to a worker that still runs. |
 
-Any of these options enables the supervising parent process, even with `--processes 1`.
+`--max-rss`, `--workers-lifetime` and `--respawn-failed-workers` each enable the supervising parent process, even with `--processes 1`. `--workers-kill-timeout` does not. With one process and no supervisor, it sets only the graceful-shutdown window of the server.
 
 ### How recycling works (near-zero-downtime, WebSocket-aware)
 
@@ -58,7 +58,7 @@ The same drain sequence runs on plain `SIGTERM` (systemd stop, `kubectl delete p
 !!! note "WebSocket clients must reconnect"
     No server can migrate a live TCP connection between processes. Recycling closes WebSockets *cleanly* (close code 1012) rather than avoiding the disconnect. Build reconnect logic into your WebSocket clients and keep per-connection session state in Redis/the database so a reconnect is transparent.
 
-The graceful-shutdown window can also be set directly via the `DJANGO_BOLT_SHUTDOWN_TIMEOUT` environment variable (seconds, default 30) when running without the supervisor.
+The `DJANGO_BOLT_SHUTDOWN_TIMEOUT` environment variable (seconds) also sets the graceful-shutdown window. It takes precedence over `--workers-kill-timeout` for this window.
 
 ## Production deployment
 
@@ -284,6 +284,8 @@ BOLT_COMPRESSION = CompressionConfig(
     minimum_size=500,  # Only compress responses > 500 bytes
 )
 ```
+
+The setting wins over the `compression` argument of `BoltAPI`. Set `BOLT_COMPRESSION = None` or `False` to switch compression off. Each other value, for example `True` or a dict, stops the server start with `ImproperlyConfigured`.
 
 ## Workers vs Processes
 

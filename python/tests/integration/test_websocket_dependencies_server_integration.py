@@ -16,12 +16,13 @@ from .helpers import SimpleWebSocketClient
 pytestmark = pytest.mark.server_integration
 
 
-def test_runbolt_websocket_dependency_gets_its_query_and_header_values(make_server_project):
+@pytest.mark.parametrize("path", ["/ws", "/ws-async"], ids=["sync-dependency", "async-dependency"])
+def test_runbolt_websocket_dependency_gets_its_query_and_header_values(make_server_project, path):
     project = make_server_project(api_module=app_module("websocket_dependencies"))
 
     with (
         project.start() as server,
-        SimpleWebSocketClient(server.host, server.port, "/ws?limit=3", headers={"X-Team": "red"}) as websocket,
+        SimpleWebSocketClient(server.host, server.port, f"{path}?limit=3", headers={"X-Team": "red"}) as websocket,
     ):
         message = json.loads(websocket.receive_text())
 

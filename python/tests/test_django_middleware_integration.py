@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import io
 import logging
 import re
 from functools import partial
@@ -23,9 +24,11 @@ from django.contrib.auth.decorators import login_not_required, login_required
 from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.auth.models import AnonymousUser, User
 from django.contrib.messages.middleware import MessageMiddleware
+from django.contrib.sessions.backends.db import SessionStore
 from django.contrib.sessions.middleware import SessionMiddleware
 from django.core.exceptions import PermissionDenied
-from django.http import HttpResponse
+from django.http import FileResponse as DjangoFileResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.middleware.common import CommonMiddleware
 from django.middleware.csrf import _does_token_match
 from django.template import RequestContext, Template
@@ -36,6 +39,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django_bolt import BoltAPI, Request, Router
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, create_jwt_for_user
 from django_bolt.concurrency import run_orm_blocking
+from django_bolt.exceptions import HTTPException
 from django_bolt.middleware import (
     DjangoMiddleware,
     DjangoMiddlewareStack,
@@ -120,6 +124,21 @@ class TestDjangoMiddlewareStack:
         """Test string representation of stack."""
         stack = DjangoMiddlewareStack([SessionMiddleware, CommonMiddleware])
         assert repr(stack) == "DjangoMiddlewareStack([SessionMiddleware, CommonMiddleware])"
+
+    def test_middleware_stack_takes_dotted_paths(self):
+        """A stack imports a dotted path, as DjangoMiddleware does, and serves requests."""
+        stack = DjangoMiddlewareStack(["django.contrib.sessions.middleware.SessionMiddleware", CommonMiddleware])
+        api = BoltAPI(middleware=[stack])
+
+        @api.get("/session")
+        async def session(request):
+            return {"has_session": request.state.get("session") is not None}
+
+        with TestClient(api) as client:
+            response = client.get("/session")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"has_session": True}
 
 
 # =============================================================================
@@ -619,24 +638,26 @@ class TestMiddlewareChainingHTTPCycle:
 
 
 class ExceptionCatchingMiddleware:
-    """Middleware that catches and handles exceptions."""
+    """Middleware that tries to catch an exception of the handler around get_response."""
 
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
         try:
-            return self.get_response(request)
+            response = self.get_response(request)
         except ValueError as e:
             return HttpResponse(f"Caught error: {e}", status=400)
+        response["X-Seen-Status"] = str(response.status_code)
+        return response
 
 
 @pytest.mark.django_db
 class TestErrorHandlingHTTPCycle:
     """Tests for error handling in middleware through HTTP cycle."""
 
-    def test_middleware_catches_exception(self):
-        """Test that middleware can catch and handle exceptions."""
+    def test_get_response_gives_the_error_response_and_does_not_raise(self):
+        """As in Django, get_response returns the error response. process_exception is the hook for the exception."""
         api = BoltAPI(middleware=[DjangoMiddlewareStack([ExceptionCatchingMiddleware])])
 
         @api.get("/error")
@@ -645,8 +666,9 @@ class TestErrorHandlingHTTPCycle:
 
         with TestClient(api, raise_server_exceptions=False) as client:
             response = client.get("/error")
-            assert response.status_code == 400
-            assert b"Caught error: test error" in response.content
+            assert response.status_code == 500
+            assert response.headers["x-seen-status"] == "500"
+            assert b"Caught error" not in response.content
 
 
 # =============================================================================
@@ -1293,6 +1315,49 @@ class TestRequestConversion:
             assert response.json() == {"received_name": "test", "received_value": 42}
 
 
+@pytest.mark.parametrize(
+    ("trusted_proxies", "proxy_ssl_header", "headers", "scheme"),
+    [
+        # A client that is not a declared proxy cannot choose the scheme.
+        ([], None, {"X-Forwarded-Proto": "https"}, "http"),
+        # A declared proxy can. The test client connects from 127.0.0.1.
+        (["127.0.0.1"], None, {"X-Forwarded-Proto": "https"}, "https"),
+        (["127.0.0.1"], None, {"X-Forwarded-Proto": "http"}, "http"),
+        # SECURE_PROXY_SSL_HEADER applies on top of the scheme, as in Django.
+        ([], ("HTTP_X_FORWARDED_PROTO", "https"), {"X-Forwarded-Proto": "https"}, "https"),
+        ([], ("HTTP_X_FORWARDED_PROTO", "https"), {"X-Forwarded-Proto": "http"}, "http"),
+        ([], ("HTTP_X_FORWARDED_PROTO", "https"), {}, "http"),
+        (["127.0.0.1"], ("HTTP_X_TLS", "on"), {"X-Forwarded-Proto": "https", "X-Tls": "off"}, "http"),
+        (["127.0.0.1"], ("HTTP_X_TLS", "on"), {"X-Forwarded-Proto": "https"}, "https"),
+    ],
+)
+def test_django_middleware_request_has_the_scheme_of_the_bolt_request(
+    settings, trusted_proxies, proxy_ssl_header, headers, scheme
+):
+    """A Django middleware and the handler see one scheme for a request behind a TLS proxy."""
+    settings.BOLT_TRUSTED_PROXIES = trusted_proxies
+    settings.SECURE_PROXY_SSL_HEADER = proxy_ssl_header
+    seen = {}
+
+    class RecordScheme(MiddlewareMixin):
+        def process_request(self, request):
+            seen["django"] = (request.scheme, request.is_secure(), request.build_absolute_uri())
+
+    api = BoltAPI(middleware=[DjangoMiddleware(RecordScheme)])
+
+    @api.get("/page")
+    async def page(request):
+        return {"uri": request.build_absolute_uri()}
+
+    with TestClient(api) as client:
+        response = client.get("/page?q=1", headers={"Host": "example.com", **headers})
+
+    assert response.status_code == 200
+    uri = f"{scheme}://example.com/page?q=1"
+    assert response.json() == {"uri": uri}
+    assert seen["django"] == (scheme, scheme == "https", uri)
+
+
 class _DjangoRequestRecorder(MiddlewareMixin):
     """Record what a Django middleware reads from the request that Bolt converted."""
 
@@ -1308,9 +1373,13 @@ class _DjangoRequestRecorder(MiddlewareMixin):
             "method": request.method,
             "path": request.path,
             "path_info": request.path_info,
+            "meta_path_info": request.META["PATH_INFO"],
+            "full_path": request.get_full_path(),
+            "absolute_uri": request.build_absolute_uri(),
             "get_tags": request.GET.getlist("tag"),
             "get_x": request.GET.get("x"),
             "get_is_mutable": request.GET._mutable,
+            "get_lists": dict(request.GET.lists()),
             "post": dict(request.POST.lists()),
             "post_is_mutable": post_is_mutable,
             "read": request.read() if request.body else b"",
@@ -1349,6 +1418,37 @@ class TestDjangoSideRequest:
         assert seen["get_is_mutable"] is True
         assert seen["post"] == {}
         assert seen["read"] == seen["body"] == b""
+
+    def test_query_keys_that_the_handler_does_not_declare_keep_every_value(self, layout):
+        seen = self._send(layout, "GET", "/query?other=a&other=b&caf%C3%A9=%C3%A9")
+
+        assert seen["get_lists"] == {"other": ["a", "b"], "caf\u00e9": ["\u00e9"]}
+
+    @pytest.mark.parametrize(
+        ("raw_path", "path", "full_path"),
+        [
+            ("/p/%C3%A9", "/p/\u00e9", "/p/%C3%A9"),
+            ("/p/a%2Fb", "/p/a/b", "/p/a/b"),
+            ("/p/a%20b", "/p/a b", "/p/a%20b"),
+            ("/p/%FF", "/p/%FF", "/p/%25FF"),
+        ],
+        ids=["utf-8", "encoded-slash", "space", "invalid-utf-8"],
+    )
+    def test_path_is_decoded_as_django_servers_give_it(self, layout, raw_path, path, full_path):
+        _DjangoRequestRecorder.seen = {}
+        api = BoltAPI(middleware=[layout()])
+
+        @api.get("/p/{name:path}")
+        async def route(name: str):
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            assert client.get(raw_path + "?q=1").status_code == 200
+        seen = _DjangoRequestRecorder.seen
+
+        assert seen["path"] == seen["path_info"] == seen["meta_path_info"] == path
+        assert seen["full_path"] == full_path + "?q=1"
+        assert seen["absolute_uri"] == "http://testserver" + full_path + "?q=1"
 
     def test_request_with_no_query_has_an_empty_query_dict(self, layout):
         seen = self._send(layout, "GET", "/plain")
@@ -1684,6 +1784,48 @@ class TestCSRFMiddleware:
             assert post_response.status_code == 200
             assert post_response.json() == {"status": "submitted"}
 
+    def test_csrf_accepts_a_token_in_a_multipart_form(self):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+
+        @api.post("/submit")
+        async def submit_route():
+            return {"status": "submitted"}
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/submit",
+                data={"csrfmiddlewaretoken": _CSRF_SECRET},
+                files={"upload": ("note.txt", b"text")},
+                headers={"Cookie": f"csrftoken={_CSRF_SECRET}"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "submitted"}
+
+    @pytest.mark.parametrize(
+        ("content_type", "body"),
+        [
+            ("multipart/form-data", b"no boundary"),
+            ("application/x-www-form-urlencoded; charset=utf-16", b"a=1"),
+        ],
+        ids=["multipart-without-boundary", "urlencoded-with-utf-16"],
+    )
+    def test_csrf_rejects_an_unreadable_form_with_a_400(self, content_type, body):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+
+        @api.post("/submit")
+        async def submit_route():
+            return {"status": "submitted"}
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.post(
+                "/submit",
+                content=body,
+                headers={"content-type": content_type, "Cookie": f"csrftoken={_CSRF_SECRET}"},
+            )
+
+        assert response.status_code == 400
+
 
 # =============================================================================
 # Test process_view through the single wrapper and the stack
@@ -1691,6 +1833,283 @@ class TestCSRFMiddleware:
 
 # A CSRF secret has 32 letters or digits. The cookie and the header carry it.
 _CSRF_SECRET = "abcdefghijklmnopqrstuvwxyz012345"
+
+
+_exception_calls: list = []
+
+
+class _ExceptionHookMiddleware(MiddlewareMixin):
+    """Record process_exception and process_response. ``answer`` is the response of process_exception."""
+
+    name = ""
+    answer = None
+
+    def process_exception(self, request, exception):
+        _exception_calls.append((self.name, "process_exception", type(exception).__name__))
+        return self.answer
+
+    def process_response(self, request, response):
+        _exception_calls.append((self.name, "process_response", response.status_code))
+        return response
+
+
+class _FirstExceptionHook(_ExceptionHookMiddleware):
+    name = "first"
+
+
+class _SecondExceptionHook(_ExceptionHookMiddleware):
+    name = "second"
+
+    def process_exception(self, request, exception):
+        super().process_exception(request, exception)
+        return HttpResponse(f"handled {exception}", status=418)
+
+
+class _ThirdExceptionHook(_ExceptionHookMiddleware):
+    name = "third"
+
+
+class _CallStyleExceptionHook:
+    """A middleware with ``__call__`` and process_exception, and no other hook."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        return self.get_response(request)
+
+    def process_exception(self, request, exception):
+        _exception_calls.append(("call-style", "process_exception", type(exception).__name__))
+
+
+def _exception_layout(layout, classes):
+    if layout == "wrappers":
+        return [DjangoMiddleware(cls) for cls in classes]
+    return [DjangoMiddlewareStack(list(classes))]
+
+
+def _exception_api(middleware, kind):
+    api = BoltAPI(middleware=middleware)
+    if kind == "sync":
+
+        @api.get("/boom")
+        def boom():
+            raise ValueError("boom")
+
+        @api.get("/conflict")
+        def conflict():
+            raise HTTPException(status_code=409, detail="conflict")
+
+    else:
+
+        @api.get("/boom")
+        async def boom():
+            raise ValueError("boom")
+
+        @api.get("/conflict")
+        async def conflict():
+            raise HTTPException(status_code=409, detail="conflict")
+
+    return api
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("layout", ["stack", "wrappers"])
+class TestProcessException:
+    """Django calls process_exception when the view raises. The last middleware runs first."""
+
+    def test_the_first_response_of_process_exception_answers_the_request(self, layout, kind):
+        _exception_calls.clear()
+        classes = (_FirstExceptionHook, _SecondExceptionHook, _ThirdExceptionHook)
+        api = _exception_api(_exception_layout(layout, classes), kind)
+
+        with TestClient(api) as client:
+            response = client.get("/boom")
+
+        assert response.status_code == 418
+        assert response.text == "handled boom"
+        # The hooks run in reverse order. "first" does not run after the response of "second".
+        # As in Django, the response goes through process_response of each middleware.
+        assert _exception_calls == [
+            ("third", "process_exception", "ValueError"),
+            ("second", "process_exception", "ValueError"),
+            ("third", "process_response", 418),
+            ("second", "process_response", 418),
+            ("first", "process_response", 418),
+        ]
+
+    def test_the_exception_goes_to_the_error_handlers_when_no_hook_answers(self, layout, kind):
+        _exception_calls.clear()
+        api = _exception_api(_exception_layout(layout, (_FirstExceptionHook, _ThirdExceptionHook)), kind)
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.get("/boom")
+
+        assert response.status_code == 500
+        # The error response of the API goes through process_response too.
+        assert _exception_calls == [
+            ("third", "process_exception", "ValueError"),
+            ("first", "process_exception", "ValueError"),
+            ("third", "process_response", 500),
+            ("first", "process_response", 500),
+        ]
+
+    def test_an_http_exception_is_a_response_and_not_an_exception_for_the_hooks(self, layout, kind):
+        _exception_calls.clear()
+        api = _exception_api(_exception_layout(layout, (_FirstExceptionHook, _SecondExceptionHook)), kind)
+
+        with TestClient(api) as client:
+            response = client.get("/conflict")
+
+        assert response.status_code == 409
+        assert _exception_calls == [("second", "process_response", 409), ("first", "process_response", 409)]
+
+    def test_a_call_style_middleware_gets_the_exception(self, layout, kind):
+        """A stack of hook and ``__call__`` middleware uses the compatibility chain."""
+        _exception_calls.clear()
+        classes = (_FirstExceptionHook, _CallStyleExceptionHook, _SecondExceptionHook)
+        api = _exception_api(_exception_layout(layout, classes), kind)
+
+        with TestClient(api) as client:
+            response = client.get("/boom")
+
+        assert response.status_code == 418
+        assert _exception_calls == [
+            ("second", "process_exception", "ValueError"),
+            ("second", "process_response", 418),
+            ("first", "process_response", 418),
+        ]
+
+    def test_a_stack_of_call_style_middleware_gets_the_exception(self, layout, kind):
+        _exception_calls.clear()
+        api = _exception_api(_exception_layout(layout, (_CallStyleExceptionHook,)), kind)
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            response = client.get("/boom")
+
+        assert response.status_code == 500
+        assert _exception_calls == [("call-style", "process_exception", "ValueError")]
+
+
+class _StampResponseMiddleware(MiddlewareMixin):
+    """Add a header in process_response, as a security-header or request-id middleware does."""
+
+    def process_response(self, request, response):
+        response["X-Stamp"] = "stamped"
+        return response
+
+
+class _StampCallMiddleware:
+    """Add the same header in ``__call__``, after the rest of the chain."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response["X-Stamp"] = "stamped"
+        return response
+
+
+def _error_format(error, request):
+    return JSON({"problem": error.detail, "code": error.status}, status_code=error.status)
+
+
+def _error_routes_api(middleware, kind, **api_kwargs):
+    api = BoltAPI(middleware=middleware, **api_kwargs)
+    if kind == "sync":
+
+        @api.get("/missing")
+        def missing():
+            raise HTTPException(status_code=404, detail="no such item", headers={"X-Reason": "gone"})
+
+        @api.post("/body")
+        def body(item: SampleRequestBody):
+            return {"name": item.name}
+
+        @api.get("/boom")
+        def boom():
+            raise ValueError("boom")
+
+        @api.get("/session")
+        def session(request: Request):
+            request.state["session"]["cart"] = "full"
+            raise HTTPException(status_code=409, detail="conflict")
+
+    else:
+
+        @api.get("/missing")
+        async def missing():
+            raise HTTPException(status_code=404, detail="no such item", headers={"X-Reason": "gone"})
+
+        @api.post("/body")
+        async def body(item: SampleRequestBody):
+            return {"name": item.name}
+
+        @api.get("/boom")
+        async def boom():
+            raise ValueError("boom")
+
+        @api.get("/session")
+        async def session(request: Request):
+            request.state["session"]["cart"] = "full"
+            raise HTTPException(status_code=409, detail="conflict")
+
+    return api
+
+
+def _error_requests(client):
+    return [
+        client.get("/missing"),
+        client.post("/body", json={"name": "a", "value": "not a number"}),
+        client.get("/boom"),
+    ]
+
+
+_STAMP_LAYOUTS = {
+    "wrapper": lambda: [DjangoMiddleware(_StampResponseMiddleware)],
+    "hook stack": lambda: [DjangoMiddlewareStack([_StampResponseMiddleware])],
+    "call stack": lambda: [DjangoMiddlewareStack([_StampCallMiddleware])],
+    "mixed stack": lambda: [DjangoMiddlewareStack([_StampResponseMiddleware, _CallStyleExceptionHook])],
+}
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("layout", list(_STAMP_LAYOUTS))
+@pytest.mark.parametrize("api_kwargs", [{}, {"error_formatter": _error_format}], ids=["default", "formatter"])
+def test_process_response_runs_for_an_error_response_of_the_handler(layout, kind, api_kwargs):
+    """Django makes the error response in the chain, so each process_response gets it.
+
+    The client gets the response of a route with no middleware, plus the header of the middleware.
+    """
+    with TestClient(_error_routes_api([], kind, **api_kwargs), raise_server_exceptions=False) as client:
+        plain = _error_requests(client)
+    with TestClient(_error_routes_api(_STAMP_LAYOUTS[layout](), kind, **api_kwargs)) as client:
+        stamped = _error_requests(client)
+
+    assert [response.status_code for response in stamped] == [404, 422, 500]
+    for with_middleware, without_middleware in zip(stamped, plain, strict=True):
+        assert with_middleware.headers["x-stamp"] == "stamped"
+        assert with_middleware.status_code == without_middleware.status_code
+        assert with_middleware.content == without_middleware.content
+        headers = dict(with_middleware.headers)
+        del headers["x-stamp"]
+        assert headers == dict(without_middleware.headers)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("layout", ["stack", "wrappers"])
+def test_the_session_is_saved_when_the_handler_raises_an_http_exception(layout, kind):
+    """SessionMiddleware saves the session in process_response."""
+    api = _error_routes_api(_exception_layout(layout, (SessionMiddleware,)), kind)
+
+    with TestClient(api) as client:
+        response = client.get("/session")
+
+    assert response.status_code == 409
+    session_key = response.cookies[settings.SESSION_COOKIE_NAME]
+    assert SessionStore(session_key=session_key)["cart"] == "full"
 
 
 class _BlockInViewMiddleware(MiddlewareMixin):
@@ -1828,6 +2247,24 @@ class TestProcessView:
 
         assert response.status_code == 200
         assert response.json() == {"status": "received"}
+
+    def test_csrf_exempt_on_a_handler_with_no_request_parameter_stops_registration(self, kind):
+        api = BoltAPI(middleware=[DjangoMiddleware("django.middleware.csrf.CsrfViewMiddleware")])
+
+        with pytest.raises(TypeError, match=r"webhook.*must take `request` as its first parameter"):
+            if kind == "sync":
+
+                @api.post("/webhook")
+                @csrf_exempt
+                def webhook():
+                    return {"status": "received"}
+
+            else:
+
+                @api.post("/webhook")
+                @csrf_exempt
+                async def webhook():
+                    return {"status": "received"}
 
     def test_process_view_response_stops_the_request(self, kind):
         api = BoltAPI(middleware=[DjangoMiddleware(_BlockInViewMiddleware)])
@@ -2131,6 +2568,57 @@ class TestFileAndStreamThroughDjangoMiddleware:
         assert response.headers["content-type"] == "text/plain"
         assert response.headers["x-own"] == "stream"
         assert {name: response.headers[name] for name in headers} == headers
+
+
+class _DjangoStreamAnswer(MiddlewareMixin):
+    """Answer with a Django streaming response, as a Django middleware can."""
+
+    def process_request(self, request):
+        return StreamingHttpResponse(iter([b"one-", b"two"]), content_type="text/plain", headers={"X-Own": "stream"})
+
+
+class _DjangoFileAnswer(MiddlewareMixin):
+    """Answer with a Django file response."""
+
+    def process_request(self, request):
+        return DjangoFileResponse(io.BytesIO(b"file-body"), as_attachment=True, filename="data.txt")
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        lambda middleware: DjangoMiddleware(middleware),
+        lambda middleware: DjangoMiddlewareStack([middleware]),
+    ],
+    ids=["wrapper", "stack"],
+)
+class TestDjangoStreamingResponseFromMiddleware:
+    """A Django middleware can answer with a streaming or a file response."""
+
+    def _get(self, layout, middleware):
+        api = BoltAPI(middleware=[layout(middleware)])
+
+        @api.get("/answer")
+        async def answer_route():
+            return {"from": "handler"}
+
+        with TestClient(api, raise_server_exceptions=False) as client:
+            return client.get("/answer", headers={"Accept-Encoding": "identity"})
+
+    def test_streaming_response(self, layout):
+        response = self._get(layout, _DjangoStreamAnswer)
+
+        assert response.status_code == 200
+        assert response.content == b"one-two"
+        assert response.headers["content-type"] == "text/plain"
+        assert response.headers["x-own"] == "stream"
+
+    def test_file_response(self, layout):
+        response = self._get(layout, _DjangoFileAnswer)
+
+        assert response.status_code == 200
+        assert response.content == b"file-body"
+        assert response.headers["content-disposition"] == 'attachment; filename="data.txt"'
 
 
 class _StateAttributesHook(MiddlewareMixin):
@@ -3296,6 +3784,13 @@ def _answers_with(make_response) -> type[Middleware]:
     return AnswersWithResponseObject
 
 
+class _TeapotJSON(JSON):
+    """A subclass of a Bolt response type, with its own default status."""
+
+    def __init__(self, data):
+        super().__init__(data, status_code=418)
+
+
 _BOLT_RESPONSE_CASES = {
     "html": (
         lambda: HTML("<p>x</p>", status_code=202, headers={"X-Own": "1"}),
@@ -3304,10 +3799,16 @@ _BOLT_RESPONSE_CASES = {
         b"<p>x</p>",
     ),
     "plain": (lambda: PlainText("hi", status_code=201), 201, "text/plain; charset=utf-8", b"hi"),
-    "json": (lambda: JSON({"a": 1}, status_code=201), 201, "application/json", b'{"a":1}'),
+    "json": (
+        lambda: JSON({"a": 1}, status_code=201, headers={"X-Own": "1"}),
+        201,
+        "application/json",
+        b'{"a":1}',
+    ),
+    "json-subclass": (lambda: _TeapotJSON({"a": 1}), 418, "application/json", b'{"a":1}'),
     "media-type": (
-        lambda: Response("<b>2</b>", media_type="application/xml", headers={"X-Own": "1"}),
-        200,
+        lambda: Response("<b>2</b>", status_code=203, media_type="application/xml", headers={"X-Own": "1"}),
+        203,
         "application/xml",
         b"<b>2</b>",
     ),
@@ -3346,15 +3847,23 @@ def test_django_middleware_keeps_a_bolt_response_of_a_middleware(wrapper, case):
     assert response.content == body
     if case == "redirect":
         assert response.headers.get("location") == "/elsewhere"
-    if case in {"html", "media-type", "redirect"}:
+    if case in {"html", "json", "media-type", "redirect"}:
         assert response.headers.get("x-own") == "1"
 
 
 @pytest.mark.parametrize("wrapper", _DJANGO_MIDDLEWARE_WRAPPERS)
-def test_django_middleware_keeps_the_cookies_of_a_bolt_response(wrapper):
+@pytest.mark.parametrize(
+    ("make_response", "content_type"),
+    [
+        pytest.param(lambda: HTML("x"), "text/html; charset=utf-8", id="html"),
+        pytest.param(lambda: JSON({"a": 1}), "application/json", id="json"),
+        pytest.param(lambda: Response("x", media_type="application/xml"), "application/xml", id="response"),
+    ],
+)
+def test_django_middleware_keeps_the_cookies_of_a_bolt_response(wrapper, make_response, content_type):
     """A cookie on a Bolt response object reaches the client behind Django middleware."""
     api = BoltAPI(
-        middleware=[wrapper(), _answers_with(lambda: HTML("x").set_cookie("sid", "abc", httponly=True))],
+        middleware=[wrapper(), _answers_with(lambda: make_response().set_cookie("sid", "abc", httponly=True))],
     )
 
     @api.get("/page")
@@ -3365,7 +3874,7 @@ def test_django_middleware_keeps_the_cookies_of_a_bolt_response(wrapper):
         response = client.get("/page")
 
     assert response.headers.get("x-seen") == "yes"
-    assert response.headers.get("content-type") == "text/html; charset=utf-8"
+    assert response.headers.get("content-type") == content_type
     assert response.cookies.get("sid") == "abc"
     assert "httponly" in response.headers["set-cookie"].lower()
 
