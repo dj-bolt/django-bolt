@@ -44,14 +44,60 @@ try:
         markcoroutinefunction,
         sync_to_async,
     )
+    from django.core.exceptions import BadRequest, SuspiciousOperation
     from django.http import HttpRequest, HttpResponse, QueryDict
+    from django.http.multipartparser import MultiPartParserError
     from django.utils.deprecation import MiddlewareMixin
     from django.utils.functional import LazyObject, empty
     from django.utils.module_loading import import_string
 
+    class _BoltHttpRequest(HttpRequest):
+        """An HttpRequest that reads POST and FILES on first use, as WSGIRequest does.
+
+        The base class sets both to empty values. A multipart form needs a parse.
+        """
+
+        def __init__(self):
+            super().__init__()
+            del self._post, self._files
+            self._read_started = False
+
+        # Django maps these two errors to a 400 response. Bolt maps SuspiciousOperation to 400.
+        def _set_content_type_params(self, meta):
+            try:
+                super()._set_content_type_params(meta)
+            except BadRequest as exc:
+                raise SuspiciousOperation(str(exc)) from exc
+
+        def _load_post_and_files(self):
+            try:
+                super()._load_post_and_files()
+            except (BadRequest, MultiPartParserError) as exc:
+                raise SuspiciousOperation(str(exc)) from exc
+
+        def _get_post(self):
+            if not hasattr(self, "_post"):
+                self._load_post_and_files()
+            return self._post
+
+        def _set_post(self, post):
+            self._post = post
+
+        def _get_files(self):
+            if not hasattr(self, "_files"):
+                self._load_post_and_files()
+            return self._files
+
+        def _set_files(self, files):
+            self._files = files
+
+        POST = property(_get_post, _set_post)
+        FILES = property(_get_files, _set_files)
+
     DJANGO_AVAILABLE = True
 except ImportError:
     DJANGO_AVAILABLE = False
+    _BoltHttpRequest = None
     async_to_sync = None
     ThreadSensitiveContext = None
     SyncToAsync = None
@@ -925,7 +971,7 @@ def _to_django_request(request: Request) -> HttpRequest:
     - Reuse empty dicts/QueryDicts where possible
     - Use direct attribute assignment (faster than setattr)
     """
-    django_request = HttpRequest()
+    django_request = _BoltHttpRequest()
 
     # Copy basic attributes (direct assignment is faster)
     django_request.method = request.method
@@ -955,21 +1001,15 @@ def _to_django_request(request: Request) -> HttpRequest:
     else:
         django_request.GET = _get_empty_querydict()  # Reuse singleton (no allocation)
 
-    # Parse POST data for form submissions (needed for CSRF token validation)
-    # Django's CsrfViewMiddleware reads request.POST['csrfmiddlewaretoken']
-    content_type = request.headers.get("content-type", "")
-    body = request.body if request.body else b""
-
-    if body and "application/x-www-form-urlencoded" in content_type:
-        # Parse form data into POST QueryDict
-        django_request.POST = QueryDict(body, mutable=False)
-    else:
-        django_request.POST = _get_empty_querydict()  # Reuse singleton (no allocation)
-
     # Store body for raw access
+    body = request.body if request.body else b""
     django_request._body = body
     # An empty body needs a stream too, so request.read() gives b"" as in Django.
     django_request._stream = io.BytesIO(body)
+
+    # Django parses POST and FILES on first read, from the content type.
+    # This gives a multipart form to CsrfViewMiddleware, as with Django.
+    django_request._set_content_type_params(django_request.META)
 
     return django_request
 
