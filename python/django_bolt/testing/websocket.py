@@ -77,7 +77,6 @@ class WebSocketTestClient:
         headers: dict[str, str] | None = None,
         query_string: str = "",
         subprotocols: list[str] | None = None,
-        auth_context: Any = None,
         cors_allowed_origins: list[str] | None = None,
         read_django_settings: bool = True,
     ):
@@ -86,11 +85,11 @@ class WebSocketTestClient:
         Args:
             api: BoltAPI instance with WebSocket routes
             path: WebSocket endpoint path (e.g., "/ws/echo")
-            headers: Optional request headers
+            headers: Optional request headers. To authenticate, send the
+                     credential that the server reads, such as
+                     ``{"Authorization": "Bearer <token>"}``.
             query_string: Optional query string (without ?)
             subprotocols: Optional list of subprotocols to request
-            auth_context: Optional authentication context for guard evaluation.
-                         Should have user_id, is_superuser, is_staff, permissions attributes.
             cors_allowed_origins: Global CORS allowed origins for testing.
                                   If None and read_django_settings=True, reads from Django settings.
             read_django_settings: If True, read CORS settings from Django settings
@@ -101,7 +100,6 @@ class WebSocketTestClient:
         self.headers = headers or {}
         self.query_string = query_string
         self.subprotocols = subprotocols or []
-        self.auth_context = auth_context
 
         # Build CORS config dict for Rust (same as HTTP TestClient)
         self._cors_allowed_origins = cors_allowed_origins
@@ -214,13 +212,8 @@ class WebSocketTestClient:
         # Convert path_params from Rust dict to Python dict
         path_params_dict = dict(path_params) if path_params else {}
 
-        # Convert scope from Rust dict to Python dict and add extras
+        # Convert scope from Rust dict to Python dict
         scope_dict = dict(scope) if scope else {}
-
-        # A mounted app gets the ASGI scope exactly as Rust built it.
-        # A route gets the auth context if provided (for Python-side guard evaluation fallback).
-        if not is_asgi_mount and self.auth_context is not None:
-            scope_dict["auth_context"] = self.auth_context
 
         return found, is_asgi_mount, handler_id, handler, path_params_dict, scope_dict
 
