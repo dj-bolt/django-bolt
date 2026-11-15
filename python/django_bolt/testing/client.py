@@ -113,7 +113,9 @@ class BoltTestTransport(httpx.BaseTransport):
 
     Args:
         app_id: Test app instance ID
-        raise_server_exceptions: If True, raise exceptions from handlers
+        raise_server_exceptions: If True, raise an error of the test backend, for example an
+            unsupported HTTP method. A handler exception still gives a 500 response.
+            If False, the backend error gives a 500 response too
     """
 
     def __init__(self, app_id: int, raise_server_exceptions: bool = True):
@@ -181,7 +183,9 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
 
     Args:
         app_id: Test app instance ID
-        raise_server_exceptions: If True, raise exceptions from handlers
+        raise_server_exceptions: If True, raise an error of the test backend, for example an
+            unsupported HTTP method. A handler exception still gives a 500 response.
+            If False, the backend error gives a 500 response too
     """
 
     def __init__(self, app_id: int, raise_server_exceptions: bool = True):
@@ -325,7 +329,9 @@ class TestClient(httpx.Client):
         Args:
             api: BoltAPI instance to test
             base_url: Base URL for requests
-            raise_server_exceptions: If True, raise exceptions from handlers
+            raise_server_exceptions: If True, raise an error of the test backend, for example an
+                unsupported HTTP method. A handler exception still gives a 500 response.
+                If False, the backend error gives a 500 response too
             cors_allowed_origins: Global CORS allowed origins for this test. They
                                   replace the CORS settings. A "*" entry allows every origin.
             read_django_settings: If True (the default), read the CORS, static and media
@@ -673,7 +679,9 @@ class AsyncTestClient(httpx.AsyncClient):
         Args:
             api: BoltAPI instance to test
             base_url: Base URL for requests
-            raise_server_exceptions: If True, raise exceptions from handlers
+            raise_server_exceptions: If True, raise an error of the test backend, for example an
+                unsupported HTTP method. A handler exception still gives a 500 response.
+                If False, the backend error gives a 500 response too
             cors_allowed_origins: Global CORS allowed origins for this test. They
                                   replace the CORS settings. A "*" entry allows every origin.
             read_django_settings: If True (the default), read the CORS, static and media
