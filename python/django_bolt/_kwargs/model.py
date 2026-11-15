@@ -22,6 +22,7 @@ from ..dependencies import (
     dependency_needs_event_loop,
     resolve_dependency,
     resolve_dependency_sync,
+    shared_dependencies,
     sync_form,
 )
 from ..typing import (
@@ -613,6 +614,13 @@ def compile_argument_injector(
             ):
                 _async_dep_fns.append(idx)
         _can_parallel = len(_async_dep_fns) >= 2
+        # The dependencies that run at the same time share the cache of the request.
+        # A dependency that two of them need runs first, so each of them reads its value.
+        _shared_deps = (
+            shared_dependencies([(_dep_plan[idx][5], _dep_plan[idx][1]) for idx in _async_dep_fns])
+            if _can_parallel
+            else ()
+        )
 
         if not _async_dep_fns:
             # Every dependency is sync, so the injector needs no event loop. A sync
@@ -700,6 +708,19 @@ def compile_argument_injector(
                 # Pre-resolve all async deps in parallel
                 async def _resolve_one(dependency, dep_meta):
                     return await resolve_dependency(
+                        dependency.dependency,
+                        dependency,
+                        dep_meta,
+                        request,
+                        dep_cache,
+                        params_map,
+                        query_map,
+                        headers_map,
+                        cookies_map,
+                    )
+
+                for dependency, dep_meta in _shared_deps:
+                    await resolve_dependency(
                         dependency.dependency,
                         dependency,
                         dep_meta,
