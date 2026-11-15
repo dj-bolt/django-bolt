@@ -12,6 +12,7 @@ from typing import Annotated
 import pytest
 
 from django_bolt import BoltAPI, Router, WebSocket
+from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
 from django_bolt.middleware import Middleware
 from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
 from django_bolt.params import Query
@@ -124,6 +125,81 @@ class TestMountPathNormalization:
                 f"Mounted route should be accessible at /sub/hello, got {response.status_code}"
             )
             assert response.json() == {"message": "Hello from mounted API"}
+
+    def test_mount_keeps_each_route_of_both_apis(self):
+        """Each HTTP and WebSocket route of the parent and of the mounted API keeps its handler and its settings."""
+        main_api = BoltAPI()
+        sub_api = BoltAPI()
+
+        @main_api.get("/first", status_code=201)
+        async def first():
+            return {"route": "first"}
+
+        @main_api.get("/second", status_code=202)
+        async def second():
+            return {"route": "second"}
+
+        @sub_api.get("/a", status_code=203)
+        async def sub_a():
+            return {"route": "a"}
+
+        @sub_api.get("/b", status_code=206)
+        async def sub_b():
+            return {"route": "b"}
+
+        @sub_api.websocket("/ws/a")
+        async def ws_a(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("ws a")
+
+        @sub_api.websocket("/ws/b")
+        async def ws_b(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("ws b")
+
+        main_api.mount("/sub", sub_api)
+
+        @main_api.get("/third", status_code=207)
+        async def third():
+            return {"route": "third"}
+
+        with TestClient(main_api) as client:
+            for path, status, route in [
+                ("/first", 201, "first"),
+                ("/second", 202, "second"),
+                ("/sub/a", 203, "a"),
+                ("/sub/b", 206, "b"),
+                ("/third", 207, "third"),
+            ]:
+                response = client.get(path)
+                assert (response.status_code, response.json()) == (status, {"route": route})
+
+        async def receive_first_text(path: str) -> str:
+            async with WebSocketTestClient(main_api, path) as ws:
+                return await ws.receive_text()
+
+        assert asyncio.run(receive_first_text("/sub/ws/a")) == "ws a"
+        assert asyncio.run(receive_first_text("/sub/ws/b")) == "ws b"
+
+    def test_mounted_websocket_route_keeps_its_auth_and_guards(self):
+        """A WebSocket route of a mounted API refuses a connection with no credentials, as before the mount."""
+        main_api = BoltAPI()
+        sub_api = BoltAPI()
+
+        @sub_api.websocket("/ws", auth=[APIKeyAuthentication(api_keys={"secret"})], guards=[IsAuthenticated()])
+        async def protected(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.send_text("welcome")
+
+        main_api.mount("/sub", sub_api)
+
+        async def connect(headers: dict[str, str]) -> str:
+            async with WebSocketTestClient(main_api, "/sub/ws", headers=headers) as ws:
+                return await ws.receive_text()
+
+        with pytest.raises(PermissionError):
+            asyncio.run(connect({}))
+        assert asyncio.run(connect({"X-API-Key": "secret"})) == "welcome"
 
     @pytest.mark.parametrize("mount_path", ["/", "//", ""])
     def test_mount_at_the_root_keeps_the_route_paths(self, mount_path):
@@ -401,6 +477,35 @@ class TestOpenAPIDocsWithPrefix:
 
             # API routes should appear
             assert "/api/items" in paths, f"API routes should be in schema: {paths}"
+
+
+class TestIncludeRouter:
+    """Tests for the arguments that include_router() gives to each route."""
+
+    def test_include_router_applies_prefix_and_router_settings(self):
+        """The prefix, the route arguments, and the tags and guards of the router reach each route."""
+        api = BoltAPI()
+        router = Router(prefix="/users", tags=["people"], guards=[IsAuthenticated()])
+
+        @router.post("", status_code=201, summary="Add a user", auth=[APIKeyAuthentication(api_keys={"secret"})])
+        async def add_user():
+            return {"added": True}
+
+        api.include_router(router, prefix="/api/v1/")
+        api._register_openapi_routes()
+
+        with TestClient(api) as client:
+            assert client.post("/users").status_code == 404
+            assert client.post("/api/v1/users").status_code == 401
+
+            response = client.post("/api/v1/users", headers={"X-API-Key": "secret"})
+            assert response.status_code == 201
+            assert response.json() == {"added": True}
+
+            operation = client.get("/docs/openapi.json").json()["paths"]["/api/v1/users"]["post"]
+
+        assert operation["tags"] == ["people"]
+        assert operation["summary"] == "Add a user"
 
 
 @pytest.mark.parametrize(
