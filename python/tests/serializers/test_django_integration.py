@@ -23,10 +23,13 @@ constraints. This is msgspec's design - Meta constraints are for parsing.
 """
 
 from datetime import datetime
-from typing import Annotated
+from decimal import Decimal
+from typing import Annotated, Any
 
 import pytest
+from django.db import models
 
+from django_bolt import BoltAPI
 from django_bolt.exceptions import RequestValidationError
 from django_bolt.serializers import (
     URL,
@@ -48,9 +51,29 @@ from django_bolt.serializers.types import (
     Percentage,
     Username,
 )
+from django_bolt.testing import TestClient
 
 # Import test models
-from tests.test_models import Article, Author, BlogPost, Comment, Tag, User, UserProfile  # noqa: PLC0415
+from tests.test_models import (  # noqa: PLC0415
+    Article,
+    Author,
+    BlogPost,
+    Comment,
+    Tag,
+    User,
+    UserProfile,
+)
+
+
+class Invoice(models.Model):
+    """A model with DecimalField columns. The tests do not save it, so it needs no table."""
+
+    total = models.DecimalField(max_digits=20, decimal_places=2)
+    discount = models.DecimalField(max_digits=6, decimal_places=2, null=True)
+
+    class Meta:
+        app_label = "django_bolt"
+
 
 # =============================================================================
 # Serializers for testing
@@ -379,6 +402,38 @@ class TestToModelWithDjango:
         # Should not have display_name attribute (it's computed)
         assert not hasattr(author, "display_name") or author.display_name != serializer.display_name()
 
+    @pytest.mark.django_db
+    def test_to_model_sets_a_foreign_key_from_the_primary_key(self):
+        """`create_serializer` gives a ForeignKey the type `int`. The model takes that value as `author_id`."""
+        PostCreate = create_serializer(BlogPost, fields=["title", "content", "author"], serializer_name="PostCreate")
+        author = Author.objects.create(name="Ana", email="ana@example.com")
+
+        post = PostCreate.model_validate({"title": "T", "content": "C", "author": author.pk}).to_model(BlogPost)
+        post.save()
+
+        assert BlogPost.objects.get(pk=post.pk).author == author
+        # The round trip gives the primary key again.
+        assert PostCreate.from_model(post).author == author.pk
+
+        # A hand-written serializer can pass the model instance, as before.
+        class PostWithInstance(Serializer):
+            title: str
+            content: str
+            author: Any
+
+        assert PostWithInstance(title="T", content="C", author=author).to_model(BlogPost).author is author
+
+    def test_to_model_sets_a_one_to_one_field_and_a_none_value(self):
+        ProfileIn = create_serializer(UserProfile, fields=["bio", "user"], serializer_name="ProfileIn")
+
+        assert ProfileIn.model_validate({"bio": "b", "user": 7}).to_model(UserProfile).user_id == 7
+
+        class PostDraft(Serializer):
+            title: str
+            author: int | None = None
+
+        assert PostDraft(title="T").to_model(BlogPost).author_id is None
+
 
 class TestUpdateInstanceWithDjango:
     """Test updating Django model instances with Serializers."""
@@ -440,6 +495,19 @@ class TestUpdateInstanceWithDjango:
         # Verify saved
         refreshed = Author.objects.get(id=author.id)
         assert refreshed.name == "Updated"
+
+    @pytest.mark.django_db
+    def test_update_instance_sets_a_foreign_key_from_the_primary_key(self):
+        PostUpdate = create_serializer(BlogPost, fields=["title", "author"], serializer_name="PostUpdate")
+        first = Author.objects.create(name="Ana", email="ana@example.com")
+        second = Author.objects.create(name="Ben", email="ben@example.com")
+        post = BlogPost.objects.create(title="T", content="C", author=first)
+
+        PostUpdate.model_validate({"title": "New", "author": second.pk}).update_instance(post).save()
+
+        post.refresh_from_db()
+        assert post.title == "New"
+        assert post.author == second
 
 
 class TestFieldValidatorsWithDjango:
@@ -1126,6 +1194,27 @@ class TestCreateSerializerHelpersWithDjango:
         assert "username" in UserSerializer.__annotations__
         assert "email" in UserSerializer.__annotations__
         assert "is_active" in UserSerializer.__annotations__
+
+    def test_create_serializer_keeps_the_precision_of_a_decimal_field(self):
+        """A DecimalField was `float`. Thus 0.1 + 0.2 was not 0.3, and a long value lost digits."""
+        InvoiceSerializer = create_serializer(Invoice, fields=["total", "discount"])
+        api = BoltAPI()
+
+        @api.post("/invoices")
+        async def create_invoice(data: InvoiceSerializer) -> InvoiceSerializer:
+            invoice = data.to_model(Invoice)
+            assert type(invoice.total) is Decimal
+            return InvoiceSerializer.from_model(invoice)
+
+        with TestClient(api) as client:
+            # The JSON text of a decimal, as Django REST Framework sends it.
+            response = client.post("/invoices", json={"total": "12345678901234567.89", "discount": None})
+            assert response.status_code == 200, response.text
+            assert response.json() == {"total": "12345678901234567.89", "discount": None}
+            # A JSON number is a valid input too.
+            response = client.post("/invoices", content=b'{"total": 0.10, "discount": 2.5}')
+            assert response.json() == {"total": "0.10", "discount": "2.5"}
+            assert client.post("/invoices", json={"total": "abc", "discount": None}).status_code == 422
 
     def test_create_serializer_keeps_the_order_of_the_fields(self):
         """The fields have the order of the `fields` argument, or the order of the model."""
