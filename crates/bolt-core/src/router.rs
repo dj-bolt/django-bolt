@@ -577,6 +577,13 @@ mod tests {
         )
     }
 
+    /// Only a native route is unique. A Python route replaces an earlier one.
+    #[test]
+    fn a_python_route_replaces_an_earlier_route_of_the_same_static_path() {
+        let router = router_with(&[("GET", "/items"), ("GET", "/items")]);
+        assert_eq!(lookup(&router, "GET", "/items"), Some((1, None)));
+    }
+
     #[test]
     fn each_method_finds_only_its_own_routes() {
         let routes: Vec<(&str, &str)> = METHODS

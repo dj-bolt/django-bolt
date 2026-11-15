@@ -776,6 +776,23 @@ mod tests {
         assert!(coerce_param("not-a-uuid", TYPE_UUID, DEFAULT_MAX_PARAM_LENGTH).is_err());
     }
 
+    /// `uuid_to_py` sets the slots directly, with no `UUID.__init__` call.
+    #[test]
+    fn uuid_to_py_builds_the_same_object_as_the_uuid_class() {
+        Python::initialize();
+        Python::attach(|py| {
+            let text = "550e8400-e29b-41d4-a716-446655440000";
+            let built = uuid_to_py(py, Uuid::parse_str(text).unwrap()).unwrap();
+            let built = built.bind(py);
+            let expected = get_uuid_class(py).bind(py).call1((text,)).unwrap();
+
+            assert_eq!(built.str().unwrap().to_string(), text);
+            assert!(built.eq(&expected).unwrap());
+            let is_safe = built.getattr("is_safe").unwrap();
+            assert!(is_safe.is(expected.getattr("is_safe").unwrap()));
+        });
+    }
+
     #[test]
     fn test_coerce_datetime() {
         // ISO 8601 with Z suffix

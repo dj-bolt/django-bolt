@@ -2039,6 +2039,50 @@ mod tests {
         });
     }
 
+    /// The log is the only sign that the provider fails.
+    #[test]
+    fn a_failed_refresh_logs_a_warning_and_keeps_the_last_keys() {
+        Python::initialize();
+        Python::attach(|py| {
+            let code = "import logging\n\
+                records = []\n\
+                class Keep(logging.Handler):\n    \
+                    def emit(self, record):\n        \
+                        records.append((record.levelname, record.getMessage()))\n\
+                logging.getLogger('django_bolt.auth').addHandler(Keep())\n\
+                def refresh():\n    \
+                    raise RuntimeError('provider 7391 is down')\n";
+            let module = PyModule::from_code(
+                py,
+                &std::ffi::CString::new(code).unwrap(),
+                c"failing_jwks_refresh.py",
+                c"failing_jwks_refresh",
+            )
+            .unwrap();
+            let key = DecodingKey::from_secret(SECRET.as_bytes());
+            let keys = HashMap::from([("a".to_string(), key)]);
+            let refresh = module.getattr("refresh").unwrap().unbind();
+            let jwks = Arc::new(RefreshingJwks::new(
+                keys,
+                refresh,
+                Duration::from_secs(3600),
+            ));
+
+            jwks.fetch();
+
+            assert!(jwks.select(Some("a")).is_some());
+            let records: Vec<(String, String)> =
+                module.getattr("records").unwrap().extract().unwrap();
+            let expected = (
+                "WARNING".to_string(),
+                "JWKS refresh failed: the refresh callback raised RuntimeError: \
+                 provider 7391 is down. Bolt keeps the last keys."
+                    .to_string(),
+            );
+            assert!(records.contains(&expected), "{records:?}");
+        });
+    }
+
     #[test]
     fn a_due_refresh_runs_in_the_background_and_keeps_the_cached_key() {
         Python::initialize();
