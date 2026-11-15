@@ -6,8 +6,10 @@ from uuid import UUID
 import msgspec
 import pytest
 
+from django_bolt import BoltAPI
 from django_bolt.exceptions import RequestValidationError
 from django_bolt.serializers import Serializer, field, field_validator
+from django_bolt.testing import TestClient
 
 
 class TestRenameCamel:
@@ -389,8 +391,36 @@ class TestRenameWithFieldValidators:
             pytest.fail(f"Expected RequestValidationError, got {type(exc)}: {exc}")
 
         assert len(errors) >= 1
-        # Field validator errors use Python field names (they run after struct creation)
-        assert errors[0]["loc"] == ["body", "email_address"]
+        # A field validator error names the field as the client sent it.
+        assert errors[0]["loc"] == ["body", "emailAddress"]
+
+    def test_rename_validator_error_and_type_error_name_the_field_in_the_same_way(self):
+        """A 422 has the wire name of a field in `loc`, for a validator error and for a msgspec error."""
+
+        class CreateUser(Serializer, rename="camel"):
+            email_address: str
+
+            @field_validator("email_address")
+            def validate_email(cls, value):
+                if "@" not in value:
+                    raise ValueError("Invalid email")
+                return value
+
+        api = BoltAPI()
+
+        @api.post("/users")
+        async def create_user(data: CreateUser):
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            wrong_type = client.post("/users", json={"emailAddress": 5})
+            rejected = client.post("/users", json={"emailAddress": "bad-email"})
+
+        assert wrong_type.status_code == rejected.status_code == 422
+        assert wrong_type.json()["detail"][0]["loc"] == ["body", "emailAddress"]
+        assert rejected.json()["detail"] == [
+            {"loc": ["body", "emailAddress"], "msg": "Invalid email", "type": "value_error"}
+        ]
 
 
 class TestRenameRoundTrip:

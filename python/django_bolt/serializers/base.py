@@ -823,10 +823,11 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
                     _setattr(self, field_name, current_value)
 
                 except (ValueError, TypeError) as e:
-                    # Collect error instead of raising immediately
+                    # Collect error instead of raising immediately. The loc has the
+                    # wire name of the field, as a msgspec error has.
                     errors.append(
                         {
-                            "loc": ["body", field_name],
+                            "loc": ["body", _class.__rename_map__.get(field_name, field_name)],
                             "msg": str(e),
                             "type": "value_error",
                         }
@@ -849,6 +850,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
 
         # Cache force_setattr for nested field validation (optimization #2)
         _setattr = msgspec_structs.force_setattr
+        # The loc of an error has the wire name of the field, as a msgspec error has.
+        rename_map = self.__class__.__rename_map__
 
         # Validate nested fields (no hasattr needed - msgspec struct fields always exist)
         for field_name, nested_config in self.__nested_fields__.items():
@@ -862,7 +865,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             except (ValueError, TypeError) as e:
                 errors.append(
                     {
-                        "loc": ["body", field_name],
+                        "loc": ["body", rename_map.get(field_name, field_name)],
                         "msg": str(e),
                         "type": "value_error",
                     }
@@ -874,7 +877,7 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if current_value not in allowed_values:
                 errors.append(
                     {
-                        "loc": ["body", field_name],
+                        "loc": ["body", rename_map.get(field_name, field_name)],
                         "msg": f"invalid value {current_value!r}. Expected one of: {', '.join(repr(v) for v in allowed_values)}",
                         "type": "value_error",
                     }
