@@ -97,6 +97,23 @@ data = user.dump(exclude_none=True)
 
 # Exclude default values
 data = user.dump(exclude_defaults=True)
+
+# Exclude fields that hold msgspec.UNSET
+data = user.dump(exclude_unset=True)
+```
+
+Use `exclude_unset` for a partial update. Give each optional field the default `msgspec.UNSET`. A field that the request body does not contain keeps that value, and `dump(exclude_unset=True)` leaves it out:
+
+```python
+import msgspec
+
+class UserPatch(Serializer):
+    username: str | msgspec.UnsetType = msgspec.UNSET
+    email: str | None | msgspec.UnsetType = msgspec.UNSET
+
+patch = UserPatch(email=None)
+patch.dump(exclude_unset=True)
+# {'email': None}
 ```
 
 ### Default values
@@ -609,6 +626,29 @@ mini_user = UserMini.from_parent(full_user)
 print(mini_user.dump())  # {'id': 1, 'name': 'John'}
 ```
 
+## Field options for the OpenAPI document
+
+`field()` takes options that describe a field in the OpenAPI schema of the serializer. They do not change validation or `dump()`.
+
+```python
+from django_bolt.serializers import Serializer, field
+
+class ProductSerializer(Serializer):
+    sku: str = field(description="Stock unit", title="SKU", examples=["AB-1"])
+    old_code: str = field(default="", deprecated=True)
+    trace_id: str = field(default="", include_in_schema=False)
+```
+
+| Option | Effect on the property schema |
+|--------|-------------------------------|
+| `description` | Sets `description`. |
+| `title` | Sets `title`. |
+| `examples` | Sets `examples`, a list of example values. |
+| `deprecated=True` | Sets `deprecated: true`. |
+| `include_in_schema=False` | Leaves the property out of the schema, also out of `required`. |
+
+The options apply to the request body schema and to the response schema. A field with `include_in_schema=False` still validates input and is still in the output of `dump()`.
+
 ## Write-only fields
 
 Hide sensitive fields from output:
@@ -799,6 +839,20 @@ users = [
 result = UserSerializer.only("id", "name").dump_many(users)
 # [{'id': 1, 'name': 'John'}, {'id': 2, 'name': 'Jane'}]
 ```
+
+## Config options
+
+The inner `Config` class of a serializer has these options:
+
+| Option | Effect |
+|--------|--------|
+| `write_only` | A set of field names that `dump()` leaves out. |
+| `read_only` | A set of field names that the server sets. |
+| `field_sets` | Named lists of fields for `use()` and `fields()`. |
+| `annotations` | Query annotations that `from_models()` applies to a QuerySet. |
+| `model` | The Django model of the serializer. `create_serializer()` sets it. Bolt does not read it. |
+
+`Config` has no `validators` option. A `Config` that sets `validators` raises `TypeError` when the class is created. Declare validators with `@field_validator` and `@model_validator`.
 
 ## Serializer inheritance
 

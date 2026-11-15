@@ -235,6 +235,52 @@ def test_cors_rejects_an_origin_or_a_pattern_that_is_not_a_str(kwargs):
         cors(credentials=True, **kwargs)(lambda: None)
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "error", "match"),
+    [
+        ({"methods": "GET"}, TypeError, "methods must be a list of str, not str"),
+        ({"methods": ["GET", 1]}, TypeError, "methods must hold only str, not int"),
+        ({"methods": 5}, TypeError, "methods must be a list of str, not int"),
+        ({"headers": "X-A"}, TypeError, "headers must be a list of str, not str"),
+        ({"headers": [b"X-A"]}, TypeError, "headers must hold only str, not bytes"),
+        ({"credentials": "yes"}, TypeError, "credentials must be a bool, not str"),
+        ({"credentials": 1}, TypeError, "credentials must be a bool, not int"),
+        ({"max_age": "600"}, TypeError, "max_age must be an int, not str"),
+        ({"max_age": 600.0}, TypeError, "max_age must be an int, not float"),
+        ({"max_age": True}, TypeError, "max_age must be an int, not bool"),
+        ({"max_age": -1}, ValueError, "max_age must be from 0 to 4294967295, got -1"),
+        ({"max_age": 2**32}, ValueError, "max_age must be from 0 to 4294967295, got 4294967296"),
+    ],
+)
+def test_cors_rejects_an_option_of_the_wrong_type_or_range(kwargs, error, match):
+    # Before, the route used the default of the option, with no error.
+    with pytest.raises(error, match=match):
+        cors(origins=["https://a.test"], **kwargs)(lambda: None)
+
+
+@pytest.mark.parametrize(
+    ("config", "match"),
+    [
+        ({"methods": "GET"}, "cors methods must be a collection of str, got str 'GET'"),
+        ({"headers": ["X-A", 1]}, "cors headers must be a collection of str"),
+        ({"expose_headers": "X-A"}, "cors expose_headers must be a collection of str, got str 'X-A'"),
+        ({"credentials": "yes"}, "cors credentials must be a bool, got str 'yes'"),
+        ({"max_age": "600"}, "cors max_age must be an int from 0 to 4294967295, got str '600'"),
+        ({"max_age": -1}, "cors max_age must be an int from 0 to 4294967295, got int -1"),
+    ],
+)
+def test_a_cors_config_with_an_option_of_the_wrong_type_stops_startup(config, match):
+    # A dict in the middleware of an API does not go through @cors. Rust reads it at startup.
+    api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://a.test"], **config}])
+
+    @api.get("/route")
+    async def route():
+        return {}
+
+    with pytest.raises(TypeError, match=re.escape(match)), TestClient(api, read_django_settings=False):
+        pass
+
+
 def test_a_cors_config_that_is_not_a_list_of_str_stops_startup():
     api = BoltAPI(middleware=[{"type": "cors", "origins": ["https://a.test", 1], "credentials": True}])
 

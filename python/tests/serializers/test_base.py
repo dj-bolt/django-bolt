@@ -48,6 +48,20 @@ class TestSerializerBasics:
 
         assert data == {"username": "charlie", "email": "charlie@example.com"}
 
+    def test_exclude_unset_leaves_out_the_fields_that_hold_unset(self):
+        """A field with the default msgspec.UNSET is unset until the caller or the input gives it a value."""
+
+        class UserPatch(Serializer):
+            username: str | msgspec.UnsetType = msgspec.UNSET
+            email: str | None | msgspec.UnsetType = msgspec.UNSET
+
+        patch = msgspec.json.decode(b'{"email": null}', type=UserPatch)
+
+        assert patch.dump(exclude_unset=True) == {"email": None}
+        assert patch.to_dict(exclude_unset=True) == {"email": None}
+        assert patch.dump_json(exclude_unset=True) == b'{"email":null}'
+        assert UserPatch.dump_many([patch], exclude_unset=True) == [{"email": None}]
+
 
 class TestFieldValidators:
     """Test field-level validation."""
@@ -620,6 +634,35 @@ class TestConfigClass:
 
         assert UserSerializer.Config.model == DummyModel
 
+    def test_config_validators_is_not_an_option(self):
+        """Nothing ran Config.validators. A class that sets it is an error, not a class with no validation."""
+
+        def reject(cls, value):
+            raise ValueError("never called")
+
+        with pytest.raises(TypeError, match=r"WithValidators\.Config\.validators is not an option.*@field_validator"):
+
+            class WithValidators(Serializer):
+                username: str
+
+                class Config:
+                    validators = {"username": [reject]}
+
+        with pytest.raises(TypeError, match=r"Child\.Config\.validators is not an option"):
+
+            class Parent(Serializer):
+                username: str
+
+                class Config:
+                    write_only = {"username"}
+
+            class Child(Parent):
+                class Config(Parent.Config):
+                    validators = {}
+
+        assert Parent(username="a").dump() == {}
+        assert not hasattr(Serializer.Config, "validators")
+
 
 class TestMultiErrorCollection:
     """Test that validation collects all errors instead of stopping at the first."""
@@ -822,6 +865,56 @@ class TestModelValidateCollectsAllErrors:
         for err in errors:
             if tuple(err["loc"]) in {("body", "password"), ("body", "age")}:
                 assert err["type"] == "missing"
+
+    def test_error_list_has_one_entry_for_each_bad_field_and_none_for_an_absent_optional_field(self):
+        class Signup(Serializer):
+            nickname: str = "anon"
+            age: int
+            billing: _Address
+            address: _Address
+            name: str
+            city: str = "x"
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Signup.model_validate({"age": [], "billing": {"city": 1, "zip": "z"}, "address": {"city": "c"}})
+
+        assert exc_info.value.errors() == [
+            {"loc": ("body", "age"), "msg": "Expected `int`, got `array`", "type": "validation_error"},
+            {
+                "loc": ("body", "billing", "city"),
+                "msg": "Expected `str`, got `int` - at `$.city`",
+                "type": "validation_error",
+            },
+            {"loc": ("body", "address", "zip"), "msg": "Object missing required field `zip`", "type": "missing"},
+            {"loc": ("body", "name"), "msg": "Object missing required field `name`", "type": "missing"},
+        ]
+
+    def test_validator_errors_of_a_dict_are_the_errors_of_the_same_json(self):
+        class Signup(Serializer):
+            email: str
+            age: int
+
+            @field_validator("email")
+            def check_email(cls, value):
+                if "@" not in value:
+                    raise ValueError("Invalid email")
+                return value
+
+            @model_validator
+            def check_age(self):
+                if self.age < 0:
+                    raise ValueError("Age is negative")
+
+        with pytest.raises(RequestValidationError) as from_json:
+            Signup.model_validate_json(b'{"email": "x", "age": -1}')
+        with pytest.raises(RequestValidationError) as from_dict:
+            Signup.model_validate({"email": "x", "age": -1})
+
+        assert from_dict.value.errors() == from_json.value.errors()
+        assert from_dict.value.errors() == [
+            {"loc": ["body", "email"], "msg": "Invalid email", "type": "value_error"},
+            {"loc": ["body"], "msg": "Age is negative", "type": "value_error"},
+        ]
 
     def test_nested_missing_field_has_the_type_of_a_top_level_one_and_its_full_loc(self):
         with pytest.raises(RequestValidationError) as exc_info:

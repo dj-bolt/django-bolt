@@ -56,6 +56,14 @@ def is_admin_installed() -> bool:
         return False
 
 
+def _pattern_prefix(url_pattern) -> str:
+    """Return the URL prefix of a pattern, with no slash and no regex anchor at its ends.
+
+    ``path("admin/", ...)`` and ``re_path(r"^admin/", ...)`` both give ``admin``.
+    """
+    return str(url_pattern.pattern).lstrip("^").rstrip("$").strip("/")
+
+
 def detect_admin_url_prefix() -> str | None:
     """
     Detect the URL prefix for Django admin by parsing urlpatterns.
@@ -70,24 +78,19 @@ def detect_admin_url_prefix() -> str | None:
         # Get root URL resolver
         resolver = get_resolver(getattr(settings, "ROOT_URLCONF", None))
 
-        # Search for admin patterns
+        # The admin site is the pattern with the "admin" app name. Search for
+        # it first: a pattern before it can look like the admin by its name.
         for url_pattern in resolver.url_patterns:
-            # Check if this is admin.site.urls
-            if hasattr(url_pattern, "app_name") and url_pattern.app_name == "admin":
-                # Extract the pattern prefix
-                pattern_str = str(url_pattern.pattern)
-                # Remove trailing slash and special regex chars
-                prefix = pattern_str.rstrip("/^$")
-                return prefix if prefix else "admin"
+            if getattr(url_pattern, "app_name", None) == "admin":
+                return _pattern_prefix(url_pattern) or "admin"
 
+        for url_pattern in resolver.url_patterns:
             # Also check URLResolver with admin urlconf
             if hasattr(url_pattern, "urlconf_name"):
                 urlconf = url_pattern.urlconf_name
                 # Check if urlconf module contains admin.site
                 if hasattr(urlconf, "__name__") and "admin" in str(urlconf.__name__):
-                    pattern_str = str(url_pattern.pattern)
-                    prefix = pattern_str.rstrip("/^$")
-                    return prefix if prefix else "admin"
+                    return _pattern_prefix(url_pattern) or "admin"
 
                 # Check if urlconf is a list containing admin patterns
                 if isinstance(urlconf, (list, tuple)):
@@ -97,9 +100,7 @@ def detect_admin_url_prefix() -> str | None:
                             and hasattr(sub_pattern.callback, "__module__")
                             and "admin" in sub_pattern.callback.__module__
                         ):
-                            pattern_str = str(url_pattern.pattern)
-                            prefix = pattern_str.rstrip("/^$")
-                            return prefix if prefix else "admin"
+                            return _pattern_prefix(url_pattern) or "admin"
 
     except Exception as e:
         # If detection fails, log warning and return default
