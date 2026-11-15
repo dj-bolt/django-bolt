@@ -235,6 +235,8 @@ token = create_jwt_for_user(
 )
 ```
 
+`extra_claims` cannot hold `sub`, `exp`, `iat`, `is_staff` or `is_superuser`. Such a claim raises `ValueError`. The function sets these claims from the user and from `expires_in`.
+
 ### get_current_user
 
 Dependency for getting the authenticated user.

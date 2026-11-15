@@ -134,6 +134,18 @@ def test_create_jwt_with_extra_claims():
     print("✓ JWT with extra claims works correctly")
 
 
+@pytest.mark.parametrize("name", ["sub", "exp", "iat", "is_staff", "is_superuser"])
+def test_create_jwt_refuses_an_extra_claim_that_replaces_a_standard_claim(name):
+    """An extra claim cannot replace the identity, the lifetime or the privilege flags."""
+    with pytest.raises(ValueError, match="^extra_claims must not contain") as raised:
+        create_jwt_for_user(_plain_user(), secret="secret", extra_claims={name: 1, "jti": "token-1"})
+
+    assert str(raised.value) == (
+        f"extra_claims must not contain the standard claims ['{name}']. "
+        "create_jwt_for_user() sets them from the user and from expires_in."
+    )
+
+
 def test_jwt_authentication_with_django_user():
     """Test JWT authentication extracts correct user data."""
     User = get_user_model()
