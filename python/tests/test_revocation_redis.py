@@ -30,12 +30,35 @@ REDIS_URL_VARIABLE = "DJANGO_BOLT_TEST_REDIS_URL"
 SECRET = "a-secure-test-secret-that-is-long-enough"
 
 
+# The connection pools that the Django cache made in these tests.
+_pools: list[redis.ConnectionPool] = []
+
+
+class RecordedPool(redis.ConnectionPool):
+    """A connection pool that the test can close.
+
+    Django makes one pool for each cache object and does not close it. The
+    garbage collector then finds the open sockets, and the ResourceWarning
+    fails the run.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _pools.append(self)
+
+
+def _close_pools() -> None:
+    while _pools:
+        _pools.pop().disconnect()
+
+
 def _redis_caches(location: str, prefix: str) -> dict:
     return {
         "default": {
             "BACKEND": "django.core.cache.backends.redis.RedisCache",
             "LOCATION": location,
             "KEY_PREFIX": prefix,
+            "OPTIONS": {"pool_class": f"{__name__}.RecordedPool"},
         }
     }
 
@@ -62,6 +85,7 @@ def redis_keys():
         with override_settings(CACHES=_redis_caches(url, prefix)):
             yield keys
     finally:
+        _close_pools()
         for name in client.scan_iter(match=f"{prefix}:*"):
             client.delete(name)
         client.close()
