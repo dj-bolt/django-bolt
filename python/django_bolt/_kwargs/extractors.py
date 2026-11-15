@@ -786,9 +786,11 @@ def create_file_extractor(
 
 
 _BODY_EXTRACTORS: dict[Any, Callable] = {}
+# The extractors of optional bodies with the default None, by the extractor of the type.
+_OPTIONAL_BODY_EXTRACTORS: dict[Callable, Callable] = {}
 
 
-def create_body_extractor(name: str, annotation: Any) -> Callable:
+def create_body_extractor(name: str, annotation: Any, default: Any = inspect.Parameter.empty) -> Callable:
     """
     Create a pre-compiled extractor for request body.
 
@@ -797,15 +799,38 @@ def create_body_extractor(name: str, annotation: Any) -> Callable:
 
     Each body type has one extractor. So a handler and a dependency with the
     same body type decode the body one time (see ``decode_body_once``).
+
+    An empty body gives the default of a parameter that has one, and None for
+    an ``Optional`` type without default. A required parameter gets a 422.
     """
     try:
-        return _BODY_EXTRACTORS[annotation]
+        extractor = _BODY_EXTRACTORS[annotation]
     except KeyError:
         extractor = _BODY_EXTRACTORS[annotation] = _build_body_extractor(annotation)
-        return extractor
     except TypeError:
         # An unhashable annotation gets its own extractor.
-        return _build_body_extractor(annotation)
+        extractor = _build_body_extractor(annotation)
+
+    if default is inspect.Parameter.empty:
+        if not is_optional(annotation):
+            return extractor
+        default = None
+    if default is not None:
+        return _with_empty_body_default(extractor, default)
+    try:
+        return _OPTIONAL_BODY_EXTRACTORS[extractor]
+    except KeyError:
+        optional = _OPTIONAL_BODY_EXTRACTORS[extractor] = _with_empty_body_default(extractor, None)
+        return optional
+
+
+def _with_empty_body_default(extractor: Callable, default_value: Any) -> Callable:
+    def extract_or_default(body_bytes: bytes) -> Any:
+        if not body_bytes:
+            return default_value
+        return extractor(body_bytes)
+
+    return extract_or_default
 
 
 def _build_body_extractor(annotation: Any) -> Callable:
@@ -902,7 +927,7 @@ def create_extractor_for_field(field: FieldDefinition) -> Callable | None:
             max_files=max_files,
         )
     elif source == "body":
-        return create_body_extractor(name, annotation)
+        return create_body_extractor(name, annotation, default)
     elif source == "request":
         # Request source is handled directly in the injector
         return None
