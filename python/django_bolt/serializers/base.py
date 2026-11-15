@@ -1770,6 +1770,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         Args:
             model_class: The Django model class to instantiate
 
+        The instance does not get the value of a ``read_only`` field.
+
         Returns:
             An unsaved model instance
 
@@ -1778,14 +1780,16 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             user = user_data.to_model(User)
             await user.asave()
         """
-        return model_class(**self.to_dict())
+        read_only = self.__read_only_fields__
+        return model_class(**{name: value for name, value in self.to_dict().items() if name not in read_only})
 
     def update_instance(self: T, instance: Model) -> Model:
         """
         Update a Django model instance with values from this serializer.
 
         Only updates fields that are present in the serializer. When omit_defaults=True,
-        only updates fields that differ from their default values.
+        only updates fields that differ from their default values. Does not update
+        a ``read_only`` field.
 
         Args:
             instance: The model instance to update
@@ -1805,7 +1809,12 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
         # Get field defaults if omit_defaults is enabled
         default_values = dict(_iter_field_defaults(type(self))) if omit_defaults else {}
 
+        read_only = self.__read_only_fields__
+
         for field_name in self.__struct_fields__:
+            if field_name in read_only:
+                continue
+
             value = getattr(self, field_name)
 
             # Skip fields that are at their default value if omit_defaults is True
