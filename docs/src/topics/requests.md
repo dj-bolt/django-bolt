@@ -220,6 +220,23 @@ async def paint(color: Color, order: Literal["asc", "desc"] = "asc"):
 An `IntEnum` or a `Literal` of numbers converts the text to a number first.
 This applies to path, query, header, cookie and form parameters.
 
+### bytes parameters
+
+A `bytes` parameter gets the UTF-8 bytes of the text value:
+
+```python
+@api.get("/echo")
+async def echo(token: bytes):
+    return {"length": len(token)}
+```
+
+`GET /echo?token=abc` gives the handler `b"abc"`. Bolt does not decode base64.
+This rule applies to a path, query, header, cookie and form parameter.
+It also applies to `bytearray`, and to a sequence such as `list[bytes]`.
+A `msgspec.Meta` constraint such as `max_length` counts the bytes.
+
+A `bytes` field of a [parameter model](#parameter-models) is different: msgspec reads its text as base64.
+
 ## Request body
 
 ### JSON body
