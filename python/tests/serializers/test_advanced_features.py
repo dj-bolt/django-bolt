@@ -705,6 +705,24 @@ class TestSubsetMethod:
         assert user.name == "John"
         assert user.role == "user"
 
+    def test_subset_keeps_the_struct_options_of_the_parent(self):
+        """A subset has the rename, omit_defaults, forbid_unknown_fields and frozen options of its parent."""
+
+        class Account(Serializer, rename="camel", omit_defaults=True, forbid_unknown_fields=True, frozen=True):
+            user_name: str
+            display_name: str = ""
+            email_address: str = ""
+
+        AccountMini = Account.subset("user_name", "display_name")
+        mini = AccountMini.model_validate({"userName": "ada", "displayName": "Ada"})
+
+        assert mini.dump() == {"userName": "ada", "displayName": "Ada"}
+        assert msgspec.json.encode(AccountMini(user_name="ada")) == b'{"userName":"ada"}'
+        with pytest.raises(msgspec.ValidationError, match="unknown field `emailAddress`"):
+            msgspec.convert({"userName": "ada", "emailAddress": "a@example.com"}, AccountMini)
+        with pytest.raises(AttributeError):
+            mini.user_name = "bob"
+
     def test_subset_with_computed_field(self):
         """Test subset includes computed fields."""
 
