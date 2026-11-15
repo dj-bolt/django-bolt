@@ -37,7 +37,7 @@ HTTPException(
 |-----------|------|-------------|
 | `status_code` | `int` | HTTP status code |
 | `detail` | `str` | Error message (defaults to HTTP phrase) |
-| `headers` | `dict` | Headers to include in response |
+| `headers` | `dict` | Headers to include in response. A number value, such as `{"Retry-After": 30}`, becomes a `str`. A value of another type raises `TypeError`. |
 | `extra` | `dict \| list` | Additional data in response |
 
 **Response format:**

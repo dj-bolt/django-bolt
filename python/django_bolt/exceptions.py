@@ -34,6 +34,24 @@ class BoltException(Exception):
         return " ".join((*self.args, self.detail)).strip()
 
 
+def _str_header_values(headers: dict[str, Any]) -> dict[str, str]:
+    """Convert each number value of ``headers`` to a str, for example ``{"Retry-After": 30}``.
+
+    A header of another type raises TypeError here, where the application
+    makes the exception. Without this check, the response became a 500.
+    The dict of the caller does not change.
+    """
+    for name, value in headers.items():
+        if not isinstance(name, str):
+            raise TypeError(f"The name of a header must be a str, not {type(name).__name__}")
+        if isinstance(value, str):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"The value of the header {name!r} must be a str or a number, not {type(value).__name__}")
+        headers = {**headers, name: str(value)}
+    return headers
+
+
 class HTTPException(BoltException):
     """Base exception for HTTP error responses.
 
@@ -65,7 +83,8 @@ class HTTPException(BoltException):
         Args:
             status_code: HTTP status code (defaults to class status_code)
             detail: Exception details or message
-            headers: HTTP headers to include in response
+            headers: HTTP headers to include in response. A number value
+                becomes a str. A value of another type raises TypeError.
             extra: Additional data to include in response
             body: Typed body (for example a msgspec Struct). Encoded as-is,
                 not validated. Declare its schema with ``response_model={code: Type}``.
@@ -79,7 +98,7 @@ class HTTPException(BoltException):
 
         self.status_code = status_code if status_code is not None else self.status_code
         self.detail = detail_str if detail_str else HTTPStatus(self.status_code).phrase
-        self.headers = headers or {}
+        self.headers = _str_header_values(headers) if headers else {}
         self.extra = extra
         self.body = body
 
