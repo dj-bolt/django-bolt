@@ -31,6 +31,7 @@ from django_bolt.api import (
     serve_with_lifespan,
 )
 from django_bolt.concurrency import close_connections_and_pools
+from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.workers import MIB, WorkerSupervisor
 
 try:
@@ -553,6 +554,37 @@ def _project_api_module_names(root_urlconf: str) -> list[str]:
     return package_module_names
 
 
+# Option name -> (lowest value, highest value). None means no limit.
+# The server panics for more than 512 worker threads.
+_OPTION_RANGES: dict[str, tuple[int, int | None]] = {
+    "port": (0, 65535),
+    "processes": (1, None),
+    "workers": (1, 512),
+    "backlog": (0, None),
+    "keep_alive": (0, None),
+    "max_rss": (0, None),
+    "workers_lifetime": (0, None),
+    "workers_kill_timeout": (0, None),
+}
+
+
+def _validate_option_ranges(options) -> None:
+    """Raise CommandError for a number that the server cannot use.
+
+    The check runs before startup. Without it, a bad value fails later with
+    a traceback, or starts a server that does not do what the option says.
+    """
+    for name, (lowest, highest) in _OPTION_RANGES.items():
+        value = options[name]
+        if value is None:
+            continue
+        flag = "--" + name.replace("_", "-")
+        if value < lowest:
+            raise CommandError(f"{flag} must be at least {lowest}, got {value}")
+        if highest is not None and value > highest:
+            raise CommandError(f"{flag} must be at most {highest}, got {value}")
+
+
 class Command(BaseCommand):
     help = "Run Django-Bolt server with autodiscovered APIs"
 
@@ -625,7 +657,8 @@ class Command(BaseCommand):
             default=30,
             help=(
                 "Seconds a worker gets to shut down gracefully (finish in-flight "
-                "requests, close WebSockets) before it is SIGKILLed (default: 30)"
+                "requests, close WebSockets) before the server closes its connections "
+                "and the supervisor sends SIGKILL (default: 30)"
             ),
         )
 
@@ -637,10 +670,9 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         self._handle_started = time.monotonic()
         processes = options["processes"]
+        _validate_option_ranges(options)
         if options["workers"] is None:
             options["workers"] = default_worker_threads()
-        elif options["workers"] < 1:
-            raise CommandError("--workers must be at least 1")
         dev_mode = options.get("dev", False)
         dev_worker_mode = os.environ.get(_ENV_DEV_WORKER) == "1"
         effective_dev_mode = dev_mode or dev_worker_mode
@@ -726,10 +758,6 @@ class Command(BaseCommand):
         # Run autodiscovery + banner once in the parent before forking so the
         # user sees a single clean banner instead of N copies.
         self._print_multiprocess_banner(options)
-
-        # Give Actix the same graceful-shutdown window the supervisor allows
-        # before escalating to SIGKILL (user-set env takes precedence).
-        os.environ.setdefault("DJANGO_BOLT_SHUTDOWN_TIMEOUT", str(kill_timeout))
 
         def spawn_worker(slot: int) -> int:
             # A forked worker inherits the sockets of the parent's open database
@@ -822,8 +850,9 @@ class Command(BaseCommand):
         if admin_enabled and detect_admin_url_prefix is not None:
             merged_api._register_admin_routes(options["host"], options["port"])
             if merged_api._admin_routes_registered:
-                admin_prefix = detect_admin_url_prefix() or "admin"
-                features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
+                admin_prefix = detect_admin_url_prefix()
+                admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
+                features.append(("Admin", f"{banner_base_url}{admin_path}"))
 
         _total_route_count = len(merged_api._routes) + len(merged_api._native_routes)
         _framework_route_count = _total_route_count - _user_route_count
@@ -930,8 +959,9 @@ class Command(BaseCommand):
             merged_api._register_admin_routes(options["host"], options["port"])
 
             if merged_api._admin_routes_registered:
-                admin_prefix = detect_admin_url_prefix() or "admin"
-                features.append(("Admin", f"{banner_base_url}/{admin_prefix}/"))
+                admin_prefix = detect_admin_url_prefix()
+                admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
+                features.append(("Admin", f"{banner_base_url}{admin_path}"))
 
         # Compute route counts
         _total_route_count = len(merged_api._routes) + len(merged_api._native_routes)
@@ -944,6 +974,8 @@ class Command(BaseCommand):
             merged_api._asgi_mounts,
             merged_api._mcp_mounts,
         )
+        # A config decorator above a route decorator has no effect.
+        refuse_unread_route_config(merged_api._routes, merged_api._websocket_routes)
 
         # Register routes with Rust. Each route carries per-route bound
         # dispatch callables (partial binding handler + handler_id) so the
@@ -996,6 +1028,10 @@ class Command(BaseCommand):
         # Set environment variables for Rust
         os.environ["DJANGO_BOLT_WORKERS"] = str(options["workers"])
         os.environ["DJANGO_BOLT_BACKLOG"] = str(options["backlog"])
+        # The graceful-shutdown window of the server. With a supervisor, it is
+        # also the time before SIGKILL. A value that the user set in the
+        # environment takes precedence.
+        os.environ.setdefault("DJANGO_BOLT_SHUTDOWN_TIMEOUT", str(options["workers_kill_timeout"]))
         if options.get("keep_alive") is not None:
             os.environ["DJANGO_BOLT_KEEP_ALIVE"] = str(options["keep_alive"])
 
@@ -1046,10 +1082,8 @@ class Command(BaseCommand):
                     features=features,
                 )
 
-        # Collect lifecycle contexts (merged APIs store them, single APIs check directly)
+        # The lifespans of the API, of the APIs that it merges, and of the APIs that they mount.
         source_lifespans = merged_api._source_lifespans
-        if source_lifespans is None and merged_api._has_lifespan:
-            source_lifespans = [(merged_api, merged_api._lifespan_context)]
 
         # Start the server (all handlers go through async dispatch with thread pool for sync)
         if source_lifespans:
@@ -1483,7 +1517,11 @@ class Command(BaseCommand):
         merged._next_handler_id = next_handler_id
 
         # Collect lifecycle contexts from source APIs
-        merged._source_lifespans = [(api, api._lifespan_context) for _, api in apis if api._has_lifespan]
+        merged._source_lifespans = []
+        for _, api in apis:
+            for source_lifespan in api._source_lifespans:
+                if source_lifespan not in merged._source_lifespans:
+                    merged._source_lifespans.append(source_lifespan)
 
         return merged
 

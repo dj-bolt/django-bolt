@@ -36,7 +36,7 @@ CORS_ALLOWED_ORIGINS = [
 
 ### CORS_ALLOWED_ORIGIN_REGEXES
 
-List of regular expressions for allowed origins. An origin is allowed when it is in `CORS_ALLOWED_ORIGINS` or when a pattern matches it. A pattern can match a part of the origin, so start each pattern with `^` and end it with `$`. Bolt ignores an invalid pattern and writes a warning at startup. A route with `@cors` uses its own origins and patterns in place of `CORS_ALLOWED_ORIGINS` and these patterns.
+List of regular expressions for allowed origins. An origin is allowed when it is in `CORS_ALLOWED_ORIGINS` or when a pattern matches it. A pattern can match a part of the origin, so start each pattern with `^` and end it with `$`. An invalid pattern or an empty pattern stops startup with `ImproperlyConfigured`. An empty pattern matches every origin. Patterns use the syntax of the Rust `regex` crate, which has no look-around and no back-references. A route with `@cors` uses its own origins and patterns in place of `CORS_ALLOWED_ORIGINS` and these patterns.
 
 ```python
 CORS_ALLOWED_ORIGIN_REGEXES = [
@@ -111,10 +111,11 @@ Bolt uses this list to find the canonical client address for
 
 Bolt uses the same list for the request scheme. Only a peer in the list can set the scheme with `X-Forwarded-Proto`. Bolt reads the rightmost value, because the proxy closest to Bolt adds it. A value other than `http` or `https` is ignored. From any other peer, the scheme is the scheme of the connection. Bolt does not end TLS, so that scheme is `http`. The scheme sets these values:
 
-- `request.build_absolute_uri()` and the default `request.META["SERVER_PORT"]` on Bolt routes.
+- `request.build_absolute_uri()`, `request.META["wsgi.url_scheme"]` and the default `request.META["SERVER_PORT"]` on Bolt routes.
+- `request.scheme`, `request.is_secure()` and `request.build_absolute_uri()` of the Django request that a Django middleware gets on a Bolt route. Thus `SecurityMiddleware` and `CsrfViewMiddleware` see `https` behind a listed proxy that ends TLS.
 - The `scheme` key, and the port of the `server` key, of the ASGI scope of `mount_asgi()` and `mount_django()`. Django reads `scope["scheme"]` for `request.is_secure()`.
 
-Django's `SECURE_PROXY_SSL_HEADER` still applies on top of this scheme, in Django code and in `request.build_absolute_uri()`, as in Django. Django middleware on a Bolt route reads the scheme only from `SECURE_PROXY_SSL_HEADER`, as before. That setting trusts the header from every peer, so set it only when the proxy removes the header from client requests.
+Django's `SECURE_PROXY_SSL_HEADER` still applies on top of this scheme, in Django code and in `request.build_absolute_uri()`, as in Django. That setting trusts the header from every peer, so set it only when the proxy removes the header from client requests.
 
 The origin check of cookie authentication reads `X-Forwarded-Proto` from every peer. That check passes only one origin, so a value that a client sends never makes it weaker than the scheme of the connection. See [Cross-site request forgery protection](../topics/authentication.md#cross-site-request-forgery-protection).
 
@@ -335,7 +336,9 @@ JWTAuthentication(secret="custom-jwt-secret")
 
 Default authentication backends applied to all endpoints.
 
-**Default:** `[]` (no authentication)
+**Default:** not set. A route with no guard then has no authentication. A route with a guard that needs a user, such as `IsAuthenticated()`, then uses `JWTAuthentication()`. See [A guard with no auth backend](../topics/authentication.md#a-guard-with-no-auth-backend).
+
+Set the setting to `[]` to give no route a default backend.
 
 ### BOLT_DEFAULT_PERMISSION_CLASSES
 
@@ -379,6 +382,32 @@ BOLT_LOG_QUEUE_SIZE = 10000
 ```
 
 **Default:** `10000`
+
+### DJANGO_BOLT_LOG_SAMPLE
+
+The part of the 1xx to 3xx responses that write a line to the access log of `runbolt`, from `0.0` to `1.0`.
+A 4xx or a 5xx response always writes its line.
+The setting applies to each API with no `logging_config`. It is the `sample_rate` of `LoggingConfig`.
+
+```python
+DJANGO_BOLT_LOG_SAMPLE = 0.05
+```
+
+**Default:** not set (each response writes its line)
+
+### DJANGO_BOLT_LOG_SLOW_MS
+
+A 1xx to 3xx response writes a line to the access log only when it took this number of milliseconds or more.
+A 4xx or a 5xx response always writes its line.
+The setting applies to each API with no `logging_config`. It is the `min_duration_ms` of `LoggingConfig`.
+
+```python
+DJANGO_BOLT_LOG_SLOW_MS = 250
+```
+
+**Default:** not set (each response writes its line)
+
+A value out of range raises `ImproperlyConfigured` at startup. See [Production settings](../topics/logging.md#production-settings).
 
 ## Django signals settings
 
@@ -453,6 +482,8 @@ The `runbolt` management command accepts these options:
 | `--backlog` | `1024` | Socket listen backlog |
 | `--keep-alive` | OS default | HTTP keep-alive timeout |
 | `--skip-checks` | off | Skip the Django system checks at startup |
+
+A number out of range stops `runbolt` before startup, with an error that names the option. `--port` takes 0 to 65535. `--workers` takes 1 to 512. `--processes` takes 1 or more. `--backlog`, `--keep-alive`, `--max-rss`, `--workers-lifetime` and `--workers-kill-timeout` take 0 or more.
 
 At startup, `runbolt` runs the Django system checks and the migration check, like `runserver`. A check error stops startup. The unapplied-migration warning prints before the banner. In `--dev` mode, each reload runs the checks again. Multi-process mode runs them once, in the parent process. `--skip-checks` skips the system checks; the migration check still runs.
 
@@ -544,10 +575,12 @@ api = BoltAPI(
 | `BOLT_STATIC_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for static (`public`) |
 | `BOLT_MEDIA_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for media (`private`) |
 | `BOLT_LOG_QUEUE_SIZE` | `int` | `10000` | Max depth of the non-blocking log queue (records dropped when full) |
+| `DJANGO_BOLT_LOG_SAMPLE` | `float` | `None` | Part of the 1xx to 3xx responses in the access log (0.0 to 1.0) |
+| `DJANGO_BOLT_LOG_SLOW_MS` | `float` | `None` | Minimum duration of a 1xx to 3xx response in the access log (milliseconds) |
 | `BOLT_EMIT_SIGNALS` | `bool` | `False` | Enable Django request signals |
 | `BOLT_DEV_FORCE_POLLING` | `bool` | `False` | Force `--dev` reloader to use polling instead of native file events |
 | `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |
-| `BOLT_AUTHENTICATION_CLASSES` | `list` | `[]` | Default authentication backends |
+| `BOLT_AUTHENTICATION_CLASSES` | `list` | not set | Default authentication backends. Not set: `JWTAuthentication()` for a route with a guard that needs a user |
 | `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |
 | `DJANGO_BOLT_MAX_PARAM_LENGTH` | `int` (env var) | `8192` | Max path/query/form parameter size in bytes, from `1` to `1048576` (1 MB); requests over the limit return `422` |
 | `DJANGO_BOLT_ORM_THREADS` | `int` (env var) | `1` (SQLite) or `4` | Threads in the ORM pool of each process |
