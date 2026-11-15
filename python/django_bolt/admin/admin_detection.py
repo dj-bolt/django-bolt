@@ -8,8 +8,10 @@ import logging
 import sys
 
 from django.conf import settings
+from django.conf.urls.i18n import is_language_prefix_patterns_used
 from django.contrib.sessions.middleware import SessionMiddleware
-from django.urls import get_resolver
+from django.urls import NoReverseMatch, get_resolver, get_script_prefix, reverse
+from django.utils import translation
 from django.utils.module_loading import import_string
 
 logger = logging.getLogger(__name__)
@@ -58,55 +60,84 @@ def is_admin_installed() -> bool:
 
 def detect_admin_url_prefix() -> str | None:
     """
-    Detect the URL prefix for Django admin by parsing urlpatterns.
+    Find the URL prefix of the Django admin site.
+
+    Django resolves the admin index through the URL resolver tree. Thus the
+    prefix is correct for a regex pattern, a nested ``include()`` and an
+    ``AdminSite`` with its own name.
 
     Returns:
-        Admin URL prefix (e.g., 'admin' or 'dashboard') or None if not found
+        The prefix with no slash at its ends, for example ``"admin"`` or
+        ``"portal/staff"``. ``""`` when the admin site is at the root path.
+        ``"admin"`` when the URLconf has no admin site that Django can
+        reverse. ``None`` when the admin is not installed. For an admin site
+        in ``i18n_patterns()``, this is the prefix of the default language.
+    """
+    prefixes = detect_admin_url_prefixes()
+    return prefixes[0] if prefixes else None
+
+
+def detect_admin_url_prefixes() -> list[str] | None:
+    """
+    Find each URL prefix of the Django admin site.
+
+    An admin site in ``i18n_patterns()`` has one prefix for each language of
+    ``settings.LANGUAGES``, for example ``"en/admin"`` and ``"fr/admin"``.
+    The list then also has the prefix with no language, ``"admin"``. Django's
+    ``LocaleMiddleware`` redirects that path to the prefix of a language.
+
+    Returns:
+        The prefixes with no slash at their ends. The prefix of the default
+        language is first. ``None`` when the admin is not installed.
     """
     if not is_admin_installed():
         return None
 
+    urlconf = getattr(settings, "ROOT_URLCONF", None)
+    if not urlconf:
+        return ["admin"]
+
+    script_prefix = get_script_prefix()
+    i18n_patterns_used, _ = is_language_prefix_patterns_used(urlconf)
+    # The default language is first. Without i18n_patterns(), each language has the same prefix.
+    codes = [settings.LANGUAGE_CODE]
+    if i18n_patterns_used:
+        codes += [code for code, _name in settings.LANGUAGES]
+
+    prefixes: list[str] = []
+    for code in codes:
+        with translation.override(code):
+            try:
+                index_url = reverse("admin:index", urlconf=urlconf)
+            except NoReverseMatch:
+                return ["admin"]
+            # reverse() puts the script prefix (FORCE_SCRIPT_NAME) first. A mount path does not have it.
+            prefix = index_url.removeprefix(script_prefix).strip("/")
+            language_prefix = f"{translation.get_language()}/"
+        found = [prefix]
+        if i18n_patterns_used and f"{prefix}/".startswith(language_prefix):
+            found.append(prefix[len(language_prefix) :].strip("/"))
+        prefixes.extend(item for item in found if item not in prefixes)
+    return prefixes
+
+
+def admin_url_needs_path_parameter() -> bool:
+    """
+    Tell if the URL pattern of the admin site has a path parameter before it.
+
+    An example is ``path("<tenant>/admin/", admin.site.urls)``. Such a prefix
+    is not a static path, so Bolt cannot mount the admin at it.
+    """
+    urlconf = getattr(settings, "ROOT_URLCONF", None)
+    if not urlconf or not is_admin_installed():
+        return False
+    if "admin" not in get_resolver(urlconf).app_dict:
+        return False
     try:
-        # Get root URL resolver
-        resolver = get_resolver(getattr(settings, "ROOT_URLCONF", None))
-
-        # Search for admin patterns
-        for url_pattern in resolver.url_patterns:
-            # Check if this is admin.site.urls
-            if hasattr(url_pattern, "app_name") and url_pattern.app_name == "admin":
-                # Extract the pattern prefix
-                pattern_str = str(url_pattern.pattern)
-                # Remove trailing slash and special regex chars
-                prefix = pattern_str.rstrip("/^$")
-                return prefix if prefix else "admin"
-
-            # Also check URLResolver with admin urlconf
-            if hasattr(url_pattern, "urlconf_name"):
-                urlconf = url_pattern.urlconf_name
-                # Check if urlconf module contains admin.site
-                if hasattr(urlconf, "__name__") and "admin" in str(urlconf.__name__):
-                    pattern_str = str(url_pattern.pattern)
-                    prefix = pattern_str.rstrip("/^$")
-                    return prefix if prefix else "admin"
-
-                # Check if urlconf is a list containing admin patterns
-                if isinstance(urlconf, (list, tuple)):
-                    for sub_pattern in urlconf:
-                        if (
-                            hasattr(sub_pattern, "callback")
-                            and hasattr(sub_pattern.callback, "__module__")
-                            and "admin" in sub_pattern.callback.__module__
-                        ):
-                            pattern_str = str(url_pattern.pattern)
-                            prefix = pattern_str.rstrip("/^$")
-                            return prefix if prefix else "admin"
-
-    except Exception as e:
-        # If detection fails, log warning and return default
-        print(f"[django-bolt] Warning: Could not auto-detect admin URL prefix: {e}", file=sys.stderr)
-
-    # Default fallback
-    return "admin"
+        reverse("admin:index", urlconf=urlconf)
+    except NoReverseMatch:
+        return True
+    return False
 
 
 def get_admin_route_patterns() -> list[tuple[str, list[str]]]:
