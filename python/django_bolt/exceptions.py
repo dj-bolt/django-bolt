@@ -72,8 +72,8 @@ class HTTPException(BoltException):
 
     status_code: int = 500
     """HTTP status code for this exception."""
-    detail: str = ""
-    """Exception details or message."""
+    detail: str | dict[str, Any] | list[Any] = ""
+    """Exception details or message. A dict or a list is sent as a JSON value."""
     headers: dict[str, str]
     """Headers to attach to the response."""
     extra: dict[str, Any] | list[Any] | None = None
@@ -95,8 +95,9 @@ class HTTPException(BoltException):
         Args:
             status_code: HTTP status code (defaults to class status_code). A str
                 here is the detail, and the status is the class status_code.
-            detail: Exception details or message. An empty detail gives the
-                standard phrase of the status.
+            detail: Exception details or message. A dict or a list goes to
+                the response as a JSON value. A value of another type becomes its text.
+                An empty detail gives the standard phrase of the status.
             headers: HTTP headers to include in response. A number value
                 becomes a str. A value of another type raises TypeError.
             extra: Additional data to include in response
@@ -115,7 +116,8 @@ class HTTPException(BoltException):
         # Handle detail
         if detail is None:
             detail = ""
-        detail_str = str(detail) if detail else ""
+        # A dict or a list is a JSON value of the body. Its str() is a Python repr, which no client can read.
+        detail_str = (detail if isinstance(detail, (dict, list)) else str(detail)) if detail else ""
 
         super().__init__(detail=detail_str)
 

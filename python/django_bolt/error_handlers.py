@@ -449,6 +449,7 @@ class BoltError(msgspec.Struct, frozen=True, kw_only=True):
             "forbidden", "not_found", "validation", "rate_limited",
             "payload_too_large", "response_validation" or "internal_error".
         detail: A message for a human. Bolt does not put internal data, such as a file path, in it.
+            It is a dict or a list when an HTTPException has such a detail.
         errors: The field errors. Each one is a dict with "loc", "msg" and "type", and some have "ctx".
             A "response_validation" error has none when DEBUG is off.
         headers: The headers that the error needs, for example WWW-Authenticate
@@ -460,7 +461,7 @@ class BoltError(msgspec.Struct, frozen=True, kw_only=True):
 
     status: int
     kind: str
-    detail: str
+    detail: str | dict[str, Any] | list[Any]
     errors: list[dict[str, Any]] = msgspec.field(default_factory=list)
     headers: dict[str, str] = msgspec.field(default_factory=dict)
     extra: Any = None

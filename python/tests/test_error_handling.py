@@ -861,6 +861,51 @@ class TestExceptionIntegration:
         data = json.loads(body)
         assert len(data["detail"]) == 3
 
+    @pytest.mark.parametrize(
+        ("detail", "sent"),
+        [
+            ({"code": "x"}, {"code": "x"}),
+            ([1, {"field": "name", "ok": None}], [1, {"field": "name", "ok": None}]),
+            ({"errors": [{"loc": ["a", 0], "ok": True}]}, {"errors": [{"loc": ["a", 0], "ok": True}]}),
+            # Other types keep their text, and an empty detail gives the status phrase.
+            ("plain", "plain"),
+            (42, "42"),
+            ({}, "Bad Request"),
+            ([], "Bad Request"),
+        ],
+    )
+    def test_http_exception_sends_a_dict_or_list_detail_as_json(self, detail, sent):
+        """A dict or a list is a JSON value in the body, not the text of its Python repr."""
+        seen = []
+
+        def formatter(error, request):
+            seen.append(error.detail)
+            return JSON({"message": error.detail}, status_code=error.status)
+
+        plain_api = BoltAPI()
+        formatted_api = BoltAPI(error_formatter=formatter)
+        for api in (plain_api, formatted_api):
+
+            @api.get("/async")
+            async def async_raise():
+                raise HTTPException(400, detail=detail)
+
+            @api.get("/sync")
+            def sync_raise():
+                raise BadRequest(detail=detail)
+
+        for path in ("/async", "/sync"):
+            with TestClient(plain_api) as client:
+                response = client.get(path)
+            assert response.status_code == 400
+            assert response.json() == {"detail": sent}
+
+            with TestClient(formatted_api) as client:
+                response = client.get(path)
+            assert response.status_code == 400
+            assert response.json() == {"message": sent}
+        assert seen == [sent, sent]
+
 
 def _decode_error(body: bytes) -> msgspec.DecodeError:
     try:
