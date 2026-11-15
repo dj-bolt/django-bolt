@@ -103,7 +103,9 @@ class OpenAPIConfig:
     render_plugins: list[OpenAPIRenderPlugin] = field(default_factory=lambda: [])
     """Plugins for rendering OpenAPI documentation UIs.
 
-    If empty, ScalarRenderPlugin will be used by default.
+    If empty, Bolt serves each docs UI: Swagger UI at the docs path, ReDoc at
+    ``/redoc``, Scalar at ``/scalar``, RapiDoc at ``/rapidoc`` and Stoplight
+    Elements at ``/stoplight``.
     """
 
     exclude_paths: list[str] = field(default_factory=lambda: ["/admin", "/static"])
@@ -136,11 +138,13 @@ class OpenAPIConfig:
     include_error_responses: bool = field(default=True)
     """Include 422 validation error responses in OpenAPI schema.
 
-    When enabled, the schema will automatically document 422 Unprocessable Entity
-    responses for endpoints that accept request bodies (JSON, form data, file uploads).
+    When enabled, the schema documents a 422 Unprocessable Entity response for
+    each route whose input Bolt validates: a path, query, header or cookie
+    parameter, or a request body (JSON, form data, file uploads). A route with
+    no parameter and no body gets no 422.
 
-    The 422 response includes detailed validation error information with field-level
-    error messages, making it easier for API consumers to understand what went wrong.
+    The ``detail`` of the 422 body is a list of field errors. For a route with a
+    parameter or a form field, it can also be a text.
 
     With ``BoltAPI(error_formatter=...)``, the 422 shows the body that the
     formatter declares with ``error_schema``. A formatter with no declaration
