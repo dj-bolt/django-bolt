@@ -379,6 +379,17 @@ With an `error_formatter`, the line has the status of the formatted response.
 
 Bolt writes no line for a request with no route (404), for a mounted ASGI app or MCP server, for a static or media file, and for a [native route](native-routes.md).
 
+A flood of 429 responses does not fill the log.
+Each worker thread writes one line for the first 429 response of each second.
+The next 429 line of that worker has the number of 429 responses that wrote no line:
+
+```text
+GET /items/7 429 0.1ms | suppressed: 41
+```
+
+The limit applies to each 429 response of a route, from a rate limit and from a handler.
+The rate limiter also writes its own line to stderr, one for each second and bucket.
+
 The log level follows the status code, the same as Django's `runserver`:
 
 | Status | Level |

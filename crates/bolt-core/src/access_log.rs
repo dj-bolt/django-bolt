@@ -6,9 +6,10 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::time::Instant;
 
 /// Route metadata key of `LoggingConfig.sample_rate`.
 const SAMPLE_RATE_KEY: &str = "access_log_sample_rate";
@@ -107,11 +108,53 @@ fn random_unit() -> f64 {
     })
 }
 
+/// The limit of the access-log lines of 429 responses: one line for each second.
+/// The rate limiter has the same limit for its own line on stderr.
+#[derive(Debug, Default, PartialEq)]
+pub struct RejectionLineLimit {
+    /// The second of the last line plus one, or 0 before the first line.
+    after_line: u64,
+    /// The 429 responses since the last line that wrote none.
+    suppressed: u64,
+}
+
+impl RejectionLineLimit {
+    /// Decide if a 429 response in `second` writes its line. The first one of
+    /// each second does. The result is the number of 429 responses before it
+    /// that wrote no line, or `None` when this response writes no line. The
+    /// stored second never goes back, so a late response of an earlier second
+    /// only adds to the count.
+    pub fn line_in(&mut self, second: u64) -> Option<u64> {
+        if second < self.after_line {
+            self.suppressed += 1;
+            return None;
+        }
+        self.after_line = second + 1;
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+thread_local! {
+    /// The 429 line limit of this worker thread, and the time of its first 429 response.
+    static REJECTION_LINES: RefCell<Option<(Instant, RejectionLineLimit)>> =
+        const { RefCell::new(None) };
+}
+
+/// Decide if a 429 response at `now` writes its access-log line on this
+/// worker thread. See `RejectionLineLimit::line_in` for the result.
+pub fn rejection_line_at(now: Instant) -> Option<u64> {
+    REJECTION_LINES.with_borrow_mut(|state| {
+        let (first, limit) = state.get_or_insert_with(|| (now, RejectionLineLimit::default()));
+        limit.line_in(now.saturating_duration_since(*first).as_secs())
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AccessLogFilter, random_unit};
+    use super::{AccessLogFilter, RejectionLineLimit, random_unit, rejection_line_at};
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
+    use std::time::{Duration, Instant};
 
     fn no_random() -> f64 {
         panic!("the filter must not sample this response")
@@ -205,5 +248,42 @@ mod tests {
             meta.set_item("access_log_min_duration_ms", -1).unwrap();
             assert!(AccessLogFilter::from_python(&meta).is_err());
         });
+    }
+
+    #[test]
+    fn the_first_429_of_each_second_writes_a_line_with_the_count_before_it() {
+        let mut limit = RejectionLineLimit::default();
+        assert_eq!(limit.line_in(0), Some(0));
+        assert_eq!(limit.line_in(0), None);
+        assert_eq!(limit.line_in(0), None);
+        assert_eq!(limit.line_in(1), Some(2));
+        // A second with no 429 response between two lines changes nothing.
+        assert_eq!(limit.line_in(5), Some(0));
+        assert_eq!(limit.line_in(5), None);
+        // A late response of an earlier second writes no line. The count has it.
+        assert_eq!(limit.line_in(3), None);
+        assert_eq!(limit.line_in(6), Some(2));
+    }
+
+    #[test]
+    fn each_thread_counts_its_seconds_from_its_first_429() {
+        std::thread::spawn(|| {
+            let start = Instant::now();
+            assert_eq!(rejection_line_at(start), Some(0));
+            assert_eq!(rejection_line_at(start + Duration::from_millis(999)), None);
+            assert_eq!(
+                rejection_line_at(start + Duration::from_millis(1000)),
+                Some(1)
+            );
+            // A time before the first response is in second 0.
+            assert_eq!(rejection_line_at(start - Duration::from_secs(9)), None);
+            assert_eq!(rejection_line_at(start + Duration::from_secs(2)), Some(1));
+        })
+        .join()
+        .unwrap();
+        // The state of the other thread is not here.
+        std::thread::spawn(|| assert_eq!(rejection_line_at(Instant::now()), Some(0)))
+            .join()
+            .unwrap();
     }
 }

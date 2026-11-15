@@ -18,7 +18,7 @@ use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
 use bolt_asgi::asgi_http;
-use bolt_core::access_log::AccessLogFilter;
+use bolt_core::access_log::{AccessLogFilter, rejection_line_at};
 use bolt_core::error::{self, handle_python_error};
 use bolt_core::form_parsing::{
     DEFAULT_MAX_FIELDS, DEFAULT_MAX_PARTS, DEFAULT_MEMORY_LIMIT, ERROR_TYPE_PAYLOAD_TOO_LARGE,
@@ -822,6 +822,15 @@ fn write_access_log(
     if state.access_log_levels & bit == 0 {
         return;
     }
+    // A flood of 429 responses writes one line for each second on this worker.
+    let suppressed = if status == 429 {
+        match rejection_line_at(start) {
+            Some(suppressed) => suppressed,
+            None => return,
+        }
+    } else {
+        0
+    };
     let Some(logger) = state.access_logger.as_ref() else {
         return;
     };
@@ -836,6 +845,12 @@ fn write_access_log(
         status,
         dur_ms
     );
+    // The line of a 429 counts the 429 responses before it that wrote no line.
+    let msg = if suppressed == 0 {
+        msg
+    } else {
+        format!("{msg} | suppressed: {suppressed}")
+    };
     Python::attach(|py| {
         let _ = logger.call_method1(py, level, (msg,));
     });
