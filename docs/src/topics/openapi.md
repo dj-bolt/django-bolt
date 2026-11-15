@@ -66,8 +66,8 @@ the problems:
   return annotation and no `response_model`.
 - A component name uses the long form `module.qualname`. This occurs when two
   types have the same short name.
-- The `error_formatter` of the API has no `error_schema`, and a route has a 422
-  response. See [OpenAPI schema](error-handling.md#openapi-schema).
+- The `error_formatter` of the API has no `error_schema`, and a route has a 422,
+  401 or 403 response. See [OpenAPI schema](error-handling.md#openapi-schema).
 
 Routes with `include_in_schema=False` are not problems. Routes with a non-JSON
 `response_class` are not problems. Run strict mode in CI to keep the generated
@@ -194,6 +194,40 @@ for a missing value and for a value of the wrong type. With
 that declares its own 422 in `response_model` keeps it. The 422 also shows the
 validation body when the API has no formatter, or a formatter with
 `error_schema`. See [OpenAPI schema](error-handling.md#openapi-schema).
+
+### Authentication
+
+A route with an auth backend gets a `security` requirement. The list has one
+entry for each backend of the route. A request needs only one of them. Each
+scheme is in `components.securitySchemes`:
+
+| Backend | Scheme name | Scheme |
+|---|---|---|
+| `JWTAuthentication()` | `BearerAuth` | `http`, `bearer`, format `JWT` |
+| `JWTAuthentication(cookie="name")` | `JWTCookieAuth` | `apiKey` in the cookie `name` |
+| `JWTAuthentication(header="X-Token")` | `JWTHeaderAuth` | `apiKey` in the header `X-Token` |
+| `APIKeyAuthentication()` | `ApiKeyAuth` | `apiKey` in the header of the backend |
+| `SessionAuthentication()` | `SessionAuth` | `apiKey` in the session cookie |
+
+Two backends of one kind can read from different places, for example two API
+key headers. The second place gets its own scheme, such as `ApiKeyAuth2`. A
+scheme in `OpenAPIConfig(components=...)` with one of these names stays as you
+wrote it.
+
+The schema also shows the error responses that the guards of such a route can
+send:
+
+- 401 for a route with `IsAuthenticated` or `Requires`. The response has the
+  `WWW-Authenticate` header.
+- 403 for a route with `Requires`. This guard can deny a user.
+- 302 in place of the 401 for a route with
+  `SessionAuthentication(login_url=...)`. The response has the `Location`
+  header.
+
+The body is `{"detail": "<message>"}`, or the body of the `error_formatter` of
+the API. A route with no auth backend has none of these responses. A route with
+no guard, or with `AllowAny` as its first guard, has none of them.
+`OpenAPIConfig(include_error_responses=False)` removes them.
 
 ## Customizing documentation UIs
 
