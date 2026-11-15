@@ -12,10 +12,13 @@ Covers:
 
 from __future__ import annotations
 
-from django_bolt import BoltAPI, ModelViewSet
+import pytest
+
+from django_bolt import BoltAPI, ModelViewSet, ViewSet
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator, _extract_path_param_names
 from django_bolt.serializers import Serializer
+from django_bolt.views import APIView, CreateMixin, PartialUpdateMixin, UpdateMixin
 from tests.test_models import Article
 
 
@@ -136,6 +139,56 @@ def test_update_falls_back_to_create_then_serializer_class():
     media = put_op.request_body.content["application/json"]
     ref = media.schema.ref if hasattr(media.schema, "ref") else None
     assert ref == "#/components/schemas/ArticleCreateSchema"
+
+
+@pytest.mark.parametrize(
+    ("attribute", "mixins", "operations"),
+    [
+        (
+            "serializer_class",
+            (CreateMixin, UpdateMixin, PartialUpdateMixin),
+            [("/articles", "post"), ("/articles/{pk}", "put"), ("/articles/{pk}", "patch")],
+        ),
+        ("create_serializer_class", (CreateMixin,), [("/articles", "post")]),
+        (
+            "update_serializer_class",
+            (UpdateMixin, PartialUpdateMixin),
+            [("/articles/{pk}", "put"), ("/articles/{pk}", "patch")],
+        ),
+    ],
+)
+def test_one_serializer_attribute_documents_the_body_of_the_write_actions(attribute, mixins, operations):
+    """Each of the three serializer attributes, with no other one, gives the write actions their body."""
+    api = BoltAPI()
+    viewset = type(
+        "ArticleViewSet", (*mixins, ViewSet), {"queryset": Article.objects.all(), attribute: ArticleUpdateSchema}
+    )
+    api.viewset("/articles")(viewset)
+
+    schema = _generate(api)
+
+    for path, method in operations:
+        media = getattr(schema.paths[path], method).request_body.content["application/json"]
+        assert media.schema.ref == "#/components/schemas/ArticleUpdateSchema", (method, path)
+
+
+def test_api_view_operation_takes_its_id_and_its_text_from_the_method():
+    """The operation id holds the class and the method. The docstring gives the summary and the description."""
+    api = BoltAPI()
+
+    @api.view("/hello")
+    class HelloView(APIView):
+        async def get(self, request) -> dict:
+            """Say hello.
+
+            Answer each caller with one greeting.
+            """
+            return {"message": "Hello"}
+
+    operation = _generate(api).paths["/hello"].get
+
+    assert operation.operation_id == "get_HelloView.get"
+    assert (operation.summary, operation.description) == ("Say hello.", "Answer each caller with one greeting.")
 
 
 def test_read_actions_have_no_request_body():

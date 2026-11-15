@@ -20,6 +20,7 @@ from django_bolt.health import (
     ready_handler,
     register_health_checks,
 )
+from django_bolt.testing import TestClient
 from tests.thread_pools import shutdown_closing_connections
 
 
@@ -209,6 +210,21 @@ class TestHealthIntegration:
         handler_names = [h.__name__ for h in handlers]
         assert "health_handler" in handler_names
         assert "ready_handler" in handler_names
+
+    def test_registered_routes_answer_on_health_and_ready_paths(self):
+        """Test that the registered endpoints answer on /health and /ready."""
+        api = BoltAPI()
+        register_health_checks(api)
+
+        with TestClient(api) as client:
+            health = client.get("/health")
+            ready = client.get("/ready")
+
+        assert health.status_code == 200
+        assert health.json() == {"status": "ok"}
+        assert ready.status_code == 200
+        assert ready.json()["status"] in ["healthy", "unhealthy"]
+        assert "checks" in ready.json()
 
     def test_add_health_check_global(self):
         """Test adding global health check."""

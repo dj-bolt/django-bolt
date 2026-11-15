@@ -5,12 +5,15 @@ from typing import ClassVar
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from django.contrib.auth import get_user_model
 from django.contrib.auth.backends import ModelBackend
+from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 
 from django_bolt import BoltAPI
-from django_bolt.auth import InMemoryRevocation, JWTAuthViews
+from django_bolt.auth import InMemoryRevocation, IsAuthenticated, JWTAuthentication, JWTAuthViews
 from django_bolt.testing import TestClient
 
 pytestmark = pytest.mark.django_db
@@ -104,7 +107,8 @@ def _views_api(**options) -> BoltAPI:
     async def validate(request, credentials):
         return User() if credentials.password == "correct" else None
 
-    JWTAuthViews(store=InMemoryRevocation(), secret=SECRET, credential_validator=validate, **options).register(api)
+    options.setdefault("secret", SECRET)
+    JWTAuthViews(store=InMemoryRevocation(), credential_validator=validate, **options).register(api)
     return api
 
 
@@ -127,6 +131,29 @@ def test_cookies_are_secure_unless_the_project_turns_it_off(secure_cookies):
         assert "HttpOnly" in attributes
 
 
+@pytest.mark.parametrize(
+    ("prefix", "path"),
+    [("/", "/"), ("", "/"), ("/auth", "/auth"), ("/api/auth/", "/api/auth")],
+)
+def test_refresh_cookie_path_is_the_prefix_of_the_routes(prefix, path):
+    """The refresh cookie has the path of the routes. Routes at the root give the path ``/``."""
+    api = _views_api(prefix=prefix, secure_cookies=False)
+
+    def refresh_cookie_path(response) -> str:
+        cookie = next(c for c in response.headers.get_list("set-cookie") if c.startswith("refresh_token="))
+        return next(a for a in cookie.split("; ") if a.startswith("Path"))
+
+    with TestClient(api) as client:
+        login = client.post(f"{path.rstrip('/')}/login", json=LOGIN)
+        assert login.status_code == 200
+        assert refresh_cookie_path(login) == f"Path={path}"
+
+        logout = client.post(f"{path.rstrip('/')}/logout", headers=NO_CSRF_ORIGIN)
+        assert logout.status_code == 200, logout.text
+        # The cookie that clears the refresh cookie has the same path, or the browser keeps the cookie.
+        assert refresh_cookie_path(logout) == f"Path={path}"
+
+
 def test_views_use_the_given_key_algorithm_and_prefix():
     """Login signs with the secret, algorithm and ``kid`` of the views. The refresh route accepts these tokens."""
     api = _views_api(algorithm="HS512", kid="key-1", prefix="/api/auth-X/", secure_cookies=False)
@@ -146,6 +173,70 @@ def test_views_use_the_given_key_algorithm_and_prefix():
         assert refreshed.status_code == 200, refreshed.text
         assert client.cookies.get("refresh_token") != refresh
         assert client.post("/api/auth-X/logout", headers=NO_CSRF_ORIGIN).status_code == 200
+
+
+@pytest.fixture(scope="module")
+def rsa_pems() -> tuple[str, str]:
+    """Give one RSA key pair as (private PEM, public PEM). Key generation is slow."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    public_pem = (
+        private_key.public_key()
+        .public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+        .decode()
+    )
+    return private_pem, public_pem
+
+
+def test_views_sign_with_the_private_key_and_verify_with_the_public_key(rsa_pems):
+    """With an asymmetric algorithm, ``secret`` signs the tokens and ``public_key`` verifies them."""
+    private_pem, public_pem = rsa_pems
+    api = _views_api(secret=private_pem, public_key=public_pem, algorithm="RS256", kid="k1", secure_cookies=False)
+
+    @api.get("/me", auth=[JWTAuthentication(public_key=public_pem, algorithms=["RS256"])], guards=[IsAuthenticated()])
+    async def me(request):
+        return {"user_id": request["context"]["user_id"]}
+
+    with TestClient(api) as client:
+        assert client.post("/auth/login", json=LOGIN).status_code == 200
+        first_refresh = client.cookies.get("refresh_token")
+
+        refreshed = client.post("/auth/refresh", headers=NO_CSRF_ORIGIN)
+        assert refreshed.status_code == 200, refreshed.text
+        access = client.cookies.get("access_token")
+        refresh = client.cookies.get("refresh_token")
+        assert refresh != first_refresh
+        # The refresh route signs the new pair with the private key.
+        for token in (access, refresh):
+            assert jwt.get_unverified_header(token)["kid"] == "k1"
+            assert jwt.decode(token, public_pem, algorithms=["RS256"])["sub"] == "view-user"
+
+        # A route of the application verifies the access token with the public key only.
+        profile = client.get("/me", headers={"Authorization": f"Bearer {access}"})
+        assert profile.status_code == 200, profile.text
+        assert profile.json() == {"user_id": "view-user"}
+
+        assert client.post("/auth/logout", headers=NO_CSRF_ORIGIN).status_code == 200
+        assert client.cookies.get("refresh_token") is None
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"algorithm": "RS256", "secret": "private-pem"}, "requires 'secret' and 'public_key'"),
+        ({"algorithm": "RS256", "public_key": "public-pem"}, "requires 'secret' and 'public_key'"),
+        ({"public_key": "public-pem"}, "'public_key' only with an asymmetric algorithm"),
+    ],
+    ids=["asymmetric-without-public-key", "asymmetric-without-private-key", "hmac-with-public-key"],
+)
+def test_keys_that_do_not_match_the_algorithm_fail_at_construction(options, message):
+    """A key set that cannot work must stop the startup, not the first refresh."""
+    with pytest.raises(ImproperlyConfigured, match=message):
+        JWTAuthViews(store=InMemoryRevocation(), **options)
 
 
 def test_refresh_cookie_without_a_jti_is_rejected():
@@ -181,7 +272,10 @@ def test_used_refresh_token_cannot_log_out_the_token_that_replaced_it(path):
         assert client.post("/auth/refresh", headers=NO_CSRF_ORIGIN).status_code == 200
         live = client.cookies.get("refresh_token")
 
-        assert _post_with_refresh(client, path, used).status_code == 401
+        rejected = _post_with_refresh(client, path, used)
+        assert rejected.status_code == 401
+        # The body is the same as for a token that the refresh route rejects.
+        assert rejected.json() == {"detail": "Invalid token"}
         assert _post_with_refresh(client, "/auth/refresh", live).status_code == 200
 
 
@@ -196,6 +290,8 @@ def test_refresh_token_from_before_logout_all_cannot_log_out_a_new_login():
 
         assert _post_with_refresh(client, "/auth/logout-all", old).status_code == 401
         assert _post_with_refresh(client, "/auth/refresh", new).status_code == 200
+        # The tokens of the new login have version 1. They are live, so they can log out.
+        assert client.post("/auth/logout", headers=NO_CSRF_ORIGIN).status_code == 200
 
 
 def test_logged_out_refresh_token_cannot_log_out_everywhere():
@@ -209,6 +305,68 @@ def test_logged_out_refresh_token_cannot_log_out_everywhere():
 
         assert _post_with_refresh(client, "/auth/logout-all", logged_out).status_code == 401
         assert _post_with_refresh(client, "/auth/refresh", other).status_code == 200
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("change", ["inactive", "deleted"])
+def test_default_refresh_refuses_a_user_that_cannot_log_in(change):
+    """With no ``credential_validator``, refresh gives no new tokens to an inactive or deleted user."""
+    user = get_user_model().objects.create_user("erin", password="right-password")
+    api = BoltAPI()
+    JWTAuthViews(
+        store=InMemoryRevocation(),
+        secret="a-secure-test-secret-that-is-long-enough",
+        secure_cookies=False,
+    ).register(api)
+
+    with TestClient(api) as client:
+        assert client.post("/auth/login", json={"username": "erin", "password": "right-password"}).status_code == 200
+        headers = {"Sec-Fetch-Site": "none"}
+        assert client.post("/auth/refresh", headers=headers).status_code == 200
+        old_refresh = client.cookies.get("refresh_token")
+
+        if change == "inactive":
+            get_user_model().objects.filter(pk=user.pk).update(is_active=False)
+        else:
+            user.delete()
+        refused = client.post("/auth/refresh", headers=headers)
+
+        assert refused.status_code == 401, refused.text
+        assert refused.json()["detail"] == "Invalid token"
+        assert client.cookies.get("refresh_token") == old_refresh
+
+
+@pytest.mark.parametrize("family", [{}, {"fam": ""}], ids=["no-fam", "empty-fam"])
+def test_refresh_token_without_a_family_cannot_log_out(family):
+    """The refresh route rejects a token with no family. This token must not end a live session."""
+    now = int(time.time())
+    claims = {"sub": "view-user", "typ": "refresh", "jti": "x1", "ver": 0, "iat": now, "exp": now + 600, **family}
+    no_family = jwt.encode(claims, SECRET, algorithm="HS256")
+
+    with TestClient(_views_api(secure_cookies=False)) as client:
+        client.post("/auth/login", json=LOGIN)
+        live = client.cookies.get("refresh_token")
+
+        paths = ("/auth/logout", "/auth/logout-all", "/auth/refresh")
+        responses = {path: _post_with_refresh(client, path, no_family) for path in paths}
+        assert {path: (r.status_code, r.json()) for path, r in responses.items()} == dict.fromkeys(
+            paths, (401, {"detail": "Invalid token"})
+        )
+        assert _post_with_refresh(client, "/auth/refresh", live).status_code == 200
+
+
+def test_refresh_token_without_a_version_has_version_zero():
+    """The refresh route reads a token with no ``ver`` claim as version 0. The logout routes do the same."""
+    now = int(time.time())
+    claims = {"sub": "view-user", "typ": "refresh", "fam": "family-1", "iat": now, "exp": now + 600}
+    first, second = (jwt.encode({**claims, "jti": jti}, SECRET, algorithm="HS256") for jti in ("jti-1", "jti-2"))
+
+    with TestClient(_views_api()) as client:
+        # The user has version 0, so the token is live. This logout-all gives the user version 1.
+        assert _post_with_refresh(client, "/auth/logout-all", first).status_code == 200
+        # Version 0 is now old.
+        assert _post_with_refresh(client, "/auth/logout-all", second).status_code == 401
+        assert _post_with_refresh(client, "/auth/refresh", second).status_code == 401
 
 
 class RecordingBackend(ModelBackend):

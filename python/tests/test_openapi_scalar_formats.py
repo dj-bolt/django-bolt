@@ -15,11 +15,13 @@ from typing import Annotated
 
 import msgspec
 import pytest
+from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
-from django_bolt.param_functions import Cookie, Form, Header, Query
+from django_bolt.param_functions import Cookie, File, Form, Header, Query
+from django_bolt.testing import TestClient
 
 SCALARS = [
     (datetime.datetime, {"type": "string", "format": "date-time"}),
@@ -95,6 +97,48 @@ def test_a_json_body_struct_field_has_the_format_of_its_type(scalar, expected):
         return {}
 
     assert _spec(api)["components"]["schemas"]["Item"]["properties"]["value"] == expected
+
+
+class Attachment(msgspec.Struct):
+    data: bytes
+    preview: bytearray
+    view: memoryview
+
+
+def test_bytes_are_base64_text_in_json_and_binary_in_a_file_part():
+    """msgspec writes bytes in JSON as base64 text. A file part of a multipart body holds the raw bytes."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+    base64_text = {"type": "string", "contentEncoding": "base64"}
+    binary = {"type": "string", "format": "binary"}
+
+    @api.get("/attachment")
+    async def get_attachment() -> Attachment:
+        return Attachment(data=b"\x00\x01hi", preview=bytearray(b"hi"), view=memoryview(b"hi"))
+
+    @api.get("/chunks")
+    async def get_chunks() -> list[bytes]:
+        return [b"\x00\x01hi"]
+
+    @api.post("/upload")
+    async def upload(raw: Annotated[bytes, File()], parts: Annotated[list[bytes], File()]):
+        return {}
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+        assert client.get("/attachment").json() == {"data": "AAFoaQ==", "preview": "aGk=", "view": "aGk="}
+        assert client.get("/chunks").json() == ["AAFoaQ=="]
+
+    validate(spec)
+    assert spec["openapi"] == "3.1.0"
+    assert spec["components"]["schemas"]["Attachment"]["properties"] == {
+        "data": base64_text,
+        "preview": base64_text,
+        "view": base64_text,
+    }
+    chunks = spec["paths"]["/chunks"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert chunks == {"type": "array", "items": base64_text}
+    assert _form_schema(spec, "/upload")["properties"] == {"raw": binary, "parts": {"type": "array", "items": binary}}
 
 
 class UserGender(enum.StrEnum):

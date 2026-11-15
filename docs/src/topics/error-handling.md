@@ -23,9 +23,18 @@ Parameters:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `status_code` | `int` | required | HTTP status code |
-| `detail` | `str` | HTTP phrase | Error message |
+| `detail` | `str`, `dict` or `list` | HTTP phrase | Error message |
 | `headers` | `dict` | `{}` | Response headers |
 | `extra` | `dict` | `None` | Additional error data |
+
+A `dict` or a `list` detail goes to the response as a JSON value:
+
+```python
+raise HTTPException(status_code=400, detail={"code": "out_of_stock", "items": [3, 7]})
+# body: {"detail": {"code": "out_of_stock", "items": [3, 7]}}
+```
+
+A detail of another type becomes its text, so `detail=42` gives `"42"`. An empty detail, such as `""`, `{}` or `[]`, gives the HTTP phrase of the status. Each value in the dict or the list must be a value that Bolt can encode as JSON.
 
 ### Specialized exceptions
 
@@ -191,7 +200,7 @@ raise ResponseValidationError(errors)
 
 Response validation errors indicate a server bug, so they return 500 Internal Server Error.
 
-The validation errors name the model, the fields and the types of your handler. With `DEBUG=False`, the body is only `{"detail": "Response validation error"}`. Bolt writes the validation errors to the server log. With `DEBUG=True`, the body also has `extra.validation_errors`.
+The validation errors name the model, the fields and the types of your handler. With `DEBUG=False`, the body is only `{"detail": "Response validation error"}`. Bolt writes the validation errors to the server log. With `DEBUG=True`, the body also has `extra.validation_errors`. The `loc` of each error has `response` and then the path of the field, for example `["response", "id"]`.
 
 ## Error handlers
 
@@ -324,7 +333,7 @@ For validation errors:
 An error formatter changes the body of each error response that the framework makes. One function formats the errors from all layers:
 
 - The Rust core:
-  - 401 and 403 from guards, and 404 for no route.
+  - 401 and 403 from guards, 404 for no route, and 405 for a route path with no route for the method.
   - 413, and 400 for bad headers.
   - 422 from path, query, header, cookie and form values.
   - 429 from rate limits.
@@ -384,7 +393,7 @@ api = BoltAPI(error_formatter=format_error)
 |-----------|-------------|
 | `status` | The HTTP status code. |
 | `kind` | A stable name for the error. See the table below. |
-| `detail` | A message for a human. Bolt does not put internal data, such as a file path, in it. |
+| `detail` | A message for a human. Bolt does not put internal data, such as a file path, in it. It is a `dict` or a `list` when an `HTTPException` has such a detail. |
 | `errors` | The field errors. Each one has `loc`, `msg` and `type`. Some also have `ctx`. A `response_validation` error has no `errors` when `DEBUG=False`. Read `error.exception.errors()` for them. |
 | `headers` | The headers that the error needs, for example `WWW-Authenticate` or `Retry-After`. |
 | `extra` | The `extra` of an `HTTPException`, or `{"retry_after": n}` for a rate limit. |
@@ -396,6 +405,7 @@ api = BoltAPI(error_formatter=format_error)
 | `not_authenticated` | 401 | A guard, or an `HTTPException(401)` |
 | `forbidden` | 403 | A guard, the CSRF origin check of Bolt, `PermissionDenied`, a `FileResponse` outside `BOLT_ALLOWED_FILE_PATHS` or an `HTTPException(403)` |
 | `not_found` | 404 | No route, Django's `Http404` (also from `get_object_or_404`), a `FileResponse` or a `File` whose path names no regular file, or an `HTTPException(404)` |
+| `method_not_allowed` | 405 | A path that has routes, but none for the method of the request, or an `HTTPException(405)` |
 | `payload_too_large` | 413 | A body over `BOLT_MAX_UPLOAD_SIZE` |
 | `validation` | 422 | A value that fails validation, in Rust or in Python |
 | `rate_limited` | 429 | A rate limit |
@@ -417,6 +427,8 @@ The formatter runs only for an error, and only when the app has a formatter. A r
 
 The formatter must be a sync callable. Bolt raises `TypeError` for an async one. The response of the formatter must have a status from 400 to 599. Each header name and value must be a `str`. The response cannot set cookies. When the formatter raises an exception or returns a response that is not valid, Bolt logs the error and sends the default response.
 
+An `HTTPException` with a status below 400, such as a redirect, is not an error. Bolt does not call the formatter for it, and sends the default `{"detail": ...}` response.
+
 Bolt logs each error that it answers with a 500 by default, also when the formatter gives another status. Bolt does not log an error that it answers with a 4xx by default, also when the formatter gives a 5xx. An `HTTPException` is a planned response, so Bolt does not log it.
 
 With more than one API in a project, `runbolt` uses one formatter for all of them. Set the same formatter on each API, or set it on one API. Two different formatters stop startup.
@@ -431,11 +443,11 @@ The formatter does not change a response that a handler or a middleware returns.
 
 ### OpenAPI schema
 
-The OpenAPI schema shows a 422 response for each route with a request body. The body of this 422 follows the formatter of the API:
+The OpenAPI schema shows a 422 response for each route with a parameter or a request body. The body of this 422 follows the formatter of the API:
 
 | Formatter | Media type | Schema |
 |-----------|------------|--------|
-| None | `application/json` | `{"detail": [...]}` |
+| None | `application/json` | `{"detail": [...]}`. For a route with a parameter or a form field, `detail` is a list or a text |
 | `problem_details` | `application/problem+json` | The `ProblemDetails` component, with `errors` |
 | A formatter with `error_schema` | The declared media type | The declared type |
 | A formatter without `error_schema` | None | None |
@@ -469,7 +481,7 @@ A formatter without `error_schema` gets a 422 with a description and no content.
 
 The formatter does not change the entries of `response_model`. For example, `response_model={409: Conflict}` keeps its `application/json` schema. This agrees with the response, because an `HTTPException` with a typed `body` skips the formatter.
 
-A route with a request body can declare its own 422, for example `response_model={422: Rejected}`. Such a route can send two 422 bodies: its own body and the validation body. The schema shows both, unless the formatter has no `error_schema`. Then the entry shows only the body of the route. When the two bodies have the same media type, the schema joins them with `anyOf`. The entry keeps the description of the route.
+A route with a parameter or a request body can declare its own 422, for example `response_model={422: Rejected}`. Such a route can send two 422 bodies: its own body and the validation body. The schema shows both, unless the formatter has no `error_schema`. Then the entry shows only the body of the route. When the two bodies have the same media type, the schema joins them with `anyOf`. The entry keeps the description of the route.
 
 ## Example: Custom error handling
 
