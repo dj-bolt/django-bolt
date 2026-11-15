@@ -7,6 +7,7 @@ from typing import Literal
 
 import msgspec
 import pytest
+from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
 from django_bolt.middleware import Middleware
@@ -289,6 +290,35 @@ def test_tagged_union_examples_use_a_value_of_each_field_type():
     }
 
 
+class Found(msgspec.Struct, tag=True):
+    name: str
+    owner: None
+
+
+class Missing(msgspec.Struct, tag=True):
+    reason: str
+
+
+def test_tagged_union_example_keeps_a_field_that_is_null():
+    """The example of a variant has each field of the real body, also a field of the type ``None``."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="t", version="1"))
+
+    @api.get("/lookup", response_model=Found | Missing)
+    async def lookup():
+        return Found(name="x", owner=None)
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        document = client.get("/docs/openapi.json").json()
+        body = client.get("/lookup").json()
+
+    validate(document)
+    assert body == {"type": "Found", "name": "x", "owner": None}
+    media = document["paths"]["/lookup"]["get"]["responses"]["200"]["content"]["application/json"]
+    assert media["examples"]["Found"]["value"] == {"type": "Found", "name": "string", "owner": None}
+    assert media["examples"]["Missing"]["value"] == {"type": "Missing", "reason": "string"}
+
+
 def test_list_of_tagged_union_omits_per_arm_examples():
     """``list[Union[A, B, ...]]`` must NOT emit per-arm examples.
 
@@ -539,9 +569,7 @@ def test_response_validation_error_locates_the_error_in_the_response(settings):
     async def serialized() -> RowSerializer:
         return {"id": "x"}
 
-    # The struct coercer wraps the msgspec error, so the field path of /struct
-    # is in the message, not in the location.
-    expected = {"/list": ["response", "1", "id"], "/struct": ["response"], "/serializer": ["response", "id"]}
+    expected = {"/list": ["response", "1", "id"], "/struct": ["response", "id"], "/serializer": ["response", "id"]}
     with TestClient(api) as client:
         for path, loc in expected.items():
             resp = client.get(path)

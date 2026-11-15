@@ -438,3 +438,15 @@ def test_the_store_is_restored_when_the_body_raises():
     with pytest.raises(ZeroDivisionError), TestClient(_make_api()):
         raise ZeroDivisionError
     assert connections._connections is store_before
+
+
+@pytest.mark.django_db
+def test_a_cursor_of_the_shared_connection_iterates_its_rows():
+    User.objects.create(username="first", email="1@example.com")
+    User.objects.create(username="second", email="2@example.com")
+
+    with TestClient(_make_api()):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT username FROM auth_user ORDER BY username")
+            rows = list(cursor)
+        assert rows == [("first",), ("second",)]

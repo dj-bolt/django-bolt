@@ -2,6 +2,7 @@
 ///
 /// This module handles parsing Python metadata dicts into strongly-typed
 /// Rust enums at registration time, eliminating per-request GIL overhead.
+use actix_web::http::StatusCode;
 use actix_web::http::header::HeaderValue;
 use ahash::{AHashMap, AHashSet};
 use pyo3::exceptions::{PyTypeError, PyValueError};
@@ -571,7 +572,7 @@ pub struct RouteMetadata {
     /// Route's default success status code. Used by the bare-bytes response
     /// fast path: sync executors may return just the encoded JSON body and
     /// Rust rebuilds the (status, JSON meta) envelope from this value.
-    pub default_status_code: u16,
+    pub default_status_code: StatusCode,
     /// WebSocket routes with a `revoked_token_handler`: an async Python
     /// callable that takes the auth context and returns True for a revoked
     /// token. The handshake awaits it before the upgrade.
@@ -654,14 +655,16 @@ fn required_bool(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<bool> {
 
 /// Read a required HTTP status code of the route metadata.
 /// A value that is not an int from 0 to 65535 is a TypeError.
-fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<u16> {
+fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<StatusCode> {
     let value = required_item(py_meta, key)?;
     if value.is_instance_of::<PyBool>() {
         return Err(wrong_type(py_meta, key, "an int", &value));
     }
     value
         .extract::<u16>()
-        .map_err(|_| wrong_type(py_meta, key, "an int from 0 to 65535", &value))
+        .ok()
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .ok_or_else(|| wrong_type(py_meta, key, "an int from 100 to 999", &value))
 }
 
 impl RouteMetadata {
@@ -928,6 +931,41 @@ fn cors_str_list(
         .map(Some)
 }
 
+/// Read the methods or a header list of a CORS config: None when the key is
+/// missing or holds None. A str is not one name here and is not a sequence of
+/// characters, so it raises `TypeError`, as each value that is not a
+/// collection of str.
+fn cors_name_list(
+    dict: &HashMap<String, Py<PyAny>>,
+    py: Python,
+    key: &str,
+) -> PyResult<Option<Vec<String>>> {
+    let Some(value) = dict.get(key).map(|value| value.bind(py)) else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    let type_error = || {
+        PyTypeError::new_err(format!(
+            "cors {key} must be a collection of str, got {}",
+            describe(value)
+        ))
+    };
+    if value.is_instance_of::<PyString>() {
+        return Err(type_error());
+    }
+    value
+        .try_iter()
+        .map_err(|_| type_error())?
+        .map(|item| {
+            item.and_then(|item| item.extract::<String>())
+                .map_err(|_| type_error())
+        })
+        .collect::<PyResult<Vec<String>>>()
+        .map(Some)
+}
+
 /// Parse CORS configuration from middleware dict
 fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<CorsConfig> {
     let mut config = CorsConfig::default();
@@ -963,35 +1001,35 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<
             .collect();
     }
 
-    // Parse credentials
-    if let Some(cred_py) = dict.get("credentials")
-        && let Ok(cred) = cred_py.extract::<bool>(py)
+    // A value that is present must be valid. A bad value must stop startup,
+    // not give the route the default of the option.
+    if let Some(value) = dict.get("credentials").map(|value| value.bind(py))
+        && !value.is_none()
     {
-        config.credentials = cred;
+        config.credentials = value
+            .cast::<PyBool>()
+            .map_err(|_| {
+                PyTypeError::new_err(format!(
+                    "cors credentials must be a bool, got {}",
+                    describe(value)
+                ))
+            })?
+            .is_true();
     }
 
-    // Parse methods (optional, has defaults)
-    if let Some(methods_py) = dict.get("methods")
-        && let Ok(methods) = methods_py.extract::<Vec<String>>(py)
-    {
+    if let Some(methods) = cors_name_list(dict, py, "methods")? {
         config.methods_str = methods.join(", ");
         config.methods_header = HeaderValue::from_str(&config.methods_str).ok();
         config.methods = methods;
     }
 
-    // Parse headers (optional, has defaults)
-    if let Some(headers_py) = dict.get("headers")
-        && let Ok(headers) = headers_py.extract::<Vec<String>>(py)
-    {
+    if let Some(headers) = cors_name_list(dict, py, "headers")? {
         config.headers_str = headers.join(", ");
         config.headers_header = HeaderValue::from_str(&config.headers_str).ok();
         config.headers = headers;
     }
 
-    // Parse expose_headers (optional)
-    if let Some(expose_py) = dict.get("expose_headers")
-        && let Ok(expose) = expose_py.extract::<Vec<String>>(py)
-    {
+    if let Some(expose) = cors_name_list(dict, py, "expose_headers")? {
         config.expose_headers_str = expose.join(", ");
         config.expose_headers_header = if !expose.is_empty() {
             HeaderValue::from_str(&config.expose_headers_str).ok()
@@ -1001,10 +1039,19 @@ fn parse_cors_config(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<
         config.expose_headers = expose;
     }
 
-    // Parse max_age (optional)
-    if let Some(age_py) = dict.get("max_age")
-        && let Ok(age) = age_py.extract::<u32>(py)
+    if let Some(value) = dict.get("max_age").map(|value| value.bind(py))
+        && !value.is_none()
     {
+        let age = (!value.is_instance_of::<PyBool>())
+            .then(|| value.extract::<u32>().ok())
+            .flatten()
+            .ok_or_else(|| {
+                PyTypeError::new_err(format!(
+                    "cors max_age must be an int from 0 to {}, got {}",
+                    u32::MAX,
+                    describe(value)
+                ))
+            })?;
         config.max_age_str = age.to_string();
         config.max_age_header = HeaderValue::from_str(&config.max_age_str).ok();
         config.max_age = age;
@@ -1981,6 +2028,76 @@ mod tests {
         assert_eq!((zero.max_age, zero.max_age_str.as_str()), (0, "0"));
     }
 
+    #[test]
+    fn cors_name_lists_can_be_any_collection_of_str() {
+        let config = cors("{'methods': ('GET',), 'headers': {'X-A'}}").unwrap();
+        assert_eq!(config.methods_str, "GET");
+        assert_eq!(config.headers_str, "X-A");
+    }
+
+    #[test]
+    fn a_cors_option_of_the_wrong_type_stops_startup() {
+        for (code, message) in [
+            (
+                "{'methods': 'GET'}",
+                "cors methods must be a collection of str, got str 'GET'",
+            ),
+            (
+                "{'methods': [1]}",
+                "cors methods must be a collection of str, got list [1]",
+            ),
+            (
+                "{'headers': 'X-A'}",
+                "cors headers must be a collection of str, got str 'X-A'",
+            ),
+            (
+                "{'headers': 5}",
+                "cors headers must be a collection of str, got int 5",
+            ),
+            (
+                "{'expose_headers': [b'X-A']}",
+                "cors expose_headers must be a collection of str, got list [b'X-A']",
+            ),
+            (
+                "{'credentials': 'yes'}",
+                "cors credentials must be a bool, got str 'yes'",
+            ),
+            (
+                "{'credentials': 1}",
+                "cors credentials must be a bool, got int 1",
+            ),
+            (
+                "{'max_age': '600'}",
+                "cors max_age must be an int from 0 to 4294967295, got str '600'",
+            ),
+            (
+                "{'max_age': -1}",
+                "cors max_age must be an int from 0 to 4294967295, got int -1",
+            ),
+            (
+                "{'max_age': 2**32}",
+                "cors max_age must be an int from 0 to 4294967295, got int 4294967296",
+            ),
+            (
+                "{'max_age': True}",
+                "cors max_age must be an int from 0 to 4294967295, got bool True",
+            ),
+            (
+                "{'max_age': 1.5}",
+                "cors max_age must be an int from 0 to 4294967295, got float 1.5",
+            ),
+        ] {
+            assert_eq!(error_of(cors(code)), format!("TypeError: {message}"));
+        }
+    }
+
+    #[test]
+    fn cors_credentials_and_max_age_of_none_keep_the_default() {
+        let config = cors("{'credentials': None, 'max_age': None}").unwrap();
+        assert!(!config.credentials);
+        assert_eq!(config.max_age, 3600);
+    }
+
     // ---- parse_rate_limit_config ----
 
     fn rate_limit(code: &str) -> RateLimitConfig {
@@ -2206,7 +2323,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_status_code_is_an_int_that_fits_a_u16() {
+    fn the_default_status_code_is_an_int_that_is_an_http_status() {
         assert_eq!(route("'default_status_code': 201").default_status_code, 201);
         assert_eq!(
             error_of(parse_route("'default_status_code': True")),
@@ -2215,13 +2332,15 @@ mod tests {
         for (value, name) in [
             ("65536", "int"),
             ("-1", "int"),
+            ("99", "int"),
+            ("1000", "int"),
             ("'200'", "str"),
             ("200.0", "float"),
         ] {
             assert_eq!(
                 error_of(parse_route(&format!("'default_status_code': {value}"))),
                 format!(
-                    "TypeError: Route metadata 'default_status_code' for GET /x must be an int from 0 to 65535, got {name}"
+                    "TypeError: Route metadata 'default_status_code' for GET /x must be an int from 100 to 999, got {name}"
                 ),
                 "{value}"
             );

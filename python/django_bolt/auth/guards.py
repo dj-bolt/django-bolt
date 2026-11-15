@@ -188,6 +188,21 @@ GUARD_TYPES = (AllowAny, IsAuthenticated, Requires)
 Guard = AllowAny | IsAuthenticated | Requires
 
 
+def guards_need_user(guards: list[Any] | None) -> bool:
+    """Whether the guards of a route need an authenticated user.
+
+    ``guards`` is the ``guards`` argument of the route. None means the default
+    guards. Rust runs the guards in order and stops at ``AllowAny``, so the
+    first guard decides. ``[]`` and a list that starts with ``AllowAny`` need
+    no user. A guard can be an instance or a class.
+    """
+    if guards is None:
+        guards = get_default_permission_classes()
+    for guard in guards:
+        return guard is not AllowAny and type(guard) is not AllowAny
+    return False
+
+
 def get_default_permission_classes() -> list[Guard]:
     """
     Get default permission classes from Django settings.
