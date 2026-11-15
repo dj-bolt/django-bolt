@@ -137,7 +137,7 @@ class PaginationBase(ABC):
     # Default page size
     page_size: int = 100
 
-    # Maximum allowed page size (prevents abuse)
+    # Maximum allowed page size (prevents abuse). It also limits the default page size.
     max_page_size: int = 1000
 
     # Name of the page size query parameter
@@ -361,12 +361,13 @@ class PaginationBase(ABC):
                     if page_size > self.max_page_size:
                         return self.max_page_size
                     if page_size < 1:
-                        return self.page_size
+                        return min(self.page_size, self.max_page_size)
                     return page_size
                 except (ValueError, TypeError):
                     pass
 
-        return self.page_size
+        # max_page_size also limits the default. A subclass can set only max_page_size.
+        return min(self.page_size, self.max_page_size)
 
 
 class PageNumberPagination(PaginationBase):
@@ -491,10 +492,11 @@ class LimitOffsetPagination(PaginationBase):
                 limit = int(limit_str)
                 if limit < 1:
                     limit = self.page_size
-                if limit > self.max_page_size:
-                    limit = self.max_page_size
             except (ValueError, TypeError):
                 limit = self.page_size
+        # max_page_size also limits the default. A subclass can set only max_page_size.
+        if limit > self.max_page_size:
+            limit = self.max_page_size
 
         # Get offset (default to 0)
         offset_str = query.get("offset", "0")

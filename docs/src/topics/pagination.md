@@ -17,7 +17,7 @@ api = BoltAPI()
 
 class ArticlePagination(PageNumberPagination):
     page_size = 20
-    max_page_size = 100
+    max_page_size = 100  # Upper limit for the query value and for page_size
     page_size_query_param = "page_size"  # Allow client to customize
 
 @api.get("/articles")
