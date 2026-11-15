@@ -1127,6 +1127,21 @@ class TestCreateSerializerHelpersWithDjango:
         assert "email" in UserSerializer.__annotations__
         assert "is_active" in UserSerializer.__annotations__
 
+    def test_create_serializer_keeps_the_order_of_the_fields(self):
+        """The fields have the order of the `fields` argument, or the order of the model."""
+        names = ["updated_at", "email", "id", "is_staff", "username", "created_at", "is_active"]
+
+        assert create_serializer(User, fields=names).__struct_fields__ == tuple(names)
+        assert create_serializer(User, exclude=["password_hash"]).__struct_fields__ == (
+            "id",
+            "username",
+            "email",
+            "is_active",
+            "is_staff",
+            "created_at",
+            "updated_at",
+        )
+
     @pytest.mark.django_db
     def test_create_serializer_config_applies_end_to_end(self):
         """Test create_serializer uses Config metadata for model mapping and dump behavior."""

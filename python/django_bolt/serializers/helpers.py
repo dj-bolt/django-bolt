@@ -56,17 +56,15 @@ def create_serializer(
         if isinstance(field, models.Field) and field.name is not None
     }
 
-    # Determine which fields to include
-    fields_to_include = set(fields) if fields is not None else set(model_fields.keys())
-
-    if exclude:
-        fields_to_include -= set(exclude)
+    # Keep the order of the `fields` argument, or the order of the model fields.
+    # The field order is the order of the JSON keys and of the schema.
+    field_names = list(fields) if fields is not None else list(model_fields)
+    excluded = set(exclude) if exclude else set()
 
     # Build field annotations
     annotations: dict[str, Any] = {}
-
-    for field_name in fields_to_include:
-        if field_name not in model_fields:
+    for field_name in field_names:
+        if field_name in excluded or field_name not in model_fields:
             continue
 
         field = model_fields[field_name]
