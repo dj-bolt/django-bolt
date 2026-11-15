@@ -700,8 +700,9 @@ class BoltAPI:
                         "type": "http",
                         "method": request.get("method", "GET"),
                         "path": request.get("path", "/"),
-                        "query_string": request.get("query_string", b""),
-                        "headers": request.get("headers", {}),
+                        # Rust keeps both for each route when signals are on.
+                        "query_string": request.get_full_path().partition("?")[2].encode(),
+                        "headers": request.headers,
                     },
                 )
                 try:
@@ -2022,6 +2023,10 @@ class BoltAPI:
                 middleware_meta["needs_headers"] = True
                 middleware_meta["needs_query"] = True
                 middleware_meta["needs_body"] = True
+            elif self._emit_signals:
+                # The scope of request_started has the query string and the headers.
+                middleware_meta["needs_headers"] = True
+                middleware_meta["needs_query"] = True
             elif "rust_arg_bindings" in middleware_meta:
                 # Rust binds every argument from its own request maps, so the
                 # Python source dicts have no reader. Rust then does not build them.
