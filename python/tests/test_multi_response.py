@@ -431,12 +431,12 @@ def test_ellipsis_only_dict_raises_at_registration():
 
 
 # ============================================================================
-# Edge case: non-2xx-only dict uses lowest int code as default
+# Edge case: a dict with no 2xx code keeps the default status 200
 # ============================================================================
 
 
-def test_non_2xx_only_dict_uses_lowest_code():
-    """response_model with only non-2xx codes defaults to lowest int code."""
+def test_non_2xx_only_dict_keeps_the_default_status_200():
+    """response_model with only non-2xx codes does not change the default status of the route."""
     api = BoltAPI()
 
     @api.get("/items", response_model={400: ErrorSchema, 500: ErrorSchema})
@@ -446,7 +446,7 @@ def test_non_2xx_only_dict_uses_lowest_code():
     _method, _path, handler_id, _handler = api._routes[0]
     meta = api._handler_meta[handler_id]
 
-    assert meta["default_status_code"] == 400
+    assert meta["default_status_code"] == 200
 
 
 # ============================================================================
