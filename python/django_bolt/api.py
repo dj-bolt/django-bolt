@@ -1898,6 +1898,13 @@ class BoltAPI:
         _skip_prefix: bool = False,
         _router_middleware: list[Any] | None = None,
     ):
+        # RFC 9110 section 15: a final status is from 200 to 599. A 1xx status is interim.
+        if status_code is not None and not _MIN_RESPONSE_STATUS <= int(status_code) <= _MAX_RESPONSE_STATUS:
+            raise ValueError(
+                f"The status_code of {method} {path} must be an int "
+                f"from {_MIN_RESPONSE_STATUS} to {_MAX_RESPONSE_STATUS}, got {status_code}"
+            )
+
         def decorator(fn: Callable):
             _check_wrapper_takes_handler_arguments(fn)
 

@@ -39,7 +39,7 @@ from django_bolt.exceptions import (
     ValidationException,
     parse_msgspec_decode_error,
 )
-from django_bolt.responses import JSON
+from django_bolt.responses import JSON, StreamingResponse
 from django_bolt.testing import TestClient
 
 
@@ -1037,32 +1037,52 @@ def _status_api() -> BoltAPI:
     def sync_json(code: int):
         return JSON({"ok": True}, status_code=code)
 
+    @api.get("/tuple/{code}", response_model={200: dict, ...: dict})
+    async def status_tuple(code: int):
+        return code, {"ok": True}
+
+    @api.get("/stream/{code}")
+    async def stream(code: int):
+        async def chunks():
+            yield b"x"
+
+        return StreamingResponse(chunks(), status_code=code)
+
     return api
 
 
-@pytest.mark.parametrize("route", ["async-raise", "sync-raise", "async-json", "sync-json"])
-@pytest.mark.parametrize("code", [0, 99, 1000, 65535, 65536, -1])
-def test_a_status_that_is_not_an_http_status_is_a_500_and_not_a_200(route, code, capfd):
+@pytest.mark.parametrize("route", ["async-raise", "sync-raise", "async-json", "sync-json", "tuple", "stream"])
+@pytest.mark.parametrize("code", [0, 99, 100, 101, 199, 600, 700, 999, 1000, 65535, 65536, -1])
+def test_a_status_that_is_not_a_final_http_status_is_a_500(route, code, capfd):
+    """RFC 9110 section 15: a final status is from 200 to 599. A 1xx status is interim."""
     with TestClient(_status_api()) as client:
         response = client.get(f"/{route}/{code}")
     assert response.status_code == 500
     assert response.json() == {"detail": "Internal Server Error"}
     # The Rust core writes its log records to stderr.
     assert (
-        f"[django-bolt] ERROR django_bolt::handler: The response status must be an int from 100 to 999, got {code}."
+        f"[django-bolt] ERROR django_bolt::handler: The response status must be an int from 200 to 599, got {code}."
         " Bolt sends a 500."
     ) in capfd.readouterr().err.splitlines()
 
 
-def test_a_route_status_code_that_is_not_an_http_status_stops_the_start():
+@pytest.mark.parametrize("route", ["async-raise", "sync-raise", "async-json", "sync-json", "tuple", "stream"])
+@pytest.mark.parametrize("code", [200, 201, 302, 404, 418, 599])
+def test_each_final_http_status_goes_to_the_client(route, code):
+    with TestClient(_status_api()) as client:
+        response = client.get(f"/{route}/{code}", follow_redirects=False)
+    assert response.status_code == code
+
+
+@pytest.mark.parametrize("code", [0, 99, 100, 199, 600, 999, 1000])
+def test_a_route_status_code_that_is_not_a_final_http_status_stops_registration(code):
     api = BoltAPI()
 
-    @api.get("/created", status_code=1000)
-    def created():
-        return {"ok": True}
+    with pytest.raises(ValueError, match=f"status_code of GET /created must be an int from 200 to 599, got {code}"):
 
-    with pytest.raises(TypeError, match="'default_status_code' for GET /created must be an int from 100 to 999"):
-        TestClient(api).__enter__()
+        @api.get("/created", status_code=code)
+        def created():
+            return {"ok": True}
 
 
 class Item(msgspec.Struct):

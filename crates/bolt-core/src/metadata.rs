@@ -710,7 +710,7 @@ fn required_bool(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<bool> {
 }
 
 /// Read a required HTTP status code of the route metadata.
-/// A value that is not an int from 0 to 65535 is a TypeError.
+/// A value that is not an int from 200 to 599 is a TypeError.
 fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<StatusCode> {
     let value = required_item(py_meta, key)?;
     if value.is_instance_of::<PyBool>() {
@@ -719,8 +719,8 @@ fn required_status_code(py_meta: &Bound<'_, PyDict>, key: &str) -> PyResult<Stat
     value
         .extract::<u16>()
         .ok()
-        .and_then(|code| StatusCode::from_u16(code).ok())
-        .ok_or_else(|| wrong_type(py_meta, key, "an int from 100 to 999", &value))
+        .and_then(crate::responses::final_status)
+        .ok_or_else(|| wrong_type(py_meta, key, "an int from 200 to 599", &value))
 }
 
 /// Read the `WWW-Authenticate` value that Python built for a route or a mount.
@@ -2467,6 +2467,9 @@ mod tests {
             ("65536", "int"),
             ("-1", "int"),
             ("99", "int"),
+            ("100", "int"),
+            ("199", "int"),
+            ("600", "int"),
             ("1000", "int"),
             ("'200'", "str"),
             ("200.0", "float"),
@@ -2474,7 +2477,7 @@ mod tests {
             assert_eq!(
                 error_of(parse_route(&format!("'default_status_code': {value}"))),
                 format!(
-                    "TypeError: Route metadata 'default_status_code' for GET /x must be an int from 100 to 999, got {name}"
+                    "TypeError: Route metadata 'default_status_code' for GET /x must be an int from 200 to 599, got {name}"
                 ),
                 "{value}"
             );
