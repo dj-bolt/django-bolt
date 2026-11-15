@@ -530,7 +530,8 @@ def cors(
                  use Django settings instead.
         origin_regexes: Patterns for allowed origins, as in CORS_ALLOWED_ORIGIN_REGEXES. Start
                  each pattern with ^ and end it with $. Patterns use the syntax of the Rust
-                 regex crate, which has no look-around and no back-references.
+                 regex crate, which has no look-around and no back-references. A pattern
+                 that does not compile stops startup with ValueError.
         methods: Allowed methods, as a list of str (default: GET, POST, PUT, PATCH, DELETE,
                  OPTIONS, QUERY)
         headers: Allowed headers, as a list of str (default: Content-Type, Authorization)

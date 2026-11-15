@@ -45,9 +45,9 @@ async def tenant_data():
     return {"data": "value"}
 ```
 
-A pattern can match a part of the origin, so start it with `^` and end it with `$`. Patterns use the syntax of the Rust `regex` crate, which has no look-around and no back-references. Bolt ignores an invalid pattern and writes a warning at startup. The route then does not use the global settings either. Bolt rejects only an empty pattern. A pattern such as `.*` or `^` allows every origin.
+A pattern can match a part of the origin, so start it with `^` and end it with `$`. Patterns use the syntax of the Rust `regex` crate, which has no look-around and no back-references. An invalid pattern or an empty pattern stops startup with `ValueError`. Bolt does not reject a pattern that allows too much. A pattern such as `.*` or `^` allows every origin.
 
-The most specific `cors` config applies. A route-level `@cors` takes precedence over the router, and the router takes precedence over the API. A config with no origins and no patterns, such as a router config that sets only `credentials`, keeps the allow list of the outer config. A route takes one cors config. A second `@cors`, or a `@cors` together with `@middleware(type="cors")`, raises `ValueError`. The config stays on the function, so give each route with `@cors` its own function. `@cors` raises `ValueError` when it gets no origin and no pattern. It raises `TypeError` when an origin or a pattern is not a `str`. Give `methods` and `headers` as a list of `str`, `credentials` as a `bool`, and `max_age` as an `int` of 0 or more. Another type raises `TypeError`, and a `max_age` out of range raises `ValueError`. A `cors` dict in the `middleware` of an API or a router gets the same check when the server starts.
+The most specific `cors` config applies. A route-level `@cors` takes precedence over the router, and the router takes precedence over the API. A config with no origins and no patterns, such as a router config that sets only `credentials`, keeps the allow list of the outer config. A route takes one cors config. A second `@cors`, or a `@cors` together with `@middleware(type="cors")`, raises `ValueError`. The config stays on the function, so give each route with `@cors` its own function. `@cors` raises `ValueError` when it gets no origin and no pattern. It raises `TypeError` when an origin or a pattern is not a `str`. Give `methods` and `headers` as a list of `str`, `credentials` as a `bool`, and `max_age` as an `int` of 0 or more. Another type raises `TypeError`, and a `max_age` out of range raises `ValueError`. A `cors` dict in the `middleware` of an API or a router gets the same check when the server starts. A method name or a header name with a character that is not valid in an HTTP header, such as a line break, stops startup with `ValueError`.
 
 A WebSocket route does not use `@cors`. The WebSocket handshake checks the `Origin` header against the global settings only.
 
@@ -78,7 +78,7 @@ CORS_EXPOSE_HEADERS = ["X-Total-Count", "X-Page-Count"]
 CORS_PREFLIGHT_MAX_AGE = 86400  # 24 hours
 ```
 
-Without these settings, Bolt allows the methods `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `QUERY`, and the headers `Content-Type` and `Authorization`. A preflight answer is cached for 3600 seconds. A `"*"` entry in `CORS_ALLOWED_ORIGINS` is not a wildcard. Use `CORS_ALLOW_ALL_ORIGINS = True` to allow each origin. A pattern in `CORS_ALLOWED_ORIGIN_REGEXES` can match a part of the origin, so start it with `^` and end it with `$`.
+Without these settings, Bolt allows the methods `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `QUERY`, and the headers `Content-Type` and `Authorization`. A preflight answer is cached for 3600 seconds. A `"*"` entry in `CORS_ALLOWED_ORIGINS` is not a wildcard. Use `CORS_ALLOW_ALL_ORIGINS = True` to allow each origin. A pattern in `CORS_ALLOWED_ORIGIN_REGEXES` can match a part of the origin, so start it with `^` and end it with `$`. An invalid pattern stops startup with `ImproperlyConfigured`. A value in `CORS_ALLOW_METHODS`, `CORS_ALLOW_HEADERS` or `CORS_EXPOSE_HEADERS` that is not valid in an HTTP header does the same.
 
 ## Rate limiting
 
