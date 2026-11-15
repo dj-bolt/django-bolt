@@ -48,22 +48,25 @@ class FieldConfig:
     """Factory function to create default value."""
 
     description: str | None = None
-    """Description for OpenAPI documentation."""
+    """The ``description`` of the property in the OpenAPI schema."""
 
     title: str | None = None
-    """Title for OpenAPI documentation."""
+    """The ``title`` of the property in the OpenAPI schema."""
 
     examples: list[Any] | None = None
-    """Example values for OpenAPI documentation."""
+    """The ``examples`` list of the property in the OpenAPI schema."""
 
     deprecated: bool = False
-    """Mark this field as deprecated in OpenAPI documentation."""
+    """If True, the property has ``deprecated: true`` in the OpenAPI schema."""
 
     exclude: bool = False
     """Always exclude this field from serialization."""
 
     include_in_schema: bool = True
-    """Whether to include this field in OpenAPI schema."""
+    """
+    If False, the OpenAPI schema has no property for this field, also not in
+    ``required``. The field still validates input and is still in the output.
+    """
 
     def has_default(self) -> bool:
         """Check if this field has a default value."""
@@ -146,12 +149,13 @@ def field(
         alias: Alternative name for this field in JSON input/output.
         default: Default value for this field.
         default_factory: Factory function to create default value (for mutable defaults).
-        description: Description for OpenAPI documentation.
-        title: Title for OpenAPI documentation.
-        examples: Example values for OpenAPI documentation.
-        deprecated: Mark this field as deprecated.
+        description: The description of the property in the OpenAPI schema.
+        title: The title of the property in the OpenAPI schema.
+        examples: A list of example values for the property in the OpenAPI schema.
+        deprecated: If True, the OpenAPI schema marks the property as deprecated.
         exclude: Always exclude this field from serialization.
-        include_in_schema: Whether to include this field in OpenAPI schema.
+        include_in_schema: If False, the OpenAPI schema has no property for this field.
+                           The field still validates input and is still in the output.
 
     Returns:
         A field configuration that can be used as a default value.
