@@ -36,6 +36,25 @@ class TestFieldFunction:
         assert "name" in result
         assert "internal_id" not in result
 
+    def test_write_only_field_is_dropped_and_the_fields_after_it_stay(self):
+        """A write-only field does not hide the fields that follow it, also in a subset."""
+
+        class Account(Serializer):
+            id: int
+            password: str = field(write_only=True)
+            token: str
+            email: str
+
+            class Config:
+                write_only = {"token"}
+
+        account = Account(id=1, password="p", token="t", email="a@example.com")
+        public = {"id": 1, "email": "a@example.com"}
+
+        assert account.dump() == public
+        assert Account.dump_many([account]) == [public]
+        assert Account.subset("id", "token", "email")(id=1, token="t", email="a@example.com").dump() == public
+
     def test_field_write_only_meta(self):
         """Test write_only fields via Meta class."""
 
@@ -346,6 +365,61 @@ class TestDumpMethods:
         # With exclude_defaults - default values are excluded
         result_filtered = user.dump(exclude_defaults=True)
         assert result_filtered == {"name": "John"}
+
+    @pytest.mark.parametrize(
+        ("option", "expected_tag", "expected_post"),
+        [
+            (
+                {"exclude_none": True},
+                {"name": "a", "weight": 1},
+                {"title": "untitled", "size": 1},
+            ),
+            (
+                {"exclude_defaults": True},
+                {"name": "a"},
+                {"parent": None, "subtitle": None, "size": 1},
+            ),
+            (
+                {"by_alias": True},
+                {"name": "a", "note": None, "w": 1},
+                {"note": None, "t": "untitled", "parent": None, "subtitle": None, "size": 1},
+            ),
+        ],
+    )
+    def test_dump_option_applies_to_nested_serializers_dump_many_and_views(self, option, expected_tag, expected_post):
+        """Each path of dump() gives the same output for an option, at each level."""
+
+        class Tag(Serializer):
+            name: str
+            note: str | None = None
+            weight: int = field(alias="w", default=1)
+
+        class Post(Serializer):
+            note: str | None = None
+            title: str = field(alias="t", default="untitled")
+            parent: int | None
+            tag: Tag
+            tags: list[Tag]
+
+            @computed_field
+            def subtitle(self) -> str | None:
+                return None
+
+            @computed_field
+            def size(self) -> int:
+                return len(self.tags)
+
+        tag = Tag(name="a")
+        post = Post(parent=None, tag={"name": "a"}, tags=[{"name": "a"}])
+        expected = {"tag": expected_tag, "tags": [expected_tag], **expected_post}
+
+        assert tag.dump(**option) == expected_tag
+        assert Tag.dump_many([tag], **option) == [expected_tag]
+        assert post.dump(**option) == expected
+        assert Post.dump_many((item for item in [post]), **option) == [expected]
+        view = Post.exclude("unknown")
+        assert view.dump(post, **option) == expected
+        assert view.dump_many([post], **option) == [expected]
 
     def test_dump_json(self):
         """Test dump_json method."""

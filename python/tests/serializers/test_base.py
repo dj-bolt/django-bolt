@@ -515,6 +515,29 @@ class TestModelValidateCollectsAllErrors:
             if tuple(err["loc"]) in {("body", "password"), ("body", "age")}:
                 assert err["type"] == "missing"
 
+    def test_error_list_has_one_entry_for_each_bad_field_and_none_for_an_absent_optional_field(self):
+        class Signup(Serializer):
+            nickname: str = "anon"
+            age: int
+            billing: _Address
+            address: _Address
+            name: str
+            city: str = "x"
+
+        with pytest.raises(RequestValidationError) as exc_info:
+            Signup.model_validate({"age": [], "billing": {"city": 1, "zip": "z"}, "address": {"city": "c"}})
+
+        assert exc_info.value.errors() == [
+            {"loc": ("body", "age"), "msg": "Expected `int`, got `array`", "type": "validation_error"},
+            {
+                "loc": ("body", "billing", "city"),
+                "msg": "Expected `str`, got `int` - at `$.city`",
+                "type": "validation_error",
+            },
+            {"loc": ("body", "address", "zip"), "msg": "Object missing required field `zip`", "type": "missing"},
+            {"loc": ("body", "name"), "msg": "Object missing required field `name`", "type": "missing"},
+        ]
+
     def test_validator_errors_of_a_dict_are_the_errors_of_the_same_json(self):
         class Signup(Serializer):
             email: str
