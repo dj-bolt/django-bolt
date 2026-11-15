@@ -1502,22 +1502,9 @@ class BoltAPI:
 
         # Scan all attributes in the class
         for name in dir(view_cls):
-            # Skip private attributes and standard action methods
-            if name.startswith("_") or name.lower() in {
-                "get",
-                "post",
-                "put",
-                "patch",
-                "delete",
-                "head",
-                "options",
-                "list",
-                "retrieve",
-                "create",
-                "update",
-                "partial_update",
-                "destroy",
-            }:
+            # Skip private attributes. A method with the name of an HTTP method
+            # or of a standard action is a custom action when it has @action.
+            if name.startswith("_"):
                 continue
 
             attr = getattr(view_cls, name)
