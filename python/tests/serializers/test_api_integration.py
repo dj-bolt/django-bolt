@@ -26,6 +26,7 @@ from msgspec import Meta
 
 from django_bolt.api import BoltAPI
 from django_bolt.exceptions import BadRequest
+from django_bolt.responses import JSON
 from django_bolt.serializers import (
     Email,
     NonEmptyStr,
@@ -1688,6 +1689,10 @@ def test_serializer_route_validates_a_returned_dict_and_drops_write_only_fields(
     async def one_async() -> PublicUser:
         return {"id": 1, "username": "a", "password": "p"}
 
+    @api.get("/one-json-async")
+    async def one_json_async() -> PublicUser:
+        return JSON({"id": 1, "username": "a", "password": "p"})
+
     @api.get("/many-sync")
     def many_sync() -> list[PublicUser]:
         return [{"id": 1, "username": "a", "password": "p"}]
@@ -1697,7 +1702,7 @@ def test_serializer_route_validates_a_returned_dict_and_drops_write_only_fields(
         return [{"id": 1, "username": "a", "password": "p"}]
 
     with TestClient(api) as client:
-        for path in ("/one-sync", "/one-async"):
+        for path in ("/one-sync", "/one-async", "/one-json-async"):
             response = client.get(path)
             assert response.status_code == 200, (path, response.text)
             assert response.json() == {"id": 1, "username": "a"}, path

@@ -747,6 +747,15 @@ class TestRotationRejections:
         with pytest.raises(TokenRotationError, match=rf"^{message}$"):
             await rotate_refresh_token(claims, store=InMemoryRevocation(), secret=SECRET, **kwargs)
 
+    @pytest.mark.parametrize("rotate", [True, False], ids=["rotate", "reuse"])
+    @pytest.mark.asyncio
+    async def test_access_token_claims_are_rejected(self, rotate):
+        """A route without ``token_type="refresh"`` must not let an access token renew itself."""
+        pair = create_token_pair("u", secret=SECRET)
+
+        with pytest.raises(TokenRotationError, match=r"^Refresh token has wrong type$"):
+            await rotate_refresh_token(pair.access_claims, store=InMemoryRevocation(), secret=SECRET, rotate=rotate)
+
     @pytest.mark.asyncio
     async def test_revoked_family_message(self):
         store = InMemoryRevocation()

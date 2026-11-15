@@ -174,7 +174,7 @@ def test_unified_viewset_partial_implementation(api):
 
         # POST not registered (create not implemented)
         response = client.post("/articles", json={"title": "Test", "content": "Test", "author": "Test"})
-        assert response.status_code == 404
+        assert response.status_code == 405
 
 
 @pytest.fixture
