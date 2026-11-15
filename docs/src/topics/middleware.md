@@ -541,6 +541,8 @@ Python middleware execution order is explicit and strict:
 3. Route middleware (`@middleware(...)` / function-style `@middleware`)
 4. Handler
 
+One `@middleware(A, B)` runs `A` first and then `B`. When a route has more than one `@middleware` decorator, the decorator nearest to the function runs first. Thus `@middleware(A)` above `@middleware(B)` runs `B` first and then `A`.
+
 For responses, the order is reversed.
 
 `BoltAPI(django_middleware=...)` puts the Django middleware before the entries of `middleware=[...]`. A `DjangoMiddleware` or `DjangoMiddlewareStack` in `middleware=[...]` runs at its position in the list.
