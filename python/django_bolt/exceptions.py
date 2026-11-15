@@ -52,6 +52,18 @@ def _str_header_values(headers: dict[str, Any]) -> dict[str, str]:
     return headers
 
 
+def _status_phrase(status_code: int) -> str:
+    """The standard phrase of a status. A status with no standard phrase, such as 499, gets the phrase of its class."""
+    try:
+        return HTTPStatus(status_code).phrase
+    except ValueError:
+        if 400 <= status_code <= 499:
+            return "Client Error"
+        if 500 <= status_code <= 599:
+            return "Server Error"
+        return "Unknown Status"
+
+
 class HTTPException(BoltException):
     """Base exception for HTTP error responses.
 
@@ -71,7 +83,7 @@ class HTTPException(BoltException):
 
     def __init__(
         self,
-        status_code: int | None = None,
+        status_code: int | str | None = None,
         detail: Any | None = None,
         headers: dict[str, str] | None = None,
         extra: dict[str, Any] | list[Any] | None = None,
@@ -81,14 +93,25 @@ class HTTPException(BoltException):
         """Initialize HTTPException.
 
         Args:
-            status_code: HTTP status code (defaults to class status_code)
-            detail: Exception details or message
+            status_code: HTTP status code (defaults to class status_code). A str
+                here is the detail, and the status is the class status_code.
+            detail: Exception details or message. An empty detail gives the
+                standard phrase of the status.
             headers: HTTP headers to include in response. A number value
                 becomes a str. A value of another type raises TypeError.
             extra: Additional data to include in response
             body: Typed body (for example a msgspec Struct). Encoded as-is,
                 not validated. Declare its schema with ``response_model={code: Type}``.
         """
+        # A str in the first position is the detail, as for BoltException: NotFound("User not found").
+        if isinstance(status_code, str):
+            if detail is not None:
+                raise TypeError(
+                    f"{type(self).__name__} status_code must be an int, not {status_code!r}. "
+                    "A str in the first position is the detail, and then there is no second detail."
+                )
+            status_code, detail = None, status_code
+
         # Handle detail
         if detail is None:
             detail = ""
@@ -97,7 +120,7 @@ class HTTPException(BoltException):
         super().__init__(detail=detail_str)
 
         self.status_code = status_code if status_code is not None else self.status_code
-        self.detail = detail_str if detail_str else HTTPStatus(self.status_code).phrase
+        self.detail = detail_str if detail_str else _status_phrase(self.status_code)
         self.headers = _str_header_values(headers) if headers else {}
         self.extra = extra
         self.body = body
