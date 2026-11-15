@@ -210,11 +210,10 @@ impl Router {
             handler_id,
             native: None,
         };
-        self.insert(method, path, route, false)
+        self.insert(method, path, route)
     }
 
-    /// Register a native route. Unlike a Python route, a native route that has
-    /// the same method and path as another route is an error.
+    /// Register a native route.
     pub fn register_native(
         &mut self,
         py: Python<'_>,
@@ -230,10 +229,12 @@ impl Router {
             handler_id: NATIVE_HANDLER_ID,
             native: Some(native),
         };
-        self.insert(method, path, route, true)
+        self.insert(method, path, route)
     }
 
-    fn insert(&mut self, method: &str, path: &str, route: Route, unique: bool) -> PyResult<()> {
+    /// Add a route. A route that has the method and path of another route is an
+    /// error: the second handler would replace the first with no sign.
+    fn insert(&mut self, method: &str, path: &str, route: Route) -> PyResult<()> {
         let method_router = match method {
             "GET" => &mut self.get,
             "POST" => &mut self.post,
@@ -255,7 +256,7 @@ impl Router {
         // Static routes use O(1) HashMap lookup, dynamic routes use radix tree
         if is_static_path(path) {
             // Static route: store in HashMap for O(1) lookup
-            if unique && method_router.static_routes.contains_key(path) {
+            if method_router.static_routes.contains_key(path) {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Failed to register route: {} {} is already registered",
                     method, path
@@ -681,6 +682,23 @@ mod tests {
             lookup(&router, "GET", "/items/1"),
             Some((0, params(&[("id", "1")])))
         );
+    }
+
+    #[test]
+    fn a_second_static_route_does_not_replace_the_first() {
+        let mut router = router_with(&[("GET", "/items"), ("POST", "/items")]);
+        Python::attach(|py| {
+            let error = router
+                .register("GET", "/items", 2, py.None(), py.None(), py.None())
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "ValueError: Failed to register route: GET /items is already registered"
+            );
+        });
+        assert_eq!(lookup(&router, "GET", "/items"), Some((0, None)));
+        assert_eq!(lookup(&router, "POST", "/items"), Some((1, None)));
     }
 
     #[test]
