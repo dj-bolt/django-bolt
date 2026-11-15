@@ -91,6 +91,8 @@ The `ordering` field does not have to be unique. Bolt also orders by the primary
 
 A `values()` queryset must include the ordering field and the primary key, for example `Article.objects.values("id", "created_at", "title")`. Without one of them, the paginator cannot make the next cursor and raises `ValueError`.
 
+The `ordering` field can be a ForeignKey. Then the cursor holds the key, not the related object. If the related model has `Meta.ordering`, Django orders a ForeignKey name by that ordering and not by the key. Thus the paginator raises `ValueError` for such a name. Use the key name, for example `ordering = "author_id"`.
+
 The `ordering` field must not be null. A null value cannot make a cursor, and SQL compares no value with null. When the last row of a page has a null value, the paginator raises `ValueError`. Order by a field that is never null, or exclude the null values, for example `Article.objects.exclude(published_at=None)`.
 
 The handler must return a QuerySet. The cursor is a filter on the database, and a list has no such filter. For a list, the paginator raises `TypeError`. Use `PageNumberPagination` or `LimitOffsetPagination` for a list.

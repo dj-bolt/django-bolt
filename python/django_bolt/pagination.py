@@ -622,6 +622,8 @@ class CursorPagination(PaginationBase):
             The primary key breaks ties, so the field does not have to be unique.
             A values() queryset must include the primary key.
             The field must not be null: a null value cannot make a cursor.
+            For a ForeignKey, the cursor holds the key. Use the key name ("author_id")
+            when the related model has Meta.ordering.
     """
 
     page_size: int = 100
@@ -676,6 +678,37 @@ class CursorPagination(PaginationBase):
         page_size = self._get_page_size(request)
 
         return {"cursor": cursor_value, "cursor_pk": cursor_pk, "page_size": page_size}
+
+    async def _row_ordering_value(self, row: Any, name: str) -> Any:
+        """
+        Read the ordering value of a row that is not a dict.
+
+        Args:
+            row: Model instance, or a named row of values_list()
+            name: Ordering field with no "-"
+
+        Returns:
+            The value for the cursor. For a ForeignKey, it is the key and not the related object.
+        """
+        state = getattr(row, "__dict__", None)
+        meta = getattr(row, "_meta", None)
+        if state is None or meta is None or name in state:
+            # A loaded field, an annotation, or a row that is not a model instance.
+            return getattr(row, name, None)
+        field = next((f for f in meta.concrete_fields if name in (f.name, f.attname)), None)
+        if field is None:
+            return getattr(row, name, None)
+        if field.attname in state:
+            # A ForeignKey name. The attribute is the related object, and to read it can run a query.
+            related_model = field.related_model
+            if related_model is not None and related_model._meta.ordering:
+                raise ValueError(
+                    f"CursorPagination ordering {self.ordering!r} names a ForeignKey to a model that has "
+                    f"Meta.ordering, so the rows are not in the order of the key. Order by {field.attname!r}."
+                )
+            return state[field.attname]
+        # The queryset defers the field. Load it on the ORM executor, not on the event loop.
+        return await run_in_orm_executor(getattr, row, field.attname)
 
     async def paginate_queryset(self, queryset: Any, request: dict[str, Any], **params: Any) -> Any:
         """
@@ -768,7 +801,7 @@ class CursorPagination(PaginationBase):
                 last_value = last_item[value_key]
                 last_pk = last_item.get(pk_field.attname, last_item.get("pk"))
             else:
-                last_value = getattr(last_item, ordering_field, None)
+                last_value = await self._row_ordering_value(last_item, ordering_field)
                 last_pk = getattr(last_item, "pk", None)
 
             if last_value is None:
