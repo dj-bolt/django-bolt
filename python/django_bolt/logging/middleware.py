@@ -1,22 +1,37 @@
 """Logging middleware for Django-Bolt.
 
-Provides request/response logging with support for Django's logging configuration.
+Bolt calls ``log_exception()`` for a server error. The Rust server writes the
+access log, so ``log_request()`` and ``log_response()`` are deprecated.
 """
+
+from __future__ import annotations
 
 import logging
 import random
+import warnings
 from typing import Any
 
-from .config import LoggingConfig, get_default_logging_config
+from .config import LoggingConfig, get_default_logging_config, warn_deprecated_options
+
+
+def _warn_deprecated_method(name: str) -> None:
+    """Warn that the caller of ``LoggingMiddleware.<name>()`` uses a deprecated method."""
+    warnings.warn(
+        f"LoggingMiddleware.{name}() is deprecated. Bolt does not call it, and the access log of runbolt "
+        "does not use it. A future release removes it. "
+        "See https://bolt.farhana.li/topics/logging/#deprecated-options",
+        DeprecationWarning,
+        stacklevel=3,
+    )
 
 
 class LoggingMiddleware:
-    """Middleware for logging HTTP requests and responses.
+    """The logger of an API, from its ``LoggingConfig``.
 
-    Integrates with Django's logging system and provides structured logging.
+    Bolt calls ``log_exception()`` for a server error.
     """
 
-    __slots__ = ("config", "logger", "_should_time_cached", "_request_debug_enabled_cached")
+    __slots__ = ("config", "logger")
 
     def __init__(self, config: LoggingConfig | None = None):
         """Initialize logging middleware.
@@ -30,26 +45,38 @@ class LoggingMiddleware:
         self.config = config
         self.logger = config.get_logger()
 
-        # Pre-compute debug-level request logging gate at init.
-        request_debug_enabled = False
-        try:
-            request_debug_enabled = self.logger.isEnabledFor(logging.DEBUG)
-        except Exception:
-            request_debug_enabled = False
-        self._request_debug_enabled_cached = request_debug_enabled
-
-        # Pre-compute timing decision at init (not per-request)
-        should_time = False
-        try:
-            if self.logger.isEnabledFor(logging.INFO):
-                should_time = True
-        except Exception:
-            should_time = False
-        if not should_time:
-            should_time = bool(getattr(config, "min_duration_ms", None))
-        self._should_time_cached = should_time
-
     def obfuscate_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        """Deprecated. Obfuscate sensitive headers."""
+        _warn_deprecated_method("obfuscate_headers")
+        return self._obfuscate_headers(headers)
+
+    def obfuscate_cookies(self, cookies: dict[str, str]) -> dict[str, str]:
+        """Deprecated. Obfuscate sensitive cookies."""
+        _warn_deprecated_method("obfuscate_cookies")
+        return self._obfuscate_cookies(cookies)
+
+    def extract_request_data(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Deprecated. Extract request data for logging."""
+        _warn_deprecated_method("extract_request_data")
+        return self._extract_request_data(request)
+
+    def log_request(self, request: dict[str, Any]) -> None:
+        """Deprecated. Log an HTTP request at DEBUG."""
+        _warn_deprecated_method("log_request")
+        self._log_request(request)
+
+    def log_response(
+        self,
+        request: dict[str, Any],
+        status_code: int,
+        duration: float,
+        response_size: int | None = None,
+    ) -> None:
+        """Deprecated. Log an HTTP response. The access log of runbolt does this."""
+        _warn_deprecated_method("log_response")
+        self._log_response(request, status_code, duration, response_size)
+
+    def _obfuscate_headers(self, headers: dict[str, str]) -> dict[str, str]:
         """Obfuscate sensitive headers.
 
         Args:
@@ -66,7 +93,7 @@ class LoggingMiddleware:
                 obfuscated[key] = value
         return obfuscated
 
-    def obfuscate_cookies(self, cookies: dict[str, str]) -> dict[str, str]:
+    def _obfuscate_cookies(self, cookies: dict[str, str]) -> dict[str, str]:
         """Obfuscate sensitive cookies.
 
         Args:
@@ -83,7 +110,7 @@ class LoggingMiddleware:
                 obfuscated[key] = value
         return obfuscated
 
-    def extract_request_data(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _extract_request_data(self, request: dict[str, Any]) -> dict[str, Any]:
         """Extract request data for logging.
 
         Args:
@@ -108,7 +135,7 @@ class LoggingMiddleware:
         if "headers" in self.config.request_log_fields:
             headers = request.get("headers", {})
             if headers:
-                data["headers"] = self.obfuscate_headers(headers)
+                data["headers"] = self._obfuscate_headers(headers)
 
         if "body" in self.config.request_log_fields and self.config.log_request_body:
             body = request.get("body", b"")
@@ -138,7 +165,7 @@ class LoggingMiddleware:
 
         return data
 
-    def log_request(self, request: dict[str, Any]) -> None:
+    def _log_request(self, request: dict[str, Any]) -> None:
         """Log an HTTP request.
 
         Args:
@@ -152,7 +179,7 @@ class LoggingMiddleware:
         if not self.logger.isEnabledFor(logging.DEBUG):
             return
 
-        data = self.extract_request_data(request)
+        data = self._extract_request_data(request)
 
         # Build log message from configured fields only
         message_parts = []
@@ -166,7 +193,7 @@ class LoggingMiddleware:
         # Log requests at DEBUG level (less important than responses)
         self.logger.log(logging.DEBUG, message, extra=data)
 
-    def log_response(
+    def _log_response(
         self,
         request: dict[str, Any],
         status_code: int,
@@ -294,7 +321,7 @@ def create_logging_middleware(
 
     Args:
         logger_name: Logger name (defaults to 'django.server')
-        log_level: Log level (defaults to DEBUG in DEBUG mode, INFO otherwise)
+        log_level: Deprecated. The level of the logger applies.
         **kwargs: Additional configuration options
 
     Returns:
@@ -313,4 +340,5 @@ def create_logging_middleware(
         if hasattr(config, key):
             setattr(config, key, value)
 
+    warn_deprecated_options(config, stacklevel=3)
     return LoggingMiddleware(config)

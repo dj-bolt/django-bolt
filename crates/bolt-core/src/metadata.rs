@@ -630,8 +630,8 @@ pub struct RouteMetadata {
     /// callable that takes the auth context and returns True for a revoked
     /// token. The handshake awaits it before the upgrade.
     pub websocket_revocation_check: Option<Arc<Py<PyAny>>>,
-    /// Sampling and the slow-request threshold of the access log, from the
-    /// `LoggingConfig` of the API of the route.
+    /// The logger, the sampling, the skips and the slow-request threshold of
+    /// the access log, from the `LoggingConfig` of the API of the route.
     pub access_log_filter: AccessLogFilter,
 }
 

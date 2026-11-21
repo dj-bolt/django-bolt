@@ -1,5 +1,5 @@
-//! The access-log filter of a route: sampling, the slow-request threshold, and
-//! the paths and status codes that write no line.
+//! The access-log filter of a route: its logger, sampling, the slow-request
+//! threshold, and the paths and status codes that write no line.
 //!
 //! Python gives the values of `LoggingConfig` at route registration. The
 //! request path reads them from the route metadata, with no Python call.
@@ -21,6 +21,63 @@ const MIN_DURATION_KEY: &str = "access_log_min_duration_ms";
 const SKIP_PATHS_KEY: &str = "access_log_skip_paths";
 /// Route metadata key of `LoggingConfig.skip_status_codes`.
 const SKIP_STATUS_CODES_KEY: &str = "access_log_skip_status_codes";
+/// Route metadata key of `LoggingConfig.logger_name`.
+const LOGGER_NAME_KEY: &str = "access_log_logger_name";
+/// The logger of a route with no `logger_name`.
+pub const DEFAULT_LOGGER_NAME: &str = "django.server";
+
+/// A Python logger of the access log and its levels, read once at startup.
+#[derive(Debug)]
+pub struct AccessLogger {
+    /// The INFO, WARNING and ERROR bits that the logger writes. 0 writes no line.
+    pub levels: u8,
+    pub logger: Py<PyAny>,
+}
+
+impl AccessLogger {
+    /// Get the logger `name` and read the levels that it writes.
+    pub fn read(py: Python<'_>, name: &str) -> PyResult<Self> {
+        let logger = py.import("logging")?.call_method1("getLogger", (name,))?;
+        let mut levels = 0;
+        for (bit, level) in [(1, 20), (2, 30), (4, 40)] {
+            if logger
+                .call_method1("isEnabledFor", (level,))?
+                .extract::<bool>()?
+            {
+                levels |= bit;
+            }
+        }
+        Ok(Self {
+            levels,
+            logger: logger.unbind(),
+        })
+    }
+}
+
+/// Read the logger of each filter once. Each filter gets the index of its
+/// logger in the result. Index 0 is `django.server`, the logger of a route
+/// with no `logger_name` and of a route with no metadata.
+pub fn read_access_loggers<'a>(
+    py: Python<'_>,
+    filters: impl IntoIterator<Item = &'a mut AccessLogFilter>,
+) -> PyResult<Vec<AccessLogger>> {
+    let mut names = vec![DEFAULT_LOGGER_NAME.to_string()];
+    let mut loggers = vec![AccessLogger::read(py, DEFAULT_LOGGER_NAME)?];
+    for filter in filters {
+        let Some(name) = filter.logger_name.as_deref() else {
+            continue;
+        };
+        filter.logger = match names.iter().position(|known| known == name) {
+            Some(index) => index,
+            None => {
+                loggers.push(AccessLogger::read(py, name)?);
+                names.push(name.to_string());
+                names.len() - 1
+            }
+        };
+    }
+    Ok(loggers)
+}
 
 /// Which responses of a route write an access-log line.
 /// The sample rate and the threshold apply to a 1xx to 3xx response only.
@@ -37,6 +94,10 @@ pub struct AccessLogFilter {
     skip_paths: AHashSet<String>,
     /// A response with one of these status codes writes no line.
     skip_status_codes: Vec<u16>,
+    /// `LoggingConfig.logger_name`. `None` is `django.server`.
+    logger_name: Option<String>,
+    /// The index of the logger in `AppState::access_loggers`. Startup sets it.
+    pub logger: usize,
 }
 
 impl AccessLogFilter {
@@ -47,7 +108,15 @@ impl AccessLogFilter {
             has_limit: sample_rate.is_some() || min_duration_ms.is_some(),
             skip_paths: AHashSet::new(),
             skip_status_codes: Vec::new(),
+            logger_name: None,
+            logger: 0,
         }
+    }
+
+    /// Write the lines to the logger `name` in place of `django.server`.
+    pub fn with_logger_name(mut self, name: impl Into<String>) -> Self {
+        self.logger_name = Some(name.into());
+        self
     }
 
     /// Add the request paths and the status codes that write no line.
@@ -90,7 +159,14 @@ impl AccessLogFilter {
             Some(value) if !value.is_none() => value.extract::<Vec<u16>>()?,
             _ => Vec::new(),
         };
-        Ok(Self::new(sample_rate, min_duration_ms).with_skips(skip_paths, skip_status_codes))
+        let filter =
+            Self::new(sample_rate, min_duration_ms).with_skips(skip_paths, skip_status_codes);
+        match py_meta.get_item(LOGGER_NAME_KEY)? {
+            Some(value) if !value.is_none() => {
+                Ok(filter.with_logger_name(value.extract::<String>()?))
+            }
+            _ => Ok(filter),
+        }
     }
 
     /// `true` when the config of the route skips this request path or this
@@ -191,7 +267,9 @@ pub fn rejection_line_at(now: Instant) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessLogFilter, RejectionLineLimit, random_unit, rejection_line_at};
+    use super::{
+        AccessLogFilter, RejectionLineLimit, random_unit, read_access_loggers, rejection_line_at,
+    };
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
     use std::time::{Duration, Instant};
@@ -294,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn from_python_reads_the_two_keys_and_refuses_a_value_out_of_range() {
+    fn from_python_reads_the_keys_and_refuses_a_value_out_of_range() {
         Python::initialize();
         Python::attach(|py| {
             let meta = PyDict::new(py);
@@ -325,11 +403,60 @@ mod tests {
             assert!(AccessLogFilter::from_python(&meta).is_err());
             meta.del_item("access_log_skip_status_codes").unwrap();
 
+            meta.set_item("access_log_logger_name", "myapp.api")
+                .unwrap();
+            assert_eq!(
+                AccessLogFilter::from_python(&meta).unwrap(),
+                AccessLogFilter::new(Some(0.05), Some(250.0))
+                    .with_skips(["/ready".to_string(), "/health".to_string()], [])
+                    .with_logger_name("myapp.api")
+            );
+            meta.set_item("access_log_logger_name", 7).unwrap();
+            assert!(AccessLogFilter::from_python(&meta).is_err());
+            meta.del_item("access_log_logger_name").unwrap();
+
             meta.set_item("access_log_sample_rate", 1.5).unwrap();
             assert!(AccessLogFilter::from_python(&meta).is_err());
             meta.set_item("access_log_sample_rate", py.None()).unwrap();
             meta.set_item("access_log_min_duration_ms", -1).unwrap();
             assert!(AccessLogFilter::from_python(&meta).is_err());
+        });
+    }
+
+    #[test]
+    fn each_logger_name_is_read_once_and_index_0_is_django_server() {
+        Python::initialize();
+        Python::attach(|py| {
+            let logging = py.import("logging").unwrap();
+            logging
+                .call_method1("getLogger", ("access_log_test.quiet",))
+                .unwrap()
+                .call_method1("setLevel", (30,))
+                .unwrap();
+            let mut filters = [
+                AccessLogFilter::default().with_logger_name("access_log_test.quiet"),
+                AccessLogFilter::default(),
+                AccessLogFilter::default().with_logger_name("access_log_test.other"),
+                AccessLogFilter::default().with_logger_name("access_log_test.quiet"),
+                AccessLogFilter::default().with_logger_name("django.server"),
+            ];
+            let loggers = read_access_loggers(py, filters.iter_mut()).unwrap();
+            let indexes: Vec<usize> = filters.iter().map(|filter| filter.logger).collect();
+            assert_eq!(indexes, [1, 0, 2, 1, 0]);
+            assert_eq!(loggers.len(), 3);
+            let name = |index: usize| -> String {
+                loggers[index]
+                    .logger
+                    .bind(py)
+                    .getattr("name")
+                    .unwrap()
+                    .extract()
+                    .unwrap()
+            };
+            assert_eq!(name(0), "django.server");
+            assert_eq!(name(1), "access_log_test.quiet");
+            // A logger at WARNING writes the WARNING and the ERROR lines only.
+            assert_eq!(loggers[1].levels, 2 | 4);
         });
     }
 

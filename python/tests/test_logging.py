@@ -30,6 +30,7 @@ from django_bolt.logging.config import (
     _BoundedQueueListener,
     _DropOnFullQueueHandler,
     _ensure_queue_logging,
+    access_log_filter_meta,
     get_default_logging_config,
     setup_django_logging,
 )
@@ -81,18 +82,43 @@ class TestLoggingConfig:
         config = LoggingConfig(logger_name="custom.logger")
         assert config.logger_name == "custom.logger"
 
-    def test_custom_request_fields(self):
-        """Custom request fields should be configurable."""
-        config = LoggingConfig(request_log_fields={"method", "path", "body", "client_ip"})
-        assert "body" in config.request_log_fields
-        assert "client_ip" in config.request_log_fields
+    @pytest.mark.parametrize(
+        ("option", "value"),
+        [
+            ("request_log_fields", {"method", "path", "body"}),
+            ("response_log_fields", {"status_code", "duration"}),
+            ("obfuscate_headers", {"authorization"}),
+            ("obfuscate_cookies", set()),
+            ("log_request_body", True),
+            ("log_response_body", True),
+            ("max_body_log_size", 10),
+            ("log_level", "DEBUG"),
+        ],
+    )
+    def test_a_deprecated_option_warns_and_keeps_its_value(self, option, value):
+        """The options with no effect on the access log warn. The warning points at the caller."""
+        with pytest.warns(DeprecationWarning, match=rf"LoggingConfig options {option} are deprecated") as record:
+            config = LoggingConfig(**{option: value})
+        assert getattr(config, option) == value
+        assert record[0].filename == __file__
 
-    def test_custom_response_fields(self):
-        """Custom response fields should be configurable."""
-        config = LoggingConfig(response_log_fields={"status_code", "duration", "size"})
-        assert "status_code" in config.response_log_fields
-        assert "duration" in config.response_log_fields
-        assert "size" in config.response_log_fields
+    def test_the_default_config_warns_for_no_option(self, recwarn):
+        LoggingConfig()
+        LoggingConfig(logger_name="myapp.api", skip_paths=set(), sample_rate=0.5, min_duration_ms=10)
+        get_default_logging_config()
+        create_logging_middleware()
+        assert not [warning for warning in recwarn if warning.category is DeprecationWarning]
+
+    def test_the_logger_name_goes_to_the_route_metadata(self):
+        """Rust reads the key at startup. The default logger adds no key."""
+        assert "access_log_logger_name" not in access_log_filter_meta(LoggingConfig())
+        meta = access_log_filter_meta(LoggingConfig(logger_name="myapp.api"))
+        assert meta["access_log_logger_name"] == "myapp.api"
+
+    @pytest.mark.parametrize("name", ["", None])
+    def test_a_logger_name_that_is_not_a_name_stops_the_api(self, name):
+        with pytest.raises(ValueError, match="LoggingConfig.logger_name must be a logger name"):
+            BoltAPI(logging_config=LoggingConfig(logger_name=name))
 
     def test_sample_rate_configuration(self):
         """Sample rate should be configurable for reducing 2xx/3xx log volume."""
@@ -214,8 +240,32 @@ class TestLoggingConfig:
         assert logger.name == "test.logger"
 
 
+# log_request(), log_response(), extract_request_data() and obfuscate_*() are
+# deprecated. These tests cover them until a release removes them.
+@pytest.mark.filterwarnings(
+    r"ignore:LoggingMiddleware\.\w+\(\) is deprecated:DeprecationWarning",
+    "ignore:LoggingConfig options .* are deprecated:DeprecationWarning",
+)
 class TestLoggingMiddleware:
     """Test LoggingMiddleware behavior."""
+
+    @pytest.mark.filterwarnings("error::DeprecationWarning")
+    @pytest.mark.parametrize(
+        ("method", "args"),
+        [
+            ("log_request", ({"method": "GET", "path": "/a"},)),
+            ("log_response", ({"method": "GET", "path": "/a"}, 200, 0.1)),
+            ("extract_request_data", ({"method": "GET", "path": "/a"},)),
+            ("obfuscate_headers", ({"authorization": "x"},)),
+            ("obfuscate_cookies", ({"sessionid": "x"},)),
+        ],
+    )
+    def test_a_deprecated_method_warns_once_at_the_caller(self, method, args):
+        middleware = LoggingMiddleware(LoggingConfig())
+        with pytest.warns(DeprecationWarning, match=rf"LoggingMiddleware\.{method}\(\) is deprecated") as record:
+            getattr(middleware, method)(*args)
+        assert len(record) == 1
+        assert record[0].filename == __file__
 
     def test_middleware_uses_default_config_when_none_provided(self):
         """Middleware should use default config when none is provided."""
@@ -778,8 +828,10 @@ class TestLoggingHelpers:
         assert middleware.config.logger_name == "custom.logger"
 
     def test_create_logging_middleware_with_custom_log_level(self):
-        """create_logging_middleware should accept custom log level."""
-        middleware = create_logging_middleware(log_level="DEBUG")
+        """log_level is deprecated. The warning points at the caller."""
+        with pytest.warns(DeprecationWarning, match="LoggingConfig options log_level are deprecated") as record:
+            middleware = create_logging_middleware(log_level="DEBUG")
+        assert record[0].filename == __file__
         assert isinstance(middleware, LoggingMiddleware)
         assert middleware.config.log_level == "DEBUG"
 

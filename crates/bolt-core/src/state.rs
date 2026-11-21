@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+use crate::access_log::AccessLogger;
 use crate::metadata::{CompressionConfig, CorsConfig, RouteMetadata, RouteMetadataStore};
 use crate::middleware::client_ip::TrustedProxies;
 use crate::middleware::rate_limit::RateLimiters;
@@ -126,8 +127,9 @@ pub struct AppState {
     pub extensions: http::Extensions, // Per-app state owned by higher-level crates (e.g. bolt-mcp mounts).
     pub static_files_config: Option<Arc<ScopeConfig>>,
     pub media_files_config: Option<Arc<ScopeConfig>>,
-    pub access_log_levels: u8, // INFO, WARNING, ERROR bits, read at startup.
-    pub access_logger: Option<Py<PyAny>>, // Python logger instance for access logging (django.server). None when disabled.
+    /// The loggers of the access log, read at startup. Index 0 is `django.server`.
+    /// The filter of a route holds the index of its logger. Empty when the log is off.
+    pub access_loggers: Vec<AccessLogger>,
     /// `error_handlers.render_core_error` bound to the error formatter of the
     /// app. None when the app has no formatter. Called on error responses only.
     pub error_renderer: Option<Py<PyAny>>,

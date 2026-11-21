@@ -834,7 +834,7 @@ pub async fn handle_request<const ACCESS_LOG: bool>(
 }
 
 /// The level bit and the logger method for the access-log line of `status`.
-/// The bits are those of `AppState::access_log_levels`.
+/// The bits are those of `AccessLogger::levels`.
 #[inline]
 fn access_log_level(status: u16) -> (u8, &'static str) {
     if status >= 500 {
@@ -846,10 +846,11 @@ fn access_log_level(status: u16) -> (u8, &'static str) {
     }
 }
 
-/// Write the access-log line of one response to the `django.server` logger.
-/// The filter of the route `handler_id` holds the skipped paths and status
-/// codes, the sample rate and the slow-request threshold. A 4xx or a 5xx always
-/// passes the last two. A route with no metadata has no filter.
+/// Write the access-log line of one response to the logger of the route
+/// `handler_id`. The filter of the route holds the index of its logger, the
+/// skipped paths and status codes, the sample rate and the slow-request
+/// threshold. A 4xx or a 5xx always passes the last two. A route with no
+/// metadata has no filter and writes to `django.server`.
 fn write_access_log(
     state: &AppState,
     req: &HttpRequest,
@@ -858,14 +859,16 @@ fn write_access_log(
     handler_id: usize,
 ) {
     let (bit, level) = access_log_level(status);
-    if state.access_log_levels & bit == 0 {
-        return;
-    }
-    let Some(logger) = state.access_logger.as_ref() else {
+    let meta = state.route_metadata.get(handler_id);
+    let logger_index = meta.map_or(0, |meta| meta.access_log_filter.logger);
+    let Some(logger) = state.access_loggers.get(logger_index) else {
         return;
     };
+    if logger.levels & bit == 0 {
+        return;
+    }
     let dur_ms = start.elapsed().as_secs_f64() * 1000.0;
-    if let Some(meta) = state.route_metadata.get(handler_id) {
+    if let Some(meta) = meta {
         let filter = &meta.access_log_filter;
         if filter.skips(req.path(), status) || !filter.keeps(status, dur_ms) {
             return;
@@ -895,7 +898,7 @@ fn write_access_log(
         format!("{msg} | suppressed: {suppressed}")
     };
     Python::attach(|py| {
-        let _ = logger.call_method1(py, level, (msg,));
+        let _ = logger.logger.call_method1(py, level, (msg,));
     });
 }
 
