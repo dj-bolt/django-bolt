@@ -28,6 +28,26 @@ async def count() -> int:
     return 3  # Body: 3, Content-Type: application/json
 ```
 
+### Values in a JSON response
+
+A dict, a list or a `msgspec.Struct` can contain these values. The table gives the JSON form of each value.
+
+| Value | JSON |
+| --- | --- |
+| `str`, `int`, `float`, `bool`, `None`, `dict`, `list`, `tuple`, `set`, `frozenset` | the same JSON value, as msgspec encodes it |
+| `Decimal`, `Fraction` | a string, such as `"1.50"` or `"1/3"` |
+| `UUID`, `Path`, an IP address or network, a compiled `re.Pattern`, `UserString` | a string |
+| `date`, `time`, `datetime`, `timedelta` | an ISO 8601 string |
+| `Enum` member | its value |
+| `bytes`, `bytearray` | a base64 string |
+| `ChainMap`, `MappingProxyType`, `UserDict` | an object |
+| `deque`, `UserList`, `range`, `array.array`, a dict view (`d.keys()`, `d.values()`, `d.items()`) | an array |
+| a generator, a `map` object, a `zip` object | an array of the items that it gives |
+
+A subclass of a type in the table has the JSON form of its base type. The items of a container go through the same rules.
+
+Bolt refuses a value with no clear JSON form, such as a `ZoneInfo`, a `datetime.timezone`, a `SimpleNamespace` or a `complex`. Django's `DjangoJSONEncoder` also refuses these values. The response is then a 500 with `TypeError: Unsupported type`. Convert such a value before you return it, for example `str(zone)` or `vars(namespace)`.
+
 `None` is the JSON `null` when the response type allows it, such as `-> None` or `-> int | None`. With no such response type, a `None` result is an error, because the handler has no `return`. A `-> None` route validates its result: a result that is not `None` is a response validation error. A response object, such as `JSON(...)` or `Response(...)`, has its own body and is not validated on a `-> None` route. A `str` and `bytes` are not JSON, see [Returning strings and bytes](#returning-strings-and-bytes).
 
 ### Custom status codes and headers

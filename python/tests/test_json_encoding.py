@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
-from collections import deque
-from datetime import UTC, datetime, time, timedelta
+from array import array
+from collections import ChainMap, OrderedDict, UserDict, UserList, UserString, deque
+from datetime import UTC, datetime, time, timedelta, timezone
 from decimal import Decimal
 from fractions import Fraction
+from types import MappingProxyType, SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import msgspec
 import pytest
@@ -100,6 +103,29 @@ STANDARD_VALUES = {
     "fraction": (lambda: Fraction(-1, 3), '"-1/3"'),
     "fraction-integer": (lambda: Fraction(4, 2), '"2"'),
     "pattern": (lambda: re.compile("a+"), '"a+"'),
+    # A mapping is a JSON object. A sequence or an iterator is a JSON array.
+    "chainmap": (lambda: ChainMap({"a": 1}, {"a": 2, "b": 2}), '{"a":1,"b":2}'),
+    "mappingproxy": (lambda: MappingProxyType({"a": Decimal("1.50")}), '{"a":"1.50"}'),
+    "userdict": (lambda: UserDict({"a": 1}), '{"a":1}'),
+    "range": (lambda: range(1, 4), "[1,2,3]"),
+    "array": (lambda: array("i", [1, 2]), "[1,2]"),
+    "array-float": (lambda: array("d", [1.5]), "[1.5]"),
+    "dict-keys": (lambda: {"a": 1, "b": 2}.keys(), '["a","b"]'),
+    "dict-values": (lambda: {"a": 1, "b": 2}.values(), "[1,2]"),
+    "dict-items": (lambda: {"a": 1}.items(), '[["a",1]]'),
+    "ordered-dict-keys": (lambda: OrderedDict(a=1).keys(), '["a"]'),
+    "userlist": (lambda: UserList([1, deque([2])]), "[1,[2]]"),
+    "map": (lambda: map(str, [1, 2]), '["1","2"]'),
+    "zip": (lambda: zip([1, 2], "ab", strict=True), '[[1,"a"],[2,"b"]]'),
+    "userstring": (lambda: UserString("hi"), '"hi"'),
+}
+
+# Types with no obvious JSON form. Django's DjangoJSONEncoder also refuses them.
+REFUSED_VALUES = {
+    "zoneinfo": lambda: ZoneInfo("UTC"),
+    "timezone": lambda: timezone(timedelta(hours=1)),
+    "namespace": lambda: SimpleNamespace(a=1),
+    "complex": lambda: complex(1, 2),
 }
 
 
@@ -116,6 +142,18 @@ def test_a_standard_container_or_scalar_in_a_response_encodes(name: str) -> None
         response = client.get("/value")
         assert response.status_code == 200
         assert response.text == '{"v":' + expected + "}"
+
+
+@pytest.mark.parametrize("name", list(REFUSED_VALUES))
+def test_a_value_with_no_json_form_in_a_response_is_a_server_error(name: str) -> None:
+    api = BoltAPI()
+
+    @api.get("/value")
+    async def value():
+        return {"v": REFUSED_VALUES[name]()}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        assert client.get("/value").status_code == 500
 
 
 def test_encode_django_safe_string() -> None:
