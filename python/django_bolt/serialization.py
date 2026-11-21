@@ -214,6 +214,7 @@ _VALIDATION_NOOP_TYPES = {
     str,
     bytes,
     bytearray,
+    type(None),
 }
 # The scalar results that Bolt sends as JSON. A bool is an int. A str is
 # text/plain and bytes are application/octet-stream. None is JSON only when
@@ -240,6 +241,34 @@ def _raise_plain_type_mismatch(expected: type, result: Any) -> NoReturn:
             f"Response type mismatch: expected {expected.__name__}, but handler returned {type(result).__name__}."
         )
     )
+
+
+def _compile_none_handlers(
+    data_handler: Callable[..., Any], data_handler_sync: Callable[..., Any]
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Compile the data handlers of a route with the response type ``None``.
+
+    Only ``None`` goes to the general data handlers of the route. Each other
+    result is a response validation error. ``None`` has no validator, so the
+    route keeps the executors of a route with no response validation.
+    """
+
+    def refuse(result: Any) -> NoReturn:
+        _raise_response_validation_error(
+            TypeError(f"Response type mismatch: expected None, but handler returned {type(result).__name__}.")
+        )
+
+    def handler_sync(result: Any, status_code: int | None = None) -> ResponseWireV1:
+        if result is None:
+            return data_handler_sync(result, status_code)
+        refuse(result)
+
+    async def handler(result: Any, status_code: int | None = None) -> ResponseWireV1:
+        if result is None:
+            return await data_handler(result, status_code)
+        refuse(result)
+
+    return handler, handler_sync
 
 
 def _compile_plain_container_handlers(
@@ -1195,21 +1224,14 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     # JSON or Response with another status (a 400 error map, a 202 receipt)
     # carries a different body, so Bolt encodes it as-is. Per-status schemas
     # come from ``response_model={code: type}``.
-    # A -> None route does not validate the body of a JSON or Response object,
-    # so a handler that builds each response can use -> None.
-    if meta.get("response_type") is type(None):
-        content_validator_sync = content_validator_async = None
-    else:
-        content_validator_sync, content_validator_async = validator_sync, validator_async
-
     async def response_type_handler(result: Any) -> ResponseWireV1:
         # The lookup gives an exact response type its own class. This check only skips it.
         if (cls := result.__class__) is not JSON and cls not in _RESPONSE_CLASSES:  # pragma: no mutate
             cls = _response_base_class(result)
         if cls is JSON:
-            if content_validator_async is not None and result.status_code == default_status_code:
+            if validator_async is not None and result.status_code == default_status_code:
                 try:
-                    validated = await content_validator_async(result.data)
+                    validated = await validator_async(result.data)
                 except ResponseValidationError:
                     raise
                 except Exception as exc:
@@ -1223,12 +1245,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
             if (
-                content_validator_async is not None
+                validator_async is not None
                 and result.status_code == default_status_code
                 and not isinstance(result.content, (bytes, bytearray, memoryview))
             ):
                 try:
-                    validated = await content_validator_async(result.content)
+                    validated = await validator_async(result.content)
                 except ResponseValidationError:
                     raise
                 except Exception as exc:
@@ -1246,9 +1268,9 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if (cls := result.__class__) is not JSON and cls not in _RESPONSE_CLASSES:  # pragma: no mutate
             cls = _response_base_class(result)
         if cls is JSON:
-            if content_validator_sync is not None and result.status_code == default_status_code:
+            if validator_sync is not None and result.status_code == default_status_code:
                 try:
-                    validated = content_validator_sync(result.data)
+                    validated = validator_sync(result.data)
                 except ResponseValidationError:
                     raise
                 except Exception as exc:
@@ -1262,12 +1284,12 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
             if (
-                content_validator_sync is not None
+                validator_sync is not None
                 and result.status_code == default_status_code
                 and not isinstance(result.content, (bytes, bytearray, memoryview))
             ):
                 try:
-                    validated = content_validator_sync(result.content)
+                    validated = validator_sync(result.content)
                 except ResponseValidationError:
                     raise
                 except Exception as exc:
@@ -1284,6 +1306,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         data_handler, data_handler_sync = _compile_plain_container_handlers(
             plain_type, default_status_code, prepare_list, data_handler, data_handler_sync
         )
+    elif meta["validate_response"] and plain_type is type(None):
+        data_handler, data_handler_sync = _compile_none_handlers(data_handler, data_handler_sync)
 
     meta["_default_response_handler"] = data_handler
     meta["_default_response_handler_sync"] = data_handler_sync

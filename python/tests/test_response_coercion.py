@@ -711,7 +711,7 @@ def test_other_generic_type_is_validated(client):
 
 @pytest.mark.parametrize("is_async", [True, False], ids=["async", "sync"])
 @pytest.mark.parametrize(
-    ("value", "got"), [({"a": 1}, "object"), ([1], "array"), (3, "int"), (Item(id=1), "Item")], ids=repr
+    ("value", "got"), [({"a": 1}, "dict"), ([1], "list"), (3, "int"), (Item(id=1), "Item")], ids=repr
 )
 def test_none_response_type_rejects_a_result_that_is_not_none(settings, value, got, is_async):
     settings.DEBUG = True
@@ -720,7 +720,7 @@ def test_none_response_type_rejects_a_result_that_is_not_none(settings, value, g
     api.get("/unvalidated", validate_response=False, response_model=type(None))(lambda: value)
 
     with TestClient(api) as none_client:
-        assert f"Expected `null`, got `{got}`" in _validation_message(none_client.get("/bad"))
+        assert f"expected None, but handler returned {got}" in _validation_message(none_client.get("/bad"))
         # A route with no validation sends the result as before.
         assert none_client.get("/unvalidated").status_code == 200
 
