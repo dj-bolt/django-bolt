@@ -286,6 +286,56 @@ def test_header_or_cookie_model_refuses_a_list_field_default_of_two_items(marker
         api.get("/tagged")(tagged)
 
 
+@pytest.mark.parametrize("marker", [Header, Cookie])
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        Annotated[list[str], msgspec.Meta(min_length=0)],
+        Annotated[list[str], msgspec.Meta(min_length=0)] | None,
+    ],
+    ids=["constrained", "optional-constrained"],
+)
+def test_constrained_one_value_list_refuses_a_default_of_two_items(marker, annotation) -> None:
+    """A msgspec.Meta constraint keeps Annotated on the type. The check still finds the list."""
+    api = BoltAPI()
+
+    async def tagged(tags=["a", "b"]):  # noqa: B006
+        return tags
+
+    tagged.__annotations__ = {"tags": Annotated[annotation, marker()]}
+    with pytest.raises(TypeError, match=r"'tags'.*default .* has 2 items"):
+        api.get("/tagged")(tagged)
+
+
+@pytest.mark.parametrize("marker", [Header, Cookie])
+def test_constrained_one_value_list_accepts_a_default_of_one_item(marker) -> None:
+    """A default of one item is valid for maxItems: 1."""
+    api = BoltAPI()
+
+    async def tagged(tags=["a"]):  # noqa: B006
+        return tags
+
+    tagged.__annotations__ = {"tags": Annotated[list[str], msgspec.Meta(min_length=0), marker()]}
+    api.get("/tagged")(tagged)
+
+
+class TaggedFactoryModel(msgspec.Struct):
+    tags: list[str] = msgspec.field(default_factory=lambda: ["a", "b"])
+
+
+@pytest.mark.parametrize("marker", [Header, Cookie])
+def test_header_or_cookie_model_refuses_a_default_factory_of_two_items(marker) -> None:
+    """A default_factory gives the default at run time. The check uses that value."""
+    api = BoltAPI()
+
+    async def tagged(model):
+        return model.tags
+
+    tagged.__annotations__ = {"model": Annotated[TaggedFactoryModel, marker()]}
+    with pytest.raises(TypeError, match=r"'tags'.*default .* has 2 items"):
+        api.get("/tagged")(tagged)
+
+
 def test_query_free_spec_keeps_openapi_3_1(full_spec: dict) -> None:
     """The 3.2.0 bump is conditional: APIs without a QUERY route must keep
     declaring 3.1.0 for maximum downstream tooling compatibility."""

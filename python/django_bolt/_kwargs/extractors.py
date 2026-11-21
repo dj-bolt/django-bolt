@@ -81,17 +81,32 @@ def _refuse_many_item_default(loc: str, key: str, annotation: Any, default: Any)
     a source holds one item, and the OpenAPI schema says ``maxItems: 1``. A
     default of two items is not valid for that schema, so the route fails here.
     """
-    if type(default) in _SEQUENCE_ORIGINS and len(default) > 1 and _is_sequence_field(annotation):
+    if type(default) in _SEQUENCE_ORIGINS and len(default) > 1 and _is_sequence_field(_strip_annotated(annotation)):
         raise TypeError(
             f"The {loc} parameter {key!r} gets at most one item, but its default {default!r} "
             f"has {len(default)} items. Use a default of at most one item, or use Query() for a list of values."
         )
 
 
+def _strip_annotated(annotation: Any) -> Any:
+    """Remove ``Annotated`` metadata, also inside ``Optional``. A ``msgspec.Meta`` constraint keeps it on the type."""
+    if get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    inner = unwrap_optional(annotation)
+    return get_args(inner)[0] if get_origin(inner) is Annotated else inner
+
+
+def _field_default(field: msgspec.structs.FieldInfo) -> Any:
+    """Return the default that a model field gets at run time, also from a ``default_factory``."""
+    if field.default is msgspec.NODEFAULT and field.default_factory is not msgspec.NODEFAULT:
+        return field.default_factory()
+    return field.default
+
+
 def _refuse_many_item_field_defaults(struct_type: type, loc: str) -> None:
     """Apply ``_refuse_many_item_default`` to each field of a header or cookie model."""
     for field in msgspec.structs.fields(struct_type):
-        _refuse_many_item_default(loc, field.encode_name, field.type, field.default)
+        _refuse_many_item_default(loc, field.encode_name, field.type, _field_default(field))
 
 
 def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = False) -> Callable | None:
