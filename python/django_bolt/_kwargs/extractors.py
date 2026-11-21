@@ -73,6 +73,27 @@ def _holds_one_item(annotation: Any) -> bool:
     return (node.min_length or 0) <= 1 and (node.max_length is None or node.max_length >= 1)
 
 
+def _refuse_many_item_default(loc: str, key: str, annotation: Any, default: Any) -> None:
+    """Raise ``TypeError`` when a one-value sequence parameter has a default of two or more items.
+
+    A path, a header or a cookie gives one value. Bolt keeps the last line of a
+    repeated header and does not split a comma list. Thus a sequence from such
+    a source holds one item, and the OpenAPI schema says ``maxItems: 1``. A
+    default of two items is not valid for that schema, so the route fails here.
+    """
+    if type(default) in _SEQUENCE_ORIGINS and len(default) > 1 and _is_sequence_field(annotation):
+        raise TypeError(
+            f"The {loc} parameter {key!r} gets at most one item, but its default {default!r} "
+            f"has {len(default)} items. Use a default of at most one item, or use Query() for a list of values."
+        )
+
+
+def _refuse_many_item_field_defaults(struct_type: type, loc: str) -> None:
+    """Apply ``_refuse_many_item_default`` to each field of a header or cookie model."""
+    for field in msgspec.structs.fields(struct_type):
+        _refuse_many_item_default(loc, field.encode_name, field.type, field.default)
+
+
 def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = False) -> Callable | None:
     """Build the conversion of one parameter value that Rust cannot do, or None.
 
@@ -672,6 +693,8 @@ def _create_param_struct_extractor(
     """
     # An unknown source fails here, when the route registers.
     source = _STRUCT_ERROR_SOURCES[param_type]
+    if source == "cookie":
+        _refuse_many_item_field_defaults(struct_type, source)
     # Check at registration time if any fields need file handling
     has_upload_file_fields = any(is_upload_file_type(f.type) for f in msgspec.structs.fields(struct_type))
     # Pre-compute sequence field names — empty tuple means zero runtime overhead.
@@ -859,6 +882,7 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     Returns:
         Extractor function that takes headers_map and returns struct instance
     """
+    _refuse_many_item_field_defaults(struct_type, "header")
     # Pre-compute header name mapping at registration time
     # Maps kebab-case header name → encoded field name (for msgspec alias support)
     header_to_encoded: list[tuple[str, str, bool]] = []
@@ -1220,6 +1244,8 @@ def create_extractor_for_field(field: FieldDefinition, other_keys: frozenset[str
     # An Optional type without default has the default None.
     default = None if field.default is inspect.Parameter.empty and is_optional(annotation) else field.default
     alias = field.alias
+    if source in _SINGLE_VALUE_SOURCES:
+        _refuse_many_item_default(source, alias or name, annotation, default)
 
     # Return appropriate extractor based on source
     if source == "path":

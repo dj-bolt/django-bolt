@@ -26,7 +26,7 @@ from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
-from django_bolt.param_functions import Cookie, Header, Query
+from django_bolt.param_functions import Cookie, Header, Path, Query
 from django_bolt.testing import TestClient
 from django_bolt.websocket.types import WebSocket
 
@@ -197,6 +197,93 @@ def test_list_parameter_with_an_empty_default_validates(marker, param_in) -> Non
     # A header or a cookie that is present gives one value. A default with one item keeps the minimum.
     (names,) = spec["paths"]["/named"]["get"]["parameters"]
     assert names["schema"].get("minItems") == (None if param_in == "query" else 1)
+
+
+@pytest.mark.parametrize("marker", [Header, Cookie])
+def test_header_or_cookie_list_gets_one_item_as_its_schema_says(marker) -> None:
+    """A header or cookie list gets one item from a request, so ``maxItems: 1`` is true (#871)."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="List API", version="1.0.0"))
+
+    async def tagged(tags=["default"]):  # noqa: B006
+        return tags
+
+    # The module has postponed annotations, so the test sets the evaluated types.
+    tagged.__annotations__ = {"tags": Annotated[list[str], marker()]}
+    api.get("/tagged")(tagged)
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+        if marker is Header:
+            # Bolt keeps the last line of a repeated header and does not split a comma list.
+            repeated = client.get("/tagged", headers=[("tags", "a"), ("tags", "b")]).json()
+            comma = client.get("/tagged", headers={"tags": "a,b"}).json()
+            assert repeated == ["b"]
+            assert comma == ["a,b"]
+        else:
+            # Bolt reads one value for each cookie name.
+            assert client.get("/tagged", headers={"cookie": "tags=a; tags=b"}).json() in (["a"], ["b"])
+            assert client.get("/tagged", headers={"cookie": "tags=a,b"}).json() == ["a,b"]
+        assert client.get("/tagged").json() == ["default"]
+
+    validate(spec)
+    (tags,) = spec["paths"]["/tagged"]["get"]["parameters"]
+    assert tags["schema"]["maxItems"] == 1
+    assert tags["schema"]["default"] == ["default"]
+
+
+@pytest.mark.parametrize("marker", [Path, Header, Cookie])
+@pytest.mark.parametrize("default", [["a", "b"], ("a", "b"), {"a", "b"}])
+def test_one_value_list_parameter_refuses_a_default_of_two_items(marker, default) -> None:
+    """A path, header or cookie list gets at most one item, so a default of two items fails at registration (#871)."""
+    api = BoltAPI()
+
+    async def tagged(tags=default):
+        return tags
+
+    tagged.__annotations__ = {"tags": Annotated[list[str], marker()]}
+    route = "/tagged/{tags}" if marker is Path else "/tagged"
+    with pytest.raises(TypeError, match=r"'tags'.*default .* has 2 items"):
+        api.get(route)(tagged)
+
+
+def test_query_list_parameter_accepts_a_default_of_two_items() -> None:
+    """A query key can repeat, so a query list can have a default of two items (#871)."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="List API", version="1.0.0"))
+
+    async def tagged(tags=["a", "b"]):  # noqa: B006
+        return tags
+
+    tagged.__annotations__ = {"tags": Annotated[list[str], Query()]}
+    api.get("/tagged")(tagged)
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+        assert client.get("/tagged").json() == ["a", "b"]
+        assert client.get("/tagged?tags=x&tags=y").json() == ["x", "y"]
+
+    validate(spec)
+    (tags,) = spec["paths"]["/tagged"]["get"]["parameters"]
+    assert "maxItems" not in tags["schema"]
+    assert tags["schema"]["default"] == ["a", "b"]
+
+
+class TaggedModel(msgspec.Struct):
+    tags: list[str] = ("a", "b")  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize("marker", [Header, Cookie])
+def test_header_or_cookie_model_refuses_a_list_field_default_of_two_items(marker) -> None:
+    """A list field of a header or cookie model gets at most one item, as a plain parameter does (#871)."""
+    api = BoltAPI()
+
+    async def tagged(model):
+        return model.tags
+
+    tagged.__annotations__ = {"model": Annotated[TaggedModel, marker()]}
+    with pytest.raises(TypeError, match=r"'tags'.*default .* has 2 items"):
+        api.get("/tagged")(tagged)
 
 
 def test_query_free_spec_keeps_openapi_3_1(full_spec: dict) -> None:
