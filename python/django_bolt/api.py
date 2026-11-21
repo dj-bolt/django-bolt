@@ -404,6 +404,9 @@ def _validate_asgi_mount_conflicts(
             )
 
 
+# The key in ``request.state`` that holds the exception of a server error for a TestClient.
+SERVER_EXCEPTION_STATE_KEY = "_bolt_server_exception"
+
 # RFC 9110 section 15: a final response status is from 200 to 599.
 _MIN_RESPONSE_STATUS = 200
 _MAX_RESPONSE_STATUS = 599
@@ -657,6 +660,10 @@ async def serve_with_lifespan(
 
 
 class BoltAPI:
+    # A TestClient with raise_server_exceptions=True sets this switch. Then the
+    # error path keeps the exception of a server error in ``request.state``.
+    _keep_server_exceptions = False
+
     def __init__(
         self,
         prefix: str = "",
@@ -3348,6 +3355,9 @@ class BoltAPI:
         """
         if self._logging_middleware and is_server_exception(e):
             self._logging_middleware.log_exception(request, e)
+        if BoltAPI._keep_server_exceptions and is_server_exception(e):
+            # Only a TestClient sets this switch. The client raises the exception in the test.
+            request.state[SERVER_EXCEPTION_STATE_KEY] = e
         try:
             # Without a formatter, the handler reads the Django DEBUG setting.
             if self._error_formatter is None:

@@ -241,7 +241,7 @@ def test_method_decorator_passes_auth_and_response_arguments(api, method):
 
     api._register_openapi_routes()
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         assert client.request(method.upper(), "/guarded").status_code == 401
         # The body is not a _Thing, so the response_model rejects it.
         assert client.request(method.upper(), "/guarded", headers={"X-API-Key": "secret"}).status_code == 500

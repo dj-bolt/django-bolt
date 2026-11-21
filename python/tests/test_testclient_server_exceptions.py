@@ -1,0 +1,255 @@
+"""``TestClient(raise_server_exceptions=True)`` raises the exception of a handler (issue #869).
+
+Starlette's test client does the same. The test then shows the traceback at the
+place of the fault, not only a 500. With ``raise_server_exceptions=False``, the
+test gets the 500 response that a real server sends.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+from django.core.exceptions import PermissionDenied
+from django.http import HttpResponse
+
+from django_bolt import BoltAPI
+from django_bolt.error_handlers import problem_details
+from django_bolt.exceptions import HTTPException
+from django_bolt.middleware import DjangoMiddlewareStack
+from django_bolt.responses import StreamingResponse
+from django_bolt.testing import AsyncTestClient, TestClient
+
+
+class Boom(Exception):
+    """The exception that the handlers of these tests raise."""
+
+
+class PassThroughMiddleware:
+    """A Django middleware that does nothing. Its route runs on a request lane."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        return self.get_response(request)
+
+
+class HandlingMiddleware(PassThroughMiddleware):
+    """A Django middleware whose ``process_exception`` gives a response."""
+
+    def process_exception(self, request, exception):
+        return HttpResponse("handled", status=418)
+
+
+def make_api(**kwargs) -> BoltAPI:
+    api = BoltAPI(**kwargs)
+
+    @api.get("/sync")
+    def sync_boom():
+        raise Boom("sync")
+
+    @api.get("/trivial-async")
+    async def trivial_async_boom():
+        raise Boom("trivial async")
+
+    @api.get("/async")
+    async def async_boom():
+        await asyncio.sleep(0)
+        raise Boom("async")
+
+    @api.get("/ok")
+    def ok():
+        return {"ok": True}
+
+    return api
+
+
+ROUTES = [("/sync", "sync"), ("/trivial-async", "trivial async"), ("/async", "async")]
+
+
+@pytest.mark.parametrize(("path", "message"), ROUTES)
+def test_the_client_raises_the_exception_of_the_handler(path, message):
+    with TestClient(make_api(), raise_server_exceptions=True) as client:
+        with pytest.raises(Boom, match=f"^{message}$"):
+            client.get(path)
+        # The client still works after the exception.
+        assert client.get("/ok").json() == {"ok": True}
+
+
+@pytest.mark.parametrize(("path", "message"), ROUTES)
+def test_the_option_is_on_by_default(path, message):
+    with TestClient(make_api()) as client, pytest.raises(Boom, match=f"^{message}$"):
+        client.get(path)
+
+
+@pytest.mark.parametrize(("path", "message"), ROUTES)
+def test_without_the_option_the_client_gets_the_500(path, message):
+    with TestClient(make_api(), raise_server_exceptions=False) as client:
+        response = client.get(path)
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal Server Error"}
+
+
+@pytest.mark.parametrize(("path", "message"), ROUTES)
+def test_a_route_with_django_middleware_raises_the_exception(path, message):
+    api = make_api(middleware=[DjangoMiddlewareStack([PassThroughMiddleware])])
+    with TestClient(api) as client:
+        with pytest.raises(Boom, match=f"^{message}$"):
+            client.get(path)
+        assert client.get("/ok").json() == {"ok": True}
+
+
+@pytest.mark.parametrize(("path", "message"), ROUTES)
+def test_a_route_with_django_middleware_gives_the_500_without_the_option(path, message):
+    api = make_api(middleware=[DjangoMiddlewareStack([PassThroughMiddleware])])
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get(path)
+    assert response.status_code == 500
+
+
+@pytest.mark.parametrize(("path", "message"), ROUTES)
+def test_an_exception_that_process_exception_handles_is_not_raised(path, message):
+    api = make_api(middleware=[DjangoMiddlewareStack([HandlingMiddleware])])
+    with TestClient(api) as client:
+        response = client.get(path)
+    assert response.status_code == 418
+    assert response.content == b"handled"
+
+
+@pytest.mark.parametrize(("path", "message"), ROUTES)
+def test_the_async_client_raises_the_exception_of_the_handler(path, message):
+    async def run():
+        async with AsyncTestClient(make_api()) as client:
+            with pytest.raises(Boom, match=f"^{message}$"):
+                await client.get(path)
+            assert (await client.get("/ok")).json() == {"ok": True}
+
+    asyncio.run(run())
+
+
+def test_the_async_client_gives_the_500_without_the_option():
+    async def run():
+        async with AsyncTestClient(make_api(), raise_server_exceptions=False) as client:
+            return await client.get("/async")
+
+    assert asyncio.run(run()).status_code == 500
+
+
+def test_concurrent_requests_raise_only_their_own_exception():
+    api = BoltAPI()
+
+    @api.get("/slow-ok")
+    async def slow_ok():
+        await asyncio.sleep(0.05)
+        return {"ok": True}
+
+    @api.get("/fail")
+    async def fail():
+        await asyncio.sleep(0.01)
+        raise Boom("fail")
+
+    async def run():
+        async with AsyncTestClient(api) as client:
+            return await asyncio.gather(
+                client.get("/slow-ok"), client.get("/fail"), client.get("/slow-ok"), return_exceptions=True
+            )
+
+    first, failed, last = asyncio.run(run())
+    assert first.json() == {"ok": True}
+    assert isinstance(failed, Boom)
+    assert last.json() == {"ok": True}
+
+
+def test_an_error_response_of_the_api_is_not_raised():
+    """An exception that Bolt answers with a 4xx, or an HTTPException, is a response, not a fault."""
+    api = BoltAPI()
+
+    @api.get("/http-500")
+    def http_500():
+        raise HTTPException(status_code=500, detail="planned")
+
+    @api.get("/denied")
+    async def denied():
+        raise PermissionDenied
+
+    @api.get("/missing/{item_id}")
+    def missing(item_id: int):
+        return {"item_id": item_id}
+
+    with TestClient(api) as client:
+        assert client.get("/http-500").status_code == 500
+        assert client.get("/denied").status_code == 403
+        assert client.get("/missing/abc").status_code == 422
+        assert client.get("/not-a-route").status_code == 404
+
+
+def test_an_error_formatter_does_not_stop_the_raise():
+    """As in Starlette, a handler for server errors formats the 500, and the test still gets the exception."""
+    api = make_api(error_formatter=problem_details)
+    with TestClient(api) as client, pytest.raises(Boom, match="^sync$"):
+        client.get("/sync")
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/sync")
+    assert response.status_code == 500
+    assert response.headers["content-type"] == "application/problem+json"
+
+
+def sync_chunks():
+    yield b"first,"
+    raise Boom("sync stream")
+
+
+async def async_chunks():
+    yield b"first,"
+    await asyncio.sleep(0)
+    raise Boom("async stream")
+
+
+def make_stream_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.get("/sync-stream")
+    def sync_stream():
+        return StreamingResponse(sync_chunks(), media_type="text/plain")
+
+    @api.get("/async-stream")
+    async def async_stream():
+        return StreamingResponse(async_chunks(), media_type="text/plain")
+
+    @api.get("/good-stream")
+    async def good_stream():
+        async def chunks():
+            yield b"a,"
+            yield b"b"
+
+        return StreamingResponse(chunks(), media_type="text/plain", headers={"x-kept": "yes"})
+
+    return api
+
+
+STREAMS = [("/sync-stream", "sync stream"), ("/async-stream", "async stream")]
+
+
+@pytest.mark.parametrize(("path", "message"), STREAMS)
+def test_an_exception_of_a_streaming_body_is_raised(path, message, caplog):
+    with TestClient(make_stream_api()) as client, pytest.raises(Boom, match=f"^{message}$"):
+        client.get(path)
+    # The server still logs the error, as runbolt does.
+    assert any(record.name == "django_bolt.streaming" for record in caplog.records)
+
+
+@pytest.mark.parametrize(("path", "message"), STREAMS)
+def test_without_the_option_a_streaming_body_ends_at_the_exception(path, message):
+    with TestClient(make_stream_api(), raise_server_exceptions=False) as client:
+        response = client.get(path)
+    assert response.status_code == 200
+    assert response.content == b"first,"
+
+
+def test_a_good_stream_has_its_body_and_headers_only():
+    with TestClient(make_stream_api()) as client:
+        response = client.get("/good-stream")
+    assert response.content == b"a,b"
+    assert response.headers["x-kept"] == "yes"
+    assert not [name for name in response.headers if name.startswith("x-django-bolt")]

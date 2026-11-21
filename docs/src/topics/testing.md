@@ -64,6 +64,43 @@ response.content                        # raw bytes
 response.headers.get("content-type")   # "application/json"
 ```
 
+## Exceptions in handlers
+
+By default, the test client raises the exception of a handler in the test.
+Thus the traceback shows the place of the fault. Starlette's test client
+does the same:
+
+```python
+@api.get("/boom")
+async def boom():
+    raise RuntimeError("boom")
+
+with TestClient(api) as client:
+    with pytest.raises(RuntimeError, match="boom"):
+        client.get("/boom")
+```
+
+The client raises an exception that the server answers with a 5xx. This
+includes an exception in the body of a streaming response, and a
+`ResponseValidationError`. The client raises it for each route: sync and
+async handlers, and routes with Django middleware. An `error_formatter` does
+not stop the raise.
+
+The client does not raise an exception that the API answers with a response.
+Thus you get the response for an `HTTPException` (also with status 500), and
+the 4xx of a validation error, a `PermissionDenied` or an `Http404`. You also
+get the response when the `process_exception` of a Django middleware returns one.
+
+To get the 500 response that `runbolt` sends, set `raise_server_exceptions=False`:
+
+```python
+with TestClient(api, raise_server_exceptions=False) as client:
+    response = client.get("/boom")
+    assert response.status_code == 500
+```
+
+`AsyncTestClient` takes the same option.
+
 ## Testing validation
 
 Path parameters, query parameters, headers, and request bodies are all

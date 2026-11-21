@@ -260,7 +260,7 @@ def client(settings):
     async def camel_objects_unvalidated(request) -> list[ArticleCamel]:
         return [Obj(id=5, is_published=True), Obj(id=6)]
 
-    return TestClient(api)
+    return TestClient(api, raise_server_exceptions=False)
 
 
 def test_dict_converts_to_the_struct(client):
@@ -444,7 +444,7 @@ def test_declared_json_scalar_type_is_validated(settings, return_type, value, ex
     api = BoltAPI()
     _scalar_route(api, "/bad", value, is_async=is_async, **{"return": return_type})
 
-    with TestClient(api) as scalar_client:
+    with TestClient(api, raise_server_exceptions=False) as scalar_client:
         assert expected in _validation_message(scalar_client.get("/bad"))
 
 
@@ -468,7 +468,7 @@ def test_str_or_bytes_for_a_type_that_does_not_allow_it_is_a_validation_error(
     _scalar_route(api, "/bad", value, is_async=is_async, **{"return": return_type})
     api.get("/unvalidated", validate_response=False, response_model=return_type)(lambda: value)
 
-    with TestClient(api) as scalar_client:
+    with TestClient(api, raise_server_exceptions=False) as scalar_client:
         assert expected in _validation_message(scalar_client.get("/bad"))
         # A route with no validation sends the result as before.
         assert scalar_client.get("/unvalidated").content == b"abc"
@@ -511,7 +511,7 @@ def test_str_that_converts_to_the_declared_type_is_sent_as_json(settings, is_asy
     _scalar_route(api, "/uuid", str(uuid.UUID(int=1)), is_async=is_async, **{"return": uuid.UUID})
     _scalar_route(api, "/long", "abcdef", is_async=is_async, **{"return": _SHORT_TEXT})
 
-    with TestClient(api) as scalar_client:
+    with TestClient(api, raise_server_exceptions=False) as scalar_client:
         response = scalar_client.get("/uuid")
         assert response.headers["content-type"] == "application/json"
         assert response.content == b'"00000000-0000-0000-0000-000000000001"'
@@ -528,7 +528,7 @@ def test_a_result_that_is_not_a_list_for_a_list_of_serializers_is_a_validation_e
     _scalar_route(api, "/none", None, is_async=is_async, **{"return": list[PublicUser]})
     api.get("/unvalidated", validate_response=False, response_model=list[PublicUser])(lambda: value)
 
-    with TestClient(api) as scalar_client:
+    with TestClient(api, raise_server_exceptions=False) as scalar_client:
         message = _validation_message(scalar_client.get("/bad"))
         assert message == (
             f"Response type mismatch: expected list[PublicUser], but handler returned {type(value).__name__}. "
@@ -595,7 +595,7 @@ def test_str_or_bytes_for_dict_or_list_is_a_validation_error_on_each_executor(se
     api = BoltAPI()
     paths = _mismatch_routes(api, return_type, value)
 
-    with TestClient(api) as scalar_client:
+    with TestClient(api, raise_server_exceptions=False) as scalar_client:
         for path in paths:
             assert expected in _validation_message(scalar_client.get(path)), path
 
@@ -621,7 +621,7 @@ def test_a_result_of_another_kind_for_dict_or_list_is_a_validation_error_on_each
     api = BoltAPI()
     paths = _mismatch_routes(api, return_type, value)
 
-    with TestClient(api) as scalar_client:
+    with TestClient(api, raise_server_exceptions=False) as scalar_client:
         for path in paths:
             assert expected in _validation_message(scalar_client.get(path)), path
 
@@ -719,7 +719,7 @@ def test_none_response_type_rejects_a_result_that_is_not_none(settings, value, g
     _scalar_route(api, "/bad", value, is_async=is_async, **{"return": None})
     api.get("/unvalidated", validate_response=False, response_model=type(None))(lambda: value)
 
-    with TestClient(api) as none_client:
+    with TestClient(api, raise_server_exceptions=False) as none_client:
         assert f"expected None, but handler returned {got}" in _validation_message(none_client.get("/bad"))
         # A route with no validation sends the result as before.
         assert none_client.get("/unvalidated").status_code == 200

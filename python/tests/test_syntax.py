@@ -412,7 +412,7 @@ def api():
 @pytest.fixture(scope="module")
 def client(api):
     """Create TestClient for the API"""
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         yield client
 
 
