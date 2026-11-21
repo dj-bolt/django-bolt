@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from _helpers import initialize, make_server, parse_rpc, post_rpc
+import json
 
+from _helpers import initialize, make_server, parse_rpc, post_rpc
+from bolt_mcp import MCP, mount_mcp
+
+from django_bolt import BoltAPI
 from django_bolt.testing import TestClient
 
 
@@ -27,6 +31,27 @@ def test_dict_result_maps_to_text_and_structured_content():
         assert result["isError"] is False
         assert result["content"][0]["type"] == "text"
         assert result["structuredContent"] == {"sum": 5}
+
+
+def test_dict_result_with_iterators_has_the_same_values_in_text_and_structured_content():
+    """The text encodes a map or zip once. structuredContent must not get the used iterator."""
+    api = BoltAPI()
+    mcp = MCP("iterator-test")
+
+    @mcp.tool
+    async def pairs() -> dict:
+        return {"upper": map(str.upper, ["a", "b"]), "pairs": zip("ab", [1, 2], strict=True)}
+
+    mount_mcp(api, mcp)
+
+    with TestClient(api) as client:
+        _, session_id = initialize(client)
+        result = parse_rpc(_call(client, session_id, "pairs", {}))["result"]
+
+    expected = {"upper": ["A", "B"], "pairs": [["a", 1], ["b", 2]]}
+    assert result["isError"] is False
+    assert json.loads(result["content"][0]["text"]) == expected
+    assert result["structuredContent"] == expected
 
 
 def test_string_result_maps_to_text_content():
