@@ -183,16 +183,68 @@ def test_admin_in_i18n_patterns_with_no_prefix_keeps_the_path_of_language_code(s
     assert english.status_code == 200
 
 
-def test_admin_behind_a_path_parameter_prints_a_warning(settings, capsys):
-    """A prefix with a path parameter cannot be a mount. runbolt names the way to serve it."""
+@pytest.mark.django_db(transaction=True)
+def test_admin_behind_a_path_parameter_is_served_with_no_user_action(settings, capsys):
+    """A prefix with a path parameter is not static. runbolt gives Django each path with no Bolt route."""
     settings.ROOT_URLCONF = "tests.admin_tests.urls_path_parameter"
     api = BoltAPI()
+
+    @api.get("/items/{item_id}")
+    async def item(item_id: int):
+        return {"item_id": item_id}
+
     api._register_admin_routes("127.0.0.1", 8000)
 
     err = capsys.readouterr().err
     assert err.count("[django-bolt] Warning") == 1
     assert "path parameter" in err
-    assert 'api.mount_django("/", clear_root_path=True)' in err
+    assert "Django answers each path that has no Bolt route" in err
+    # The warning does not tell the user to do something that runbolt already did.
+    assert "mount_django" not in err
+    assert detect_admin_url_prefixes() == [""]
+    with TestClient(api, use_http_layer=True) as client:
+        acme = client.get("/acme/admin/login/")
+        globex = client.get("/globex/admin/")
+        bolt_route = client.get("/items/7")
+        bolt_validation = client.get("/items/abc")
+
+    assert acme.status_code == 200
+    assert acme.text == "admin login of acme"
+    assert globex.status_code == 200
+    assert globex.text == "admin index of globex"
+    # Bolt routes answer first.
+    assert bolt_route.json() == {"item_id": 7}
+    assert bolt_validation.status_code == 422
+
+
+def test_admin_at_the_root_path_keeps_the_root_mount_of_the_user(settings):
+    """A Django mount at "/" of the user already serves an admin site at the root path."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_root_admin"
+    api = BoltAPI()
+    api.mount_django("/", clear_root_path=True)
+
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    assert api._admin_routes_registered
+    assert [prefix for prefix, _app in api._asgi_mounts] == ["/"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_behind_a_path_parameter_keeps_the_root_mount_of_the_user(settings, capsys):
+    """The workaround of earlier versions, a Django mount at "/", stays valid."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_path_parameter"
+    api = BoltAPI()
+    api.mount_django("/", clear_root_path=True)
+
+    api._register_admin_routes("127.0.0.1", 8000)
+
+    assert api._admin_routes_registered
+    assert [prefix for prefix, _app in api._asgi_mounts] == ["/"]
+    assert "[django-bolt] Warning" not in capsys.readouterr().err
+    with TestClient(api, use_http_layer=True) as client:
+        response = client.get("/acme/admin/login/")
+
+    assert response.text == "admin login of acme"
 
 
 @pytest.mark.django_db(transaction=True)

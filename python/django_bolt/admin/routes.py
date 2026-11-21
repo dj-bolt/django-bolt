@@ -34,12 +34,16 @@ class AdminRouteRegistrar:
         if admin_prefixes is None:
             return
 
+        # A mount of the user at the root path stays. It gets each path that has no Bolt route.
+        if admin_prefixes == [""] and "/" in self.api._asgi_mount_prefixes:
+            self.api._admin_routes_registered = True
+            return
+
         if admin_url_needs_path_parameter():
             print(
                 "[django-bolt] Warning: the URL pattern of the admin site has a path parameter. "
-                "Bolt cannot mount the admin at a prefix that is not a static path. "
-                'To serve it, call api.mount_django("/", clear_root_path=True). '
-                "Django then answers each path that has no Bolt route.",
+                "Bolt mounts Django at the root path for it. "
+                "Django answers each path that has no Bolt route.",
                 file=sys.stderr,
             )
         elif "" in admin_prefixes:
