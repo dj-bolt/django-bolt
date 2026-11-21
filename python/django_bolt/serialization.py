@@ -243,6 +243,34 @@ def _raise_plain_type_mismatch(expected: type, result: Any) -> NoReturn:
     )
 
 
+def _compile_none_handlers(
+    data_handler: Callable[..., Any], data_handler_sync: Callable[..., Any]
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Compile the data handlers of a route with the response type ``None``.
+
+    Only ``None`` goes to the general data handlers of the route. Each other
+    result is a response validation error. ``None`` has no validator, so the
+    route keeps the executors of a route with no response validation.
+    """
+
+    def refuse(result: Any) -> NoReturn:
+        _raise_response_validation_error(
+            TypeError(f"Response type mismatch: expected None, but handler returned {type(result).__name__}.")
+        )
+
+    def handler_sync(result: Any, status_code: int | None = None) -> ResponseWireV1:
+        if result is None:
+            return data_handler_sync(result, status_code)
+        refuse(result)
+
+    async def handler(result: Any, status_code: int | None = None) -> ResponseWireV1:
+        if result is None:
+            return await data_handler(result, status_code)
+        refuse(result)
+
+    return handler, handler_sync
+
+
 def _compile_plain_container_handlers(
     container: type,
     default_status_code: int,
@@ -1278,6 +1306,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         data_handler, data_handler_sync = _compile_plain_container_handlers(
             plain_type, default_status_code, prepare_list, data_handler, data_handler_sync
         )
+    elif meta["validate_response"] and plain_type is type(None):
+        data_handler, data_handler_sync = _compile_none_handlers(data_handler, data_handler_sync)
 
     meta["_default_response_handler"] = data_handler
     meta["_default_response_handler_sync"] = data_handler_sync

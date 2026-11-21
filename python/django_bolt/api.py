@@ -189,12 +189,12 @@ def _sync_finisher(meta: dict[str, Any], defer: Callable) -> Callable[[Any], Res
 def _fast_dict_type(meta: dict[str, Any]) -> type | tuple:
     """Return the type whose instances an executor encodes as a JSON object with no other check.
 
-    This is ``dict``. A route with the bare response type ``list`` that validates
-    its response refuses a dict. For it the result is ``()``: the ``isinstance``
+    This is ``dict``. A route with the bare response type ``list`` or ``None`` that
+    validates its response refuses a dict. For it the result is ``()``: the ``isinstance``
     test of the executor is false, and the response handlers raise the error.
     Thus the rule adds no test to an executor.
     """
-    return () if meta.get("response_type") is list and meta["validate_response"] else dict
+    return () if meta.get("response_type") in (list, type(None)) and meta["validate_response"] else dict
 
 
 def _request_only_sync_executor(is_async: bool, meta: dict[str, Any], defer: Callable) -> Callable:
@@ -2576,12 +2576,18 @@ class BoltAPI:
                 # pragma: no mutate start
                 _response_type = meta.get("response_type")
                 _resp_origin = get_origin(_response_type) if _response_type else None
-                _skip_convert = _resp_origin is list or _response_type is dict or _resp_origin is dict
+                # A -> None route sends no list, so it has no conversion to do.
+                _skip_convert = (
+                    _resp_origin is list
+                    or _response_type is dict
+                    or _resp_origin is dict
+                    or _response_type is type(None)
+                )
                 # pragma: no mutate end
                 # Only a result of the declared container goes to the encoder here. Each
                 # other result, such as a str, gets the checks of the response handlers.
-                _fast_type = list if _resp_origin is list else dict
                 _fast_dict = _fast_dict_type(meta)
+                _fast_type = list if _resp_origin is list else _fast_dict
 
                 if _trivially_async:
                     # Sync executor for trivially-async handlers: drive coroutine inline.
@@ -2947,12 +2953,18 @@ class BoltAPI:
                 # pragma: no mutate start
                 _response_type = meta.get("response_type")
                 _resp_origin = get_origin(_response_type) if _response_type else None
-                _skip_convert = _resp_origin is list or _response_type is dict or _resp_origin is dict
+                # A -> None route sends no list, so it has no conversion to do.
+                _skip_convert = (
+                    _resp_origin is list
+                    or _response_type is dict
+                    or _resp_origin is dict
+                    or _response_type is type(None)
+                )
                 # pragma: no mutate end
                 # Only a result of the declared container goes to the encoder here. Each
                 # other result, such as a str, gets the checks of the response handlers.
-                _fast_type = list if _resp_origin is list else dict
                 _fast_dict = _fast_dict_type(meta)
+                _fast_type = list if _resp_origin is list else _fast_dict
 
                 # Plain (non-async) sync executor for Rust sync dispatch bypass.
                 # Eliminates coroutine creation + into_future_with_locals overhead.
