@@ -29,6 +29,7 @@ from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
 
 from . import _core, _json
+from ._bridge import make_bound_dispatch
 from ._kwargs import (
     compile_argument_injector,
     compile_binder,
@@ -599,6 +600,23 @@ def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: s
     return new_message
 
 
+# request.state key. Rust sets it to the ResponseWireV1 of a response that it
+# gives before the handler, for a route that runs Python middleware.
+_RUST_ANSWER_KEY = "_bolt_rust_answer"
+# The path of the route for a request that matches no route. The router does
+# not get this route, so no request matches the path.
+_NO_ROUTE_PATH = "/__bolt_no_route__"
+
+
+def _no_route(request) -> None:
+    """The handler of the route for a request that matches no route.
+
+    Rust sends such a request with its answer, and the middleware chain
+    returns the answer before the handler.
+    """
+    raise RuntimeError("Bolt calls no handler for a request that matches no route")
+
+
 class _ErrorResponseFailure(Exception):
     """Bolt met ``error`` while it built an error response inside the middleware chain."""
 
@@ -845,6 +863,9 @@ class BoltAPI:
         # handler can have different skip lists.
         self._route_global_chain_cache: dict[int, Callable] = {}
         self._route_executor_lock = threading.Lock()
+        # (handler_id, handler) of the route for a request that matches no route.
+        # ``_no_route_handler`` makes it at the first call.
+        self._no_route: tuple[int, Callable] | None = None
 
         # Handler-to-API mapping for merged APIs (initialized here to avoid hasattr in hot path)
         self._handler_api_map: dict[int, BoltAPI] = {}
@@ -2309,6 +2330,9 @@ class BoltAPI:
             )
             meta["can_lane_dispatch"] = can_lane_dispatch
             middleware_meta["can_lane_dispatch"] = can_lane_dispatch
+            # A response that Rust gives before the handler (401, 403, 429)
+            # then goes through the Python middleware of the route.
+            middleware_meta["runs_python_middleware"] = meta["_middleware_api"] is not None
             # Rust installs WorkerLoop as the running loop while executing the
             # trivially-async sync fast path. This keeps create_task() and
             # get_running_loop() valid even when the coroutine never awaits.
@@ -3554,15 +3578,23 @@ class BoltAPI:
         # Registration normalized both lists.
         route_specs = [*meta["_router_middleware"], *meta["_route_middleware"]]
 
+        # Rust gives the answer of a request that it rejected or that matches
+        # no route as the response of the handler. The handler does not run.
         check_session_guards = meta["_session_guard_check"]
         if check_session_guards is None:
 
             async def execute_handler(req):
+                rust_answer = req.state.get(_RUST_ANSWER_KEY)
+                if rust_answer is not None:
+                    return MiddlewareResponse.from_tuple(rust_answer)
                 return await self._execute_handler_as_middleware_response(handler, req, meta)
 
         else:
             # The innermost layer: Django's middleware has loaded the user.
             async def execute_handler(req):
+                rust_answer = req.state.get(_RUST_ANSWER_KEY)
+                if rust_answer is not None:
+                    return MiddlewareResponse.from_tuple(rust_answer)
                 rejection = await check_session_guards(req)
                 if rejection is not None:
                     if isinstance(rejection, HTTPException):
@@ -3608,6 +3640,46 @@ class BoltAPI:
                 self._route_executor_cache[key] = cached_executor
 
         return cached_executor
+
+    def _no_route_handler(self) -> tuple[int, Callable]:
+        """Return ``(handler_id, handler)`` of the route for a request that matches no route.
+
+        Rust answers such a request with a 404 or a 405. The metadata of this
+        route has the access-log filter of the API. When the API has Python
+        middleware, Rust sends the answer through the middleware of the API, as
+        Django runs each middleware for a 404. The route has no auth, no guards
+        and no rate limit, and the router does not get it. Middleware gets no
+        view in ``process_view``, because Django finds no view for the path.
+        """
+        if self._no_route is not None:
+            return self._no_route
+        handler_id = self._next_handler_id
+        self._route_decorator("GET", _NO_ROUTE_PATH, auth=[], guards=[], include_in_schema=False, _skip_prefix=True)(
+            _no_route
+        )
+        # The router does not match this route.
+        self._routes = [route for route in self._routes if route[2] != handler_id]
+        self._handler_meta[handler_id]["view_func"] = None
+        middleware_meta = self._handler_middleware.get(handler_id)
+        if middleware_meta is not None and "middleware" in middleware_meta:
+            # A rate limit of the API counts the requests of its routes only.
+            kept = [spec for spec in middleware_meta["middleware"] if spec.get("type") != "rate_limit"]
+            if kept:
+                middleware_meta["middleware"] = kept
+            else:
+                del middleware_meta["middleware"]
+        self._no_route = (handler_id, _no_route)
+        return self._no_route
+
+    def _rust_no_route(self) -> tuple[int, Callable, Callable, Callable]:
+        """Return the route for a request that matches no route, in the form of ``_core.register_routes``."""
+        handler_id, handler = self._no_route_handler()
+        return (
+            handler_id,
+            handler,
+            make_bound_dispatch(self._dispatch, handler, handler_id),
+            make_bound_dispatch(self._dispatch_sync, handler, handler_id),
+        )
 
     async def _dispatch_with_middleware(
         self,

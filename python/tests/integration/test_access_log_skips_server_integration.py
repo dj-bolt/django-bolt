@@ -45,6 +45,9 @@ def test_access_log_skips_the_paths_and_the_status_codes_of_a_logging_config(mak
         assert server.request("DELETE", "/quiet/items/8").status_code == 204
         assert server.request("GET", "/quiet/gone").status_code == 404
         assert server.request("GET", "/quiet/down").status_code == 503
+        # A path with no route has the config of the API: /metrics is a default skip path.
+        assert server.request("GET", "/metrics").status_code == 404
+        assert server.request("GET", "/no-route").status_code == 404
     lines = [line.rsplit(" ", 1)[0] for line in project.path("access.log").read_text().splitlines()]
 
     assert lines == [
@@ -52,4 +55,5 @@ def test_access_log_skips_the_paths_and_the_status_codes_of_a_logging_config(mak
         "INFO GET /quiet/health 200",
         "INFO GET /quiet/items/8 200",
         "ERROR GET /quiet/down 503",
+        "WARNING GET /no-route 404",
     ]

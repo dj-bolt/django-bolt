@@ -1000,7 +1000,7 @@ class Command(BaseCommand):
             )
 
         try:
-            _core.register_routes(rust_routes, list(merged_api._native_routes))
+            _core.register_routes(rust_routes, list(merged_api._native_routes), merged_api._rust_no_route())
         except ValueError as e:
             raise CommandError(str(e)) from e
 
@@ -1518,6 +1518,19 @@ class Command(BaseCommand):
                 "The APIs set different error_formatter values. Set the same error_formatter on each API, or on one."
             )
         merged._error_formatter = formatters[0] if formatters else None
+
+        # A request that matches no route belongs to no API. It gets the route
+        # of the first API: its middleware and its access-log filter, as the
+        # docs routes get the middleware of the first API.
+        first_api = apis[0][1]
+        no_route_id, no_route_handler = first_api._no_route_handler()
+        merged._no_route = (next_handler_id, no_route_handler)
+        merged._handlers[next_handler_id] = no_route_handler
+        merged._handler_api_map[next_handler_id] = first_api
+        merged._handler_meta[next_handler_id] = first_api._handler_meta[no_route_id]
+        if no_route_id in first_api._handler_middleware:
+            merged._handler_middleware[next_handler_id] = first_api._handler_middleware[no_route_id]
+        next_handler_id += 1
 
         # Update next handler ID
         merged._next_handler_id = next_handler_id

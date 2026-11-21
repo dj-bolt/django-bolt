@@ -333,8 +333,7 @@ class DjangoMiddleware:
             _sync_request_attributes(django_request, bolt_request)
 
             # __call__ does not run process_view. Django's handler runs it, so the bridge runs it.
-            if view_hook is not None:
-                callback = _view_callback(bolt_request)
+            if view_hook is not None and (callback := _view_callback(bolt_request)) is not None:
                 if view_hook is raw_view_hook:
                     response = view_hook(django_request, callback, _EMPTY_TUPLE, _EMPTY_DICT)
                 else:
@@ -411,8 +410,8 @@ class DjangoMiddleware:
                 ctx = _request_context.get()
                 bolt_request = ctx["bolt_request"]
                 _sync_request_attributes(django_request, bolt_request)
-                if lane_view_hook is not None:
-                    response = lane_view_hook(django_request, _view_callback(bolt_request), _EMPTY_TUPLE, _EMPTY_DICT)
+                if lane_view_hook is not None and (callback := _view_callback(bolt_request)) is not None:
+                    response = lane_view_hook(django_request, callback, _EMPTY_TUPLE, _EMPTY_DICT)
                     if response is not None:
                         return response
                     # process_view can set request attributes for the handler.
@@ -594,6 +593,9 @@ def _error_response(request: Request, exception: Exception) -> MiddlewareRespons
 
 def _view_callback(request: Request) -> Callable:
     """Return the view that ``process_view`` gets: the route handler, as Django gives the view.
+
+    A request that matches no route has no view (None). Django calls no
+    ``process_view`` for it, so Bolt does not either.
 
     Django middleware reads the flags of view decorators on it, for example
     ``csrf_exempt`` (CsrfViewMiddleware) and ``login_required`` (LoginRequiredMiddleware).
@@ -857,7 +859,7 @@ class DjangoMiddlewareStack:
         _sync_request_attributes(django_request, request)
         view_func = _view_callback(request)
         ran_view_hook = False
-        for entry in entries:
+        for entry in entries if view_func is not None else ():
             hook = entry["raw_process_view"]
             if hook is not None:
                 ran_view_hook = True
@@ -924,7 +926,7 @@ class DjangoMiddlewareStack:
             view_func = _view_callback(bolt_request)
             ran_view_hook = False
 
-            for entry in entered_hook_entries:
+            for entry in entered_hook_entries if view_func is not None else ():
                 if entry["process_view"] is None:
                     continue
                 ran_view_hook = True

@@ -82,4 +82,5 @@ def test_access_log_has_a_line_for_each_response_of_a_route(make_server_project)
         "INFO GET /open/ 308",
         "INFO OPTIONS /open 204",
         "WARNING POST /open 405",
+        "WARNING GET /no-route 404",
     ]

@@ -398,7 +398,11 @@ Examples are a 401 or a 403 from authentication or a guard, a 429 from a rate li
 Bolt also writes a line for three answers about a route path: the 308 redirect to the other slash form, the automatic `OPTIONS` answer, and the 405 for a method that the path does not have.
 With an `error_formatter`, the line has the status of the formatted response.
 
-Bolt writes no line for a request with no route (404), for a mounted ASGI app or MCP server, for a static or media file, and for a [native route](native-routes.md).
+Bolt also writes a line for the 404 of a path with no route.
+The line uses the `skip_paths`, `skip_status_codes` and `sample_rate` of the API.
+When `runbolt` serves more than one API, it uses the config of the first API.
+
+Bolt writes no line for a mounted ASGI app or MCP server, for a static or media file, and for a [native route](native-routes.md).
 
 A flood of 429 responses does not fill the log.
 Each worker thread writes one line for the first 429 response of each second.
