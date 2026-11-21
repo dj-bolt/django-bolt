@@ -10,6 +10,10 @@ import msgspec
 from django.core.exceptions import ImproperlyConfigured
 from django.core.signals import setting_changed
 
+# Django's TemplateResponse. Bolt renders it after the view. Before the render,
+# Bolt calls process_template_response of each Django middleware.
+from django.template.response import TemplateResponse as TemplateResponse
+
 # Django import - may fail if Django not configured, kept at top for consistency
 try:
     from django.conf import settings as django_settings

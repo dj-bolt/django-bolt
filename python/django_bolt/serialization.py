@@ -38,10 +38,12 @@ from django.core.exceptions import FieldError
 from django.db.models import QuerySet
 from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
+from django.template.response import SimpleTemplateResponse, TemplateResponse
 
 from . import _json
 from ._kwargs import compile_response_coercer, compile_struct_row_readers
 from ._response_dump import compile_serializer_dumper
+from ._template_response import render_template_response
 from .concurrency import run_in_orm_executor
 from .cookies import Cookie
 from .exceptions import ResponseValidationError, UnloadedRelationError
@@ -1323,6 +1325,9 @@ def _response_base_class(result: Any) -> type:
     for cls in _BOLT_RESPONSE_TYPES:
         if isinstance(result, cls):
             return cls
+    # A subclass of a template response renders before it serializes.
+    if isinstance(result, SimpleTemplateResponse):
+        return SimpleTemplateResponse
     # serialize_response sends only the response types, and Django's is the last of them.
     return DjangoHttpResponse
 
@@ -1477,6 +1482,14 @@ def serialize_django_response(result: DjangoHttpResponse) -> ResponseWireV1:
     return _wire_bytes(result.status_code, meta, result.content)
 
 
+def serialize_template_response(result: SimpleTemplateResponse) -> ResponseWireV1:
+    """Render a TemplateResponse, then serialize it as a Django response.
+
+    The process_template_response hooks of the Django middleware run before the render.
+    """
+    return serialize_django_response(render_template_response(result, getattr(result, "_request", None)))
+
+
 def serialize_file_response(result: File) -> ResponseWireV1:
     """Serialize file response.
 
@@ -1551,6 +1564,8 @@ _RESPONSE_SERIALIZERS: dict[type, Callable[[Any], ResponseWireV1]] = {
     StreamingResponse: _to_stream_wire,
     EventSourceResponse: _to_stream_wire,
     DjangoHttpResponse: serialize_django_response,
+    SimpleTemplateResponse: serialize_template_response,
+    TemplateResponse: serialize_template_response,
 }
 # The exact classes that the route handlers dispatch on.
 _RESPONSE_CLASSES = frozenset((JSON, ResponseClass, *_RESPONSE_SERIALIZERS))

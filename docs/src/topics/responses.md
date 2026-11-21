@@ -132,6 +132,25 @@ async def account(request: Request):
     return render(request, "myapp/account.html")
 ```
 
+### Template responses
+
+`render()` renders the template at once. To render it later, return a `TemplateResponse`. It is the `TemplateResponse` class of Django, with the same arguments:
+
+```python
+from django_bolt import Request
+from django_bolt.responses import TemplateResponse
+
+@api.get("/page")
+async def show_page(request: Request):
+    return TemplateResponse(request, "myapp/page.html", {"title": "My Page"})
+```
+
+Bolt renders the template after the handler returns. A route behind Django middleware first calls the `process_template_response` hook of each middleware. A hook can change `template_name` and `context_data` before the render. See [Django middleware integration](middleware.md#django-middleware-integration). A route with no Django middleware renders the response at once.
+
+Pass `status`, `content_type` and `headers` as in Django. Bolt does not send a cookie that you set on a `TemplateResponse` with `set_cookie()`.
+
+The hooks and the render run on the thread that runs the handler. In an async handler, this is the event loop, as for `render()`.
+
 Use standard Django templates - nothing special required:
 
 ```html
