@@ -473,8 +473,9 @@ def test_cache_consume_marker_lifetime(cache_store, kwargs, exp_offset, marker_l
     store = cache_store(**kwargs)
     exp = None if exp_offset is None else int(time.time()) + exp_offset
 
-    assert asyncio.run(store.consume("a", exp=exp)) is True
-    assert asyncio.run(store.consume("a", exp=exp)) is (not marker_lives)
+    # A consume that cannot keep its marker refuses the token, on each call.
+    assert asyncio.run(store.consume("a", exp=exp)) is marker_lives
+    assert asyncio.run(store.consume("a", exp=exp)) is False
 
 
 @_CACHE_MARKER_CASES
@@ -593,7 +594,6 @@ def test_orm_consume_is_single_use_for_each_jti(orm_store):
     [
         ({}, FUTURE, FUTURE + 60),
         ({"leeway": 0}, FUTURE, FUTURE),
-        ({}, PAST, 0),
         ({}, IN_LEEWAY, 50),
         ({}, None, _DEFAULT_TTL_SECONDS),
         ({"default_ttl": 900}, None, 900),
@@ -601,7 +601,6 @@ def test_orm_consume_is_single_use_for_each_jti(orm_store):
     ids=[
         "exp-in-future",
         "exp-in-future-no-leeway",
-        "exp-in-past",
         "exp-inside-leeway",
         "module-default",
         "default-ttl-900",
@@ -617,6 +616,17 @@ def test_orm_consume_row_expires_with_the_token(orm_store, kwargs, exp_offset, e
     assert _expires_in("a") == pytest.approx(expected, abs=3)
 
 
+@pytest.mark.parametrize(("kwargs", "exp_offset"), [({}, PAST), ({"leeway": 0}, IN_LEEWAY)])
+def test_orm_consume_refuses_a_token_that_the_backend_no_longer_accepts(orm_store, kwargs, exp_offset):
+    """The cleanup task deletes an expired row, so the row cannot make a later consume fail."""
+    store = orm_store(**kwargs)
+    exp = int(time.time()) + exp_offset
+
+    assert asyncio.run(store.consume("a", exp=exp)) is False
+    assert asyncio.run(store.consume("a", exp=exp)) is False
+    assert not RevokedToken.objects.filter(jti="a").exists()
+
+
 def test_orm_family_revocation_is_per_family(orm_store):
     store = orm_store()
 
@@ -627,7 +637,9 @@ def test_orm_family_revocation_is_per_family(orm_store):
     assert asyncio.run(store.is_family_revoked("g")) is False
     # A family and a token with the same name are not the same thing.
     assert asyncio.run(store.is_revoked("f")) is False
-    assert asyncio.run(store.is_revoked("family:f")) is True
+    # A jti cannot read the row of a family (#887).
+    with pytest.raises(ValueError, match="reserved prefix"):
+        asyncio.run(store.is_revoked("family:f"))
     assert _expires_in("family:f") == pytest.approx(FUTURE + 60, abs=3)
 
 
@@ -687,3 +699,68 @@ def test_jwt_auth_views_work_on_the_orm_store(orm_store):
 
         assert client.post("/auth/login", json=login).status_code == 200
         assert client.post("/auth/refresh", headers=no_csrf_origin).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# A jti must not use the key of a family or of a user version (#887)
+# ---------------------------------------------------------------------------
+
+_TOKEN_CALLS = pytest.mark.parametrize(
+    "call",
+    [
+        lambda store, jti: store.revoke(jti, exp=int(time.time()) + FUTURE),
+        lambda store, jti: store.consume(jti, exp=int(time.time()) + FUTURE),
+        lambda store, jti: store.is_revoked(jti),
+    ],
+    ids=["revoke", "consume", "is_revoked"],
+)
+
+
+@_TOKEN_CALLS
+@pytest.mark.parametrize("jti", ["fam:f", "ver:u"])
+def test_cache_refuses_a_jti_that_uses_the_key_of_another_entry(cache_store, call, jti):
+    store = cache_store()
+
+    with pytest.raises(ValueError, match=f"^jti {jti!r} starts with a reserved prefix"):
+        asyncio.run(call(store, jti))
+
+    assert asyncio.run(store.is_family_revoked("f")) is False
+    assert asyncio.run(store.get_user_version("u")) == 0
+    assert asyncio.run(store.bump_user_version("u")) == 1
+
+
+@_TOKEN_CALLS
+@pytest.mark.parametrize("jti", ["family:f", "version:u"])
+def test_orm_refuses_a_jti_that_uses_the_key_of_another_entry(orm_store, call, jti):
+    store = orm_store()
+    asyncio.run(store.bump_user_version("u"))
+
+    with pytest.raises(ValueError, match=f"^jti {jti!r} starts with a reserved prefix"):
+        asyncio.run(call(store, jti))
+
+    assert asyncio.run(store.is_family_revoked("f")) is False
+    assert asyncio.run(store.get_user_version("u")) == 1
+    assert RevokedToken.objects.filter(jti="family:f").exists() is False
+
+
+@pytest.mark.parametrize("jti", ["fam", "ver", "xfam:f", "FAM:f", "family:f", "version:u", ""])
+def test_cache_accepts_a_jti_that_does_not_start_with_a_reserved_prefix(cache_store, jti):
+    store = cache_store()
+
+    asyncio.run(store.revoke(jti))
+
+    assert asyncio.run(store.is_revoked(jti)) is True
+    assert asyncio.run(store.consume(jti)) is False
+    assert asyncio.run(store.is_family_revoked("f")) is False
+    assert asyncio.run(store.get_user_version("u")) == 0
+
+
+@pytest.mark.parametrize("jti", ["family", "fam:f", "ver:u", "xfamily:f"])
+def test_orm_accepts_a_jti_that_does_not_start_with_a_reserved_prefix(orm_store, jti):
+    store = orm_store()
+
+    asyncio.run(store.revoke(jti))
+
+    assert asyncio.run(store.is_revoked(jti)) is True
+    assert asyncio.run(store.consume(jti)) is False
+    assert asyncio.run(store.is_family_revoked("f")) is False

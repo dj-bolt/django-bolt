@@ -5,6 +5,8 @@ Provides flexible revocation strategies that users can choose based on their nee
 Revocation is OPTIONAL - only checked if user provides a handler.
 """
 
+from __future__ import annotations
+
 import time
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, timedelta
@@ -19,6 +21,18 @@ from django.db.models import F
 _DEFAULT_TTL_SECONDS = 86400 * 7  # 7 days — fallback when caller doesn't pass `exp`
 # A user version row must stay, so the cleanup task of expired rows must not find it.
 _NEVER_EXPIRES = datetime(9999, 1, 1, tzinfo=UTC)
+# The key of a family or of a user version starts with one of these prefixes.
+# A jti with such a prefix would read or write that key, so the stores refuse it.
+_CACHE_RESERVED_PREFIXES = ("fam:", "ver:")
+_ORM_RESERVED_PREFIXES = ("family:", "version:")
+
+
+def _refuse_jti(jti: str, reserved: tuple[str, ...]) -> None:
+    """Raise ``ValueError`` for a ``jti`` that starts with a reserved prefix."""
+    raise ValueError(
+        f"jti {jti!r} starts with a reserved prefix ({', '.join(reserved)}). "
+        "The store uses these prefixes for families and user versions."
+    )
 
 
 def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS, *, leeway: int) -> int:
@@ -303,9 +317,10 @@ class DjangoCacheRevocation(RevocationStore):
         return self._cache
 
     async def is_revoked(self, jti: str) -> bool:
-        key = f"{self.key_prefix}{jti}"
+        if jti.startswith(_CACHE_RESERVED_PREFIXES):
+            _refuse_jti(jti, _CACHE_RESERVED_PREFIXES)
         # Django cache get is sync, but fast
-        return self.cache.get(key) is not None
+        return self.cache.get(f"{self.key_prefix}{jti}") is not None
 
     async def revoke(self, jti: str, *, exp: int | None = None) -> None:
         """
@@ -319,9 +334,12 @@ class DjangoCacheRevocation(RevocationStore):
 
         If ``exp`` is omitted, the entry lives for ``self.default_ttl``
         seconds (set on the constructor).
+
+        A ``jti`` that starts with ``fam:`` or ``ver:`` raises ``ValueError``.
         """
-        key = f"{self.key_prefix}{jti}"
-        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        if jti.startswith(_CACHE_RESERVED_PREFIXES):
+            _refuse_jti(jti, _CACHE_RESERVED_PREFIXES)
+        self.cache.set(f"{self.key_prefix}{jti}", "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
 
     def _require_atomic_cache(self) -> None:
         cache_type = type(self.cache)
@@ -340,8 +358,14 @@ class DjangoCacheRevocation(RevocationStore):
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
         self._require_atomic_cache()
-        key = f"{self.key_prefix}{jti}"
-        return bool(self.cache.add(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway)))
+        if jti.startswith(_CACHE_RESERVED_PREFIXES):
+            _refuse_jti(jti, _CACHE_RESERVED_PREFIXES)
+        ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
+        if ttl == 0:
+            # The cache deletes an entry with no time to live, so a later consume
+            # would also succeed. The backend refuses this token, so refuse it here too.
+            return False
+        return bool(self.cache.add(f"{self.key_prefix}{jti}", "1", timeout=ttl))
 
     async def get_user_version(self, user_id: str) -> int:
         return int(self.cache.get(f"{self.key_prefix}ver:{user_id}") or 0)
@@ -460,6 +484,8 @@ class DjangoORMRevocation(RevocationStore):
         return self._model
 
     async def is_revoked(self, jti: str) -> bool:
+        if jti.startswith(_ORM_RESERVED_PREFIXES):
+            _refuse_jti(jti, _ORM_RESERVED_PREFIXES)
         return await self.model.objects.filter(jti=jti).aexists()
 
     async def revoke(self, jti: str, *, exp: int | None = None) -> None:
@@ -474,12 +500,26 @@ class DjangoORMRevocation(RevocationStore):
 
         If ``exp`` is omitted, ``expires_at`` is set to ``now +
         self.default_ttl`` (set on the constructor).
+
+        A ``jti`` that starts with ``family:`` or ``version:`` raises ``ValueError``.
         """
+        if jti.startswith(_ORM_RESERVED_PREFIXES):
+            _refuse_jti(jti, _ORM_RESERVED_PREFIXES)
+        await self._upsert(jti, exp)
+
+    async def _upsert(self, jti: str, exp: int | None) -> None:
         expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
         await self.model.objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
-        expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        if jti.startswith(_ORM_RESERVED_PREFIXES):
+            _refuse_jti(jti, _ORM_RESERVED_PREFIXES)
+        ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
+        if ttl == 0:
+            # The cleanup task deletes an expired row, and a later consume would then
+            # succeed. The backend refuses this token, so refuse it here too.
+            return False
+        expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
         try:
             await self.model.objects.acreate(jti=jti, expires_at=expires_at)
         except IntegrityError:
@@ -487,10 +527,10 @@ class DjangoORMRevocation(RevocationStore):
         return True
 
     async def revoke_family(self, fam: str, *, exp: int | None = None) -> None:
-        await self.revoke(f"family:{fam}", exp=exp)
+        await self._upsert(f"family:{fam}", exp)
 
     async def is_family_revoked(self, fam: str) -> bool:
-        return await self.is_revoked(f"family:{fam}")
+        return await self.model.objects.filter(jti=f"family:{fam}").aexists()
 
     async def get_user_version(self, user_id: str) -> int:
         rows = self.model.objects.filter(jti=f"version:{user_id}")

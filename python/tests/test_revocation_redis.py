@@ -186,3 +186,32 @@ def test_a_redis_that_does_not_answer_refuses_each_request():
             }
 
     assert statuses == dict.fromkeys(statuses, 500)
+
+
+@pytest.mark.redis
+@pytest.mark.asyncio
+async def test_a_jti_cannot_write_the_key_of_a_family_or_of_a_user_version_on_redis(redis_keys):
+    """Reproduction of #887: ``revoke("ver:u2")`` made each token of ``u2`` invalid."""
+    store = DjangoCacheRevocation()
+    exp = int(time.time()) + 100
+
+    for jti in ("ver:u2", "fam:f1"):
+        with pytest.raises(ValueError, match="starts with a reserved prefix"):
+            await store.revoke(jti, exp=exp)
+
+    assert redis_keys() == {}
+    assert await store.get_user_version("u2") == 0
+    assert await store.bump_user_version("u2") == 1
+    assert await store.is_family_revoked("f1") is False
+
+
+@pytest.mark.redis
+@pytest.mark.asyncio
+async def test_a_consume_of_an_expired_token_is_refused_on_each_call_on_redis(redis_keys):
+    """Redis deletes a key with no time to live, so the store cannot keep the marker."""
+    store = DjangoCacheRevocation()
+    exp = int(time.time()) - 3600
+
+    assert await store.consume("expired-jti", exp=exp) is False
+    assert await store.consume("expired-jti", exp=exp) is False
+    assert redis_keys() == {}
