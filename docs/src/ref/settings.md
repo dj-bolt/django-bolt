@@ -426,7 +426,7 @@ Django-Bolt disables signals by default for maximum performance. Enable this set
 - Using third-party packages that depend on request signals (e.g. django-debug-toolbar)
 - Implementing custom signal receivers for request lifecycle events
 
-`CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` do not need signals. Bolt runs Django's connection check on the executor thread before each call when a database sets a positive `CONN_MAX_AGE` or `CONN_HEALTH_CHECKS`. With neither set, Bolt runs the check only after a call raises. A connection that the database closed then fails one request. The next request reconnects, and the other threads reconnect before their next call. See [Database Connection Management](../topics/signals.md#database-connection-management).
+`CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` do not need signals. Bolt runs Django's connection check on the executor thread before each call when a database sets a positive `CONN_MAX_AGE` or `CONN_HEALTH_CHECKS`. A worker thread that opened a connection runs the check before each sync request. With neither set, Bolt runs the check only after a call raises. A connection that the database closed then fails one request. The next request reconnects, and the other threads reconnect before their next call. See [Database Connection Management](../topics/signals.md#database-connection-management).
 
 See [Django Signals](../topics/signals.md) for detailed documentation.
 

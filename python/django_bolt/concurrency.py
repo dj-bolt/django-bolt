@@ -167,7 +167,30 @@ _POOL_EPOCH_ATTR = "_django_bolt_pool_epoch"
 _pool_epochs: dict[str, int] = {}
 
 
+class _ConnectionFlags:
+    """What a thread did with database connections. Each thread has its own object.
+
+    ``_dispatch_sync`` reads the thread-local one time for each request and
+    then reads these plain attributes, which costs less than two thread-local reads.
+    """
+
+    __slots__ = ("holds_pooled", "opened")
+
+    def __init__(self) -> None:
+        # Set when this thread opens a connection or checks one out of a pool.
+        # A sync request on a thread that never did so skips the connection checks.
+        self.opened = False
+        # Set when this thread checks out a pooled connection. A call that used
+        # no pooled connection skips the release, which reads Django's
+        # connection handler through a lock.
+        self.holds_pooled = False
+
+
 class _ThreadState(threading.local):
+    def __init__(self) -> None:
+        # Python calls this one time on each thread, at its first read of the state.
+        self.connections = _ConnectionFlags()
+
     # Class defaults: a missing attribute of a thread-local costs an exception on each read.
     epoch = 0
     # The nesting depth of _call_guarded on a thread without releases_later.
@@ -177,10 +200,6 @@ class _ThreadState(threading.local):
     # connections one time, at the start and the end of its request.
     is_lane = False
     active = False
-    # Set when this thread checks out a pooled connection. A call that used no
-    # pooled connection skips the release, which reads Django's connection
-    # handler through a lock.
-    holds_pooled = False
     # Set on a thread that gives its pooled connections back later than the end
     # of a call: a lane at the end of its request, and a worker of a Bolt
     # executor when its queue is empty (see _ReleasePooledConnectionsWhenIdle).
@@ -195,13 +214,15 @@ _thread_state = _ThreadState()
 def _stamp_connection_generation(sender: object, connection: object, **kwargs: object) -> None:
     alias = connection.alias
     setattr(connection, _GENERATION_ATTR, _generations.get(alias, 0))
+    flags = _thread_state.connections
+    flags.opened = True
     if alias in _pooled_aliases:
         # Django sends connection_created for each checkout from a pool, so the
         # epoch goes on the driver connection, which keeps it while it is in the pool.
         raw = connection.connection
         if not hasattr(raw, _POOL_EPOCH_ATTR):
             setattr(raw, _POOL_EPOCH_ATTR, _pool_epochs.get(alias, 0))
-        _thread_state.holds_pooled = True
+        flags.holds_pooled = True
 
 
 connection_created.connect(_stamp_connection_generation, dispatch_uid="django_bolt.connection_generation")
@@ -303,7 +324,7 @@ def release_pooled_connections() -> None:
                 failed = exc
             else:
                 logger.exception("Could not give the pooled connection of the database %r back", alias)
-    _thread_state.holds_pooled = kept
+    _thread_state.connections.holds_pooled = kept
     if failed is not None:
         raise failed
 
@@ -351,12 +372,33 @@ def _call_guarded_pooled[T](
         raise
     finally:
         state.depth = depth
-        if not depth and state.holds_pooled:
+        if not depth and state.connections.holds_pooled:
             try:
                 release_pooled_connections()
             except Exception:
                 # A raise here would replace the result or the error of the call.
                 logger.exception("Could not give the pooled database connections of a thread back after a call")
+
+
+def check_connections_before_sync_dispatch() -> None:
+    """Run the checks before a call on a worker thread that runs a sync request.
+
+    A sync handler with no blocking call in its own source runs on the worker
+    thread that accepted the request, and a helper of the handler can query
+    there. The worker thread keeps that connection between requests. Without
+    these checks, it does not reconnect after another thread met a dead
+    connection, and ``CONN_MAX_AGE`` and ``CONN_HEALTH_CHECKS`` do not apply to it.
+
+    An async handler with no await also comes through ``_dispatch_sync``, with
+    the loop of its thread marked as running. Django then gives the thread a
+    different store of connections, so the checks would find none and record
+    a reconnect as done. Such a handler queries only through
+    :func:`run_orm_blocking`, which runs these checks with no running loop.
+    """
+    if (
+        (_generation_epoch and _thread_state.epoch != _generation_epoch) or _check_before_call
+    ) and _get_running_loop() is None:
+        _check_before_pool_call()
 
 
 def release_pooled_connections_after_sync_dispatch() -> None:
@@ -393,7 +435,7 @@ class _ReleasePooledConnectionsWhenIdle:
         return self._semaphore.acquire(blocking, timeout)
 
     def release(self, n: int = 1) -> None:
-        if _thread_state.holds_pooled:
+        if _thread_state.connections.holds_pooled:
             try:
                 release_pooled_connections()
             except Exception:
@@ -519,7 +561,7 @@ def close_lane_request() -> None:
     except Exception:
         logger.exception("Could not close the unusable database connections of a lane after its request")
     # A failed close above must not keep the other pooled connections on the lane.
-    if _thread_state.holds_pooled:
+    if _thread_state.connections.holds_pooled:
         try:
             release_pooled_connections()
         except Exception:
