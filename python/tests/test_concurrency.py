@@ -163,6 +163,27 @@ def test_a_sync_read_on_a_loop_can_run_a_loop_of_its_own():
     assert results == [(2, True)]
 
 
+def test_a_sync_read_in_a_loop_callback_with_no_task_runs():
+    """A callback of the loop has no current task. A sync read there runs, and no task is set after it."""
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        def callback() -> None:
+            try:
+                value = run_orm_blocking(lambda: 1)
+            except BaseException as error:  # noqa: BLE001 - the test reports any error of the read
+                done.set_result(error)
+            else:
+                done.set_result((value, asyncio.current_task()))
+
+        loop.call_soon(callback)
+        return await done
+
+    assert asyncio.run(main()) == (1, None)
+
+
 def _slow_thread_name() -> str:
     time.sleep(0.05)
     return threading.current_thread().name
