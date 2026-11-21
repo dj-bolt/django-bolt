@@ -481,7 +481,7 @@ def test_a_file_that_the_server_cannot_read_in_an_allowed_dir_is_a_logged_500(se
     def file():
         return FileResponse(str(private / "data.txt"))
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/file")
 
     assert response.status_code == 500
@@ -510,7 +510,7 @@ def test_a_parent_of_the_allowed_dir_that_the_server_cannot_search(
     def file():
         return FileResponse(str(home / target))
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/file")
 
     assert response.status_code == status
