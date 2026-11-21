@@ -153,6 +153,7 @@ If you call `api.mount_django("/", ...)` yourself, `runbolt` keeps your mount an
 - Prefixes are normalized (leading slash, no trailing slash except `/`).
 - Duplicate exact mount prefixes are rejected.
 - Exact collisions between Bolt route paths and mount prefixes are rejected.
+- A mount at `/` and a Bolt route at `/` can exist together. The route answers `/`, and the mount gets each path with no route.
 - Non-exact prefix overlap is allowed.
 - Longest prefix wins when multiple mounts match.
 

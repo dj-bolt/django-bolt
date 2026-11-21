@@ -217,6 +217,28 @@ def test_admin_behind_a_path_parameter_is_served_with_no_user_action(settings, c
     assert bolt_validation.status_code == 422
 
 
+@pytest.mark.django_db(transaction=True)
+def test_admin_behind_a_path_parameter_leaves_a_bolt_route_at_the_root_path(settings, capsys):
+    """A Bolt route at "/" and the root mount of the admin work together. The Bolt route answers "/"."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_path_parameter"
+    api = BoltAPI()
+
+    @api.get("/")
+    async def home():
+        return {"home": True}
+
+    api._register_admin_routes("127.0.0.1", 8000)
+    capsys.readouterr()
+
+    with TestClient(api, use_http_layer=True) as client:
+        home_response = client.get("/")
+        acme = client.get("/acme/admin/login/")
+
+    assert home_response.json() == {"home": True}
+    assert acme.status_code == 200
+    assert acme.text == "admin login of acme"
+
+
 def test_admin_at_the_root_path_keeps_the_root_mount_of_the_user(settings):
     """A Django mount at "/" of the user already serves an admin site at the root path."""
     settings.ROOT_URLCONF = "tests.admin_tests.urls_root_admin"
