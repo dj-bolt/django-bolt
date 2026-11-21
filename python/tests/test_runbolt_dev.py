@@ -352,7 +352,9 @@ def test_runbolt_passes_its_options_to_the_server(
         runbolt_module,
         "_core",
         SimpleNamespace(
-            register_routes=lambda routes, _native_routes, _no_route: started.update(paths=[route[1] for route in routes]),
+            register_routes=lambda routes, _native_routes, _no_route: started.update(
+                paths=[route[1] for route in routes]
+            ),
             register_asgi_mounts=lambda asgi_mounts: started.update(mounts=[prefix for prefix, _ in asgi_mounts]),
             register_middleware_metadata=lambda _metadata: None,
             start_server=fake_start_server,
