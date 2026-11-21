@@ -21,6 +21,9 @@ from django_bolt.serializers import (
 )
 from django_bolt.testing import TestClient
 
+from .read_only_bases import TaggedBase
+from .read_only_bases_pep649 import LazyBareChild, LazyChild
+
 
 class ReadOnlyAddress(Serializer):
     id: int = field(read_only=True, default=0)
@@ -51,6 +54,21 @@ class StrictFieldReadOnly(Serializer, forbid_unknown_fields=True):
     name: str
     id: int = field(read_only=True, default=0)
     tags: list[str] = field(read_only=True, default_factory=list)
+
+
+class SameModuleBase(Serializer):
+    id: int = 0
+    name: str
+
+
+class StrictBaseIdChild(SameModuleBase, forbid_unknown_fields=True):
+    class Config:
+        read_only = {"id"}
+
+
+class StrictOtherModuleChild(TaggedBase, forbid_unknown_fields=True):
+    class Config:
+        read_only = {"id", "tag", "tags", "user_id"}
 
 
 class NoDefaultBody(Serializer):
@@ -174,6 +192,76 @@ class TestFieldFunction:
         assert subset.model_validate({"name": "a"}).id == 0
         with pytest.raises(msgspec.ValidationError, match="unknown field `id`"):
             subset.model_validate({"name": "a", "id": sent_id})
+
+    @pytest.mark.parametrize(
+        ("Strict", "read_only_input"),
+        [
+            (StrictBaseIdChild, {"id": (0, 5)}),
+            (
+                StrictOtherModuleChild,
+                {"id": (0, 5), "tag": (None, {"label": "x"}), "tags": ([], ["x"]), "userId": (0, 5)},
+            ),
+            (LazyChild, {"id": (0, 5), "label": (None, {"text": "x"})}),
+            (LazyBareChild, {"id": (0, 5), "label": (None, {"text": "x"})}),
+        ],
+    )
+    def test_a_strict_body_refuses_each_value_of_a_read_only_field_of_a_base_class(  # noqa: N803
+        self, Strict, read_only_input
+    ):
+        """Config.read_only gives a field of a base class the same rule as a field of the class.
+
+        An input value that is equal to the default is an unknown field, as is
+        each other value.
+        """
+        api = BoltAPI()
+
+        async def create(body):
+            return body.dump()
+
+        create.__annotations__ = {"body": Strict, "return": dict}
+        api.post("/strict")(create)
+
+        with TestClient(api) as client:
+            response = client.post("/strict", json={"name": "a"})
+            assert response.status_code == 200
+            assert response.json() == {"name": "a", **Strict(name="a").dump()}
+            # The first value is the default.
+            for input_name, values in read_only_input.items():
+                for value in values:
+                    response = client.post("/strict", json={"name": "a", input_name: value})
+                    assert response.status_code == 422, (input_name, value)
+                    assert f"unknown field `{input_name}`" in response.text
+
+        # Python code sets the field.
+        assert Strict(name="a", id=7).id == 7
+        with pytest.raises(msgspec.ValidationError, match="unknown field `id`"):
+            Strict.model_validate({"name": "a", "id": 0})
+
+    def test_config_read_only_names_a_base_field_with_an_unknown_annotation(self):
+        """A forward reference that does not resolve is an error at class creation."""
+
+        class Base(Serializer):
+            other: Missing | None = None  # noqa: F821
+            name: str
+
+        with pytest.raises(ImproperlyConfigured, match=r"Child\.Config\.read_only.*`other`.*Missing"):
+
+            class Child(Base, forbid_unknown_fields=True):
+                class Config:
+                    read_only = {"other"}
+
+    def test_config_read_only_names_a_base_field_with_a_type_parameter(self):
+        """The class has no value for the type parameter. This is an error at class creation."""
+
+        class Base[T](Serializer):
+            item: T | None = None
+            name: str
+
+        with pytest.raises(ImproperlyConfigured, match=r"Child\.Config\.read_only.*`item`.*type parameter"):
+
+            class Child(Base[int]):
+                class Config:
+                    read_only = {"item"}
 
     def test_read_only_field_with_no_default_cannot_validate_input(self):
         """Input has no value for the field, and there is no default to use."""

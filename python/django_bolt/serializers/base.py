@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import sys
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import UnionType
@@ -26,6 +27,9 @@ from typing import (
     get_type_hints,
 )
 from weakref import WeakKeyDictionary
+
+if sys.version_info >= (3, 14):
+    import annotationlib
 
 import msgspec
 from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
@@ -426,7 +430,108 @@ def _get_django_relation_info(model_cls: type, attr_name: str) -> _DjangoRelatio
 _EMPTY_MUTABLE_DEFAULTS = (list, dict, set, bytearray)
 
 
-def _mark_config_read_only_defaults(namespace: dict[str, Any]) -> None:
+def _read_only_marker(default: Any) -> Any:
+    """
+    The ``field()`` marker for a ``Config.read_only`` field with this plain default.
+
+    Return ``_MISSING`` when the default needs no marker: a marker, a msgspec
+    field, a method or property, or a non-empty mutable default.
+    """
+    if isinstance(default, (_FieldMarker, _MSGSPEC_FIELD)) or hasattr(default, "__get__"):
+        return _MISSING
+    if type(default) is _MSGSPEC_FACTORY:
+        return field(read_only=True, default_factory=default.factory)
+    if isinstance(default, _EMPTY_MUTABLE_DEFAULTS):
+        if default:
+            # msgspec refuses this default with its own message.
+            return _MISSING
+        return field(read_only=True, default_factory=type(default))
+    return field(read_only=True, default=default)
+
+
+def _own_annotations(cls: type) -> Mapping[str, Any]:
+    """The annotations of the class body of ``cls``. Names that do not resolve stay as they are."""
+    if sys.version_info >= (3, 14):
+        return annotationlib.get_annotations(cls, format=annotationlib.Format.FORWARDREF)
+    return cls.__dict__.get("__annotations__", {})
+
+
+def _namespace_annotation_names(namespace: dict[str, Any]) -> Collection[str]:
+    """The annotated names of a class body that is not a class yet."""
+    if "__annotations__" in namespace:
+        return namespace["__annotations__"]
+    annotate = namespace.get("__annotate_func__")
+    if annotate is None:
+        return ()
+    return annotationlib.call_annotate_function(annotate, annotationlib.Format.FORWARDREF)
+
+
+def _resolve_base_annotation(class_name: str, owner: type, field_name: str) -> Any:
+    """
+    Resolve the annotation of ``field_name`` in the class body of ``owner``.
+
+    A string annotation resolves in the module of ``owner``, as msgspec does it.
+    A name that does not resolve now, or a type parameter of ``owner``, raises
+    ``ImproperlyConfigured``.
+    """
+    annotation: Any
+    if sys.version_info >= (3, 14):
+        try:
+            annotation = annotationlib.get_annotations(owner)[field_name]
+        except NameError:
+            # Another annotation of ``owner`` does not resolve. Read the text of this one.
+            annotation = annotationlib.get_annotations(owner, format=annotationlib.Format.STRING)[field_name]
+    else:
+        annotation = owner.__dict__["__annotations__"][field_name]
+
+    def fail(problem: str) -> ImproperlyConfigured:
+        return ImproperlyConfigured(
+            f"{class_name}.Config.read_only names `{field_name}`, a field of {owner.__qualname__}. "
+            f"{problem} Declare the field in {class_name} with "
+            f"`{field_name}: <type> = field(read_only=True, default=...)`."
+        )
+
+    if isinstance(annotation, str):
+        # msgspec and typing.get_type_hints look up a name in the module first,
+        # then in the class body.
+        class_locals = {param.__name__: param for param in getattr(owner, "__type_params__", ())}
+        class_locals.update(vars(owner))
+        module_globals = getattr(sys.modules.get(owner.__module__), "__dict__", {})
+        try:
+            annotation = eval(annotation, class_locals, module_globals)  # noqa: S307
+        except NameError as exc:
+            raise fail(f"Its annotation {annotation!r} does not resolve at class creation: {exc}.") from exc
+
+    type_params = getattr(owner, "__parameters__", ())
+    if type_params and (
+        any(annotation is param for param in type_params)
+        or any(param in type_params for param in getattr(annotation, "__parameters__", ()))
+    ):
+        raise fail(f"Its annotation {annotation!r} uses a type parameter of {owner.__qualname__}.")
+    return annotation
+
+
+def _add_namespace_annotations(namespace: dict[str, Any], added: dict[str, Any]) -> None:
+    """Add resolved annotations to a class body, before msgspec reads it."""
+    if "__annotations__" in namespace or "__annotate_func__" not in namespace:
+        namespace["__annotations__"] = {**namespace.get("__annotations__", {}), **added}
+        return
+
+    # Python 3.14 (PEP 649): the class body has an annotate function.
+    original = namespace["__annotate_func__"]
+
+    def annotate(format: int) -> dict[str, Any]:  # noqa: A002 (the PEP 649 name)
+        if format == annotationlib.Format.VALUE_WITH_FAKE_GLOBALS:
+            raise NotImplementedError
+        annotations = annotationlib.call_annotate_function(original, format)
+        if format == annotationlib.Format.STRING:
+            return {**annotations, **{name: annotationlib.type_repr(value) for name, value in added.items()}}
+        return {**annotations, **added}
+
+    namespace["__annotate_func__"] = annotate
+
+
+def _mark_config_read_only_defaults(name: str, bases: tuple, namespace: dict[str, Any]) -> None:
     """
     Give each ``Config.read_only`` field with a plain default a ``field()`` marker default.
 
@@ -434,27 +539,42 @@ def _mark_config_read_only_defaults(namespace: dict[str, Any]) -> None:
     ``id: int = field(read_only=True, default=0)``. The marker tells an absent
     field from an input value that is equal to the default.
 
-    This applies to a field that the class body declares. A field of a base
-    class keeps its struct default, and so does a ``msgspec.field()`` default.
+    A field of a base class gets a declaration in the class body, with the
+    resolved annotation of the base class and the marker. A ``msgspec.field()``
+    default of the class body keeps its struct default.
     """
     config = namespace.get("Config")
     read_only = getattr(config, "read_only", None)
     if not read_only:
         return
+    added_annotations: dict[str, Any] = {}
+    own_names: Collection[str] | None = None
     for field_name in read_only:
-        if field_name not in namespace:
+        if field_name in namespace:
+            marker = _read_only_marker(namespace[field_name])
+            if marker is not _MISSING:
+                namespace[field_name] = marker
             continue
-        default = namespace[field_name]
-        if isinstance(default, (_FieldMarker, _MSGSPEC_FIELD)) or hasattr(default, "__get__"):
-            # A marker, a msgspec field, or a method or property with this name.
+        if own_names is None:
+            own_names = _namespace_annotation_names(namespace)
+        if field_name in own_names:
+            # The class body declares the field with no default.
             continue
-        if isinstance(default, _EMPTY_MUTABLE_DEFAULTS):
-            if default:
-                # msgspec refuses this default with its own message.
-                continue
-            namespace[field_name] = field(read_only=True, default_factory=type(default))
-        else:
-            namespace[field_name] = field(read_only=True, default=default)
+        base = next((base for base in bases if field_name in getattr(base, "__struct_fields__", ())), None)
+        if base is None:
+            continue
+        default = dict(_iter_field_defaults(base)).get(field_name, msgspec.NODEFAULT)
+        # A field with no default keeps the error of a read_only field with no default.
+        marker = _MISSING if default is msgspec.NODEFAULT else _read_only_marker(default)
+        if marker is _MISSING:
+            continue
+        owner = next(cls for cls in base.__mro__ if field_name in _own_annotations(cls))
+        added_annotations[field_name] = _resolve_base_annotation(name, owner, field_name)
+        encode_name = dict(zip(base.__struct_fields__, base.__struct_encode_fields__, strict=True))[field_name]
+        # The field keeps the JSON name of the base class.
+        namespace[field_name] = marker if encode_name == field_name else msgspec.field(default=marker, name=encode_name)
+    if added_annotations:
+        _add_namespace_annotations(namespace, added_annotations)
 
 
 class _SerializerMeta(_STRUCT_META):
@@ -468,7 +588,7 @@ class _SerializerMeta(_STRUCT_META):
     def __new__(mcs, name: str, bases: tuple, namespace: dict, **kwargs):
         # Force kw_only=True for all Serializer subclasses
         kwargs.setdefault("kw_only", True)
-        _mark_config_read_only_defaults(namespace)
+        _mark_config_read_only_defaults(name, bases, namespace)
 
         # field() with no default is not a default value. Take the marker out of
         # the class body, so msgspec reports a missing value as it does for a
@@ -903,8 +1023,8 @@ class Serializer(msgspec.Struct, metaclass=_SerializerMeta):
             if forbid_unknown:
                 value = getattr(self, field_name)
                 # An absent ``field()`` field holds its marker. Config.read_only
-                # gives a plain default of the class body a marker too. The plain
-                # default of a base class field or of ``msgspec.field()`` has no
+                # gives a plain default a marker too, also for a field of a base
+                # class. A ``msgspec.field()`` default of the class body has no
                 # such sign, so an input value equal to it passes.
                 if not isinstance(value, _FieldMarker) if is_marker else value != default:
                     raise ValueError(f"Object contains unknown field `{input_name}`")

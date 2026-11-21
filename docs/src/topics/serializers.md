@@ -750,7 +750,16 @@ Input is a JSON request body, `model_validate()` and `model_validate_json()`. A 
 
 `Config.read_only` and `field(read_only=True, default=...)` give the same result. With `forbid_unknown_fields=True`, each input value for the field is an error, also a value equal to the default.
 
-There is one exception. A `Config.read_only` name can refer to a field of a base class, or to a field with a `msgspec.field()` default. With `forbid_unknown_fields=True`, such a field accepts an input value equal to its default. Declare the field in the class that has the `Config`, or use `field(read_only=True, default=...)`.
+A `Config.read_only` name can refer to a field of a base class. The serializer then declares the field again in the class that has the `Config`. The field keeps the annotation, the default and the JSON name of the base class. The position of the field in the output can change.
+
+The serializer resolves the annotation of the base class when it creates the class. Class creation raises `ImproperlyConfigured` in these cases:
+
+- A name in the annotation is not defined yet.
+- The annotation uses a type parameter of a generic base class.
+
+In these cases, declare the field in the class that has the `Config`. Use `field(read_only=True, default=...)`.
+
+There is one exception. A `Config.read_only` name can refer to a field with a `msgspec.field()` default in the class body. With `forbid_unknown_fields=True`, such a field accepts an input value equal to its default. Use `field(read_only=True, default=...)` for this field.
 
 ### Write-only fields in a response
 
