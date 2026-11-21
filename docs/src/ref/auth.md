@@ -364,17 +364,18 @@ than its own.
 
 All methods are coroutines.
 
-The stores keep families and user versions in the same key space as tokens.
-Thus `revoke`, `consume` and `is_revoked` raise `ValueError` for a `jti` with a reserved prefix.
+`DjangoCacheRevocation` and `DjangoORMRevocation` keep families and user versions in the same key space as tokens.
+Thus their `revoke`, `consume` and `is_revoked` raise `ValueError` for a `jti` with a reserved prefix.
 For `DjangoCacheRevocation`, the reserved prefixes are `fam:` and `ver:`.
 For `DjangoORMRevocation`, they are `family:` and `version:`.
 A `jti` from `create_token_pair` is a UUID, so it does not have these prefixes.
+`InMemoryRevocation` keeps tokens, families and user versions apart, so it accepts each `jti`.
 
 | Method                          | Description                                                    |
 | ------------------------------- | -------------------------------------------------------------- |
 | `revoke(jti, *, exp=None)`      | Revoke a single token by its `jti` claim                       |
 | `is_revoked(jti)`               | Whether a token has been revoked                               |
-| `consume(jti, *, exp=None)`     | Atomically consume a refresh token; `True` only for the first caller. `False` for a token after `exp + leeway` |
+| `consume(jti, *, exp=None)`     | Atomically consume a refresh token; `True` only for the first caller. The two Django stores give `False` for a token after `exp + leeway`. `InMemoryRevocation` does not read `exp` |
 | `get_user_version(user_id)`     | The user's current token version (`0` if never bumped)         |
 | `bump_user_version(user_id)`    | Increment the version, invalidating earlier refresh tokens at rotation |
 | `revoke_family(fam, *, exp=None)` | Revoke an entire refresh-token rotation family               |
