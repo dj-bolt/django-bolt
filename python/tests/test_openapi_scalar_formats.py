@@ -207,7 +207,8 @@ def test_bytes_in_a_parameter_are_plain_text():
     model_fields = {
         "token": text,
         "tags": {"type": "array", "items": text, "default": []},
-        "hint": {"anyOf": [text, {"type": "null"}], "default": None},
+        # An optional field has the schema of its type. `required: false` says that it is optional.
+        "hint": text,
     }
 
     def parameters(path):
@@ -285,7 +286,7 @@ def test_a_header_or_cookie_model_is_one_parameter_for_each_field():
     schemas = [
         {"type": "string"},
         {"type": "string", "default": "none"},
-        {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}], "default": None},
+        {"type": "integer", "minimum": 0},
         {"type": "string", "default": "std"},
     ]
     required = [True, False, False, False]
@@ -302,6 +303,52 @@ def test_a_header_or_cookie_model_is_one_parameter_for_each_field():
         ("cookie", name, *rest)
         for name, *rest in zip(["token", "x_request_id", "retries", "X_Custom"], required, schemas, strict=True)
     ]
+
+
+class OptionalParams(msgspec.Struct):
+    hint: str | None = None
+    limit: Annotated[int, msgspec.Meta(ge=1)] | None = None
+    tags: list[str] | None = None
+    mode: str | None = "fast"
+
+
+def test_an_optional_field_of_a_header_model_has_the_schema_of_a_query_model_field():
+    """A header, cookie or query value cannot be null. `required: false` says that the field is optional."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/query")
+    async def query_model(params: Annotated[OptionalParams, Query()]):
+        return {}
+
+    @api.get("/header")
+    async def header_model(params: Annotated[OptionalParams, Header()]):
+        return {}
+
+    @api.get("/cookie")
+    async def cookie_model(params: Annotated[OptionalParams, Cookie()]):
+        return {}
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+
+    validate(spec)
+
+    def parameters(path):
+        return {p["name"]: (p["required"], p["schema"]) for p in spec["paths"][path]["get"]["parameters"]}
+
+    tags = {"type": "array", "items": {"type": "string"}}
+    in_query = {
+        "hint": (False, {"type": "string"}),
+        "limit": (False, {"type": "integer", "minimum": 1}),
+        "tags": (False, tags),
+        "mode": (False, {"type": "string", "default": "fast"}),
+    }
+    assert parameters("/query") == in_query
+    # A header or a cookie gives one value, so its array holds exactly one item.
+    one_value = {**in_query, "tags": (False, {**tags, "minItems": 1, "maxItems": 1})}
+    assert parameters("/header") == one_value
+    assert parameters("/cookie") == one_value
 
 
 class UserGender(enum.StrEnum):
