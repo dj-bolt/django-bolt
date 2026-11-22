@@ -19,4 +19,9 @@ async def health():
     return {"status": "ok"}
 
 
+@named.get("/ping")
+async def ping():
+    return {"ok": True}
+
+
 api.mount("/named", named)
