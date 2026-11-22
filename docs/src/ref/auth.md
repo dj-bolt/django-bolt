@@ -117,7 +117,7 @@ Accepts a key from a fixed set.
 | `key_permissions` | `None` | A dict from a key to its permissions. `Requires("permissions", ...)` reads them. |
 
 Bolt compares keys in constant time. The context of an accepted request has `"user_id": "apikey:<key>"` and `"auth_backend": "api_key"`.
-The backend loads no user: `request.user` is `None`, and `await request.auser()` gives `AnonymousUser`.
+The backend loads no user: `request.user` and `await request.auser()` give `AnonymousUser`.
 Its `WWW-Authenticate` scheme is `ApiKey`.
 
 **Errors.** `ImproperlyConfigured` for `api_keys` that is a string or holds a value that is not a string, an empty key, a key that starts with `Bearer ` or `ApiKey ` in any case, an empty `header`, a `key_permissions` that is not a dict, or a `key_permissions` key that is not in `api_keys`.

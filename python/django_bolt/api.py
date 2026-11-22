@@ -3827,7 +3827,7 @@ class BoltAPI:
 
             # 2. Lazy user loading (Django pattern)
             # User is only loaded from DB when request.user is actually accessed
-            # Skip setting user=None — PyRequest.user getter already returns None.
+            # Leave the user unset when there is none. PyRequest.user then gives AnonymousUser.
             if meta["_has_auth_backends"] and (auth_context := request.get("auth")):
                 revocation_handlers = meta["_revocation_handlers"]
                 if revocation_handlers is not None:
@@ -3838,7 +3838,7 @@ class BoltAPI:
                     # Route-local loaders of the backend that authenticated.
                     # Loaders of None mean the backend has no user
                     # resolution — leave request.user unset (PyRequest
-                    # getter returns None). The sync loader looks at the
+                    # getter gives AnonymousUser). The sync loader looks at the
                     # thread that forces the user. ``await request.auser()``
                     # uses the async loader.
                     loaders = meta["_user_loaders"][auth_context["auth_backend_index"]]
@@ -3910,7 +3910,7 @@ class BoltAPI:
                 check_connections_before_sync_dispatch()
 
             # Lazy user loading: only set when auth context has a user_id.
-            # Skip setting user=None — PyRequest.user getter already returns None.
+            # Leave the user unset when there is none. PyRequest.user then gives AnonymousUser.
             if meta["_has_auth_backends"] and (auth_context := request.get("auth")):
                 user_id = auth_context.get("user_id")
                 if user_id:
