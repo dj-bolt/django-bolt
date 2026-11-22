@@ -878,12 +878,15 @@ class TestQueueBasedLogging:
 
         pid = os.fork()
         if pid == 0:
+            # An error in the child gives exit status 1. The child must not go on to run pytest.
+            exit_code = 1
             try:
                 restart_queue_listener_after_fork()
                 config_module._QUEUE.put(logging.makeLogRecord({"msg": "from the child"}))
                 stop_queue_listener()
+                exit_code = 0
             finally:
-                os._exit(0)
+                os._exit(exit_code)
 
         deadline = time.monotonic() + 5
         status = None
