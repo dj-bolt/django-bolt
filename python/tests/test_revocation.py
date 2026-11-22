@@ -20,6 +20,7 @@ from django_bolt.auth.revocation import (
     DjangoCacheRevocation,
     DjangoORMRevocation,
     InMemoryRevocation,
+    ReservedJtiError,
     RevocationStore,
     _ttl_for,
 )
@@ -732,7 +733,7 @@ _TOKEN_CALLS = pytest.mark.parametrize(
 def test_cache_refuses_a_jti_that_uses_the_key_of_another_entry(cache_store, call, jti, key):
     store = cache_store()
 
-    with pytest.raises(ValueError, match=f"^jti {jti!r} starts with a reserved prefix"):
+    with pytest.raises(ReservedJtiError, match=f"^jti {jti!r} starts with a reserved prefix"):
         asyncio.run(call(store, jti))
 
     assert caches["revocation"].get(key) is None
@@ -743,7 +744,7 @@ def test_cache_refuses_a_jti_that_uses_the_key_of_another_entry(cache_store, cal
 def test_orm_refuses_a_jti_that_uses_the_key_of_another_entry(orm_store, call, jti):
     store = orm_store()
 
-    with pytest.raises(ValueError, match=f"^jti {jti!r} starts with a reserved prefix"):
+    with pytest.raises(ReservedJtiError, match=f"^jti {jti!r} starts with a reserved prefix"):
         asyncio.run(call(store, jti))
 
     assert RevokedToken.objects.filter(jti=jti).exists() is False
@@ -777,18 +778,92 @@ def _signed(typ: str, jti: str) -> str:
     return jwt.encode(claims, _SECRET, algorithm="HS256")
 
 
-def test_a_token_whose_jti_has_a_reserved_prefix_gives_a_500_at_authentication(cache_store, caplog):
+_RESERVED_JTI_STORES = pytest.mark.parametrize(
+    ("store_fixture", "jti"),
+    [("cache_store", "ver:u"), ("cache_store", "fam:f"), ("orm_store", "version:u"), ("orm_store", "family:f")],
+)
+
+
+@_RESERVED_JTI_STORES
+def test_a_token_whose_jti_has_a_reserved_prefix_gets_a_401_at_authentication(request, caplog, store_fixture, jti):
+    """The store refuses the jti, so the backend refuses the token. A refused token is not a server error."""
+    store = request.getfixturevalue(store_fixture)()
     api = BoltAPI()
 
-    @api.get("/protected", auth=[JWTAuthentication(secret=_SECRET, revocation_store=cache_store())])
+    @api.get("/protected", auth=[JWTAuthentication(secret=_SECRET, revocation_store=store)])
     async def protected():
         return {"ok": True}
 
     with TestClient(api, raise_server_exceptions=False) as client:
-        response = client.get("/protected", headers={"Authorization": f"Bearer {_signed('access', 'ver:u')}"})
+        response = client.get("/protected", headers={"Authorization": f"Bearer {_signed('access', jti)}"})
+
+    assert response.status_code == 401
+    assert "reserved prefix" not in caplog.text
+
+
+class _BrokenStore(InMemoryRevocation):
+    """A custom store with a bug: ``is_revoked`` raises a ``ValueError`` that is not ``ReservedJtiError``."""
+
+    async def is_revoked(self, jti: str) -> bool:
+        raise ValueError("bug in the store")
+
+
+def test_a_value_error_of_a_broken_store_is_not_a_revoked_token(caplog):
+    """Only ``ReservedJtiError`` means a revoked token. Another error of the store stays a server error."""
+    api = BoltAPI()
+
+    @api.get("/protected", auth=[JWTAuthentication(secret=_SECRET, revocation_store=_BrokenStore())])
+    async def protected():
+        return {"ok": True}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/protected", headers={"Authorization": f"Bearer {_signed('access', 'jti-1')}"})
 
     assert response.status_code == 500
-    assert "starts with a reserved prefix" in caplog.text
+    assert "bug in the store" in caplog.text
+
+
+def test_logout_with_a_broken_store_is_a_server_error(caplog):
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return _ViewsUser()
+
+    JWTAuthViews(store=_BrokenStore(), secret=_SECRET, secure_cookies=False, credential_validator=validate).register(
+        api
+    )
+    headers = {"Cookie": f"refresh_token={_signed('refresh', 'jti-1')}", "Sec-Fetch-Site": "none"}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.post("/auth/logout", headers=headers)
+
+    assert response.status_code == 500
+    assert "bug in the store" in caplog.text
+
+
+@pytest.mark.parametrize("path", ["/auth/logout", "/auth/logout-all"])
+@_RESERVED_JTI_STORES
+def test_logout_with_a_token_whose_jti_has_a_reserved_prefix_gives_the_uniform_401(
+    request, caplog, store_fixture, jti, path
+):
+    store = request.getfixturevalue(store_fixture)()
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return _ViewsUser()
+
+    JWTAuthViews(store=store, secret=_SECRET, secure_cookies=False, credential_validator=validate).register(api)
+    headers = {"Cookie": f"refresh_token={_signed('refresh', jti)}", "Sec-Fetch-Site": "none"}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.post(path, headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid token"
+    assert "reserved prefix" not in caplog.text
+    # The user version stays, so the live tokens of the user stay valid.
+    assert asyncio.run(store.get_user_version("u")) == 0
+    assert asyncio.run(store.is_family_revoked("f")) is False
 
 
 def test_refresh_of_a_token_whose_jti_has_a_reserved_prefix_gives_the_uniform_401(cache_store):

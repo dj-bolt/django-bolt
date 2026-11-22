@@ -365,10 +365,15 @@ than its own.
 All methods are coroutines.
 
 `DjangoCacheRevocation` and `DjangoORMRevocation` keep families and user versions in the same key space as tokens.
-Thus their `revoke`, `consume` and `is_revoked` raise `ValueError` for a `jti` with a reserved prefix.
+Thus their `revoke`, `consume` and `is_revoked` raise `ReservedJtiError` for a `jti` with a reserved prefix.
+`ReservedJtiError` is a subclass of `ValueError`.
 For `DjangoCacheRevocation`, the reserved prefixes are `fam:` and `ver:`.
 For `DjangoORMRevocation`, they are `family:` and `version:`.
 A `jti` from `create_token_pair` is a UUID, so it does not have these prefixes.
+`JWTAuthentication(revocation_store=store)` and `JWTAuthViews` count a token as revoked when `is_revoked` raises `ReservedJtiError`.
+Thus such a token gets a 401.
+A custom store can raise it for a `jti` that it cannot keep.
+Another exception from `is_revoked` gives a 500.
 `InMemoryRevocation` keeps tokens, families and user versions apart, so it accepts each `jti`.
 The two Django stores give `False` from `consume` for a token after `exp + leeway`.
 `InMemoryRevocation` does not read `exp`.

@@ -21,7 +21,7 @@ from django.test import override_settings
 
 from django_bolt import BoltAPI
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, JWTAuthViews, create_token_pair
-from django_bolt.auth.revocation import DjangoCacheRevocation
+from django_bolt.auth.revocation import DjangoCacheRevocation, ReservedJtiError
 from django_bolt.testing import TestClient
 
 from .thread_pools import shutdown_closing_connections
@@ -196,7 +196,7 @@ async def test_a_jti_cannot_write_the_key_of_a_family_or_of_a_user_version_on_re
     exp = int(time.time()) + 100
 
     for jti in ("ver:u2", "fam:f1"):
-        with pytest.raises(ValueError, match="starts with a reserved prefix"):
+        with pytest.raises(ReservedJtiError, match="starts with a reserved prefix"):
             await store.revoke(jti, exp=exp)
 
     assert redis_keys() == {}

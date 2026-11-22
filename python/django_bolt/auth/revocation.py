@@ -27,10 +27,17 @@ _CACHE_RESERVED_PREFIXES = ("fam:", "ver:")
 _ORM_RESERVED_PREFIXES = ("family:", "version:")
 
 
+class ReservedJtiError(ValueError):
+    """A store refuses a ``jti`` that starts with one of its reserved prefixes.
+
+    Authentication and ``JWTAuthViews`` count such a token as revoked.
+    """
+
+
 def _check_jti(jti: str, reserved: tuple[str, ...]) -> None:
-    """Raise ``ValueError`` when ``jti`` starts with a reserved prefix."""
+    """Raise ``ReservedJtiError`` when ``jti`` starts with a reserved prefix."""
     if jti.startswith(reserved):
-        raise ValueError(
+        raise ReservedJtiError(
             f"jti {jti!r} starts with a reserved prefix ({', '.join(reserved)}). "
             "The store uses these prefixes for families and user versions."
         )
@@ -337,7 +344,7 @@ class DjangoCacheRevocation(RevocationStore):
         If ``exp`` is omitted, the entry lives for ``self.default_ttl``
         seconds (set on the constructor).
 
-        A ``jti`` that starts with ``fam:`` or ``ver:`` raises ``ValueError``.
+        A ``jti`` that starts with ``fam:`` or ``ver:`` raises ``ReservedJtiError``.
         """
         _check_jti(jti, _CACHE_RESERVED_PREFIXES)
         key = f"{self.key_prefix}{jti}"
@@ -501,7 +508,7 @@ class DjangoORMRevocation(RevocationStore):
         If ``exp`` is omitted, ``expires_at`` is set to ``now +
         self.default_ttl`` (set on the constructor).
 
-        A ``jti`` that starts with ``family:`` or ``version:`` raises ``ValueError``.
+        A ``jti`` that starts with ``family:`` or ``version:`` raises ``ReservedJtiError``.
         """
         _check_jti(jti, _ORM_RESERVED_PREFIXES)
         await self._upsert(jti, exp)
@@ -556,7 +563,8 @@ def create_revocation_handler(store: RevocationStore):
         store: RevocationStore instance
 
     Returns:
-        Async callable that checks if token is revoked
+        Async callable that checks if token is revoked. A ``ReservedJtiError``
+        from ``store.is_revoked`` gives ``True``, so the backend refuses the token.
 
     Example:
         ```python
@@ -573,6 +581,11 @@ def create_revocation_handler(store: RevocationStore):
     """
 
     async def handler(jti: str) -> bool:
-        return await store.is_revoked(jti)
+        try:
+            return await store.is_revoked(jti)
+        except ReservedJtiError:
+            # The store refuses this jti, for example a jti with a reserved prefix.
+            # The store cannot check such a token, so the token counts as revoked.
+            return True
 
     return handler

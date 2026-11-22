@@ -15,6 +15,7 @@ from django_bolt.responses import JSON
 
 from .backends import JWTAuthentication, www_authenticate_challenge
 from .guards import IsAuthenticated
+from .revocation import ReservedJtiError
 from .tokens import (
     DEFAULT_REFRESH_TTL,
     TokenRotationError,
@@ -102,6 +103,14 @@ class JWTAuthViews:
         response.delete_cookie(self.refresh_cookie, path=self._refresh_path)
         return response
 
+    async def _token_revoked(self, jti: str) -> bool:
+        try:
+            return await self.store.is_revoked(jti)
+        except ReservedJtiError:
+            # The store refuses this jti, for example a jti with a reserved prefix.
+            # Such a token is not live, so it gets the same 401 as a revoked token.
+            return True
+
     async def _require_live_refresh(self, request: Any) -> dict[str, Any]:
         """Reject a refresh token that ``/refresh`` also rejects.
 
@@ -113,7 +122,7 @@ class JWTAuthViews:
         fam = claims.get("fam")
         if (
             not fam
-            or await self.store.is_revoked(claims["jti"])
+            or await self._token_revoked(claims["jti"])
             or await self.store.is_family_revoked(fam)
             or claims.get("ver", 0) != await self.store.get_user_version(request["context"]["user_id"])
         ):
