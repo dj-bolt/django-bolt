@@ -10,6 +10,7 @@ import pytest
 from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
+from django_bolt.exceptions import ResponseValidationError
 from django_bolt.middleware import Middleware
 from django_bolt.openapi.config import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
@@ -92,7 +93,7 @@ def test_union_validation_error():
     async def get_bad_pet():
         return {"name": "Bird", "flies": True}
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         resp = client.get("/bad-pet")
         assert resp.status_code == 500
         assert b"Response validation error" in resp.content
@@ -222,15 +223,10 @@ def test_inline_path_with_queryset_like_object_delegates_to_slow_path():
     async def qs_endpoint() -> list[Tagged]:
         return FakeQuerySet()
 
-    with TestClient(api) as client:
-        resp = client.get("/qs")
-        # Either 200 (slow-path values() → []) or 500 is acceptable here, but the
-        # response must NOT be a validation error citing the wrong wire shape —
-        # that would mean the inline path swallowed the input and bypassed
-        # slow-path QuerySet detection.
-        assert resp.status_code in (200, 500)
-        if resp.status_code == 200:
-            assert resp.json() == []
+    # The slow path refuses the duck-type, because it is not a QuerySet. The
+    # error of the inline path would name the wire shape, not the handler result.
+    with TestClient(api) as client, pytest.raises(ResponseValidationError, match="handler returned FakeQuerySet"):
+        client.get("/qs")
 
 
 def test_tagged_union_emits_per_arm_examples_in_openapi():
@@ -438,7 +434,7 @@ def test_inline_list_path_reports_an_invalid_element(settings):
     async def rows() -> list[Row]:
         return [{"id": 1}, {"id": "x"}]
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         resp = client.get("/rows")
         assert resp.status_code == 500
         assert resp.json()["extra"]["validation_errors"] == [
@@ -454,7 +450,7 @@ def test_list_route_that_returns_one_struct_gives_a_response_validation_error():
     async def rows() -> list[Row]:
         return Row(id=1)
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         resp = client.get("/rows")
         assert resp.status_code == 500
         assert resp.json()["detail"] == "Response validation error"
@@ -533,7 +529,7 @@ def test_inline_list_path_reports_each_error_as_the_slow_path_does(api_kwargs, s
     def checked_sync() -> list[Checked]:
         return [{"n": -1}]
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         slow_union_body = client.get("/slow-union").json()
         slow_checked_body = client.get("/slow-checked").json()
         assert slow_union_body["detail"] == "Response validation error"
@@ -570,7 +566,7 @@ def test_response_validation_error_locates_the_error_in_the_response(settings):
         return {"id": "x"}
 
     expected = {"/list": ["response", "1", "id"], "/struct": ["response", "id"], "/serializer": ["response", "id"]}
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         for path, loc in expected.items():
             resp = client.get(path)
             assert resp.status_code == 500, path

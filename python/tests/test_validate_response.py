@@ -45,7 +45,7 @@ def test_validate_response_route_and_api_defaults():
     assert _get_meta(api, "/model-default-off")["_has_response_validation"] is False
     assert _get_meta(api, "/model-override-on")["_has_response_validation"] is True
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         assert client.get("/default-off").json() == [{"name": "missing-price"}]
         assert client.get("/model-default-off").json() == [{"name": "missing-price"}]
 
@@ -108,7 +108,7 @@ def test_validate_response_view_and_viewset_inheritance():
     assert _get_meta(api, "/widgets")["_has_response_validation"] is False
     assert _get_meta(api, "/widgets/strict")["_has_response_validation"] is True
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         assert client.get("/loose").status_code == 200
         assert client.get("/loose").json() == [{"name": "missing-price"}]
 
@@ -148,7 +148,7 @@ def test_return_annotation_validates_only_the_default_status():
             return JSON({"price": ["Must be positive."]}, status_code=400)
         return Response({"name": "x", "price": 1.0})
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         bad = client.post("/items?flag=bad")
         assert bad.status_code == 400
         assert bad.json() == {"price": ["Must be positive."]}
