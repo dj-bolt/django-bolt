@@ -77,7 +77,7 @@ def _routes(api: BoltAPI) -> BoltAPI:
 
 @pytest.fixture(scope="module")
 def client():
-    with TestClient(_routes(BoltAPI())) as client:
+    with TestClient(_routes(BoltAPI()), raise_server_exceptions=False) as client:
         yield client
 
 
@@ -130,7 +130,7 @@ def test_the_exception_logging_handler_gets_only_5xx_exceptions():
         seen.append(f"{request['path']}: {type(exc).__name__}")
 
     api = _routes(BoltAPI(logging_config=LoggingConfig(exception_logging_handler=handler)))
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         assert client.get("/async/denied").status_code == 403
         assert client.get("/query").status_code == 422
         assert client.get("/async/crash").status_code == 500
@@ -209,7 +209,7 @@ def test_a_formatter_does_not_change_which_exceptions_are_logged(server_errors, 
         await asyncio.sleep(0)
         raise make_error()
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/raise")
 
     if formatter is None:
@@ -228,7 +228,7 @@ def test_an_error_while_bolt_builds_the_error_response_is_logged(server_errors):
         await asyncio.sleep(0)
         raise RequestValidationError([{"loc": ["query", "q"], "msg": "bad", "type": "value_error", "input": object()}])
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/unencodable")
 
     assert response.status_code == 500
@@ -267,7 +267,7 @@ def test_an_error_while_bolt_builds_an_http_exception_response_is_logged(server_
         await asyncio.sleep(0)
         raise HTTPException(400, "bad", extra={"value": object()})
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/unencodable")
 
     assert response.status_code == 500
@@ -300,7 +300,7 @@ def test_a_failure_to_drop_the_connections_does_not_replace_the_error(server_err
         _break_the_connection_close()
         raise RuntimeError("database is down")
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/db")
 
     assert response.status_code == 500
@@ -336,7 +336,7 @@ def test_an_error_while_a_queryset_loads_on_the_orm_pool(server_errors, queryset
     def listing(request):
         return articles()
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/articles")
 
     assert response.status_code == status
@@ -357,7 +357,7 @@ def test_an_os_error_of_handler_code_is_a_logged_500_without_the_path(server_err
     def key():
         raise PermissionError(f"[Errno 13] Permission denied: '{missing}'")
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         config_response = client.get("/config")
         key_response = client.get("/key")
 
@@ -481,7 +481,7 @@ def test_a_file_that_the_server_cannot_read_in_an_allowed_dir_is_a_logged_500(se
     def file():
         return FileResponse(str(private / "data.txt"))
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/file")
 
     assert response.status_code == 500
@@ -510,7 +510,7 @@ def test_a_parent_of_the_allowed_dir_that_the_server_cannot_search(
     def file():
         return FileResponse(str(home / target))
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/file")
 
     assert response.status_code == status

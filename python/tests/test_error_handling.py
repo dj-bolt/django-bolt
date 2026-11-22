@@ -1125,7 +1125,10 @@ class TestResponseValidationDisclosure:
     @pytest.mark.parametrize("path", ["/async-bad", "/sync-bad"])
     def test_debug_off_hides_the_validation_errors(self, settings, caplog, path):
         settings.DEBUG = False
-        with TestClient(_bad_response_api()) as client, caplog.at_level(logging.ERROR, logger="django_bolt"):
+        with (
+            TestClient(_bad_response_api(), raise_server_exceptions=False) as client,
+            caplog.at_level(logging.ERROR, logger="django_bolt"),
+        ):
             response = client.get(path)
 
         assert response.status_code == 500
@@ -1139,7 +1142,7 @@ class TestResponseValidationDisclosure:
     @pytest.mark.parametrize("path", ["/async-bad", "/sync-bad"])
     def test_debug_on_keeps_the_validation_errors(self, settings, path):
         settings.DEBUG = True
-        with TestClient(_bad_response_api()) as client:
+        with TestClient(_bad_response_api(), raise_server_exceptions=False) as client:
             response = client.get(path)
 
         assert response.status_code == 500
@@ -1173,7 +1176,7 @@ class TestResponseValidationDisclosure:
     )
     def test_debug_on_gives_the_field_in_the_location_of_the_error(self, settings, kind, case, error):
         settings.DEBUG = True
-        with TestClient(_bad_response_api()) as client:
+        with TestClient(_bad_response_api(), raise_server_exceptions=False) as client:
             response = client.get(f"/{kind}-{case}")
 
         assert response.status_code == 500
@@ -1189,7 +1192,10 @@ class TestResponseValidationDisclosure:
             return JSON({"kind": error.kind, "errors": error.errors}, status_code=error.status)
 
         api = _bad_response_api(error_formatter=formatter)
-        with TestClient(api) as client, caplog.at_level(logging.ERROR, logger="django_bolt"):
+        with (
+            TestClient(api, raise_server_exceptions=False) as client,
+            caplog.at_level(logging.ERROR, logger="django_bolt"),
+        ):
             response = client.get("/async-bad")
 
         assert response.status_code == 500
@@ -1217,7 +1223,7 @@ class TestResponseValidationDisclosure:
         def formatter(error: BoltError, request) -> JSON:
             return JSON({"errors": error.errors}, status_code=error.status)
 
-        with TestClient(_bad_response_api(error_formatter=formatter)) as client:
+        with TestClient(_bad_response_api(error_formatter=formatter), raise_server_exceptions=False) as client:
             response = client.get("/async-bad")
 
         assert response.status_code == 500
