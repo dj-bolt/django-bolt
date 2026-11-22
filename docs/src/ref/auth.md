@@ -491,6 +491,12 @@ For `DjangoORMRevocation`, they are `family:` and `version:`.
 A `jti` from `create_token_pair` is a UUID, so it does not have these prefixes.
 `JWTAuthentication(revocation_store=store)` and `JWTAuthViews` count a token as revoked when `is_revoked` raises `ReservedJtiError`.
 Thus such a token gets a 401.
+The two Django stores also raise `ReservedJtiError` for a key that they cannot keep.
+`DjangoORMRevocation` refuses a key longer than the `max_length` of the `jti` field of its model, and a key with a NUL character.
+`DjangoCacheRevocation` refuses a key that the cache backend refuses with `InvalidCacheKey`.
+For example, a memcached backend refuses a key with a space, or a key longer than 250 characters.
+These checks apply to the `jti`, and to the keys of families and user versions.
+`JWTAuthViews` gives a 401 for a refresh token whose `fam` or `sub` the store cannot keep, and `rotate_refresh_token` raises `TokenRotationError`.
 A custom store can raise `ReservedJtiError` for a `jti` that it cannot keep.
 Another exception from `is_revoked` gives a 500.
 `InMemoryRevocation` keeps tokens, families and user versions apart, so it accepts each `jti`.

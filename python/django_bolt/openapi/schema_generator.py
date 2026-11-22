@@ -20,6 +20,7 @@ from ..datastructures import UploadFile
 from ..pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, PaginationBase
 from ..responses import (
     HTML,
+    JSON,
     EventSourceResponse,
     File,
     FileResponse,
@@ -27,6 +28,7 @@ from ..responses import (
     Redirect,
     StreamingResponse,
 )
+from ..serialization import split_response_annotation
 from ..serializers.base import Serializer
 from ..serializers.fields import FieldConfig, _FieldMarker
 from ..typing import is_msgspec_struct, is_optional, resolve_type_alias, unwrap_optional
@@ -93,11 +95,12 @@ def _response_class_media(response_class: type | None) -> tuple[str, Schema] | N
     return None
 
 
-def _is_response_class(annotation: Any) -> bool:
-    """True for a response class that the generator documents with its own media type or as a redirect."""
-    return isinstance(annotation, type) and (
-        issubclass(annotation, Redirect) or _response_class_media(annotation) is not None
-    )
+def _unwrap_annotated(annotation: Any) -> Any:
+    """The type behind a ``type`` alias and ``Annotated``, without the metadata."""
+    annotation = resolve_type_alias(annotation)
+    while get_origin(annotation) is Annotated:
+        annotation = resolve_type_alias(annotation.__origin__)
+    return annotation
 
 
 def _struct_origin(annotation: Any) -> type | None:
@@ -1319,24 +1322,60 @@ class SchemaGenerator:
             required=required,
         )
 
-    def _response_type_content(self, response_type: Any) -> dict[str, OpenAPIMediaType]:
+    def _response_class_content(self, classes: tuple[type, ...], body_type: Any) -> dict[str, OpenAPIMediaType] | None:
+        """Return the content of a response type that names response classes.
+
+        The body type has its own content. Each response class with a media
+        type adds that media type. ``JSON`` can hold each JSON value, and
+        ``Response`` each media type. Thus, with no body type, their schema is
+        empty: it accepts each value. A redirect has no content.
+        """
+        content: dict[str, OpenAPIMediaType] = {}
+        if body_type is not None:
+            content.update(self._response_type_content(body_type))
+        any_body_classes = []
+        for cls in classes:
+            if issubclass(cls, Redirect):
+                continue
+            media = _response_class_media(cls)
+            if media is None:
+                any_body_classes.append(cls)
+            else:
+                content.setdefault(media[0], OpenAPIMediaType(schema=media[1]))
+        if any_body_classes and body_type is None:
+            media_type = "application/json" if all(issubclass(cls, JSON) for cls in any_body_classes) else "*/*"
+            content.setdefault(media_type, OpenAPIMediaType(schema=Schema()))
+        elif any_body_classes and set(content) != {"application/json"}:
+            # ``JSON("ok")`` of ``-> str | JSON`` is JSON, not text. Its body has the full body type.
+            content["application/json"] = OpenAPIMediaType(
+                schema=self._type_to_schema(body_type, register_component=True)
+            )
+        return content or None
+
+    def _response_type_content(self, response_type: Any) -> dict[str, OpenAPIMediaType] | None:
         """Return the content of a response type, by the media type of each result.
 
         Bolt sends a ``str`` result as text/plain and a ``bytes`` result as
         application/octet-stream. Each other result is JSON. Thus ``str | None``
         has a text/plain string and an application/json null.
         """
-        arms = get_args(response_type) if get_origin(response_type) in (Union, UnionType) else (response_type,)
-        json_arms = [arm for arm in arms if arm not in (str, bytes, bytearray)]
+        body_type, classes = split_response_annotation(response_type)
+        if classes:
+            return self._response_class_content(classes, body_type)
+        # ``Annotated`` and a ``type`` alias do not change the media type of a result.
+        unwrapped = _unwrap_annotated(response_type)
+        arms = get_args(unwrapped) if get_origin(unwrapped) in (Union, UnionType) else (unwrapped,)
+        plain_arms = [_unwrap_annotated(arm) for arm in arms]
+        json_arms = [arm for arm, plain in zip(arms, plain_arms, strict=True) if plain not in (str, bytes, bytearray)]
         if len(json_arms) == len(arms):
             schema = self._type_to_schema(response_type, register_component=True)
             examples = _build_union_examples(response_type)
             return {"application/json": OpenAPIMediaType(schema=schema, examples=examples)}
 
         content: dict[str, OpenAPIMediaType] = {}
-        if str in arms:
+        if str in plain_arms:
             content[_STR_MEDIA[0]] = OpenAPIMediaType(schema=_STR_MEDIA[1])
-        if bytes in arms or bytearray in arms:
+        if bytes in plain_arms or bytearray in plain_arms:
             content[_BYTES_MEDIA[0]] = OpenAPIMediaType(schema=_BYTES_MEDIA[1])
         if not json_arms:
             return content
@@ -1399,13 +1438,19 @@ class SchemaGenerator:
             default_status = meta.get("default_status_code", 200)
 
             response_class = meta.get("response_class")
-            if _is_response_class(response_type):
-                # ``-> StreamingResponse`` names the response class. It is not the type of a JSON body.
-                response_class = response_class or response_type
-                response_type = None
+            # ``-> StreamingResponse`` names the response class. It is not the type of a JSON body.
+            body_type, annotated_classes = split_response_annotation(response_type)
+            if annotated_classes:
+                response_type = body_type
+                if (
+                    response_class is None
+                    and body_type is None
+                    and all(issubclass(cls, Redirect) for cls in annotated_classes)
+                ):
+                    response_class = Redirect
             has_type = bool(response_type) and response_type != inspect._empty
             media = _response_class_media(response_class)
-            if response_class is None and (response_type is str or response_type is bytes):
+            if response_class is None and not annotated_classes and (response_type is str or response_type is bytes):
                 # Bolt sends a str as text and bytes as they are. Neither is a JSON body.
                 media = _STR_MEDIA if response_type is str else _BYTES_MEDIA
                 has_type = False
@@ -1424,6 +1469,11 @@ class SchemaGenerator:
                 responses[str(default_status)] = OpenAPIResponse(
                     description="Successful response",
                     content={media_type: OpenAPIMediaType(schema=body_schema)},
+                )
+            elif annotated_classes:
+                responses[str(default_status)] = OpenAPIResponse(
+                    description="Successful response",
+                    content=self._response_class_content(annotated_classes, body_type),
                 )
             elif has_type:
                 responses[str(default_status)] = OpenAPIResponse(

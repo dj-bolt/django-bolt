@@ -279,6 +279,7 @@ It sends `bytes` content with no change for each media type.
     A response class in the return annotation names the class of the result, not the type of the body.
     `-> JSON`, `-> Response` and `-> JSON | Redirect` send the body as it is. Bolt does not validate it.
     `-> Item | JSON` validates the body against `Item`, as `-> Item` does.
+    `Annotated` and a `type` alias do not change this. `-> Annotated[Item | JSON, ...]` also validates against `Item`.
     To validate the body of a `-> JSON` handler, use `response_model=`, or annotate the type of the data, as in [Validation of response objects](#validation-of-response-objects).
 
 ### Redirect

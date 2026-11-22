@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,6 +10,7 @@ import jwt
 import pytest
 from django.core.cache import caches
 from django.core.cache.backends.locmem import LocMemCache
+from django.core.cache.backends.memcached import BaseMemcachedCache
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
 from django.db import IntegrityError
@@ -923,3 +925,170 @@ def test_orm_entry_lives_to_the_end_of_exp_plus_leeway_at_a_second_boundary(orm_
 
     row = RevokedToken.objects.get(jti="family:jti-1" if method == "revoke_family" else "jti-1")
     assert row.expires_at.timestamp() >= exp + store.leeway + 1
+
+
+# ---------------------------------------------------------------------------
+# A store refuses a key that it cannot keep (#931)
+# ---------------------------------------------------------------------------
+
+_JTI_MAX_LENGTH = RevokedToken._meta.get_field("jti").max_length
+
+
+class MemcachedKeyRulesCache(LocMemCache):
+    """A local-memory cache with the key check of the memcached backends of Django.
+
+    The check raises ``InvalidCacheKey`` for a key with a space or a control
+    character, and for a key longer than 250 characters.
+    """
+
+    validate_key = BaseMemcachedCache.validate_key
+
+
+@pytest.fixture
+def memcached_store(settings):
+    """Build a ``DjangoCacheRevocation`` on a cache with the key rules of memcached."""
+    settings.CACHES = {
+        **settings.CACHES,
+        "revocation-memcached": {
+            "BACKEND": "tests.test_revocation.MemcachedKeyRulesCache",
+            "LOCATION": "revocation-memcached-tests",
+        },
+    }
+    caches["revocation-memcached"].clear()
+    return lambda **kwargs: DjangoCacheRevocation(cache_alias="revocation-memcached", **kwargs)
+
+
+_KEY_CALLS = pytest.mark.parametrize(
+    "call",
+    [
+        lambda store, value: store.revoke(value, exp=int(time.time()) + FUTURE),
+        lambda store, value: store.consume(value, exp=int(time.time()) + FUTURE),
+        lambda store, value: store.is_revoked(value),
+        lambda store, value: store.revoke_family(value, exp=int(time.time()) + FUTURE),
+        lambda store, value: store.is_family_revoked(value),
+        lambda store, value: store.get_user_version(value),
+        lambda store, value: store.bump_user_version(value),
+    ],
+    ids=["revoke", "consume", "is_revoked", "revoke_family", "is_family_revoked", "get_user_version", "bump"],
+)
+
+
+@_KEY_CALLS
+@pytest.mark.parametrize("value", ["a" * (_JTI_MAX_LENGTH + 1), "a\x00b"], ids=["too-long", "nul"])
+def test_orm_refuses_a_key_that_its_jti_column_cannot_keep(orm_store, call, value):
+    """PostgreSQL raises ``DataError`` for such a key, and MySQL can cut it short. The store refuses it first."""
+    store = orm_store()
+
+    with pytest.raises(ReservedJtiError):
+        asyncio.run(call(store, value))
+
+    assert RevokedToken.objects.exists() is False
+
+
+def test_orm_accepts_a_jti_as_long_as_its_jti_column(orm_store):
+    store = orm_store()
+    jti = "a" * _JTI_MAX_LENGTH
+
+    asyncio.run(store.revoke(jti))
+
+    assert asyncio.run(store.is_revoked(jti)) is True
+
+
+def test_orm_reads_the_length_limit_from_the_model_of_the_store(transactional_db):
+    store = DjangoORMRevocation(model="django_bolt.ShortJtiRevokedToken")
+
+    asyncio.run(store.revoke("a" * 40))
+    with pytest.raises(ReservedJtiError):
+        asyncio.run(store.revoke("a" * 41))
+
+    assert asyncio.run(store.is_revoked("a" * 40)) is True
+
+
+@_KEY_CALLS
+@pytest.mark.parametrize("value", ["has space", "a" * 251, "a\nb"], ids=["space", "too-long", "control-char"])
+def test_cache_refuses_a_key_that_the_cache_backend_refuses(memcached_store, call, value):
+    """A memcached backend raises ``InvalidCacheKey`` for such a key. The store raises ``ReservedJtiError``."""
+    with pytest.raises(ReservedJtiError):
+        asyncio.run(call(memcached_store(), value))
+
+
+def test_cache_on_a_memcached_backend_keeps_a_valid_jti(memcached_store):
+    store = memcached_store()
+
+    asyncio.run(store.revoke("a-valid-jti"))
+
+    assert asyncio.run(store.is_revoked("a-valid-jti")) is True
+
+
+_UNKEEPABLE_KEY_STORES = pytest.mark.parametrize(
+    ("store_fixture", "unkeepable"),
+    [
+        ("orm_store", lambda unique: unique.ljust(_JTI_MAX_LENGTH + 1, "a")),
+        ("orm_store", lambda unique: f"{unique}\x00"),
+        ("memcached_store", lambda unique: f"{unique} x"),
+        ("memcached_store", lambda unique: unique.ljust(251, "a")),
+    ],
+    ids=["orm-too-long", "orm-nul", "memcached-space", "memcached-too-long"],
+)
+
+
+def _signed_claims(typ: str, **claims) -> str:
+    now = int(time.time())
+    # A new jti and family for each token, so no test sees the entries of another test.
+    base = {"sub": "u", "iat": now, "exp": now + FUTURE, "typ": typ, "jti": uuid.uuid4().hex, "fam": uuid.uuid4().hex}
+    return jwt.encode({**base, **claims}, _SECRET, algorithm="HS256")
+
+
+@_UNKEEPABLE_KEY_STORES
+def test_a_token_whose_jti_the_store_cannot_keep_gets_a_401_at_authentication(request, store_fixture, unkeepable):
+    store = request.getfixturevalue(store_fixture)()
+    value = unkeepable(uuid.uuid4().hex)
+    api = BoltAPI()
+
+    @api.get("/protected", auth=[JWTAuthentication(secret=_SECRET, revocation_store=store)])
+    async def protected():
+        return {"ok": True}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/protected", headers={"Authorization": f"Bearer {_signed_claims('access', jti=value)}"})
+
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize("path", ["/auth/refresh", "/auth/logout", "/auth/logout-all"])
+@pytest.mark.parametrize("claim", ["jti", "fam", "sub"])
+@_UNKEEPABLE_KEY_STORES
+def test_a_refresh_token_with_a_claim_that_the_store_cannot_keep_gets_the_uniform_401(
+    request, store_fixture, unkeepable, claim, path
+):
+    """A family or a user version that the store cannot keep cannot be revoked, so the token is refused."""
+    store = request.getfixturevalue(store_fixture)()
+    value = unkeepable(uuid.uuid4().hex)
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return _ViewsUser()
+
+    JWTAuthViews(store=store, secret=_SECRET, secure_cookies=False, credential_validator=validate).register(api)
+    token = _signed_claims("refresh", **{claim: value})
+    headers = {"Cookie": f"refresh_token={token}", "Sec-Fetch-Site": "none"}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.post(path, headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid token"
+
+
+@pytest.mark.parametrize("rotate", [True, False], ids=["rotate", "reusable"])
+@pytest.mark.parametrize("claim", ["jti", "fam", "sub"])
+@_UNKEEPABLE_KEY_STORES
+def test_rotation_of_a_refresh_token_with_a_claim_that_the_store_cannot_keep_raises_token_rotation_error(
+    request, store_fixture, unkeepable, claim, rotate
+):
+    store = request.getfixturevalue(store_fixture)()
+    value = unkeepable(uuid.uuid4().hex)
+    claims = jwt.decode(_signed_claims("refresh", **{claim: value}), _SECRET, algorithms=["HS256"])
+
+    with pytest.raises(TokenRotationError):
+        asyncio.run(rotate_refresh_token(claims, store=store, secret=_SECRET, rotate=rotate))

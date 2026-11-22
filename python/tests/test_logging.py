@@ -313,41 +313,9 @@ class TestLoggingHelpers:
         assert middleware.config is not None
 
 
+@pytest.mark.usefixtures("bolt_logging_state")
 class TestQueueBasedLogging:
     """Test queue-based non-blocking logging setup documented in LOGGING.md."""
-
-    @pytest.fixture(autouse=True)
-    def _restore_logging_state(self):
-        """Restore logger handlers and module globals that these tests change.
-
-        The tests clear handlers, reset module flags, and stop or start the
-        queue listener. Without this fixture, the state leaks to the next test
-        in the same worker process.
-        """
-        saved_loggers = [
-            (logger, logger.handlers[:], logger.level, logger.propagate)
-            for logger in map(logging.getLogger, ("", "django", "django.server", "django_bolt"))
-        ]
-        configured = config_module._LOGGING_CONFIGURED
-        listener = config_module._QUEUE_LISTENER
-        queue = config_module._QUEUE
-        listener_running = listener is not None and listener._thread is not None
-
-        yield
-
-        current = config_module._QUEUE_LISTENER
-        if current is not None and current is not listener and current._thread is not None:
-            current.stop()
-        # setup_django_logging(force=True) stops the listener that was running before the test.
-        if listener_running and listener._thread is None:
-            listener.start()
-        config_module._LOGGING_CONFIGURED = configured
-        config_module._QUEUE_LISTENER = listener
-        config_module._QUEUE = queue
-        for logger, handlers, level, propagate in saved_loggers:
-            logger.handlers[:] = handlers
-            logger.setLevel(level)
-            logger.propagate = propagate
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
     def test_a_fork_takes_the_logging_lock_before_the_handler_locks(self):

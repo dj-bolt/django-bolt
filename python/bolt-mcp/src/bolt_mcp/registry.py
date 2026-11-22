@@ -114,6 +114,8 @@ class ToolDef:
     is_async: bool = False
     injects_request: bool = False
     ctx_param: str | None = None  # name of the parameter to inject the Context under
+    # An exposed route: {"auth_backends": [...], "guards": [...]} of the route. Rust runs them for each call.
+    route_auth: dict[str, Any] | None = None
 
 
 @dataclass
