@@ -24,6 +24,14 @@ from django_bolt.testing import TestClient
 from tests.thread_pools import shutdown_closing_connections
 
 
+@pytest.fixture(autouse=True)
+def restore_global_checks():
+    """Give each test the global list of checks as it is at import, and restore it after the test."""
+    saved = _health_check._checks[:]
+    yield
+    _health_check._checks[:] = saved
+
+
 class TestHealthCheck:
     """Test HealthCheck class."""
 
@@ -182,14 +190,13 @@ class TestHealthHandlers:
         assert result["status"] == "ok"
 
     @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
     async def test_ready_handler(self):
-        """Test readiness endpoint."""
+        """With all checks healthy, the handler gives the plain dict."""
         result = await ready_handler()
         assert isinstance(result, dict)
-        assert "status" in result
-        assert "checks" in result
-        # Status should be healthy or unhealthy
-        assert result["status"] in ["healthy", "unhealthy"]
+        assert result["status"] == "healthy"
+        assert result["checks"]["check_database"]["healthy"] is True
 
 
 class TestHealthIntegration:
@@ -211,6 +218,7 @@ class TestHealthIntegration:
         assert "health_handler" in handler_names
         assert "ready_handler" in handler_names
 
+    @pytest.mark.django_db(transaction=True)
     def test_registered_routes_answer_on_health_and_ready_paths(self):
         """Test that the registered endpoints answer on /health and /ready."""
         api = BoltAPI()
@@ -223,7 +231,7 @@ class TestHealthIntegration:
         assert health.status_code == 200
         assert health.json() == {"status": "ok"}
         assert ready.status_code == 200
-        assert ready.json()["status"] in ["healthy", "unhealthy"]
+        assert ready.json()["status"] == "healthy"
         assert "checks" in ready.json()
 
     def test_add_health_check_global(self):
@@ -262,6 +270,85 @@ class TestHealthIntegration:
 
         # Restore original checks
         _health_check._checks = original_checks
+
+
+class TestReadyEndpoint:
+    """The /ready endpoint through HTTP (#911)."""
+
+    def test_ready_returns_503_when_a_check_fails(self):
+        """A load balancer reads only the status code, so a failed check must give 503."""
+        api = BoltAPI()
+        register_health_checks(api)
+
+        async def failing():
+            return False, "cache down"
+
+        add_health_check(failing)
+
+        with TestClient(api) as client:
+            response = client.get("/ready")
+
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "unhealthy"
+        assert body["checks"]["failing"] == {"healthy": False, "message": "cache down"}
+
+    def test_ready_returns_503_when_a_check_raises(self):
+        """A check that raises counts as a failed check."""
+        api = BoltAPI()
+        register_health_checks(api)
+
+        async def crashing():
+            raise RuntimeError("boom")
+
+        add_health_check(crashing)
+
+        with TestClient(api) as client:
+            response = client.get("/ready")
+
+        assert response.status_code == 503
+        assert response.json()["checks"]["crashing"] == {"healthy": False, "message": "Check failed: boom"}
+
+    @pytest.mark.django_db(transaction=True)
+    def test_ready_keeps_the_database_check_after_add_health_check(self):
+        """A custom check added before the first request does not remove the database check."""
+        api = BoltAPI()
+        register_health_checks(api)
+
+        async def cache():
+            return True, "cache OK"
+
+        add_health_check(cache)
+
+        with TestClient(api) as client:
+            response = client.get("/ready")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "healthy"
+        assert body["checks"] == {
+            "check_database": {"healthy": True, "message": "Database connection OK"},
+            "cache": {"healthy": True, "message": "cache OK"},
+        }
+
+    @pytest.mark.django_db(transaction=True)
+    def test_ready_gives_the_same_checks_when_it_runs_before_add_health_check(self):
+        """The order of the first request and add_health_check() does not change the checks."""
+        api = BoltAPI()
+        register_health_checks(api)
+
+        async def cache():
+            return True, "cache OK"
+
+        with TestClient(api) as client:
+            first = client.get("/ready")
+            add_health_check(cache)
+            second = client.get("/ready")
+
+        assert first.status_code == 200
+        assert list(first.json()["checks"]) == ["check_database"]
+        assert second.status_code == 200
+        assert list(second.json()["checks"]) == ["check_database", "cache"]
 
 
 class TestHealthCheckScenarios:
