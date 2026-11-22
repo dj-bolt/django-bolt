@@ -1535,13 +1535,15 @@ class StructRelationLoader:
     def load(self, items: list[Any]) -> None:
         """Load the relations of the model instances in ``items``. Run it where sync ORM calls are safe.
 
-        A relation that is already loaded makes no query.
+        A relation that is already loaded makes no query. Each batch holds the
+        instances of one model and one database: Django reads the database of
+        the related rows from the first instance of a batch.
         """
-        groups: dict[type, list[Model]] = {}
+        groups: dict[tuple[type, str | None], list[Model]] = {}
         for item in items:
             if isinstance(item, Model):
-                groups.setdefault(type(item), []).append(item)
-        for model, instances in groups.items():
+                groups.setdefault((type(item), item._state.db), []).append(item)
+        for (model, _), instances in groups.items():
             relations = self._plan_of(model)[2]
             if relations:
                 prefetch_related_objects(instances, *relations)

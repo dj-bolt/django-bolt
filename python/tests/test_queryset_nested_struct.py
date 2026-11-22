@@ -537,3 +537,41 @@ def test_nested_struct_of_a_many_relation_gives_a_clear_error(item_type, field):
         for path in ("/items", "/page"):
             with pytest.raises(TypeError, match=field):
                 client.get(path)
+
+
+class PostTitleOnly(msgspec.Struct):
+    id: int
+    title: str
+
+
+async def _load_posts(select_author: bool) -> list[BlogPost]:
+    queryset = BlogPost.objects.select_related("author") if select_author else BlogPost.objects.all()
+    return [post async for post in queryset.order_by("id")]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_list_of_instances_from_a_helper_without_validation(sql_statements):
+    """A helper hides the ORM calls, so the route takes the executor that encodes a list as it is."""
+    _make_posts()
+    api = BoltAPI()
+
+    @api.get("/nested", validate_response=False)
+    async def nested(joined: bool = False) -> list[PostOut]:
+        return await _load_posts(joined)
+
+    @api.get("/flat", validate_response=False)
+    async def flat(joined: bool = False) -> list[PostTitleOnly]:
+        return await _load_posts(joined)
+
+    expected = _expected_posts()
+    with TestClient(api) as client:
+        for path, queries in (("/nested", 2), ("/nested?joined=true", 1)):
+            sql_statements.clear()
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == expected, path
+            assert len(sql_statements) == queries, (path, sql_statements)
+
+        response = client.get("/flat")
+        assert response.status_code == 200, response.text
+        assert response.json() == [{"id": post["id"], "title": post["title"]} for post in expected]
