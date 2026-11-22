@@ -93,11 +93,15 @@ def _schema_default(field: msgspec.structs.FieldInfo) -> Any:
     """Return the default of a model field that the OpenAPI schema shows.
 
     The schema calls the ``default_factory`` of a serializer ``field()``. It
-    calls no other factory that can give two items.
+    calls no other factory that can give two items. A field with
+    ``include_in_schema=False`` is not in the schema.
     """
     default = field.default
     if isinstance(default, _FieldMarker):
-        return default.config.get_default() if default.config.has_default() else msgspec.NODEFAULT
+        config = default.config
+        if not config.include_in_schema or not config.has_default():
+            return msgspec.NODEFAULT
+        return config.get_default()
     return default
 
 

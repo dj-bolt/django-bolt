@@ -395,6 +395,22 @@ def test_header_or_cookie_model_with_a_default_factory_registers(marker) -> None
     assert "default" not in tags["schema"]
 
 
+class HiddenTagsSerializer(Serializer):
+    tags: list[str] = field(default=["a", "b"], include_in_schema=False)
+
+
+@pytest.mark.parametrize("marker", [Header, Cookie])
+def test_header_or_cookie_model_skips_a_field_that_the_schema_hides(marker) -> None:
+    """A field with ``include_in_schema=False`` has no array schema, so its default can have many items."""
+    api = BoltAPI()
+
+    async def handler(model):
+        return model.tags
+
+    handler.__annotations__ = {"model": Annotated[HiddenTagsSerializer, marker()]}
+    api.get("/model")(handler)
+
+
 def test_query_free_spec_keeps_openapi_3_1(full_spec: dict) -> None:
     """The 3.2.0 bump is conditional: APIs without a QUERY route must keep
     declaring 3.1.0 for maximum downstream tooling compatibility."""
