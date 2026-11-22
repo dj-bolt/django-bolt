@@ -128,6 +128,7 @@ def _column_values(model: type[Model], values: Iterable[tuple[str, Any]], skip: 
     (``author: int``). This value goes to the column attribute (``author_id``), as in
     ``Serializer.to_model()``. A model instance and the dict of a nested serializer
     stay on the relation. The map of the relations is made one time for each model.
+    A relation is also left out when ``skip`` names its column attribute.
     """
     relation_attnames = _RELATION_ATTNAMES.get(model)
     if relation_attnames is None:
@@ -137,8 +138,12 @@ def _column_values(model: type[Model], values: Iterable[tuple[str, Any]], skip: 
         if name in skip:
             continue
         attname = relation_attnames.get(name)
-        if attname is not None and not isinstance(value, (Model, dict)):
-            name = attname
+        if attname is not None:
+            # A value on the relation also writes its column, for example a lookup field.
+            if attname in skip:
+                continue
+            if not isinstance(value, (Model, dict)):
+                name = attname
         result[name] = value
     return result
 
@@ -812,7 +817,7 @@ class PartialUpdateMixin(_ViewSet):
 
         # Apply only the patched fields, but use the validated values.
         patched = ((field_name, getattr(validated_obj, field_name)) for field_name in patch_data)
-        for key, value in _column_values(type(obj), patched, frozenset()).items():
+        for key, value in _column_values(type(obj), patched, skip).items():
             setattr(obj, key, value)
 
         # Save object

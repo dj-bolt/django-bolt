@@ -454,6 +454,37 @@ def test_write_actions_take_the_primary_key_of_a_foreign_key_field(api):
 
 
 @pytest.mark.django_db(transaction=True)
+def test_update_does_not_write_a_lookup_field_through_its_relation(api):
+    """A foreign key field does not change the column of the lookup field."""
+
+    class PostIn(Serializer):
+        title: str
+        content: str
+        author: int
+
+    @api.viewset("/posts")
+    class PostByAuthorViewSet(ModelViewSet):
+        queryset = BlogPost.objects.all()
+        serializer_class = PostIn
+        lookup_field = "author_id"
+
+    first = Author.objects.create(name="first", email="first@example.com")
+    second = Author.objects.create(name="second", email="second@example.com")
+    post = BlogPost.objects.create(title="t", content="c", author=first)
+
+    with TestClient(api) as client:
+        response = client.put(f"/posts/{first.id}", json={"title": "t2", "content": "c2", "author": second.id})
+        assert response.status_code == 200, response.text
+        post.refresh_from_db()
+        assert (post.title, post.author_id) == ("t2", first.id)
+
+        response = client.patch(f"/posts/{first.id}", json={"title": "t3", "author": second.id})
+        assert response.status_code == 200, response.text
+        post.refresh_from_db()
+        assert (post.title, post.author_id) == ("t3", first.id)
+
+
+@pytest.mark.django_db(transaction=True)
 def test_model_viewset_lookup_field(api):
     """Test ModelViewSet with custom lookup_field."""
     # Create article
