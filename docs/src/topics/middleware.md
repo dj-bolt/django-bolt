@@ -39,7 +39,9 @@ class RequestIdMiddleware(Middleware):
 Pass the class, not an instance, to the API:
 
 ```python title="blog/api.py"
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Request
+
+from blog.middleware import RequestIdMiddleware
 
 api = BoltAPI(middleware=[RequestIdMiddleware])
 

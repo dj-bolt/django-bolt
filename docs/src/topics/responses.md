@@ -174,6 +174,9 @@ The type then only documents the response in the [OpenAPI document](openapi.md).
 A `JSON` or `Response` object is validated only when its status is the default status of the route:
 
 ```python
+from django_bolt import JSON
+
+
 @api.post("/tags", status_code=201)
 async def create_tag(name: str) -> AuthorOut:
     if name == "taken":

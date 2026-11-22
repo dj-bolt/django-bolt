@@ -41,6 +41,7 @@ You do not need it to build an API.
 Only the handler and serialization steps run Python.
 Bolt answers a CORS preflight, a request over the rate limit, or a request with a bad token in Rust.
 Such a request does not take the Python global interpreter lock (GIL).
+A route with Python or Django middleware is different: a 401, 403, 404 or 405 of Rust goes through that middleware. See [Responses from Rust](topics/middleware.md#responses-from-rust).
 
 ## What runs where
 

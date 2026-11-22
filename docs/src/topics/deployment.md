@@ -358,7 +358,8 @@ WORKDIR /srv/blog
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-RUN python manage.py collectstatic --noinput
+# collectstatic loads the settings. Give it a SECRET_KEY for the build only.
+RUN SECRET_KEY=collectstatic-only python manage.py collectstatic --noinput
 
 EXPOSE 8000
 CMD ["python", "manage.py", "runbolt", "--host", "0.0.0.0", "--port", "8000", "--processes", "4"]
@@ -374,7 +375,7 @@ services:
   api:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"  # only the proxy on the host reaches the server
     env_file: .env
     stop_grace_period: 35s
 ```

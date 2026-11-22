@@ -46,6 +46,7 @@ Here the URLconf of the project still has the old view for `api/comments/`. `pyt
 
 - `clear_root_path=True` gives Django the full path, so the URL patterns of the URLconf match as before.
 - A Bolt route with the same path as an old view wins. Thus each endpoint that you move takes over its path at once.
+- Move all methods of a path together. When Bolt has `GET /api/articles/` and Django has the `POST`, a `POST` gets `405` from Bolt and does not reach Django.
 - DRF URLs end with a slash. `BoltAPI(trailing_slash="append")` keeps the slash on Bolt routes, so clients keep the same URLs. With the default `"strip"`, Bolt answers `/api/articles/` with a `308` redirect to `/api/articles`.
 - Django middleware, authentication and permission classes apply to the old views as before. Bolt auth, guards, rate limits and route `@cors` do not apply to them. The global CORS settings apply.
 - `runbolt` mounts the Django admin by itself. You do not mount it.
@@ -258,7 +259,7 @@ class ArticleSerializer(Serializer):
     id: int = field(read_only=True, default=0)
     title: str
     body: str
-    author_id: int
+    author: int
     published: bool = False
 
 
@@ -281,7 +282,7 @@ The routes are `/articles/`, `/articles/{pk}/` and `/articles/{pk}/publish/`, as
 
 Some differences to check:
 
-- DRF writes a foreign key field `author` as a primary key. The Bolt `ModelViewSet` passes the fields to the model by name. Name the field `author_id`.
+- DRF writes a foreign key field `author` as a primary key. In Bolt, `author: int` does the same. The `ModelViewSet` writes the key to `author_id`.
 - The DRF list response is `{"count", "next", "previous", "results"}`. The Bolt envelope has `items`, `total` and page fields. Override `build_response()` to keep the DRF shape. See [Pagination](pagination.md#change-the-envelope).
 - A DRF permission class runs Python code. A Bolt guard checks a claim of the token, in Rust. Put a check that needs the database in a dependency. See [Permissions](permissions.md).
 - DRF `SessionAuthentication` checks a CSRF token. Bolt `SessionAuthentication()` has its own check: it rejects a cross-site request with an unsafe method that sends the session cookie. See [Authentication](authentication.md).

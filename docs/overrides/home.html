@@ -7,6 +7,8 @@
 
 {% block tabs %}{{ super() }}{% endblock %}
 
+{% block htmltitle %}<title>{{ config.site_name }}: Django APIs on a Rust server</title>{% endblock %}
+
 {% block hero %}
 <div class="bl-home">
   <a id="__skip" tabindex="-1"></a>
@@ -123,7 +125,7 @@ api = BoltAPI()
         <h2>Rust does the work around your handler</h2>
         <p>
           Bolt rejects a bad token or a request over the rate limit in Rust, and it
-          answers each CORS preflight. Python runs only for a request that reaches your handler.
+          answers each CORS preflight. With no Python middleware, Python runs only for a request that reaches your handler.
         </p>
       </header>
       <ol class="bl-flow">

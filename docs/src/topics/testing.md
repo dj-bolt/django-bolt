@@ -595,8 +595,9 @@ def bolt_server():
             if process.poll() is not None:
                 raise RuntimeError("runbolt exited before it became ready")
             try:
-                client.get("/")  # Each response, also a 404, shows that the server is up.
-                break
+                # Each response, also a 404, shows that the server is up. Read only the headers.
+                with client.stream("GET", "/"):
+                    break
             except httpx.TransportError as err:
                 if time.time() > deadline:
                     raise TimeoutError("server did not become ready in 15s") from err

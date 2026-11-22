@@ -148,7 +148,7 @@ async def list_articles() -> list[Article]:
     return []
 ```
 
-Set `OpenAPIConfig(use_handler_docstrings=False)` to keep docstrings out of the schema.
+Set `use_handler_docstrings=False` in the `OpenAPIConfig` to keep docstrings out of the schema.
 
 The `operationId` is the HTTP method and the function name: `get_list_articles`. When two routes get the same ID, Bolt adds `_2`, `_3` and so on to the later ones. Client generators use this ID as the name of a function.
 
@@ -276,7 +276,7 @@ Bolt adds the error responses that it sends itself:
 
 With `BoltAPI(error_formatter=...)`, the error bodies have the schema of the formatter. See [Error handling](error-handling.md).
 
-Set `OpenAPIConfig(include_error_responses=False)` to document only the success responses.
+Set `include_error_responses=False` in the `OpenAPIConfig` to document only the success responses.
 
 ## Mark a route as deprecated
 
@@ -419,7 +419,7 @@ api = BoltAPI(
 - A logged-in user who is not staff gets 403.
 - Without `login_url`, an anonymous user gets 401.
 
-To let in each logged-in user, use `guards=[IsAuthenticated()]`. For docs that a program reads, use `auth=[JWTAuthentication()]` or an API key. A request with no valid token then gets 401.
+To let in each logged-in user, use `guards=[IsAuthenticated()]`. For docs that a program reads, use `auth=[JWTAuthentication()]` or an API key, with `guards=[IsAuthenticated()]`. A request with no valid token then gets 401. `auth` with no `guards` uses `BOLT_DEFAULT_PERMISSION_CLASSES`. With the default `[AllowAny()]`, the docs stay open.
 
 ## Turn off the docs in production
 

@@ -109,7 +109,8 @@ BOLT_TRUSTED_PROXIES = ["10.0.0.0/8"]
 ```
 
 For a request from a listed proxy, Bolt reads `X-Forwarded-For` from the right. It takes the first address that is not a listed proxy.
-A client cannot choose its bucket, because the proxy appends the real address after the values that the client sent.
+A client cannot choose its bucket when the proxy appends the real address after the values that the client sent.
+Configure the proxy to do this, for example `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` in nginx. A proxy that passes the header of the client with no change lets the client choose its bucket.
 Bolt ignores `X-Forwarded-For` from a peer that is not in the list.
 
 `BOLT_RATE_LIMIT_IPV6_PREFIX` sets the network size of an IPv6 client. The default is 64. Set 128 to count each IPv6 address.

@@ -379,6 +379,8 @@ async def live_room(websocket: WebSocket, article_id: int) -> None:
                     rooms[article_id].discard(reader)  # this reader left
     finally:
         rooms[article_id].discard(websocket)
+        if not rooms[article_id]:
+            del rooms[article_id]  # the last reader left
 ```
 
 !!! warning
