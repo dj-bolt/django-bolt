@@ -108,6 +108,8 @@ class ToolDef:
     icons: list[dict[str, Any]] | None = None
     meta: dict[str, Any] | None = None  # sent as the tool's `_meta` (e.g. MCP Apps `ui`)
     guards: list[Any] = field(default_factory=list)
+    # The compiled guards of an exposed route. Rust checks them with ``guards``.
+    route_guards: list[dict[str, Any]] = field(default_factory=list)
     # Computed at registration:
     args_struct: Any = None
     input_schema: dict[str, Any] | None = None

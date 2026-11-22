@@ -125,7 +125,7 @@ def tool_entry(mcp: MCP, tool: ToolDef) -> dict[str, Any]:
     return {
         "dispatch": partial(_run_tool, tool, mcp),
         "needs_context": tool.ctx_param is not None,
-        "guards": [g.to_metadata() for g in tool.guards],
+        "guards": [*(g.to_metadata() for g in tool.guards), *tool.route_guards],
     }
 
 

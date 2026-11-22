@@ -65,6 +65,11 @@ def expose_routes(
     ignored. A listed handler that isn't a route on ``api``, or that takes file/form
     parameters (which can't be represented as JSON tool arguments), raises ``ValueError``
     rather than being silently skipped.
+
+    A tool keeps the guards of its route, also the default permission classes.
+    Rust checks them against the principal of the MCP mount before the call.
+    The ``auth`` of the mount, or its ``oauth``, makes this principal. The
+    ``auth`` backends of the route do not run for an MCP call.
     """
     explicit = handlers is not None
     # Materialize once — `handlers` may be a generator, and we iterate it twice
@@ -119,6 +124,9 @@ def expose_routes(
             or meta.get("openapi_summary")
         )
         args_struct = schema.struct_from_fields(name, fields)
+        # The route keeps its guards over MCP. Rust checks them against the
+        # principal of the mount, as for the guards of a native tool.
+        route_middleware = api._handler_middleware.get(handler_id) or {}
         mcp.add_tool(
             ToolDef(
                 name=name,
@@ -128,6 +136,7 @@ def expose_routes(
                 input_schema=schema.input_schema_for(args_struct),
                 is_async=inspect.iscoroutinefunction(handler),
                 injects_request=any(f.source == "request" for f in fields),
+                route_guards=list(route_middleware.get("guards") or ()),
             )
         )
 

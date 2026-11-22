@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import pytest
-from _helpers import initialize, parse_rpc, post_rpc
-from bolt_mcp import MCP, expose_as_tool
+from _helpers import initialize, mint_jwt, parse_rpc, post_rpc
+from bolt_mcp import MCP, expose_as_tool, expose_routes, mount_mcp
+from django.test import override_settings
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, IsAuthenticated, JWTAuthentication
 from django_bolt.testing import TestClient
 
 
@@ -109,3 +110,72 @@ def test_duplicate_tool_name_raises():
 
     with pytest.raises(ValueError, match="already registered"):
         api.mount_mcp(mcp, expose=[a, b])
+
+
+SECRET = "expose-secret-key-0123456789-abcdefgh"
+
+
+def _guarded_api(expose_with_marker: bool):
+    """A route with auth and guards, exposed on a mount whose auth accepts the same token."""
+    api = BoltAPI()
+    mcp = MCP("guarded-expose-server")
+
+    @api.delete("/articles/{article_id}", auth=[JWTAuthentication(secret=SECRET)], guards=[IsAuthenticated()])
+    @expose_as_tool()
+    async def delete_article(article_id: int) -> dict:
+        return {"deleted": article_id}
+
+    if expose_with_marker:
+        expose_routes(mcp, api, methods=("DELETE",))
+        mount_mcp(api, mcp, auth=[JWTAuthentication(secret=SECRET)])
+    else:
+        api.mount_mcp(mcp, auth=[JWTAuthentication(secret=SECRET)], expose=[delete_article])
+    return api
+
+
+def _call(client, authorization: str | None = None) -> dict:
+    _, session_id = initialize(client, authorization=authorization)
+    resp = post_rpc(
+        client,
+        "tools/call",
+        {"name": "delete_article", "arguments": {"article_id": 3}},
+        session_id=session_id,
+        authorization=authorization,
+    )
+    return parse_rpc(resp)["result"]
+
+
+@pytest.mark.parametrize("expose_with_marker", [False, True], ids=["expose", "expose_routes"])
+def test_an_exposed_route_keeps_its_guards(expose_with_marker):
+    """An anonymous MCP client cannot call a route that answers 401 over HTTP."""
+    api = _guarded_api(expose_with_marker)
+    with TestClient(api) as client:
+        assert client.delete("/articles/3").status_code == 401
+        result = _call(client)
+        assert result["isError"] is True
+        assert "structuredContent" not in result
+
+
+@pytest.mark.parametrize("expose_with_marker", [False, True], ids=["expose", "expose_routes"])
+def test_an_exposed_route_runs_for_a_principal_that_passes_its_guards(expose_with_marker):
+    api = _guarded_api(expose_with_marker)
+    bearer = f"Bearer {mint_jwt(SECRET, sub='7')}"
+    with TestClient(api) as client:
+        assert client.delete("/articles/3", headers={"Authorization": bearer}).status_code == 200
+        assert _call(client, bearer)["structuredContent"] == {"deleted": 3}
+
+
+def test_an_exposed_route_keeps_the_default_permission_classes():
+    """A route with no ``guards`` gets BOLT_DEFAULT_PERMISSION_CLASSES over MCP too."""
+    with override_settings(BOLT_DEFAULT_PERMISSION_CLASSES=[IsAuthenticated()]):
+        api = BoltAPI()
+        mcp = MCP("default-guard-expose-server")
+
+        @api.delete("/articles/{article_id}", auth=[JWTAuthentication(secret=SECRET)])
+        async def delete_article(article_id: int) -> dict:
+            return {"deleted": article_id}
+
+        api.mount_mcp(mcp, auth=[JWTAuthentication(secret=SECRET)], expose=[delete_article])
+    with TestClient(api) as client:
+        assert client.delete("/articles/3").status_code == 401
+        assert _call(client)["isError"] is True
