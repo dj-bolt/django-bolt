@@ -204,8 +204,19 @@ def test_a_route_with_a_rate_limit_cannot_be_exposed():
     async def limited() -> dict:
         return {}
 
-    with pytest.raises(ValueError, match="limited"):
+    with pytest.raises(ValueError, match=r"limited.*rate_limit"):
         api.mount_mcp(MCP("limited"), expose=[limited])
+
+
+def test_a_route_with_django_middleware_cannot_be_exposed():
+    api = BoltAPI(django_middleware=["django.middleware.security.SecurityMiddleware"])
+
+    @api.get("/secure")
+    async def secure() -> dict:
+        return {}
+
+    with pytest.raises(ValueError, match=r"secure.*SecurityMiddleware"):
+        api.mount_mcp(MCP("secure"), expose=[secure])
 
 
 def test_a_route_with_python_middleware_cannot_be_exposed():
@@ -215,5 +226,5 @@ def test_a_route_with_python_middleware_cannot_be_exposed():
     async def tagged() -> dict:
         return {}
 
-    with pytest.raises(ValueError, match="tagged"):
+    with pytest.raises(ValueError, match=r"tagged.*_Tag"):
         api.mount_mcp(MCP("tagged"), expose=[tagged])

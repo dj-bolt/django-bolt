@@ -13,6 +13,8 @@ import re
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack
+
 from . import schema
 from .registry import ToolDef
 from .server import MCP
@@ -45,18 +47,33 @@ def _tool_name(handler: Callable, method: str, path: str) -> str:
     return name if name and not name.startswith("<") else _slug(method, path)
 
 
-def _route_auth(handler: Callable, route_meta: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any] | None:
+def _middleware_names(spec: Any) -> list[str]:
+    """Return the class names of one Python middleware spec, for an error message."""
+    if isinstance(spec, DjangoMiddlewareStack):
+        return [getattr(cls, "__name__", repr(cls)) for cls in spec.middleware_classes]
+    if isinstance(spec, DjangoMiddleware):
+        return [getattr(spec.middleware_class, "__name__", repr(spec.middleware_class))]
+    return [spec.__name__ if isinstance(spec, type) else type(spec).__name__]
+
+
+def _route_auth(
+    handler: Callable, method: str, path: str, route_meta: dict[str, Any], meta: dict[str, Any]
+) -> dict[str, Any] | None:
     """Return the auth and the guards of a route for its tool, or None for a route with neither.
 
     Rust runs them for each call of the tool, as for an HTTP request to the route.
-    A tool call cannot run middleware, so a route with protective middleware raises ``ValueError``.
+    A tool call cannot run middleware, so a route with middleware that can refuse a request raises ``ValueError``.
     """
-    rate_limited = any(mw.get("type") == "rate_limit" for mw in route_meta.get("middleware", ()))
-    if rate_limited or meta.get("_middleware_api") is not None:
+    blocking = [mw["type"] for mw in route_meta.get("middleware", ()) if mw.get("type") == "rate_limit"]
+    middleware_api = meta.get("_middleware_api")
+    if middleware_api is not None:
+        specs = [*middleware_api._middleware, *meta.get("_router_middleware", ()), *meta.get("_route_middleware", ())]
+        blocking += [name for spec in specs if not isinstance(spec, dict) for name in _middleware_names(spec)]
+    if blocking:
         raise ValueError(
-            f"Cannot expose handler {_name(handler)!r} as an MCP tool: its route has "
-            f"{'a rate limit' if rate_limited else 'Python or Django middleware'}, and a tool "
-            f"call cannot run it. Write an @mcp.tool for this operation."
+            f"Cannot expose handler {_name(handler)!r} ({method} {path}) as an MCP tool: "
+            f"a tool call cannot run the middleware of its route ({', '.join(blocking)}). "
+            f"Write an @mcp.tool(guards=...) for this operation."
         )
     backends = route_meta.get("auth_backends", [])
     guards = route_meta.get("guards", [])
@@ -123,7 +140,7 @@ def expose_routes(
                 )
             continue
 
-        route_auth = _route_auth(handler, api._handler_middleware.get(handler_id) or {}, meta)
+        route_auth = _route_auth(handler, method, path, api._handler_middleware.get(handler_id) or {}, meta)
 
         marker = marker or {}
         # Name/description derive from the route itself; @expose_as_tool only overrides.

@@ -478,10 +478,11 @@ The auth and the guards of the mount run first, and do not replace those of the 
 - `tools/list` does not show the tool to a caller that the route refuses.
 - Tool middleware gets the principal from the auth of the route.
 
-A tool call cannot run middleware.
-Thus a route with `@rate_limit`, Python middleware or Django middleware raises `ValueError`.
+**Behavior change:** a tool call cannot run middleware.
+Thus `mount_mcp()` raises `ValueError` for an exposed route with `@rate_limit`, Python middleware or Django middleware.
 This includes the middleware of the API and of the router, and a route with `SessionAuthentication`.
-Write an `@mcp.tool` for such an operation.
+The error names the route and the middleware.
+Write an `@mcp.tool(guards=...)` for such an operation.
 
 `mount_mcp()` exposes only the routes that you name.
 A handler that is not a route of the API, a handler with `File` or `Form` parameters, or a duplicate tool name raises `ValueError`.
