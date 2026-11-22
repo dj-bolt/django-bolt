@@ -344,7 +344,7 @@ curl -X POST localhost:8000/articles/1/cover -F "cover=@cover.png;type=image/png
 ```
 
 The `BOLT_MAX_UPLOAD_SIZE` setting limits the whole request body, before `File()` runs. The default is 1 MiB. A larger body gets 413.
-Set it as high as your largest upload. See the [settings reference](../ref/settings.md).
+Set it above your largest upload, because the multipart boundaries and headers add some bytes. See the [settings reference](../ref/settings.md).
 
 ### Use an upload in the handler
 

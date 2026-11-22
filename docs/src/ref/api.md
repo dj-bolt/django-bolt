@@ -41,7 +41,7 @@ Make an API. `runbolt` finds a `BoltAPI` that you assign at the top level of an 
 | `namespace` | `str \| None` | `None` | A namespace for `reverse()`. With `"blog"`, a route named `"detail"` reverses as `"blog:detail"`. |
 | `middleware` | `list \| None` | `None` | Middleware for each route of the API: middleware classes, `DjangoMiddleware(...)`, `DjangoMiddlewareStack(...)` or middleware configs. An instance of a middleware class raises `TypeError`. See [Middleware](../topics/middleware.md). |
 | `django_middleware` | `bool \| list[str] \| dict \| None` | `None` | Run Django middleware on each route. `True` loads `settings.MIDDLEWARE`. A list gives the dotted paths to load, in order. A dict with `"include"` or `"exclude"` lists filters `settings.MIDDLEWARE`. `None` or `False` loads none. |
-| `enable_logging` | `bool` | `True` | Log each request and response. See [Logging](../topics/logging.md). |
+| `enable_logging` | `bool` | `True` | Use `logging_config`, or the default configuration. `False` removes the exception log and the default `skip_paths`. It does not turn off the access log. See [Logging](../topics/logging.md). |
 | `logging_config` | `LoggingConfig \| None` | `None` | The log configuration. `None` uses the default configuration. |
 | `compression` | `CompressionConfig \| bool \| None` | `None` | `None` uses `CompressionConfig()`. `False` turns compression off for this API. Another value raises `TypeError`. The `BOLT_COMPRESSION` setting wins over this argument. See [Compression](../topics/compression.md). |
 | `openapi_config` | `OpenAPIConfig \| None` | `None` | The OpenAPI configuration. `None` serves the documentation at `/docs`, with the title from the `PROJECT_NAME` or `SITE_NAME` setting, or `"API"`. See [OpenAPI](../topics/openapi.md). |
@@ -52,7 +52,7 @@ Make an API. `runbolt` finds a `BoltAPI` that you assign at the top level of an 
 
 **Errors**
 
-- `ValueError`: `trailing_slash` is not `"strip"`, `"append"` or `"keep"`.
+- `ValueError`: `trailing_slash` is not `"strip"`, `"append"` or `"keep"`, or the `logger_name` of `logging_config` is empty or is not a `str`.
 - `TypeError`: `error_formatter` is not callable, or is an async function.
 
 **Attributes**

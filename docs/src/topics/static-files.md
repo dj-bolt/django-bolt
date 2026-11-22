@@ -38,7 +38,7 @@ Bolt serves `GET` and `HEAD`. Static responses do not appear in the access log.
 For a request to `/static/css/site.css`, Bolt looks for `css/site.css` in this order:
 
 1. `STATIC_ROOT`.
-2. Each directory of `STATICFILES_DIRS`, in order.
+2. Each directory of `STATICFILES_DIRS`, in order. Bolt does not read a `(prefix, path)` entry. With `DEBUG = False`, run `collectstatic` to copy its files into `STATIC_ROOT`.
 3. With `DEBUG = True` only: the Django staticfiles finders, for example the `static/` directory of each app.
 
 The first file found wins. A request with no file gets `404` with the body `File not found`.
@@ -165,7 +165,7 @@ Bolt applies these rules to each static request:
 
 - A path with `..` gets `400` with the body `Invalid path`.
 - A path with a part that starts with a dot, such as `.env` or `.git/config`, gets `404`.
-- A symbolic link that points out of the directory gives `404`.
+- A symbolic link that points out of the directory gives `404`. With `DEBUG = True`, the Django finders can still find the file of such a link. Do not expose a server with `DEBUG = True`.
 - Each response, also a `404`, has `X-Content-Type-Options: nosniff`.
 
 Bolt sends a static file with its own content type, also an `.html` or `.svg` file. Put only files that you trust in `STATIC_ROOT`. For files that users upload, see [Media files](media-files.md).

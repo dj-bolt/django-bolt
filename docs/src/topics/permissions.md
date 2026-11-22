@@ -5,7 +5,7 @@ description: Allow or reject a request with guards. Require a login, check roles
 # Permissions
 
 A guard decides if an authenticated request can reach the handler.
-Django-Bolt runs guards in Rust, after [authentication](authentication.md) and before any Python code.
+Django-Bolt runs guards in Rust, after [authentication](authentication.md) and before any Python code. The guards of a session request run in Python, after Django loads the user.
 A request that fails a guard gets a 401 or a 403, and your handler does not run.
 
 Bolt has three guards:

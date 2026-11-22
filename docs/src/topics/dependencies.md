@@ -26,7 +26,8 @@ class PageParams(msgspec.Struct):
 
 
 def page_params(page: int = 1, size: int = 10) -> PageParams:
-    size = min(size, 50)
+    page = max(page, 1)
+    size = min(max(size, 1), 50)
     return PageParams(offset=(page - 1) * size, limit=size)
 
 
@@ -204,8 +205,8 @@ api = BoltAPI()
 
 
 def client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    return forwarded.split(",")[0].strip() or "unknown"
+    # Bolt reads X-Forwarded-For only from a proxy in BOLT_TRUSTED_PROXIES.
+    return request.META["REMOTE_ADDR"]
 
 
 @api.get("/ip")
@@ -213,13 +214,17 @@ async def show_ip(ip: str = Depends(client_ip)) -> dict:
     return {"ip": ip}
 ```
 
+With `BOLT_TRUSTED_PROXIES = ["127.0.0.1"]`, a request from the proxy at `127.0.0.1` gives the address that the proxy forwards:
+
 ```bash
-curl localhost:8000/ip -H "X-Forwarded-For: 203.0.113.7, 10.0.0.1"
+curl localhost:8000/ip -H "X-Forwarded-For: 203.0.113.7"
 ```
 
 ```json
 {"ip": "203.0.113.7"}
 ```
+
+Do not read `X-Forwarded-For` yourself. A client can send this header with any address. See [`BOLT_TRUSTED_PROXIES`](../ref/settings.md#bolt_trusted_proxies).
 
 ## Limits
 
@@ -248,7 +253,9 @@ class PageParams(msgspec.Struct):
 
 
 def page_params(page: int = 1, size: int = 10) -> PageParams:
-    return PageParams(offset=(page - 1) * size, limit=min(size, 50))
+    page = max(page, 1)
+    size = min(max(size, 1), 50)
+    return PageParams(offset=(page - 1) * size, limit=size)
 
 
 @api.viewset("/articles")

@@ -168,7 +168,7 @@ server {
 
     location /static/ {
         alias /srv/blog/staticfiles/;
-        expires 1y;
+        expires 1h;  # 1y only with ManifestStaticFilesStorage
     }
 
     location / {
@@ -334,13 +334,13 @@ During a network partition, a query gets no answer and no error. With the Linux 
 Give libpq TCP timeouts:
 
 ```python title="blog/settings.py"
-DATABASES["default"]["OPTIONS"] |= {
+DATABASES["default"].setdefault("OPTIONS", {}).update({
     "connect_timeout": 5,
     "keepalives_idle": 5,
     "keepalives_interval": 2,
     "keepalives_count": 3,
     "tcp_user_timeout": 10000,
-}
+})
 ```
 
 With these values, a connection with no answer fails after about 10 seconds. Bolt then drops it.
@@ -424,8 +424,8 @@ A request in flight completes, and `runbolt` exits with status 0 after the last 
 Give the process manager a stop timeout longer than `--workers-kill-timeout`.
 For each signal, see [runbolt](../ref/runbolt.md#signals).
 
-!!! warning "Do not send SIGHUP"
-    `runbolt` has no handler for `SIGHUP`. It stops one process at once. Under a supervisor, it stops only the supervisor, and the workers continue with the old code.
+!!! warning "Do not send SIGHUP to reload"
+    `runbolt` has no reload signal. `SIGHUP` stops `runbolt`: one process stops at once, and a supervisor drains its workers as on `SIGTERM`.
 
 ## See also
 

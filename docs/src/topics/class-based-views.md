@@ -319,7 +319,7 @@ The actions work like this:
 - `retrieve`, `create`, `update` and `partial_update` return the object with `serializer_class`.
 - `destroy` deletes the row and answers `204`.
 
-`create`, `update` and `partial_update` pass the serializer fields to the model with their names. Name a foreign key field `author_id`, not `author`, so that the model gets the key.
+A field for a `ForeignKey` or a `OneToOneField` can hold the primary key of the related row, as `author: int` or `author_id: int`. `create`, `update` and `partial_update` write the key to the column attribute `author_id`, as `Serializer.to_model()` does.
 
 `ReadOnlyModelViewSet` has only `list` and `retrieve`. The mixins `ListMixin`, `RetrieveMixin`, `CreateMixin`, `UpdateMixin`, `PartialUpdateMixin` and `DestroyMixin` give one action each. Combine them with `ViewSet`:
 

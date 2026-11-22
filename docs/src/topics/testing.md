@@ -482,7 +482,7 @@ Bolt reads `BOLT_EMIT_SIGNALS` when you create the `BoltAPI`, not the client. Se
 
 ## Test the lifespan
 
-`TestClient` runs the startup part of the lifespan when the `with` block starts. It runs the shutdown part when the block ends. Each `with` block runs the lifespan again, so no state goes from one test to the next.
+`TestClient` runs the startup part of the lifespan when the `with` block starts. It runs the shutdown part when the block ends. Each `with` block runs the lifespan again. Other state, such as a module-level cache, stays from one test to the next. Reset such state in the shutdown part of the lifespan, or in a fixture.
 
 `TestClient` runs the lifespan on its own event loop. That loop does not run while the test sends requests. Thus a task that the lifespan starts with `asyncio.create_task()` does not run in a `TestClient` test. Use `AsyncTestClient` for such a lifespan: its lifespan runs on the loop of the test.
 

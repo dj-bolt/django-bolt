@@ -110,7 +110,7 @@ Check the types and the constraints of an instance that Python code made. Return
 def from_model(cls, instance: Model, *, max_depth: int = 10) -> Self
 ```
 
-Make an instance from a Django model instance. Each field reads the attribute with its name, or the dotted path of `field(source=...)`. This method runs no query.
+Make an instance from a Django model instance. Each field reads the attribute with its name, or the dotted path of `field(source=...)`. This method runs no query for a relation. A field that `only()` or `defer()` did not load runs a query when Django reads it, and in async code that query raises `SynchronousOnlyOperation`.
 
 - A `ForeignKey` or `OneToOneField` field with a type that is not a serializer gets the primary key, from `<name>_id`.
 - A nested serializer field gets the related object, converted with `from_model()`.
@@ -284,7 +284,7 @@ def subset(cls, *fields: str, name: str | None = None) -> type[Self]
 
 Return a new `Serializer` class with only the named fields. Use it as a type. Make it at module level.
 
-The new class keeps the type, the default and the `field()` options of each field, and the field validators of the fields. It keeps a model validator only when the subset has each attribute that the validator reads. It keeps the `rename`, `omit_defaults`, `forbid_unknown_fields` and `frozen` options. It does not keep the `tag` option. It has `Config.read_only` and `Config.write_only` limited to its fields.
+The new class keeps the type, the default and the `field()` options of each field, and the field validators of the fields. It keeps a model validator with `mode="after"` only when the subset has each attribute that the validator reads. It does not keep a model validator with `mode="before"`. It keeps the `rename`, `omit_defaults`, `forbid_unknown_fields` and `frozen` options. It does not keep the `tag` option. It has `Config.read_only` and `Config.write_only` limited to its fields.
 
 The new class has a class method `from_parent(instance)`. It makes an instance of the subset from an instance of the full class.
 

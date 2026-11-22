@@ -191,8 +191,8 @@ A process manager uses the status. For example, systemd restarts the service wit
 | --- | --- | --- |
 | `SIGTERM` | Drain, then stop. | Send `SIGTERM` to each worker. Each worker drains. `SIGKILL` after `--workers-kill-timeout`. |
 | `SIGINT` (Ctrl+C) | Stop at once. Requests in flight fail. | Same as `SIGTERM`. A second `SIGINT` sends `SIGKILL` to each worker that still runs. |
-| `SIGQUIT` | Stop at once. | No handler: the supervisor stops, and the workers continue. |
-| `SIGHUP` | No handler: the process stops at once. | No handler: the supervisor stops, and the workers continue. |
+| `SIGQUIT` | Stop at once. | Same as `SIGTERM`. |
+| `SIGHUP` | No handler: the process stops at once. | Same as `SIGTERM`. |
 
 To drain, a worker does these steps:
 
@@ -205,7 +205,7 @@ In a terminal, Ctrl+C sends `SIGINT` to the supervisor and to each worker, so th
 
 !!! warning "runbolt does not reload on SIGHUP"
     `runbolt` has no reload signal. Do not send `SIGHUP` to reload code. To deploy new code, restart the service with `SIGTERM`.
-    With a supervisor, `SIGHUP` stops only the supervisor. The workers continue to serve the old code, and nothing replaces them when they fail.
+    `SIGHUP` stops `runbolt`. With a supervisor, the workers drain as on `SIGTERM`, and `runbolt` exits with status 0.
 
 ## Worker recycling
 

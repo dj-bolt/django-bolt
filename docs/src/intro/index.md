@@ -51,7 +51,7 @@ Django-Bolt replaces the HTTP server and the API layer. The rest of your project
 
 - Models, migrations and the ORM, with the sync and the async query API.
 - `settings.py`, `INSTALLED_APPS` and the `manage.py` commands.
-- The Django admin. `runbolt` serves it at `/admin/`.
+- The Django admin. `runbolt` serves it at the path of your URLconf, for example `/admin/`.
 - Users, passwords and permissions from `django.contrib.auth`.
 - Signals, and Django middleware on the APIs where you turn it on. See [Middleware](../topics/middleware.md).
 - Your other Django views. Serve them with `api.mount_django()`. See [ASGI mounts](../topics/asgi-mounts.md).

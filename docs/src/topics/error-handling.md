@@ -82,6 +82,8 @@ async def create_article(slug: str) -> dict:
 {"detail": {"code": "duplicate_slug", "slug": "hello"}}
 ```
 
+An empty `dict` or `list` is the same as no detail. The client gets the standard phrase of the status.
+
 `extra` adds an `extra` key next to `detail`:
 
 ```python

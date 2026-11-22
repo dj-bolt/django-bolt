@@ -6,7 +6,7 @@ description: Limit how often a client can call a route. Count per IP address, pe
 
 A rate limit caps the number of requests that one client can send to a route.
 Use it on routes that are expensive or easy to abuse, such as login, search or comment creation.
-Django-Bolt counts requests in Rust, before authentication and before any Python code.
+Django-Bolt counts requests in Rust, before any Python code. A limit per IP address or per header runs before authentication. A limit per user or per API key runs after it.
 
 ## Limit a route
 

@@ -46,7 +46,7 @@ The constructor registers the HTTP routes, WebSocket routes, ASGI mounts, MCP mo
 | --- | --- | --- | --- |
 | `api` | `BoltAPI` | required | The API to test. |
 | `base_url` | `str` | `"http://testserver"` | The base URL of each request. The host of this URL is the `Host` header. |
-| `raise_server_exceptions` | `bool` | `True` | If `True`, an error of the test backend raises in the test, for example an HTTP method that the backend does not support. If `False`, such an error gives a response with status 500. An exception in a handler always gives a 500 response. |
+| `raise_server_exceptions` | `bool` | `True` | If `True`, an exception that gives a 5xx response raises in the test. This includes an exception of a handler, of a streaming body and of the test backend. An exception that the API answers with a response, such as an `HTTPException` or a 4xx, gives that response. If `False`, each such exception gives the 500 response of `runbolt`. See [Exceptions in handlers](../topics/testing.md#exceptions-in-handlers). |
 | `cors_allowed_origins` | `list[str] \| None` | `None` | Replaces the CORS origins of the settings. A `"*"` entry allows each origin. The other CORS values are the defaults of the server. |
 | `read_django_settings` | `bool` | `True` | If `True`, read the CORS, static files and media settings, as `runbolt` does. If `False`, use none of them. |
 | `use_http_layer` | `bool` | `True` | Ignored. Each request goes through the HTTP layer. |
@@ -92,7 +92,7 @@ With `stream=True`, the response has two more methods:
 | Method | Description |
 | --- | --- |
 | `iter_content(chunk_size=1024, decode_unicode=False)` | Yield the body in parts of `chunk_size` bytes. With `decode_unicode=True`, yield UTF-8 text. |
-| `iter_lines(decode_unicode=True)` | Yield the body one line at a time, with no line ending. With `decode_unicode=False`, yield `bytes`. |
+| `iter_lines(decode_unicode=True)` | Yield the body one line at a time. Bolt splits the body at `\n` and removes it. A `\r` before it stays. With `decode_unicode=False`, yield `bytes`. |
 
 ### Errors
 
@@ -332,7 +332,7 @@ class ConnectionClosed(Exception):
 A subclass of `RuntimeError`. `TestClient` raises it in the test thread in two cases:
 
 - A second thread enters a `TestClient` while another thread lends its connection. Django keeps one store of connections for each process, so the rows of two tests would mix.
-- A thread of the test holds a cursor open, and a handler needs the lent connection. The handler waits 10 seconds, then the request fails.
+- Another thread of the test holds a cursor open, and a handler needs the lent connection. The handler waits 10 seconds, then the request fails. A cursor of the thread that sends the request does not cause this.
 
 The message names the cause and the fixes. The fixes are: read the rows before the request, pass `share_db_connection=False` and commit the rows, or wait longer.
 

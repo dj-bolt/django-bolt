@@ -139,17 +139,21 @@ A response with a `Content-Encoding` header passes through with no change. Use i
 ```python
 import gzip
 
+from django_bolt import Request
 from django_bolt.responses import Response
 
-CACHED_EXPORT = gzip.compress(b'[{"id": 1, "title": "Hello"}]')
+EXPORT = b'[{"id": 1, "title": "Hello"}]'
+CACHED_EXPORT = gzip.compress(EXPORT)
 
 
 @api.get("/articles/cached")
-async def cached_export() -> Response:
+async def cached_export(request: Request) -> Response:
+    if "gzip" not in request.headers.get("accept-encoding", ""):
+        return Response(EXPORT, media_type="application/json")
     return Response(CACHED_EXPORT, media_type="application/json", headers={"Content-Encoding": "gzip"})
 ```
 
-Bolt does not check that the body matches the header, and it does not check the `Accept-Encoding` of the client.
+Bolt does not check that the body matches the header, and it does not check the `Accept-Encoding` of the client. Thus the handler checks it.
 
 ## Avoid the BREACH attack
 

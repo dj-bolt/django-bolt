@@ -378,6 +378,8 @@ api = BoltAPI(
 
 This serves Scalar at `/api-docs` and ReDoc at `/api-docs/redoc`. The JSON and YAML schema routes are always there: `/api-docs/openapi.json`, `/api-docs/openapi.yaml` and `/api-docs/openapi.yml`.
 
+The `path` column gives the default of the constructor. The default UIs of `OpenAPIConfig` pass their own paths, as the URL table above shows.
+
 | Plugin | Default `path` | Other arguments |
 | --- | --- | --- |
 | `SwaggerRenderPlugin` | `"/swagger"` | `version="5.32.9"`, `js_url`, `css_url`, `standalone_preset_js_url` |

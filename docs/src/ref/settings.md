@@ -245,7 +245,7 @@ See [Server-sent events](../topics/sse.md).
 
 ### WebSocket limits
 
-An environment variable with the same name and the prefix `DJANGO_BOLT_` wins over each setting.
+An environment variable with the name of the setting and the prefix `DJANGO_` wins over the setting. For example, `DJANGO_BOLT_WS_MAX_CONNECTIONS` wins over `BOLT_WS_MAX_CONNECTIONS`.
 See [WebSocket](../topics/websocket.md).
 
 | Setting | Type | Default | Effect |
@@ -335,7 +335,7 @@ See [runbolt](runbolt.md#development-mode).
 ## Environment variables
 
 Bolt reads its environment variables one time, at startup. An unset or empty variable gives the default.
-A value that does not parse stops startup with `ImproperlyConfigured`:
+A value that does not parse stops startup with `ImproperlyConfigured`. `DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT` is different: it raises `ValueError` when you create a `TestClient`.
 
 ```text
 django.core.exceptions.ImproperlyConfigured: DJANGO_BOLT_ORM_THREADS must be an int of 1 or more, got '0'.
@@ -382,7 +382,7 @@ A parameter that is too long gives this response:
 
 ### WebSocket
 
-`DJANGO_BOLT_WS_MAX_CONNECTIONS`, `DJANGO_BOLT_WS_CHANNEL_SIZE`, `DJANGO_BOLT_WS_HEARTBEAT_INTERVAL`, `DJANGO_BOLT_WS_CLIENT_TIMEOUT` and `DJANGO_BOLT_WS_MAX_MESSAGE_SIZE` win over the settings with the same name.
+`DJANGO_BOLT_WS_MAX_CONNECTIONS`, `DJANGO_BOLT_WS_CHANNEL_SIZE`, `DJANGO_BOLT_WS_HEARTBEAT_INTERVAL`, `DJANGO_BOLT_WS_CLIENT_TIMEOUT` and `DJANGO_BOLT_WS_MAX_MESSAGE_SIZE` win over the `BOLT_WS_` settings with the same suffix.
 See [WebSocket limits](#websocket-limits).
 
 ### Tests

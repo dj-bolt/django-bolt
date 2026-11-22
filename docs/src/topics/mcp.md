@@ -455,7 +455,7 @@ A middleware must be an `async def` function, else Bolt raises `TypeError`.
 
 ## Expose existing routes as tools
 
-Give the handlers of existing routes to `expose`:
+Give the handlers of existing routes to `expose`. This call replaces the `mount_mcp()` call of the first example, because a second mount at `/mcp` raises `ValueError`:
 
 ```python
 @api.get("/articles/{article_id}")

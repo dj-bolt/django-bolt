@@ -114,6 +114,7 @@ An `Authorization` header with a token is not a credential in this sense. It nee
     List your origins instead.
 
 A cookie backend of Bolt also checks the `Origin` of each unsafe request. CORS does not turn that check off. See [Read the token from a cookie](authentication.md#read-the-token-from-a-cookie).
+Thus a front end on another origin, also on a subdomain of your site, cannot send an unsafe request with a cookie token. Serve the front end and the API from one origin, for example through a proxy, or send the token in the `Authorization` header.
 
 ## Set CORS for one route
 

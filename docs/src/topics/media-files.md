@@ -62,7 +62,7 @@ Bolt serves `MEDIA_URL` only when each of these is true:
 
 - `MEDIA_URL` starts with `/`, is not `/`, and has no `{` or `}`.
 - `MEDIA_ROOT` is an absolute path.
-- `MEDIA_ROOT` is a directory that exists when the server starts.
+- `MEDIA_ROOT` is a directory that exists when the server starts. Create it before the first start. If you create it later, restart the server.
 
 Otherwise, Bolt prints a warning at startup and does not serve media. For example:
 
@@ -134,7 +134,7 @@ Keep private files out of `MEDIA_ROOT`, and serve them from a handler with a gua
 ```python title="blog/api.py"
 from django.conf import settings
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Request
 from django_bolt.auth import IsAuthenticated
 from django_bolt.exceptions import NotFound
 from django_bolt.responses import FileResponse
@@ -145,15 +145,17 @@ PRIVATE_ROOT = settings.BASE_DIR / "private"
 
 
 @api.get("/invoices/{invoice_id}/pdf", guards=[IsAuthenticated()])
-async def invoice_pdf(invoice_id: int) -> FileResponse:
-    path = PRIVATE_ROOT / "invoices" / f"{invoice_id}.pdf"
+async def invoice_pdf(request: Request, invoice_id: int) -> FileResponse:
+    user = await request.auser()
+    # Each user has a directory. Thus a user cannot read the invoice of another user.
+    path = PRIVATE_ROOT / "invoices" / str(user.pk) / f"{invoice_id}.pdf"
     if not path.is_file():
         raise NotFound(detail="Invoice not found")
     return FileResponse(str(path), filename=f"invoice-{invoice_id}.pdf")
 ```
 
 With no token, the response is `401` with `{"detail":"Authentication required"}`.
-With a valid token, the response is the file:
+With the token of another user, the response is `404`. With the token of the owner, the response is the file:
 
 ```http
 HTTP/1.1 200 OK
@@ -171,15 +173,21 @@ Bolt can serve media in production. A reverse proxy, a CDN or an object store is
 - A large download keeps a connection of your API server open.
 - A separate domain for user files keeps the files away from the cookies of your site.
 
-When nginx serves `MEDIA_ROOT`, the download rule of Bolt does not apply. Add it yourself:
+When nginx serves `MEDIA_ROOT`, the rules of Bolt do not apply. Add them yourself. The first block refuses hidden files, such as `/media/.env`:
 
 ```nginx
+location ~ ^/media/(.*/)?\. {
+    return 404;
+}
+
 location /media/ {
+    disable_symlinks on;
     alias /srv/blog/media/;
     add_header X-Content-Type-Options nosniff;
 }
 
 location ~* ^/media/(.+\.(?:html?|xhtml?|shtml?|htc|hta|svgz?|xml|xslt?|m?js|cjs|wasm))$ {
+    disable_symlinks on;
     alias /srv/blog/media/$1;
     types { }
     default_type application/octet-stream;

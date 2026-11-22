@@ -18,7 +18,7 @@ register_health_checks(api)
 `register_health_checks()` adds two `GET` routes to the API:
 
 - `/health` answers when the process runs. It does no other work.
-- `/ready` runs the checks and reports each result.
+- `/ready` runs the checks and reports each result. It returns `503 Service Unavailable` when a check fails.
 
 ```bash
 curl localhost:8000/health
@@ -36,7 +36,7 @@ curl localhost:8000/ready
 {"status": "healthy", "checks": {"check_database": {"healthy": true, "message": "Database connection OK"}}}
 ```
 
-With no check of your own, `/ready` runs `check_database`.
+`/ready` always runs `check_database`.
 This check opens a new connection to the `default` database, and closes it. Thus it finds a database that stopped since the last request.
 
 ## Add a check
@@ -46,7 +46,7 @@ Add it with `add_health_check()`:
 
 ```python title="blog/api.py"
 from django_bolt import BoltAPI
-from django_bolt.health import add_health_check, check_database, register_health_checks
+from django_bolt.health import add_health_check, register_health_checks
 
 api = BoltAPI()
 register_health_checks(api)
@@ -60,16 +60,18 @@ async def check_cache() -> tuple[bool, str]:
     raise ConnectionError("cache refused the connection")
 
 
-add_health_check(check_database)
 add_health_check(check_search_index)
 add_health_check(check_cache)
 ```
 
 ```bash
-curl localhost:8000/ready
+curl -i localhost:8000/ready
 ```
 
-```json
+```http
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+
 {
   "status": "unhealthy",
   "checks": {
@@ -82,17 +84,14 @@ curl localhost:8000/ready
 
 - The checks run at the same time. The name of each check is the name of its function.
 - A check that raises an exception is unhealthy. Its message is `Check failed: ` and the text of the exception.
-- `status` is `"unhealthy"` when one check or more is unhealthy.
-- When you add a check, `/ready` does not add `check_database` for you. Add it yourself, as above.
+- `status` is `"unhealthy"` when one check or more is unhealthy. The status code is then `503`.
+- `check_database` runs first. `add_health_check()` adds a check after it.
 - The list of checks is one list for the process. Add the checks at import time, in `api.py`.
 
-## Return 503 when the service is not ready
+## Write your own health routes
 
-!!! warning "/ready always returns 200"
-    The `/ready` route of `register_health_checks()` returns `200 OK` also when `status` is `"unhealthy"`.
-    Kubernetes and most load balancers read only the status code. They see an unhealthy process as ready.
-
-Write your own readiness route with `HealthCheck`, and return `503` when a check fails:
+Kubernetes and most load balancers read only the status code. Return `503` when a check fails.
+Use `HealthCheck` to run a list of checks of your own:
 
 ```python title="blog/api.py"
 from django_bolt import JSON, BoltAPI
@@ -154,7 +153,7 @@ content-type: application/json
 {"detail":"Authentication required"}
 ```
 
-A probe sends no credentials. Write the routes yourself with `guards=[AllowAny()]`, as in [Return 503 when the service is not ready](#return-503-when-the-service-is-not-ready).
+A probe sends no credentials. Write the routes yourself with `guards=[AllowAny()]`, as in [Write your own health routes](#write-your-own-health-routes).
 See [Permissions](permissions.md).
 
 ## Configure Kubernetes probes

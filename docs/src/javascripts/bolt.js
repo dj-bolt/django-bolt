@@ -9,6 +9,9 @@ document.addEventListener("click", (event) => {
       setTimeout(() => (button.textContent = "Copy"), 1500);
     },
     () => {
+      // No clipboard access: select the command, so that Ctrl+C copies it.
+      const target = document.getElementById("bl-install-cmd");
+      if (target) window.getSelection().selectAllChildren(target);
       button.textContent = "Press Ctrl+C";
     },
   );

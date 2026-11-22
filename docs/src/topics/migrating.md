@@ -47,7 +47,7 @@ Here the URLconf of the project still has the old view for `api/comments/`. `pyt
 - `clear_root_path=True` gives Django the full path, so the URL patterns of the URLconf match as before.
 - A Bolt route with the same path as an old view wins. Thus each endpoint that you move takes over its path at once.
 - DRF URLs end with a slash. `BoltAPI(trailing_slash="append")` keeps the slash on Bolt routes, so clients keep the same URLs. With the default `"strip"`, Bolt answers `/api/articles/` with a `308` redirect to `/api/articles`.
-- Django middleware, authentication and permission classes apply to the old views as before. Bolt auth, guards, CORS and rate limits do not apply to them.
+- Django middleware, authentication and permission classes apply to the old views as before. Bolt auth, guards, rate limits and route `@cors` do not apply to them. The global CORS settings apply.
 - `runbolt` mounts the Django admin by itself. You do not mount it.
 
 See [ASGI mounts](asgi-mounts.md) for the details of `mount_django()`.

@@ -200,7 +200,7 @@ Each mixin gives one action. Combine mixins with `ViewSet`, for example `class C
 | `PartialUpdateMixin` | `partial_update(request)` | Takes a JSON object. Sets the fields of the body, with the same exceptions as `update`. Validates the merged object with `get_serializer_class("update")`. Calls `perform_update()`. Returns the object. A body with no known field returns the object unchanged. |
 | `DestroyMixin` | `destroy(request)` | Calls `get_object()` and `perform_destroy()`. The response is `204` with no body. |
 
-A body that is not valid gives `422`. The mixins pass the fields to the model with their Python names. A field for a `ForeignKey` must thus have the name of the column attribute, for example `author_id`.
+A body that is not valid gives `422`. The mixins pass the fields to the model with their Python names. A field for a `ForeignKey` or a `OneToOneField` can hold the primary key of the related row, for example `author: int`. The mixins write it to the column attribute (`author_id`). A model instance or the dict of a nested serializer goes to the relation.
 
 ## ModelViewSet and ReadOnlyModelViewSet
 

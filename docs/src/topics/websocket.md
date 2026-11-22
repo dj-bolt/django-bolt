@@ -168,7 +168,8 @@ async def readers(websocket: WebSocket, article_id: int) -> None:
         print(f"Reader of article {article_id} left with code {exc.code}")
 ```
 
-A send to a client that left also raises `WebSocketDisconnect`, with code 1006.
+A send that finds that the client left raises `WebSocketDisconnect`, with code 1006.
+A send after Bolt knows of the disconnect, for example after `receive_text()` raised, raises `RuntimeError`.
 The handler continues to run after the client leaves, so code after the receive loop runs.
 
 ## Close the connection
@@ -372,7 +373,10 @@ async def live_room(websocket: WebSocket, article_id: int) -> None:
     try:
         async for text in websocket.iter_text():
             for reader in list(rooms[article_id]):
-                await reader.send_text(text)
+                try:
+                    await reader.send_text(text)
+                except (WebSocketDisconnect, RuntimeError):
+                    rooms[article_id].discard(reader)  # this reader left
     finally:
         rooms[article_id].discard(websocket)
 ```
@@ -480,8 +484,9 @@ An environment variable with the `DJANGO_BOLT_` prefix overrides the setting, fo
 | `BOLT_WS_CLIENT_TIMEOUT` | `10` | Seconds with no frame and no pong from the client. Bolt then closes the connection, and the handler gets code 1001. |
 | `BOLT_WS_CHANNEL_SIZE` | `100` | Messages from the client that wait for the handler. When the handler falls behind and the queue is full, Bolt closes the connection with code 1011. |
 
-When `runbolt` stops or restarts a worker, it closes each open connection with code 1012 (Service Restart).
+When `runbolt` drains a worker, for example on `SIGTERM` or a recycle, it closes each open connection with code 1012 (Service Restart).
 A client can connect again and reach a different worker.
+A stop at once, for example on `SIGINT`, closes the connections with no close code. Thus a client must also handle an abnormal close.
 
 ## See also
 

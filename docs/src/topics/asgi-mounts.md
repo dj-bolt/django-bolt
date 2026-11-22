@@ -216,7 +216,7 @@ Bolt does not run `auth` or guards for a mounted app. Check the user in the app.
 
 Bolt sends a request to a mount only when no Bolt route matches the path.
 Thus a mount cannot hide a Bolt route.
-A route matches by method and path. Thus in the first example, `POST /legacy/health` goes to Django, and Django answers `404`.
+A path of a Bolt route with another method gets `405` from Bolt. Thus in the first example, `POST /legacy/health` does not go to Django.
 
 For a request to a mount:
 

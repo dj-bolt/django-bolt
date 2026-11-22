@@ -441,7 +441,7 @@ Login, refresh and logout routes with cookies. Call `register(api)` to add them 
 | `public_key` | With an asymmetric `algorithm`, the PEM public key that verifies the refresh token |
 | `prefix` | The path prefix of the routes, and the path of the refresh cookie |
 | `secure_cookies` | The `Secure` flag of both cookies |
-| `credential_validator` | An async callable `(request, credentials: LoginCredentials) -> user | None`. The default calls Django's `aauthenticate()`. |
+| `credential_validator` | An async callable `(request, credentials: LoginCredentials) -> user \| None`. The default calls Django's `aauthenticate()`. |
 
 | Route | Body | Response |
 | --- | --- | --- |

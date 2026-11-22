@@ -1,6 +1,6 @@
 # Django-Bolt
 
-> Django-Bolt serves typed API routes from a Django project with a Rust HTTP server (Actix Web and Tokio, called through PyO3). It validates and encodes with msgspec. The Django ORM, admin, auth, settings and apps keep working. Handlers are typed `async def` or `def` functions, in the style of FastAPI and Django Ninja. Bolt is not a WSGI or ASGI application: `python manage.py runbolt` is the server in development and in production, with no gunicorn or uvicorn. Routing, authentication (JWT, API keys), guards, CORS, rate limits and compression run in Rust before Python starts.
+> Django-Bolt serves typed API routes from a Django project with a Rust HTTP server (Actix Web and Tokio, called through PyO3). It validates and encodes with msgspec. The Django ORM, admin, auth, settings and apps keep working. Handlers are typed `async def` or `def` functions, in the style of FastAPI and Django Ninja. Bolt is not a WSGI or ASGI application: `python manage.py runbolt` is the server in development and in production, with no gunicorn or uvicorn. Routing, authentication (JWT, API keys), guards, CORS and rate limits run in Rust before Python starts. Compression of the response also runs in Rust.
 
 Key facts:
 - Install: `pip install django-bolt`. Add `"django_bolt"` to `INSTALLED_APPS`. Write `api.py` with `api = BoltAPI()` and `@api.get(...)` handlers. Run `python manage.py runbolt --dev`. OpenAPI docs are at `/docs`.

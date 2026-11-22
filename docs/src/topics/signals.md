@@ -82,14 +82,15 @@ A receiver of `request_started` gets a `scope` dict:
 ## Know which requests send the signals
 
 Bolt sends the signals around the Python part of a request. A request that Bolt answers in Rust sends no signal.
+A 404, a 405, a 401 or a 403 of Rust goes through Python when the API has Python or Django middleware. See [Responses from Rust](middleware.md#responses-from-rust).
 
 | Request | Signals |
 | --- | --- |
 | The handler returns a response. | Both |
 | The handler raises an error, for example `HTTPException` or an unexpected error that gives 500. | Both |
 | The request body fails validation (422). | Both |
-| No route matches the path (404). | None |
-| Authentication or a guard refuses the request (401, 403). | None |
+| No route matches the path (404), or the path has no route for the method (405). | Both when the API has middleware. Else none. |
+| Authentication or a guard refuses the request (401, 403). | Both when the API has middleware. Else none. |
 | A rate limit refuses the request (429). | None |
 | A CORS preflight, or an automatic `OPTIONS` response. | None |
 | A path or query value has the wrong type (422). | None |

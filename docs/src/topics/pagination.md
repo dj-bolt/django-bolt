@@ -53,7 +53,7 @@ curl "localhost:8000/articles?page=3&page_size=3"
 
 Order the QuerySet. A QuerySet with no order can give a row on two pages, or on none.
 
-The response type of the route is the envelope, `PaginatedResponse[ArticleItem]`. The OpenAPI schema shows the envelope. It does not show the `page`, `page_size`, `limit`, `offset` or `cursor` query parameters.
+The response type of the route is the envelope, `PaginatedResponse[ArticleItem]`. The OpenAPI schema shows the envelope and the query parameters of the class. The schema of the page size has the `page_size` default and the `max_page_size` maximum.
 
 The envelope leaves out each field that is `None`. Thus the last page has no `next_page`, and the first page has no `previous_page`.
 

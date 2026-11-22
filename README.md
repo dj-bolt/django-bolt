@@ -265,7 +265,7 @@ api.mount_mcp(mcp)
 
 ## When not to use Django-Bolt
 
-- **You need a stable API.** Django-Bolt is at version 0.x. A minor release can change an API. Read the [changelog](CHANGELOG.md) before you upgrade.
+- **You need a stable API.** Django-Bolt is at version 0.x. A minor release can change an API. Read the [changelog](https://github.com/dj-bolt/django-bolt/blob/master/CHANGELOG.md) before you upgrade.
 - **Your host needs a WSGI or ASGI application.** Bolt routes run only in `runbolt`.
 - **You depend on Django REST Framework packages or on Pydantic.** Bolt has its own serializers and validates with msgspec.
 
@@ -273,7 +273,7 @@ The [comparison](https://bolt.farhana.li/comparison/) gives the full list of tra
 
 ## Contribute
 
-[CONTRIBUTING.md](CONTRIBUTING.md) explains the setup (Rust toolchain, `uv`, `just`), the tests and the pull request rules.
+[CONTRIBUTING.md](https://github.com/dj-bolt/django-bolt/blob/master/CONTRIBUTING.md) explains the setup (Rust toolchain, `uv`, `just`), the tests and the pull request rules.
 
 ```bash
 git clone https://github.com/dj-bolt/django-bolt.git
