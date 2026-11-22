@@ -317,7 +317,8 @@ Then the request path has no logging code.
 `sample_rate` and `min_duration_ms` remove lines of 1xx to 3xx responses. See [Production settings](#production-settings).
 This includes the 308 redirect and the automatic `OPTIONS` answer of a route path.
 The 308 redirect uses the values of the route at the other slash form.
-The automatic `OPTIONS` answer uses the values of the first route of the path.
+The automatic `OPTIONS` answer uses the values of the route for the first method in its `Allow` header.
+The `Allow` header lists the methods in a fixed order: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, `QUERY`.
 The logger name also comes from that route.
 
 ## Example: Complete production setup
