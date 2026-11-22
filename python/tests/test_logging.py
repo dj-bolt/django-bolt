@@ -71,7 +71,7 @@ class TestLoggingConfig:
         with pytest.raises(TypeError, match=option):
             LoggingConfig(**{option: None})
 
-    @pytest.mark.parametrize("name", ["", None])
+    @pytest.mark.parametrize("name", ["", None, 123])
     def test_a_logger_name_that_is_not_a_name_stops_the_api(self, name):
         with pytest.raises(ValueError, match="LoggingConfig.logger_name must be a logger name"):
             BoltAPI(logging_config=LoggingConfig(logger_name=name))

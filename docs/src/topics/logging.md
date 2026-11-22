@@ -308,14 +308,17 @@ The log level follows the status code, the same as Django's `runserver`:
 | 4xx | `WARNING` |
 | 5xx | `ERROR` |
 
-Set the logger to `WARNING` to keep only the 4xx and 5xx lines. Set it above `WARNING` to remove all its lines.
+Set the logger to `WARNING` to keep only the 4xx and 5xx lines. Set it to `ERROR` to keep only the 5xx lines. Set it above `ERROR` to remove all its lines.
 Bolt reads the level of each logger once, at startup.
 When no route writes to a logger with a level of `ERROR` or lower, the access log is off.
 Then the request path has no logging code.
 
 `skip_paths` and `skip_status_codes` remove the lines of some paths and status codes. See [Basic options](#basic-options).
 `sample_rate` and `min_duration_ms` remove lines of 1xx to 3xx responses. See [Production settings](#production-settings).
-This includes the 308 redirect and the automatic `OPTIONS` answer of a route path. They use the values of the API of that route.
+This includes the 308 redirect and the automatic `OPTIONS` answer of a route path.
+The 308 redirect uses the values of the route at the other slash form.
+The automatic `OPTIONS` answer uses the values of the first route of the path.
+The logger name also comes from that route.
 
 ## Example: Complete production setup
 

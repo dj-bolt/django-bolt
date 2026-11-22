@@ -70,9 +70,10 @@ class LoggingConfig:
     def get_logger(self) -> logging.Logger:
         """Get the configured logger.
 
-        Uses Django's logging configuration if available.
+        Uses Django's logging configuration if available. A ``logger_name``
+        that is not a name raises ``ValueError``.
         """
-        return logging.getLogger(self.logger_name)
+        return logging.getLogger(_checked_logger_name(self.logger_name))
 
     def should_log_request(self, path: str, status_code: int | None = None) -> bool:
         """Check if a request should be logged.
@@ -139,7 +140,10 @@ def access_log_filter_meta(config: LoggingConfig) -> dict[str, str | float | tup
     """Return the route metadata keys for the access log of ``config``.
 
     Rust reads the keys one time, at startup. A key is absent when its option
-    has the default value. A value out of range raises ``ValueError``.
+    has no effect: ``logger_name`` is ``django.server``, ``skip_paths`` or
+    ``skip_status_codes`` is empty, ``sample_rate`` is 1.0 or None, or
+    ``min_duration_ms`` is 0.0 or None. The default ``skip_paths`` are not
+    empty, so their key is present. A value out of range raises ``ValueError``.
     """
     meta: dict[str, str | float | tuple[str, ...] | tuple[int, ...]] = {}
     logger_name = _checked_logger_name(config.logger_name)
