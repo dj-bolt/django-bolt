@@ -483,6 +483,8 @@ Thus `mount_mcp()` raises `ValueError` for an exposed route with `@rate_limit`, 
 This includes the middleware of the API and of the router, and a route with `SessionAuthentication`.
 The error names the route and the middleware.
 Write an `@mcp.tool(guards=...)` for such an operation.
+The guards of a tool do not limit the rate of calls.
+If the route has `@rate_limit`, add an equal limit for the tool, for example in tool middleware or at a gateway.
 
 `mount_mcp()` exposes only the routes that you name.
 A handler that is not a route of the API, a handler with `File` or `Form` parameters, or a duplicate tool name raises `ValueError`.

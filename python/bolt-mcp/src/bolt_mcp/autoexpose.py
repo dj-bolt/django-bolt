@@ -67,7 +67,11 @@ def _route_auth(
     blocking = [mw["type"] for mw in route_meta.get("middleware", ()) if mw.get("type") == "rate_limit"]
     middleware_api = meta.get("_middleware_api")
     if middleware_api is not None:
-        specs = [*middleware_api._middleware, *meta.get("_router_middleware", ()), *meta.get("_route_middleware", ())]
+        # The global middleware that the route runs over HTTP: None means all of the API, after @skip_middleware.
+        global_middleware = meta.get("_global_middleware")
+        if global_middleware is None:
+            global_middleware = middleware_api._middleware
+        specs = [*global_middleware, *meta.get("_router_middleware", ()), *meta.get("_route_middleware", ())]
         blocking += [name for spec in specs if not isinstance(spec, dict) for name in _middleware_names(spec)]
     if blocking:
         raise ValueError(

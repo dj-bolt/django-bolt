@@ -14,7 +14,7 @@ from django_bolt import (
     JWTAuthentication,
     Requires,
 )
-from django_bolt.middleware import BaseMiddleware, rate_limit
+from django_bolt.middleware import BaseMiddleware, rate_limit, skip_middleware
 from django_bolt.testing import TestClient
 
 SECRET = "expose-auth-secret-key-0123456789-abcdef"
@@ -228,3 +228,17 @@ def test_a_route_with_python_middleware_cannot_be_exposed():
 
     with pytest.raises(ValueError, match=r"tagged.*_Tag"):
         api.mount_mcp(MCP("tagged"), expose=[tagged])
+
+
+def test_a_route_that_skips_the_python_middleware_of_the_api_can_be_exposed():
+    """The check reads the middleware that the route runs over HTTP, after ``@skip_middleware``."""
+    api = BoltAPI(middleware=[_Tag])
+
+    @api.get("/plain")
+    @skip_middleware(_Tag)
+    async def plain() -> dict:
+        return {"plain": True}
+
+    api.mount_mcp(MCP("plain"), expose=[plain])
+    with TestClient(api) as client:
+        assert _call(client, "plain")["structuredContent"] == {"plain": True}
