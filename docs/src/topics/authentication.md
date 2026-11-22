@@ -522,6 +522,7 @@ Without `exp`, the entry lives for the `default_ttl` of the store: 7 days.
 Refresh rotation and `bump_user_version()` need an atomic `add` and `incr` in the cache. `DjangoCacheRevocation` refuses the file, database and dummy cache backends for them.
 `DjangoORMRevocation` does not delete old rows. Delete rows with `expires_at` in the past from a periodic task. Keep the rows whose `jti` starts with `version:`.
 A token `jti` cannot start with `family:` or `version:`. The store raises `ReservedJtiError` for it, and the request gets a 401.
+A `jti` longer than the `max_length` of the `jti` field of the model also gets a 401. For the `RevokedToken` model of Bolt, this limit is 255 characters. On a memcached backend, a `jti` with a space also gets a 401.
 
 When you change the `leeway` of the backend, give the store the same value: `DjangoCacheRevocation(leeway=120)`. A store `leeway` smaller than the backend `leeway` raises `ImproperlyConfigured`.
 
