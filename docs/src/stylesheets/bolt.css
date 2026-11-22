@@ -882,9 +882,21 @@
   color: var(--bl-ink-2);
 }
 
-/* The template leaves .md-main empty on the landing page. */
-.bl-home ~ .md-main {
+/* The template leaves the content of .md-main empty on the landing page.
+   On a narrow screen, .md-main keeps the navigation drawer of the header. */
+.bl-home ~ .md-main .md-content {
   display: none;
+}
+
+.bl-home ~ .md-main .md-main__inner {
+  margin-top: 0;
+  min-height: 0;
+}
+
+@media screen and (min-width: 76.25em) {
+  .bl-home ~ .md-main {
+    display: none;
+  }
 }
 
 /* Narrow screens */
