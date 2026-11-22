@@ -343,6 +343,46 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
     return queue_handler
 
 
+def restart_queue_listener_after_fork() -> None:
+    """Start a new queue listener in a forked child process.
+
+    A fork copies the queue, but not the listener thread. Without a new
+    listener, the records of the child stay in the queue, and nothing writes
+    them. Call this function in the child, immediately after the fork.
+    The function does nothing when no listener runs.
+    """
+    global _QUEUE_LISTENER  # noqa: PLW0603
+
+    if _QUEUE_LISTENER is None or _QUEUE is None:
+        return
+    # Initialize the queue again. This clears the copied records, which the
+    # listener of the parent writes. It also makes new locks, because a thread
+    # of the parent can hold a lock at the time of the fork.
+    _QUEUE.__init__(_QUEUE.maxsize)
+    listener = _BoundedQueueListener(
+        _QUEUE,
+        *_QUEUE_LISTENER.handlers,
+        respect_handler_level=_QUEUE_LISTENER.respect_handler_level,
+    )
+    listener.start()
+    _QUEUE_LISTENER = listener
+
+
+def stop_queue_listener() -> None:
+    """Write the records in the queue, then stop the queue listener.
+
+    ``os._exit()`` does not run the ``atexit`` functions. Call this function
+    before ``os._exit()``, or the records in the queue are lost.
+    The function does nothing when no listener runs.
+    """
+    global _QUEUE_LISTENER  # noqa: PLW0603
+
+    if _QUEUE_LISTENER is None:
+        return
+    _QUEUE_LISTENER.stop()
+    _QUEUE_LISTENER = None
+
+
 def setup_django_logging(force: bool = False) -> None:
     """Setup Django logging configuration with console output.
 
