@@ -17,7 +17,7 @@ use pyo3::prelude::*;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::state::{ScopeConfig, ServeMode};
+use crate::state::{FinderRoot, ScopeConfig, ServeMode};
 
 /// Extensions that can carry executable script in a browser context.
 /// For media (user uploads), these are rewritten to `application/octet-stream`
@@ -115,6 +115,61 @@ fn find_with_django_finders(relative_path: &str) -> Option<PathBuf> {
     })
 }
 
+/// Give the canonical path of a file that a finder found, if the file stays
+/// inside the root of the finder location that found it.
+///
+/// A finder joins the request path to the absolute path of its location, so
+/// that location is a prefix of `found`. A symlink can point out of the
+/// location. Thus the canonical file must start with the canonical root.
+/// The handler opens the canonical path, which is the path that we checked.
+fn contain_finder_result(found: &Path, roots: &[FinderRoot]) -> Option<PathBuf> {
+    let canonical = found.canonicalize().ok()?;
+    let inside = roots.iter().any(|root| {
+        found.starts_with(&root.location)
+            && match root.canonical {
+                Some(ref root_canonical) => canonical.starts_with(root_canonical),
+                // The directory was made after startup. Resolve it now.
+                None => root
+                    .location
+                    .canonicalize()
+                    .is_ok_and(|root_canonical| canonical.starts_with(root_canonical)),
+            }
+    });
+    (inside && canonical.is_file()).then_some(canonical)
+}
+
+/// Read the roots of the Django staticfiles finders, once at startup.
+///
+/// Python gives the absolute path of each finder location. A location that
+/// does not exist yet keeps no canonical form; a request resolves it if a
+/// finder later finds a file there. A finder without a
+/// filesystem storage has no known root, so Bolt refuses its files and
+/// prints a warning.
+pub fn load_finder_roots(py: Python<'_>) -> PyResult<Vec<FinderRoot>> {
+    let (locations, unknown): (Vec<String>, Vec<String>) = py
+        .import("django_bolt.admin.static")?
+        .getattr("finder_locations")?
+        .call0()?
+        .extract()?;
+    for finder in &unknown {
+        eprintln!(
+            "[django-bolt] Warning: Static files: the finder {finder} has no filesystem \
+             storage. Bolt does not serve its files."
+        );
+    }
+    Ok(locations
+        .into_iter()
+        .map(|location| {
+            let location = PathBuf::from(location);
+            let canonical = location.canonicalize().ok();
+            FinderRoot {
+                location,
+                canonical,
+            }
+        })
+        .collect())
+}
+
 /// Unified static/media file handler. Behaviour is driven entirely by
 /// `config` (`ScopeConfig`), so both the `/static` and `/media` scopes route
 /// here — there is no per-scope code path.
@@ -125,8 +180,9 @@ fn find_with_django_finders(relative_path: &str) -> Option<PathBuf> {
 /// built CSP header; dotfile components (`.env`, `.git/...`, …) are 404'd.
 ///
 /// Scope-specific behaviour, all keyed off `config`:
-/// - Static (`allow_django_finders`, debug only): falls back to Django's
-///   staticfiles finders for app static like admin. In production only the
+/// - Static (`django_finders`, debug only): falls back to Django's
+///   staticfiles finders for app static like admin. A found file must stay
+///   inside the root of its finder location. In production only the
 ///   configured dirs (STATIC_ROOT, STATICFILES_DIRS) are served.
 /// - Media (`ServeMode::Media`): never uses finders (they don't know
 ///   MEDIA_ROOT), and any upload whose extension can carry script
@@ -195,8 +251,11 @@ pub async fn handle_file(
     // Static-only: fall back to Django finders in debug mode for app static
     // files like admin. Media intentionally skips this — finders only know
     // about STATICFILES_DIRS / app static dirs, never MEDIA_ROOT.
-    if config.allow_django_finders && file_path.is_none() {
-        file_path = find_with_django_finders(relative_path);
+    if file_path.is_none()
+        && let Some(ref roots) = config.django_finders
+    {
+        file_path = find_with_django_finders(relative_path)
+            .and_then(|found| contain_finder_result(&found, roots));
     }
 
     let mut response = if let Some(ref resolved) = file_path {
@@ -312,14 +371,14 @@ mod tests {
         assert!(find_in_directories(absolute.to_str().unwrap(), &directories).is_none());
     }
 
-    fn scope(root: &Path, mode: ServeMode, allow_django_finders: bool) -> ScopeConfig {
+    fn scope(root: &Path, mode: ServeMode, finders: bool) -> ScopeConfig {
         ScopeConfig {
             url_prefix: "/files".to_string(),
             directories: vec![canon(root)],
             csp_header: None,
             cache_control: Some(header::HeaderValue::from_static("max-age=60")),
             mode,
-            allow_django_finders,
+            django_finders: finders.then(Vec::new),
         }
     }
 
@@ -390,6 +449,100 @@ mod tests {
             Some("nosniff")
         );
         assert_eq!(header_of(&missing, "cache-control"), None);
+    }
+
+    fn finder_root(location: &Path) -> FinderRoot {
+        FinderRoot {
+            location: location.to_path_buf(),
+            canonical: Some(canon(location)),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finder_result_must_stay_inside_its_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().join("static");
+        let other = temp_dir.path().join("other");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&other).unwrap();
+        fs::write(root.join("app.css"), "app").unwrap();
+        fs::write(other.join("other.css"), "other").unwrap();
+        fs::write(temp_dir.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(temp_dir.path().join("secret.txt"), root.join("leak.txt"))
+            .unwrap();
+        std::os::unix::fs::symlink(root.join("app.css"), root.join("alias.css")).unwrap();
+        // A link into another finder root also leaves the root that found it.
+        std::os::unix::fs::symlink(other.join("other.css"), root.join("cross.css")).unwrap();
+        fs::create_dir(root.join("dir")).unwrap();
+        let roots = [finder_root(&root), finder_root(&other)];
+
+        assert_eq!(
+            contain_finder_result(&root.join("app.css"), &roots),
+            Some(canon(&root.join("app.css")))
+        );
+        assert_eq!(
+            contain_finder_result(&root.join("alias.css"), &roots),
+            Some(canon(&root.join("app.css")))
+        );
+        assert_eq!(contain_finder_result(&root.join("leak.txt"), &roots), None);
+        assert_eq!(contain_finder_result(&root.join("cross.css"), &roots), None);
+        assert_eq!(contain_finder_result(&root.join("dir"), &roots), None);
+        assert_eq!(
+            contain_finder_result(&root.join("missing.css"), &roots),
+            None
+        );
+        // A path from no known root (a finder without a storage) is refused.
+        assert_eq!(contain_finder_result(&root.join("app.css"), &[]), None);
+    }
+
+    /// A finder location that is itself a symlink to a directory is legal.
+    /// Its files resolve into the target, which is the canonical root.
+    #[cfg(unix)]
+    #[test]
+    fn finder_root_that_is_a_symlink_serves_its_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let real = temp_dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("app.css"), "app").unwrap();
+        fs::write(temp_dir.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(temp_dir.path().join("secret.txt"), real.join("leak.txt"))
+            .unwrap();
+        let linked = temp_dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let roots = [finder_root(&linked)];
+
+        assert_eq!(
+            contain_finder_result(&linked.join("app.css"), &roots),
+            Some(canon(&real.join("app.css")))
+        );
+        assert_eq!(
+            contain_finder_result(&linked.join("leak.txt"), &roots),
+            None
+        );
+    }
+
+    /// A finder location made after startup has no canonical form yet.
+    #[cfg(unix)]
+    #[test]
+    fn finder_root_made_after_startup_is_resolved_on_request() {
+        let temp_dir = TempDir::new().unwrap();
+        let later = temp_dir.path().join("later");
+        let roots = [FinderRoot {
+            location: later.clone(),
+            canonical: None,
+        }];
+        fs::create_dir(&later).unwrap();
+        fs::write(later.join("app.css"), "app").unwrap();
+        fs::write(temp_dir.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(temp_dir.path().join("secret.txt"), later.join("leak.txt"))
+            .unwrap();
+
+        assert_eq!(
+            contain_finder_result(&later.join("app.css"), &roots),
+            Some(canon(&later.join("app.css")))
+        );
+        assert_eq!(contain_finder_result(&later.join("leak.txt"), &roots), None);
     }
 
     #[test]

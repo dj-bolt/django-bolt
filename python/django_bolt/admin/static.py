@@ -11,9 +11,10 @@ handler directly; there is no Python static request route.
 from __future__ import annotations
 
 try:
-    from django.contrib.staticfiles.finders import find
+    from django.contrib.staticfiles.finders import find, get_finders
 except ImportError:
     find = None
+    get_finders = None
 
 
 def find_static_file(path: str) -> str | None:
@@ -32,3 +33,37 @@ def find_static_file(path: str) -> str | None:
             return found_path
 
     return None
+
+
+def finder_locations() -> tuple[list[str], list[str]]:
+    """
+    Give the absolute directory of each location of the staticfiles finders.
+
+    Rust reads these directories once at startup. A file that a finder finds
+    must stay inside the directory of its location, also through a symlink.
+
+    Returns:
+        The directories, and the class names of the finders that have no
+        filesystem storage. Bolt cannot check the files of these finders.
+    """
+    locations: list[str] = []
+    unknown: list[str] = []
+    if get_finders is None:
+        return locations, unknown
+    for finder in get_finders():
+        # FileSystemFinder and AppDirectoriesFinder keep `storages`.
+        # A BaseStorageFinder keeps one `storage`.
+        storages = list(getattr(finder, "storages", {}).values())
+        storage = getattr(finder, "storage", None)
+        if storage is not None:
+            storages.append(storage)
+        if not storages and not hasattr(finder, "storages"):
+            unknown.append(type(finder).__qualname__)
+            continue
+        for item in storages:
+            location = getattr(item, "location", None)
+            if isinstance(location, str):
+                locations.append(location)
+            else:
+                unknown.append(type(finder).__qualname__)
+    return locations, unknown
