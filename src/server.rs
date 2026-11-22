@@ -784,17 +784,19 @@ pub fn start_server(
             .map(|meta| &mut meta.access_log_filter),
     )?;
     // A logger counts only when a route writes to it. A route with no
-    // metadata writes to django.server.
+    // metadata writes to django.server. The no-route route writes the 404
+    // and the 405 of a path with no route.
+    let router = GLOBAL_ROUTER.get().expect("checked at the start");
     let access_log_enabled = bolt_core::access_log::access_log_on(
         &access_loggers,
-        GLOBAL_ROUTER
-            .get()
-            .expect("checked at the start")
+        router
             .handler_ids()
             .iter()
+            .copied()
+            .chain(router.no_route().map(|route| route.handler_id))
             .map(|id| {
                 metadata
-                    .get(id)
+                    .get(&id)
                     .map_or(0, |meta| meta.access_log_filter.logger)
             }),
     );

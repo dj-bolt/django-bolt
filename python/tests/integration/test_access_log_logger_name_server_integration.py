@@ -77,3 +77,16 @@ def test_access_log_starts_when_only_a_named_logger_writes(make_server_project):
     server_lines, named_lines = _run(make_server_project, "CRITICAL")
     assert server_lines == []
     assert named_lines == _NAMED_LINES
+
+
+@pytest.mark.server_integration
+def test_a_path_with_no_route_writes_its_404_when_no_route_logger_writes(make_server_project):
+    """The first API has no route. Its 404 line goes to django.server, and myapp.api writes nothing."""
+    logging_settings = _LOGGING.replace("{server_level}", "INFO").replace(
+        '"myapp.api": {"handlers": ["named_file"], "level": "INFO"',
+        '"myapp.api": {"handlers": ["named_file"], "level": "CRITICAL"',
+    )
+    project = make_server_project(api_module=app_module("access_log_no_route_logger"), settings_extra=logging_settings)
+    with project.start(startup_path="/named/health") as server:
+        assert server.request("GET", "/nowhere").status_code == 404
+    assert _lines(project, "server.log") == ["django.server WARNING GET /nowhere 404"]
