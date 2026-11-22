@@ -95,5 +95,5 @@ The two have the most in common. Both run in Django, and both read parameters fr
 
 ## Move to Django-Bolt
 
-You can move one endpoint at a time. Your old views keep working next to the new routes.
+You can move one endpoint at a time. Mount Django with `api.mount_django("/", clear_root_path=True)`, and your old views keep working next to the new routes.
 [Migrate from Ninja, DRF or FastAPI](topics/migrating.md) shows each step.
