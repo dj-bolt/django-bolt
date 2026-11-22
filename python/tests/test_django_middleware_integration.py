@@ -396,6 +396,34 @@ class TestBoltAuthUserPrecedence:
         assert response.json() == {"username": "lazy_user"}
         assert loads == []
 
+    def test_django_session_user_replaces_a_user_set_to_none(self):
+        """A middleware that sets request.user to None leaves no user. Django's session user then applies."""
+
+        class ClearUser(Middleware):
+            async def process_request(self, request):
+                request.user = None
+                return await self.get_response(request)
+
+        api = BoltAPI(middleware=[ClearUser, DjangoMiddlewareStack([SessionMiddleware, AuthenticationMiddleware])])
+
+        @api.post("/login")
+        async def login(request):
+            await alogin(request, await User.objects.aget(username="session_user"))
+            return {"ok": True}
+
+        @api.get("/me")
+        def me(request):
+            return {"username": request.user.username, "is_authenticated": request.user.is_authenticated}
+
+        User.objects.create(username="session_user")
+
+        with TestClient(api) as client:
+            assert client.post("/login").status_code == 200
+            response = client.get("/me")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"username": "session_user", "is_authenticated": True}
+
     def test_user_that_has_no_is_authenticated_never_replaces_the_bolt_user(self):
         """A value that is not a user object does not count as an authenticated user."""
 

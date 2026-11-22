@@ -1240,8 +1240,9 @@ def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
     never run).
 
     Rules:
-    - No Bolt user set → adopt Django's user (plain Django behavior). The
-      check does not read ``bolt_request.user``, which makes an anonymous user.
+    - No Bolt user set, or a user set to None → adopt Django's user (plain
+      Django behavior). The check of an unset user does not read
+      ``bolt_request.user``, which makes an anonymous user.
     - Django user is already the request user → adopt it again. Each
       ``DjangoMiddleware`` wrapper copies the attributes, and a later copy
       must keep Django's ``auser`` for a user that an earlier copy adopted.
@@ -1254,7 +1255,7 @@ def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
     if not bolt_request._has_user:
         return True
     bolt_user = bolt_request.user
-    if bolt_user is django_user:
+    if bolt_user is None or bolt_user is django_user:
         return True
     if isinstance(django_user, LazyObject) and django_user._wrapped is empty:
         return False
