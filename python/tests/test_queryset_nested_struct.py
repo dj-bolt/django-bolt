@@ -7,7 +7,7 @@ reads the fields of the nested Struct across the relation, in the same query.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 import msgspec
 import pytest
@@ -621,3 +621,45 @@ def test_model_instance_with_a_written_out_response_type(sql_statements):
         assert response.json() == expected_list
         # The query of the handler, and one query for the authors.
         assert len(sql_statements) == 2, sql_statements
+
+
+@pytest.mark.django_db(transaction=True)
+def test_instances_from_a_handler_with_no_await(sql_statements):
+    """An async handler with no await runs on the thread of the worker loop. It loads the relations there."""
+    _make_posts()
+    cache: dict[str, Any] = {}
+    api = BoltAPI()
+
+    @api.get("/validated")
+    async def validated() -> list[PostOut]:
+        return cache["posts"]
+
+    @api.get("/unvalidated", validate_response=False)
+    async def unvalidated() -> list[PostOut]:
+        return cache["posts"]
+
+    @api.get("/with-param")
+    async def with_param(limit: int = 10) -> list[PostOut]:
+        return cache["posts"][:limit]
+
+    @api.get("/one")
+    async def one() -> PostOut:
+        return cache["posts"][0]
+
+    expected = _expected_posts()
+    with TestClient(api) as client:
+        for path, body in (("/validated", expected), ("/unvalidated", expected), ("/with-param", expected)):
+            cache["posts"] = list(BlogPost.objects.order_by("id"))
+            sql_statements.clear()
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == body, path
+            # One query for the authors.
+            assert len(sql_statements) == 1, (path, sql_statements)
+
+        cache["posts"] = list(BlogPost.objects.order_by("id"))
+        sql_statements.clear()
+        response = client.get("/one")
+        assert response.status_code == 200, response.text
+        assert response.json() == expected[0]
+        assert len(sql_statements) == 1, sql_statements
