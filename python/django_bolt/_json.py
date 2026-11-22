@@ -2,7 +2,7 @@
 
 This module provides optimized JSON encoding/decoding using msgspec with:
 - Thread-local cached encoder/decoder instances (thread-safe buffer reuse)
-- Support for common non-JSON-native types (datetime, Path, Decimal, UUID, IP addresses, deque)
+- Support for standard types (see DEFAULT_TYPE_ENCODERS)
 - Automatic Serializer.dump() for write_only, computed_field support
 - Type-safe decoding with validation
 - Custom encoder/decoder hooks
@@ -13,7 +13,8 @@ Inspired by Litestar's serialization approach.
 from __future__ import annotations
 
 import re
-from collections import deque
+from array import array
+from collections import ChainMap, UserDict, UserList, UserString, deque
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -28,7 +29,7 @@ from ipaddress import (
     IPv6Network,
 )
 from pathlib import Path, PurePath
-from types import GeneratorType
+from types import GeneratorType, MappingProxyType
 from typing import Any
 from uuid import UUID
 
@@ -80,6 +81,20 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
     Fraction: str,
     # A compiled regular expression is its pattern text.
     re.Pattern: lambda v: v.pattern,
+    # A mapping is a JSON object. A sequence, a dict view or an iterator is a JSON array.
+    # The items go through the encoder again.
+    ChainMap: dict,
+    MappingProxyType: dict,
+    UserDict: dict,
+    UserList: list,
+    UserString: lambda v: v.data,
+    range: list,
+    array: array.tolist,
+    type({}.keys()): list,
+    type({}.values()): list,
+    type({}.items()): list,
+    map: list,
+    zip: list,
 }
 
 

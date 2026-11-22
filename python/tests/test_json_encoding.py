@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
-from collections import deque
+from array import array
+from collections import ChainMap, OrderedDict, UserDict, UserList, UserString, deque
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from fractions import Fraction
+from types import MappingProxyType
 
 import msgspec
 import pytest
@@ -83,6 +85,11 @@ class MyDeque(deque):
     pass
 
 
+class UpperDict(UserDict):
+    def __getitem__(self, key):
+        return super().__getitem__(key).upper()
+
+
 def _numbers():
     yield 1
     yield 2
@@ -100,6 +107,21 @@ STANDARD_VALUES = {
     "fraction": (lambda: Fraction(-1, 3), '"-1/3"'),
     "fraction-integer": (lambda: Fraction(4, 2), '"2"'),
     "pattern": (lambda: re.compile("a+"), '"a+"'),
+    # A mapping is a JSON object. A sequence or an iterator is a JSON array.
+    "chainmap": (lambda: ChainMap({"a": 1}, {"a": 2, "b": 2}), '{"a":1,"b":2}'),
+    "mappingproxy": (lambda: MappingProxyType({"a": Decimal("1.50")}), '{"a":"1.50"}'),
+    "userdict": (lambda: UserDict({"a": 1}), '{"a":1}'),
+    "userdict-subclass": (lambda: UpperDict({"a": "x"}), '{"a":"X"}'),
+    "range": (lambda: range(1, 4), "[1,2,3]"),
+    "array": (lambda: array("i", [1, 2]), "[1,2]"),
+    "dict-keys": (lambda: {"a": 1, "b": 2}.keys(), '["a","b"]'),
+    "dict-values": (lambda: {"a": 1, "b": 2}.values(), "[1,2]"),
+    "dict-items": (lambda: {"a": 1}.items(), '[["a",1]]'),
+    "ordered-dict-keys": (lambda: OrderedDict(a=1).keys(), '["a"]'),
+    "userlist": (lambda: UserList([1, deque([2])]), "[1,[2]]"),
+    "map": (lambda: map(str, [1, 2]), '["1","2"]'),
+    "zip": (lambda: zip([1, 2], "ab", strict=True), '[[1,"a"],[2,"b"]]'),
+    "userstring": (lambda: UserString("hi"), '"hi"'),
 }
 
 

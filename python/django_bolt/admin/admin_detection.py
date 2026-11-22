@@ -69,10 +69,11 @@ def detect_admin_url_prefix() -> str | None:
 
     Returns:
         The prefix with no slash at its ends, for example ``"admin"`` or
-        ``"portal/staff"``. ``""`` when the admin site is at the root path.
-        ``"admin"`` when the URLconf has no admin site that Django can
-        reverse. ``None`` when the admin is not installed. For an admin site
-        in ``i18n_patterns()``, this is the prefix of the default language.
+        ``"portal/staff"``. ``""`` when the admin site is at the root path,
+        or when its URL pattern has a path parameter before it.
+        ``"admin"`` when the URLconf has no admin site. ``None`` when the
+        admin is not installed. For an admin site in ``i18n_patterns()``,
+        this is the prefix of the default language.
     """
     prefixes = detect_admin_url_prefixes()
     return prefixes[0] if prefixes else None
@@ -90,6 +91,10 @@ def detect_admin_url_prefixes() -> list[str] | None:
     The default language is the variant of ``settings.LANGUAGE_CODE`` that
     ``settings.LANGUAGES`` has, as in ``LocaleMiddleware``. For ``"en-us"``
     with only ``"en"`` in ``LANGUAGES``, the first prefix is ``"en/admin"``.
+
+    A path parameter before the admin site, as in
+    ``path("<tenant>/admin/", site.urls)``, gives no static prefix. The list
+    is then ``[""]``: Django gets each path that has no Bolt route.
 
     Returns:
         The prefixes with no slash at their ends. The prefix of the default
@@ -122,7 +127,7 @@ def detect_admin_url_prefixes() -> list[str] | None:
             try:
                 index_url = reverse("admin:index", urlconf=urlconf)
             except NoReverseMatch:
-                return ["admin"]
+                return [""] if _urlconf_has_admin_site(urlconf) else ["admin"]
             # reverse() puts the script prefix (FORCE_SCRIPT_NAME) first. A mount path does not have it.
             prefix = index_url.removeprefix(script_prefix).strip("/")
             language_prefix = f"{translation.get_language()}/"
@@ -133,17 +138,22 @@ def detect_admin_url_prefixes() -> list[str] | None:
     return prefixes
 
 
+def _urlconf_has_admin_site(urlconf: str) -> bool:
+    """Tell if the URLconf has a URL pattern with the ``admin`` app namespace."""
+    return "admin" in get_resolver(urlconf).app_dict
+
+
 def admin_url_needs_path_parameter() -> bool:
     """
     Tell if the URL pattern of the admin site has a path parameter before it.
 
-    An example is ``path("<tenant>/admin/", admin.site.urls)``. Such a prefix
-    is not a static path, so Bolt cannot mount the admin at it.
+    An example is ``path("<tenant>/admin/", site.urls)``. Such a prefix is not
+    a static path. Bolt thus mounts Django at the root path for it.
     """
     urlconf = getattr(settings, "ROOT_URLCONF", None)
     if not urlconf or not is_admin_installed():
         return False
-    if "admin" not in get_resolver(urlconf).app_dict:
+    if not _urlconf_has_admin_site(urlconf):
         return False
     try:
         reverse("admin:index", urlconf=urlconf)
