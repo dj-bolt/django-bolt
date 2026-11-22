@@ -781,7 +781,21 @@ pub fn start_server(
             .values_mut()
             .map(|meta| &mut meta.access_log_filter),
     )?;
-    let access_log_enabled = access_loggers.iter().any(|logger| logger.levels != 0);
+    // A logger counts only when a route writes to it. A route with no
+    // metadata writes to django.server.
+    let access_log_enabled = bolt_core::access_log::access_log_on(
+        &access_loggers,
+        GLOBAL_ROUTER
+            .get()
+            .expect("checked at the start")
+            .handler_ids()
+            .iter()
+            .map(|id| {
+                metadata
+                    .get(id)
+                    .map_or(0, |meta| meta.access_log_filter.logger)
+            }),
+    );
     let access_loggers = if access_log_enabled {
         access_loggers
     } else {

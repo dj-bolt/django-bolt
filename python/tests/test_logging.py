@@ -3,9 +3,8 @@
 These tests validate the behavior documented in docs/LOGGING.md:
 - Queue-based non-blocking logging
 - Production defaults (min_duration_ms, sample_rate)
-- Request/response logging with proper log levels
 - Skip paths and status codes
-- Header/cookie obfuscation
+- Exception logging
 - Integration with Django's logging system
 """
 
@@ -30,7 +29,6 @@ from django_bolt.logging.config import (
     _BoundedQueueListener,
     _DropOnFullQueueHandler,
     _ensure_queue_logging,
-    access_log_filter_meta,
     get_default_logging_config,
     setup_django_logging,
 )
@@ -43,32 +41,6 @@ class TestLoggingConfig:
         """Default logger should be 'django.server' as documented."""
         config = LoggingConfig()
         assert config.logger_name == "django.server", "Default logger must be 'django.server' per LOGGING.md"
-
-    def test_default_request_fields_include_basic_info(self):
-        """Default request fields should include method, path, and status_code."""
-        config = LoggingConfig()
-        assert "method" in config.request_log_fields
-        assert "path" in config.request_log_fields
-        assert "status_code" in config.request_log_fields
-
-    def test_default_response_fields_include_status_code(self):
-        """Default response fields should include status_code."""
-        config = LoggingConfig()
-        assert "status_code" in config.response_log_fields
-
-    def test_default_security_headers_are_obfuscated(self):
-        """Security-sensitive headers should be obfuscated by default."""
-        config = LoggingConfig()
-        assert "authorization" in config.obfuscate_headers
-        assert "cookie" in config.obfuscate_headers
-        assert "x-api-key" in config.obfuscate_headers
-        assert "x-auth-token" in config.obfuscate_headers
-
-    def test_default_security_cookies_are_obfuscated(self):
-        """Security-sensitive cookies should be obfuscated by default."""
-        config = LoggingConfig()
-        assert "sessionid" in config.obfuscate_cookies
-        assert "csrftoken" in config.obfuscate_cookies
 
     def test_default_skip_paths_include_health_checks(self):
         """Health check paths should be skipped by default."""
@@ -83,37 +55,21 @@ class TestLoggingConfig:
         assert config.logger_name == "custom.logger"
 
     @pytest.mark.parametrize(
-        ("option", "value"),
+        "option",
         [
-            ("request_log_fields", {"method", "path", "body"}),
-            ("response_log_fields", {"status_code", "duration"}),
-            ("obfuscate_headers", {"authorization"}),
-            ("obfuscate_cookies", set()),
-            ("log_request_body", True),
-            ("log_response_body", True),
-            ("max_body_log_size", 10),
-            ("log_level", "DEBUG"),
+            "request_log_fields",
+            "response_log_fields",
+            "obfuscate_headers",
+            "obfuscate_cookies",
+            "log_request_body",
+            "log_response_body",
+            "max_body_log_size",
+            "log_level",
         ],
     )
-    def test_a_deprecated_option_warns_and_keeps_its_value(self, option, value):
-        """The options with no effect on the access log warn. The warning points at the caller."""
-        with pytest.warns(DeprecationWarning, match=rf"LoggingConfig options {option} are deprecated") as record:
-            config = LoggingConfig(**{option: value})
-        assert getattr(config, option) == value
-        assert record[0].filename == __file__
-
-    def test_the_default_config_warns_for_no_option(self, recwarn):
-        LoggingConfig()
-        LoggingConfig(logger_name="myapp.api", skip_paths=set(), sample_rate=0.5, min_duration_ms=10)
-        get_default_logging_config()
-        create_logging_middleware()
-        assert not [warning for warning in recwarn if warning.category is DeprecationWarning]
-
-    def test_the_logger_name_goes_to_the_route_metadata(self):
-        """Rust reads the key at startup. The default logger adds no key."""
-        assert "access_log_logger_name" not in access_log_filter_meta(LoggingConfig())
-        meta = access_log_filter_meta(LoggingConfig(logger_name="myapp.api"))
-        assert meta["access_log_logger_name"] == "myapp.api"
+    def test_a_removed_option_raises_type_error(self, option):
+        with pytest.raises(TypeError, match=option):
+            LoggingConfig(**{option: None})
 
     @pytest.mark.parametrize("name", ["", None])
     def test_a_logger_name_that_is_not_a_name_stops_the_api(self, name):
@@ -240,32 +196,8 @@ class TestLoggingConfig:
         assert logger.name == "test.logger"
 
 
-# log_request(), log_response(), extract_request_data() and obfuscate_*() are
-# deprecated. These tests cover them until a release removes them.
-@pytest.mark.filterwarnings(
-    r"ignore:LoggingMiddleware\.\w+\(\) is deprecated:DeprecationWarning",
-    "ignore:LoggingConfig options .* are deprecated:DeprecationWarning",
-)
 class TestLoggingMiddleware:
     """Test LoggingMiddleware behavior."""
-
-    @pytest.mark.filterwarnings("error::DeprecationWarning")
-    @pytest.mark.parametrize(
-        ("method", "args"),
-        [
-            ("log_request", ({"method": "GET", "path": "/a"},)),
-            ("log_response", ({"method": "GET", "path": "/a"}, 200, 0.1)),
-            ("extract_request_data", ({"method": "GET", "path": "/a"},)),
-            ("obfuscate_headers", ({"authorization": "x"},)),
-            ("obfuscate_cookies", ({"sessionid": "x"},)),
-        ],
-    )
-    def test_a_deprecated_method_warns_once_at_the_caller(self, method, args):
-        middleware = LoggingMiddleware(LoggingConfig())
-        with pytest.warns(DeprecationWarning, match=rf"LoggingMiddleware\.{method}\(\) is deprecated") as record:
-            getattr(middleware, method)(*args)
-        assert len(record) == 1
-        assert record[0].filename == __file__
 
     def test_middleware_uses_default_config_when_none_provided(self):
         """Middleware should use default config when none is provided."""
@@ -278,480 +210,6 @@ class TestLoggingMiddleware:
         config = LoggingConfig(logger_name="custom.logger")
         middleware = LoggingMiddleware(config)
         assert middleware.config.logger_name == "custom.logger"
-
-    def test_obfuscate_headers_masks_sensitive_headers(self):
-        """Sensitive headers should be obfuscated to '***'."""
-        config = LoggingConfig(obfuscate_headers={"authorization", "x-api-key"})
-        middleware = LoggingMiddleware(config)
-
-        headers = {
-            "content-type": "application/json",
-            "authorization": "Bearer secret-token-12345",
-            "x-api-key": "my-secret-key",
-            "user-agent": "test-agent",
-        }
-
-        obfuscated = middleware.obfuscate_headers(headers)
-        assert obfuscated["content-type"] == "application/json"
-        assert obfuscated["authorization"] == "***", "Authorization header must be obfuscated"
-        assert obfuscated["x-api-key"] == "***", "X-API-Key header must be obfuscated"
-        assert obfuscated["user-agent"] == "test-agent"
-
-    def test_obfuscate_headers_is_case_insensitive(self):
-        """Header obfuscation should be case-insensitive."""
-        config = LoggingConfig(obfuscate_headers={"authorization"})
-        middleware = LoggingMiddleware(config)
-
-        headers = {
-            "Authorization": "Bearer token",
-            "AUTHORIZATION": "Bearer token2",
-        }
-
-        obfuscated = middleware.obfuscate_headers(headers)
-        assert obfuscated["Authorization"] == "***"
-        assert obfuscated["AUTHORIZATION"] == "***"
-
-    def test_obfuscate_cookies_masks_sensitive_cookies(self):
-        """Sensitive cookies should be obfuscated to '***'."""
-        config = LoggingConfig(obfuscate_cookies={"sessionid", "csrftoken"})
-        middleware = LoggingMiddleware(config)
-
-        cookies = {
-            "sessionid": "abc123xyz789",
-            "csrftoken": "token456def",
-            "preferences": "dark-mode",
-        }
-
-        obfuscated = middleware.obfuscate_cookies(cookies)
-        assert obfuscated["sessionid"] == "***", "sessionid cookie must be obfuscated"
-        assert obfuscated["csrftoken"] == "***", "csrftoken cookie must be obfuscated"
-        assert obfuscated["preferences"] == "dark-mode"
-
-    def test_extract_request_data_includes_configured_fields_only(self):
-        """Only configured request fields should be extracted."""
-        config = LoggingConfig(request_log_fields={"method", "path"})
-        middleware = LoggingMiddleware(config)
-
-        request = {
-            "method": "POST",
-            "path": "/api/users",
-            "query_params": {"page": "1"},
-            "headers": {"content-type": "application/json"},
-        }
-
-        data = middleware.extract_request_data(request)
-        assert "method" in data
-        assert "path" in data
-        assert "query" not in data, "Query should not be included when not configured"
-        assert "headers" not in data, "Headers should not be included when not configured"
-
-    def test_extract_request_data_includes_query_params_when_configured(self):
-        """Query params should be included when configured."""
-        config = LoggingConfig(request_log_fields={"method", "path", "query"})
-        middleware = LoggingMiddleware(config)
-
-        request = {
-            "method": "GET",
-            "path": "/api/users",
-            "query_params": {"page": "1", "limit": "10"},
-        }
-
-        data = middleware.extract_request_data(request)
-        assert "query" in data
-        assert data["query"] == {"page": "1", "limit": "10"}
-
-    def test_extract_request_data_obfuscates_headers(self):
-        """Headers should be obfuscated when included."""
-        config = LoggingConfig(
-            request_log_fields={"method", "path", "headers"},
-            obfuscate_headers={"authorization"},
-        )
-        middleware = LoggingMiddleware(config)
-
-        request = {
-            "method": "POST",
-            "path": "/api/users",
-            "headers": {
-                "content-type": "application/json",
-                "authorization": "Bearer secret-token",
-            },
-        }
-
-        data = middleware.extract_request_data(request)
-        assert "headers" in data
-        assert data["headers"]["authorization"] == "***", "Authorization must be obfuscated"
-        assert data["headers"]["content-type"] == "application/json"
-
-    def test_extract_request_data_includes_body_when_configured(self):
-        """Request body should be included when log_request_body=True."""
-        config = LoggingConfig(
-            request_log_fields={"method", "path", "body"},
-            log_request_body=True,
-            max_body_log_size=100,
-        )
-        middleware = LoggingMiddleware(config)
-
-        request = {
-            "method": "POST",
-            "path": "/api/users",
-            "body": b'{"name": "test", "email": "test@example.com"}',
-        }
-
-        data = middleware.extract_request_data(request)
-        assert "body" in data
-        assert "test@example.com" in data["body"]
-
-    def test_extract_request_data_skips_body_when_too_large(self):
-        """Request body should be skipped when exceeding max_body_log_size."""
-        config = LoggingConfig(
-            request_log_fields={"method", "path", "body"},
-            log_request_body=True,
-            max_body_log_size=10,
-        )
-        middleware = LoggingMiddleware(config)
-
-        request = {
-            "method": "POST",
-            "path": "/api/users",
-            "body": b'{"name": "test", "email": "test@example.com"}',  # >10 bytes
-        }
-
-        data = middleware.extract_request_data(request)
-        assert "body" not in data, "Body should not be included when too large"
-
-    def test_extract_request_data_handles_binary_body(self):
-        """Binary body should be logged with size info."""
-        config = LoggingConfig(
-            request_log_fields={"method", "path", "body"},
-            log_request_body=True,
-            max_body_log_size=100,
-        )
-        middleware = LoggingMiddleware(config)
-
-        request = {
-            "method": "POST",
-            "path": "/api/upload",
-            "body": b"\xff\xfe\x00\x01",  # Binary data
-        }
-
-        data = middleware.extract_request_data(request)
-        assert "body" in data
-        assert "<binary data," in data["body"]
-        assert "bytes>" in data["body"]
-
-    def test_extract_request_data_extracts_client_ip_from_x_forwarded_for(self):
-        """Client IP should be extracted from X-Forwarded-For header."""
-        config = LoggingConfig(request_log_fields={"client_ip"})
-        middleware = LoggingMiddleware(config)
-
-        request = {
-            "method": "GET",
-            "path": "/api/users",
-            "headers": {"x-forwarded-for": "192.168.1.1, 10.0.0.1"},
-        }
-
-        data = middleware.extract_request_data(request)
-        assert data["client_ip"] == "192.168.1.1", "Should extract first IP from X-Forwarded-For"
-
-    def test_extract_request_data_extracts_client_ip_from_x_real_ip(self):
-        """Client IP should be extracted from X-Real-IP header."""
-        config = LoggingConfig(request_log_fields={"client_ip"})
-        middleware = LoggingMiddleware(config)
-
-        request = {
-            "method": "GET",
-            "path": "/api/users",
-            "headers": {"x-real-ip": "192.168.1.2"},
-        }
-
-        data = middleware.extract_request_data(request)
-        assert data["client_ip"] == "192.168.1.2"
-
-    def test_extract_request_data_prefers_canonical_client_ip(self):
-        """Runtime REMOTE_ADDR must win over client-controlled headers."""
-        config = LoggingConfig(request_log_fields={"client_ip"})
-        middleware = LoggingMiddleware(config)
-        request_data = {"headers": {"x-forwarded-for": "1.1.1.1"}}
-        request = Mock()
-        request.get.side_effect = request_data.get
-        request.META = {"REMOTE_ADDR": "203.0.113.9"}
-
-        assert middleware.extract_request_data(request)["client_ip"] == "203.0.113.9"
-
-    def test_extract_request_data_extracts_user_agent(self):
-        """User agent should be extracted when configured."""
-        config = LoggingConfig(request_log_fields={"user_agent"})
-        middleware = LoggingMiddleware(config)
-
-        request = {
-            "method": "GET",
-            "path": "/api/users",
-            "headers": {"user-agent": "Mozilla/5.0"},
-        }
-
-        data = middleware.extract_request_data(request)
-        assert data["user_agent"] == "Mozilla/5.0"
-
-    def test_log_request_skips_when_path_in_skip_paths(self, caplog):
-        """Requests to skip_paths should not be logged."""
-        config = LoggingConfig(skip_paths={"/health"})
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/health"}
-
-        with caplog.at_level(logging.DEBUG):
-            middleware.log_request(request)
-
-        assert len(caplog.records) == 0, "Health checks should not be logged"
-
-    def test_log_request_logs_when_debug_enabled(self, caplog):
-        """Requests should be logged at DEBUG level when logger is enabled for DEBUG."""
-        config = LoggingConfig(logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/users"}
-
-        with caplog.at_level(logging.DEBUG, logger="test.logger"):
-            middleware.log_request(request)
-
-        # Should have logged at DEBUG level
-        assert len(caplog.records) > 0, "Request should be logged at DEBUG level"
-        assert caplog.records[0].levelno == logging.DEBUG
-
-    def test_log_request_skips_when_debug_disabled(self, caplog):
-        """Requests should not be logged when logger is not enabled for DEBUG."""
-        config = LoggingConfig(logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/users"}
-
-        # Set level to INFO (higher than DEBUG)
-        with caplog.at_level(logging.INFO, logger="test.logger"):
-            middleware.log_request(request)
-
-        # Should not log because DEBUG is disabled
-        assert len(caplog.records) == 0, "Request should not be logged when DEBUG is disabled"
-
-    def test_log_response_uses_info_level_for_2xx(self, caplog):
-        """Successful 2xx responses should be logged at INFO level."""
-        config = LoggingConfig(logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "POST", "path": "/api/users"}
-
-        with caplog.at_level(logging.INFO, logger="test.logger"):
-            middleware.log_response(request, 201, 0.1)
-
-        assert len(caplog.records) > 0, "2xx response should be logged"
-        assert caplog.records[0].levelno == logging.INFO
-
-    def test_log_response_uses_info_level_for_3xx(self, caplog):
-        """Redirect 3xx responses should be logged at INFO level."""
-        config = LoggingConfig(logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/redirect"}
-
-        with caplog.at_level(logging.INFO, logger="test.logger"):
-            middleware.log_response(request, 302, 0.05)
-
-        assert len(caplog.records) > 0, "3xx response should be logged"
-        assert caplog.records[0].levelno == logging.INFO
-
-    def test_log_response_uses_warning_level_for_4xx(self, caplog):
-        """Client error 4xx responses should be logged at WARNING level."""
-        config = LoggingConfig(logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/notfound"}
-
-        with caplog.at_level(logging.WARNING, logger="test.logger"):
-            middleware.log_response(request, 404, 0.05)
-
-        assert len(caplog.records) > 0, "4xx response should be logged"
-        assert caplog.records[0].levelno == logging.WARNING
-
-    def test_log_response_uses_error_level_for_5xx(self, caplog):
-        """Server error 5xx responses should be logged at ERROR level."""
-        config = LoggingConfig(logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/error"}
-
-        with caplog.at_level(logging.ERROR, logger="test.logger"):
-            middleware.log_response(request, 500, 0.1)
-
-        assert len(caplog.records) > 0, "5xx response should be logged"
-        assert caplog.records[0].levelno == logging.ERROR
-
-    def test_log_response_skips_for_skip_paths(self, caplog):
-        """Responses for skip_paths should not be logged."""
-        config = LoggingConfig(skip_paths={"/metrics"})
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/metrics"}
-
-        with caplog.at_level(logging.INFO):
-            middleware.log_response(request, 200, 0.01)
-
-        assert len(caplog.records) == 0, "Metrics endpoint should not be logged"
-
-    def test_log_response_skips_for_skip_status_codes(self, caplog):
-        """Responses with skip_status_codes should not be logged."""
-        config = LoggingConfig(skip_status_codes={204})
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "DELETE", "path": "/api/users/1"}
-
-        with caplog.at_level(logging.INFO):
-            middleware.log_response(request, 204, 0.01)
-
-        assert len(caplog.records) == 0, "204 responses should not be logged when configured"
-
-    def test_log_response_skips_when_info_disabled_for_2xx(self, caplog):
-        """2xx responses should not be logged when logger is not enabled for INFO."""
-        config = LoggingConfig(logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/users"}
-
-        # Set level to ERROR (higher than INFO)
-        with caplog.at_level(logging.ERROR, logger="test.logger"):
-            middleware.log_response(request, 200, 0.1)
-
-        # Should not log 2xx when INFO is disabled
-        assert len(caplog.records) == 0, "2xx should not be logged when INFO is disabled"
-
-    def test_log_response_always_logs_4xx_regardless_of_level(self, caplog):
-        """4xx errors should always be logged even if WARNING is disabled (they use WARNING level)."""
-        config = LoggingConfig(logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/notfound"}
-
-        # Set level to WARNING to capture WARNING logs
-        with caplog.at_level(logging.WARNING, logger="test.logger"):
-            middleware.log_response(request, 404, 0.05)
-
-        # 4xx should be logged at WARNING level
-        assert len(caplog.records) > 0, "4xx should be logged at WARNING level"
-
-    def test_log_response_always_logs_5xx_regardless_of_level(self, caplog):
-        """5xx errors should always be logged at ERROR level."""
-        config = LoggingConfig(logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/error"}
-
-        with caplog.at_level(logging.ERROR, logger="test.logger"):
-            middleware.log_response(request, 500, 0.1)
-
-        # 5xx should be logged at ERROR level
-        assert len(caplog.records) > 0, "5xx should be logged at ERROR level"
-
-    def test_log_response_respects_sample_rate_for_2xx(self):
-        """Sample rate should reduce 2xx/3xx log volume probabilistically."""
-        config = LoggingConfig(sample_rate=0.0, logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/users"}
-
-        # With sample_rate=0.0, no 2xx responses should be logged
-        logged_count = 0
-        for _ in range(100):
-            logger = logging.getLogger("test.logger")
-            logger.handlers.clear()
-            handler = logging.Handler()
-            handler.handle = Mock()
-            logger.addHandler(handler)
-            logger.setLevel(logging.INFO)
-
-            middleware.log_response(request, 200, 0.1)
-
-            if handler.handle.called:
-                logged_count += 1
-
-        assert logged_count == 0, "With sample_rate=0.0, no 2xx responses should be logged"
-
-    def test_log_response_does_not_sample_errors(self, caplog):
-        """Sample rate should NOT affect 4xx/5xx errors - they should always be logged."""
-        config = LoggingConfig(sample_rate=0.0, logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/error"}
-
-        # Even with sample_rate=0.0, errors should be logged
-        with caplog.at_level(logging.ERROR, logger="test.logger"):
-            middleware.log_response(request, 500, 0.1)
-
-        assert len(caplog.records) > 0, "Errors should be logged regardless of sample_rate"
-
-    def test_log_response_respects_min_duration_ms_for_2xx(self, caplog):
-        """Fast 2xx responses should be skipped when below min_duration_ms threshold."""
-        config = LoggingConfig(min_duration_ms=250, logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/users"}
-
-        # Fast response (100ms < 250ms)
-        with caplog.at_level(logging.INFO, logger="test.logger"):
-            middleware.log_response(request, 200, 0.1)
-
-        assert len(caplog.records) == 0, "Fast 2xx responses should not be logged with min_duration_ms"
-
-    def test_log_response_logs_slow_2xx_above_min_duration_ms(self, caplog):
-        """Slow 2xx responses should be logged when above min_duration_ms threshold."""
-        config = LoggingConfig(min_duration_ms=250, logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/users"}
-
-        # Slow response (300ms > 250ms)
-        with caplog.at_level(logging.INFO, logger="test.logger"):
-            middleware.log_response(request, 200, 0.3)
-
-        assert len(caplog.records) > 0, "Slow 2xx responses should be logged"
-
-    def test_log_response_ignores_min_duration_ms_for_errors(self, caplog):
-        """min_duration_ms should NOT affect 4xx/5xx errors - they should always be logged."""
-        config = LoggingConfig(min_duration_ms=250, logger_name="test.logger")
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/error"}
-
-        # Fast error (50ms < 250ms)
-        with caplog.at_level(logging.ERROR, logger="test.logger"):
-            middleware.log_response(request, 500, 0.05)
-
-        assert len(caplog.records) > 0, "Errors should be logged regardless of min_duration_ms"
-
-    def test_log_response_includes_duration_in_milliseconds(self, caplog):
-        """Duration should be logged in milliseconds when configured."""
-        config = LoggingConfig(logger_name="test.logger", response_log_fields={"status_code", "duration"})
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/users"}
-
-        with caplog.at_level(logging.INFO, logger="test.logger"):
-            middleware.log_response(request, 200, 0.123)
-
-        assert len(caplog.records) > 0
-        log_message = caplog.records[0].message
-        assert "123" in log_message, "Duration should be in milliseconds"
-        assert "ms" in log_message
-
-    def test_log_response_includes_response_size_when_configured(self, caplog):
-        """Response size should be logged when configured."""
-        config = LoggingConfig(logger_name="test.logger", response_log_fields={"status_code", "size"})
-        middleware = LoggingMiddleware(config)
-
-        request = {"method": "GET", "path": "/api/users"}
-
-        with caplog.at_level(logging.INFO, logger="test.logger"):
-            middleware.log_response(request, 200, 0.1, response_size=1024)
-
-        assert len(caplog.records) > 0
-        assert caplog.records[0].response_size == 1024
 
     def test_log_exception_logs_at_error_level(self, caplog):
         """Exceptions should be logged at ERROR level by default."""
@@ -827,13 +285,10 @@ class TestLoggingHelpers:
         assert isinstance(middleware, LoggingMiddleware)
         assert middleware.config.logger_name == "custom.logger"
 
-    def test_create_logging_middleware_with_custom_log_level(self):
-        """log_level is deprecated. The warning points at the caller."""
-        with pytest.warns(DeprecationWarning, match="LoggingConfig options log_level are deprecated") as record:
-            middleware = create_logging_middleware(log_level="DEBUG")
-        assert record[0].filename == __file__
-        assert isinstance(middleware, LoggingMiddleware)
-        assert middleware.config.log_level == "DEBUG"
+    @pytest.mark.parametrize("option", ["log_level", "sample_rat"])
+    def test_create_logging_middleware_refuses_an_unknown_option(self, option):
+        with pytest.raises(TypeError, match=f"create_logging_middleware\\(\\) got an unknown option '{option}'"):
+            create_logging_middleware(**{option: 0.1})
 
     def test_create_logging_middleware_with_kwargs(self):
         """create_logging_middleware should accept additional kwargs."""

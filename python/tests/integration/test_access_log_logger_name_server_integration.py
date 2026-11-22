@@ -6,8 +6,7 @@ import pytest
 
 from .apps import app_module
 
-# django.server keeps only WARNING and above. myapp.api keeps INFO and above.
-# Thus the access log must start, also when django.server has no INFO line.
+# myapp.api keeps INFO and above. The test sets the level of django.server.
 _LOGGING = """
 LOGGING = {
     "version": 1,
@@ -26,7 +25,7 @@ LOGGING = {
         },
     },
     "loggers": {
-        "django.server": {"handlers": ["server_file"], "level": "WARNING", "propagate": False},
+        "django.server": {"handlers": ["server_file"], "level": "{server_level}", "propagate": False},
         "myapp.api": {"handlers": ["named_file"], "level": "INFO", "propagate": False},
     },
 }
@@ -37,21 +36,42 @@ def _lines(project, name):
     return [line.rsplit(" ", 1)[0] for line in project.path(name).read_text().splitlines()]
 
 
-@pytest.mark.server_integration
-def test_access_log_writes_to_the_logger_of_the_logging_config(make_server_project):
+def _run(make_server_project, server_level):
+    """Send the requests and return the lines of the two logs."""
     project = make_server_project(
         api_module=app_module("access_log_logger_name"),
-        settings_extra=_LOGGING,
+        settings_extra=_LOGGING.replace("{server_level}", server_level),
     )
     with project.start(startup_path="/health") as server:
         assert server.request("GET", "/open").status_code == 200
         assert server.request("GET", "/broken").status_code == 404
         assert server.request("GET", "/named/ping").status_code == 200
+        assert server.request("GET", "/named/ping/", follow_redirects=False).status_code == 308
+        assert server.request("OPTIONS", "/named/ping").status_code == 204
         assert server.request("GET", "/named/gone").status_code == 404
+    return _lines(project, "server.log"), _lines(project, "named.log")
 
+
+# The redirect and the automatic OPTIONS answer use the logger of the route.
+_NAMED_LINES = [
+    "myapp.api INFO GET /named/ping 200",
+    "myapp.api INFO GET /named/ping/ 308",
+    "myapp.api INFO OPTIONS /named/ping 204",
+    "myapp.api WARNING GET /named/gone 404",
+]
+
+
+@pytest.mark.server_integration
+def test_access_log_writes_to_the_logger_of_the_logging_config(make_server_project):
+    server_lines, named_lines = _run(make_server_project, "WARNING")
     # Each line goes to the logger of the API of its route, at the level of that logger.
-    assert _lines(project, "server.log") == ["django.server WARNING GET /broken 404"]
-    assert _lines(project, "named.log") == [
-        "myapp.api INFO GET /named/ping 200",
-        "myapp.api WARNING GET /named/gone 404",
-    ]
+    assert server_lines == ["django.server WARNING GET /broken 404"]
+    assert named_lines == _NAMED_LINES
+
+
+@pytest.mark.server_integration
+def test_access_log_starts_when_only_a_named_logger_writes(make_server_project):
+    """django.server writes no access-log level, but myapp.api writes INFO."""
+    server_lines, named_lines = _run(make_server_project, "CRITICAL")
+    assert server_lines == []
+    assert named_lines == _NAMED_LINES

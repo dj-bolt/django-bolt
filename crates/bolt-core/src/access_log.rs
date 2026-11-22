@@ -79,6 +79,17 @@ pub fn read_access_loggers<'a>(
     Ok(loggers)
 }
 
+/// `true` when a route writes to a logger that writes a line. `route_loggers`
+/// gives the logger index of each route.
+pub fn access_log_on(
+    loggers: &[AccessLogger],
+    route_loggers: impl IntoIterator<Item = usize>,
+) -> bool {
+    route_loggers
+        .into_iter()
+        .any(|index| loggers.get(index).is_some_and(|logger| logger.levels != 0))
+}
+
 /// Which responses of a route write an access-log line.
 /// The sample rate and the threshold apply to a 1xx to 3xx response only.
 /// A skipped path or status code writes no line for each status class.
@@ -251,16 +262,21 @@ impl RejectionLineLimit {
 }
 
 thread_local! {
-    /// The 429 line limit of this worker thread, and the time of its first 429 response.
-    static REJECTION_LINES: RefCell<Option<(Instant, RejectionLineLimit)>> =
-        const { RefCell::new(None) };
+    /// The 429 line limit of each logger on this worker thread, by logger
+    /// index, and the time of its first 429 response.
+    static REJECTION_LINES: RefCell<Vec<Option<(Instant, RejectionLineLimit)>>> =
+        const { RefCell::new(Vec::new()) };
 }
 
-/// Decide if a 429 response at `now` writes its access-log line on this
-/// worker thread. See `RejectionLineLimit::line_in` for the result.
-pub fn rejection_line_at(now: Instant) -> Option<u64> {
-    REJECTION_LINES.with_borrow_mut(|state| {
-        let (first, limit) = state.get_or_insert_with(|| (now, RejectionLineLimit::default()));
+/// Decide if a 429 response at `now` writes its line to the logger `logger`
+/// on this worker thread. See `RejectionLineLimit::line_in` for the result.
+pub fn rejection_line_at(logger: usize, now: Instant) -> Option<u64> {
+    REJECTION_LINES.with_borrow_mut(|limits| {
+        if limits.len() <= logger {
+            limits.resize_with(logger + 1, || None);
+        }
+        let (first, limit) =
+            limits[logger].get_or_insert_with(|| (now, RejectionLineLimit::default()));
         limit.line_in(now.saturating_duration_since(*first).as_secs())
     })
 }
@@ -268,7 +284,8 @@ pub fn rejection_line_at(now: Instant) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessLogFilter, RejectionLineLimit, random_unit, read_access_loggers, rejection_line_at,
+        AccessLogFilter, AccessLogger, RejectionLineLimit, access_log_on, random_unit,
+        read_access_loggers, rejection_line_at,
     };
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
@@ -461,6 +478,22 @@ mod tests {
     }
 
     #[test]
+    fn the_log_is_on_only_when_a_route_uses_a_logger_that_writes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let logger = |levels| AccessLogger {
+                levels,
+                logger: py.None(),
+            };
+            // django.server writes INFO. The custom logger writes nothing.
+            let loggers = [logger(1 | 2 | 4), logger(0)];
+            assert!(!access_log_on(&loggers, [1, 1]));
+            assert!(access_log_on(&loggers, [1, 0]));
+            assert!(!access_log_on(&loggers, []));
+        });
+    }
+
+    #[test]
     fn the_first_429_of_each_second_writes_a_line_with_the_count_before_it() {
         let mut limit = RejectionLineLimit::default();
         assert_eq!(limit.line_in(0), Some(0));
@@ -479,21 +512,45 @@ mod tests {
     fn each_thread_counts_its_seconds_from_its_first_429() {
         std::thread::spawn(|| {
             let start = Instant::now();
-            assert_eq!(rejection_line_at(start), Some(0));
-            assert_eq!(rejection_line_at(start + Duration::from_millis(999)), None);
+            assert_eq!(rejection_line_at(0, start), Some(0));
             assert_eq!(
-                rejection_line_at(start + Duration::from_millis(1000)),
+                rejection_line_at(0, start + Duration::from_millis(999)),
+                None
+            );
+            assert_eq!(
+                rejection_line_at(0, start + Duration::from_millis(1000)),
                 Some(1)
             );
             // A time before the first response is in second 0.
-            assert_eq!(rejection_line_at(start - Duration::from_secs(9)), None);
-            assert_eq!(rejection_line_at(start + Duration::from_secs(2)), Some(1));
+            assert_eq!(rejection_line_at(0, start - Duration::from_secs(9)), None);
+            assert_eq!(
+                rejection_line_at(0, start + Duration::from_secs(2)),
+                Some(1)
+            );
         })
         .join()
         .unwrap();
         // The state of the other thread is not here.
-        std::thread::spawn(|| assert_eq!(rejection_line_at(Instant::now()), Some(0)))
+        std::thread::spawn(|| assert_eq!(rejection_line_at(0, Instant::now()), Some(0)))
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn each_logger_has_its_own_429_line_limit() {
+        std::thread::spawn(|| {
+            let start = Instant::now();
+            assert_eq!(rejection_line_at(2, start), Some(0));
+            // The 429 of logger 2 does not take the line of logger 0.
+            assert_eq!(rejection_line_at(0, start), Some(0));
+            assert_eq!(rejection_line_at(2, start), None);
+            assert_eq!(rejection_line_at(2, start), None);
+            // The count of logger 2 is not in the line of logger 0.
+            let next = start + Duration::from_secs(1);
+            assert_eq!(rejection_line_at(0, next), Some(0));
+            assert_eq!(rejection_line_at(2, next), Some(2));
+        })
+        .join()
+        .unwrap();
     }
 }

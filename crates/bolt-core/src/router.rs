@@ -304,6 +304,8 @@ pub struct Router {
     head: MethodRouter,
     options: MethodRouter,
     query: MethodRouter,
+    /// The handler id of each route, in the order of registration.
+    handler_ids: Vec<usize>,
 }
 
 impl Default for Router {
@@ -323,7 +325,13 @@ impl Router {
             head: MethodRouter::new(),
             options: MethodRouter::new(),
             query: MethodRouter::new(),
+            handler_ids: Vec::new(),
         }
+    }
+
+    /// The handler id of each route. A native route has `NATIVE_HANDLER_ID`.
+    pub fn handler_ids(&self) -> &[usize] {
+        &self.handler_ids
     }
 
     pub fn register(
@@ -384,6 +392,7 @@ impl Router {
             }
         };
 
+        let handler_id = route.handler_id;
         // The lookup gets the request path in the form of `normalize_request_path`.
         let path = &*encode_route_path(path);
 
@@ -411,6 +420,7 @@ impl Router {
                     ))
                 })?;
         }
+        self.handler_ids.push(handler_id);
 
         Ok(())
     }
@@ -729,6 +739,7 @@ mod tests {
             );
         });
         assert_eq!(lookup(&router, "GET", "/items"), Some((0, None)));
+        assert_eq!(router.handler_ids(), [0]);
     }
 
     #[test]

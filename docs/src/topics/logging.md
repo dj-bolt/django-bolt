@@ -26,7 +26,7 @@ api = BoltAPI(logging_config=config)
 
 ## LoggingConfig
 
-The `LoggingConfig` class controls all logging behavior.
+`LoggingConfig` sets the access log and exception logging of an API.
 
 ### Basic options
 
@@ -95,28 +95,6 @@ To log these paths, use `LoggingConfig(skip_paths=set())`.
 
 The access log of `runbolt` applies five options: `logger_name`, `skip_paths`, `skip_status_codes`, `sample_rate` and `min_duration_ms`.
 Its line always contains the method, the path, the status and the duration.
-
-### Deprecated options
-
-These options of `LoggingConfig` have no effect on the access log:
-
-- `request_log_fields` and `response_log_fields`
-- `obfuscate_headers` and `obfuscate_cookies`
-- `log_request_body`, `log_response_body` and `max_body_log_size`
-- `log_level`
-
-A value other than the default gives a `DeprecationWarning`.
-A future release removes them.
-Remove them from your config.
-To change the level of the access log, set the level of its logger in `LOGGING`.
-
-The methods `log_request()`, `log_response()`, `extract_request_data()`, `obfuscate_headers()` and `obfuscate_cookies()` of `LoggingMiddleware` are also deprecated.
-Bolt does not call them.
-A call gives a `DeprecationWarning`.
-
-The access-log line has a fixed format, and Bolt writes it in Rust.
-A field list or a request body needs a Python dict for each request.
-That cost is too high for each request, so Bolt does not apply these options.
 To log more fields of a request, use a [middleware](middleware.md) of your own.
 
 ## Production settings
@@ -154,7 +132,7 @@ DJANGO_BOLT_LOG_SLOW_MS = 250   # min_duration_ms
 
 Without the settings, the access log has no limit.
 A `sample_rate` out of 0.0 to 1.0, or a negative `min_duration_ms`, stops startup.
-The level of the `django.server` logger applies first. See [Access log](#access-log).
+The level of the logger of the API applies first. See [Access log](#access-log).
 
 ### Sample rate
 
@@ -179,19 +157,6 @@ config = LoggingConfig(min_duration_ms=250)
 ```
 
 A request that completes in 100ms won't be logged unless it's an error.
-
-## Log levels
-
-Django-Bolt uses appropriate log levels based on status codes:
-
-| Status Code | Log Level | Description |
-|-------------|-----------|-------------|
-| 2xx | INFO | Successful requests |
-| 3xx | INFO | Redirects |
-| 4xx | WARNING | Client errors |
-| 5xx | ERROR | Server errors |
-
-The access log writes each line at the level of its status.
 
 ## LoggingMiddleware
 
@@ -325,8 +290,8 @@ With an `error_formatter`, the line has the status of the formatted response.
 Bolt writes no line for a request with no route (404), for a mounted ASGI app or MCP server, for a static or media file, and for a [native route](native-routes.md).
 
 A flood of 429 responses does not fill the log.
-Each worker thread writes one line for the first 429 response of each second.
-The next 429 line of that worker has the number of 429 responses that wrote no line:
+Each worker thread writes one line to each logger for the first 429 response of each second.
+The next 429 line of that worker and logger has the number of 429 responses that wrote no line:
 
 ```text
 GET /items/7 429 0.1ms | suppressed: 41
@@ -345,7 +310,7 @@ The log level follows the status code, the same as Django's `runserver`:
 
 Set the logger to `WARNING` to keep only the 4xx and 5xx lines. Set it above `WARNING` to remove all its lines.
 Bolt reads the level of each logger once, at startup.
-When no logger of the access log has a level of `ERROR` or lower, the access log is off.
+When no route writes to a logger with a level of `ERROR` or lower, the access log is off.
 Then the request path has no logging code.
 
 `skip_paths` and `skip_status_codes` remove the lines of some paths and status codes. See [Basic options](#basic-options).

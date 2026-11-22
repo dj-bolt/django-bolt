@@ -374,34 +374,6 @@ class TestAPIDeduplication:
 class TestLoggingWithHandlerCalls:
     """Test that logging actually works when handlers are called."""
 
-    def test_logging_middleware_logs_on_handler_call(self, caplog):
-        """Logging middleware should log when handler is invoked."""
-        config = LoggingConfig(logger_name="test.api", min_duration_ms=None)
-        api = BoltAPI(logging_config=config)
-
-        @api.get("/test")
-        async def test_handler():
-            return {"result": "success"}
-
-        # Simulate calling the handler (simplified)
-        request = {
-            "method": "GET",
-            "path": "/test",
-            "query_params": {},
-            "headers": {},
-        }
-
-        # log_response() is deprecated. The test covers it until a release removes it.
-        with (
-            caplog.at_level(logging.INFO, logger="test.api"),
-            pytest.warns(DeprecationWarning, match=r"log_response\(\) is deprecated"),
-        ):
-            api._logging_middleware.log_response(request, 200, 0.1)
-
-        # Should have logged
-        assert len(caplog.records) > 0, "Handler response should be logged"
-        assert caplog.records[0].status_code == 200
-
     def test_logging_middleware_logs_exceptions(self, caplog):
         """Logging middleware should log exceptions."""
         config = LoggingConfig(logger_name="test.api")

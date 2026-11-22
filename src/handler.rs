@@ -874,10 +874,10 @@ fn write_access_log(
             return;
         }
     }
-    // A flood of 429 responses writes one line for each second on this worker.
-    // A 429 that the filter skips takes no line and is not in the count.
+    // A flood of 429 responses writes one line for each second and logger on
+    // this worker. A 429 that the filter skips takes no line and is not in the count.
     let suppressed = if status == 429 {
-        match bolt_core::access_log::rejection_line_at(start) {
+        match bolt_core::access_log::rejection_line_at(logger_index, start) {
             Some(suppressed) => suppressed,
             None => return,
         }

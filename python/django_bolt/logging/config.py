@@ -14,9 +14,8 @@ import contextlib
 import importlib
 import logging
 import sys
-import warnings
 from collections.abc import Callable, Iterable
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import dataclass, field
 from logging.handlers import QueueHandler, QueueListener
 from queue import Full, Queue
 
@@ -41,25 +40,10 @@ class LoggingConfig:
     ``skip_status_codes``, ``sample_rate`` and ``min_duration_ms``.
     ``LoggingMiddleware.log_exception()`` applies ``logger_name``,
     ``error_log_level`` and ``exception_logging_handler``.
-    The other options are deprecated. See ``DEPRECATED_OPTIONS``.
     """
 
     # The access log of runbolt and log_exception() write to this logger.
     logger_name: str = "django.server"
-
-    # Deprecated: only the deprecated log_request() and log_response() read the
-    # options from here to log_level. The access log does not apply them.
-    request_log_fields: set[str] = field(default_factory=lambda: {"method", "path", "status_code"})
-    response_log_fields: set[str] = field(default_factory=lambda: {"status_code"})
-    obfuscate_headers: set[str] = field(
-        default_factory=lambda: {"authorization", "cookie", "x-api-key", "x-auth-token"}
-    )
-    obfuscate_cookies: set[str] = field(default_factory=lambda: {"sessionid", "csrftoken"})
-    log_request_body: bool = False
-    log_response_body: bool = False
-    max_body_log_size: int = 1024
-    # Deprecated: the level of the logger sets which lines the access log writes.
-    log_level: str = "INFO"
 
     # Log level for exceptions (used by log_exception method)
     error_log_level: str = "ERROR"
@@ -83,9 +67,6 @@ class LoggingConfig:
     # this many milliseconds or more. A 4xx or a 5xx always writes its line.
     min_duration_ms: float | None = None
 
-    def __post_init__(self) -> None:
-        warn_deprecated_options(self, stacklevel=4)
-
     def get_logger(self) -> logging.Logger:
         """Get the configured logger.
 
@@ -107,39 +88,6 @@ class LoggingConfig:
             return False
 
         return not (status_code and status_code in self.skip_status_codes)
-
-
-# The options of LoggingConfig with no effect on the access log. They are
-# removed in a future release.
-DEPRECATED_OPTIONS = (
-    "request_log_fields",
-    "response_log_fields",
-    "obfuscate_headers",
-    "obfuscate_cookies",
-    "log_request_body",
-    "log_response_body",
-    "max_body_log_size",
-    "log_level",
-)
-
-_DEPRECATED_DEFAULTS = {
-    option.name: option.default if option.default is not MISSING else option.default_factory()
-    for option in fields(LoggingConfig)
-    if option.name in DEPRECATED_OPTIONS
-}
-
-
-def warn_deprecated_options(config: LoggingConfig, stacklevel: int) -> None:
-    """Warn when ``config`` sets a deprecated option to a value other than its default."""
-    changed = [name for name in DEPRECATED_OPTIONS if getattr(config, name) != _DEPRECATED_DEFAULTS[name]]
-    if changed:
-        warnings.warn(
-            f"LoggingConfig options {', '.join(changed)} are deprecated and have no effect on the access log. "
-            "A future release removes them. "
-            "See https://bolt.farhana.li/topics/logging/#deprecated-options",
-            DeprecationWarning,
-            stacklevel=stacklevel,
-        )
 
 
 def _checked_logger_name(value: object) -> str:
