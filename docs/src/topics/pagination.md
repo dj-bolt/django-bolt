@@ -57,7 +57,7 @@ The response type of the route is the envelope, `PaginatedResponse[ArticleItem]`
 
 The envelope leaves out each field that is `None`. Thus the last page has no `next_page`, and the first page has no `previous_page`.
 
-Bolt converts each item to the item type, as for a route with no `@paginate`. Declare the item type. With no return type, each item is a dict of all the columns of the model.
+Bolt converts each item to the item type, as for a route with no `@paginate`. Declare the item type. With no return type, each item is a dict of all the columns of the model. A nested Struct of a foreign key or a one-to-one relation loads in the query of the page, with `select_related()`.
 
 ## Choose a pagination class
 

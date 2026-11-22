@@ -36,6 +36,7 @@ from django.db.models import CompositePrimaryKey, F, Field, IntegerField
 from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, TupleLessThan
 
 from . import _json
+from ._kwargs import StructRelationLoader, compile_struct_relation_loader
 from .concurrency import run_in_orm_executor
 from .exceptions import ResponseValidationError, UnloadedRelationError
 from .middleware.middleware import note_config_decorator
@@ -343,21 +344,27 @@ class PaginationBase(ABC):
         # Django's `async for` iterates in chunks of 100, each chunk a
         # sync_to_async(thread_sensitive=True) hop onto one shared thread —
         # both per-chunk overhead AND a cross-request serialization point.
+        relation_loader = _struct_relation_loader(self.serializer_class)
         if hasattr(queryset, "_iterable_class") and hasattr(queryset, "model"):
             serializer_class = self.serializer_class
             if getattr(serializer_class, "__is_bolt_serializer__", False):
                 # Pre-load what the item serializer reads (select_related /
                 # prefetch_related / annotate) so a page never costs N+1.
                 queryset = serializer_class._prepare_queryset(queryset)
+            elif relation_loader is not None:
+                # Join the relations of a nested Struct item type, in the same hop.
+                return await run_in_orm_executor(relation_loader.evaluate, queryset)
             return await run_in_orm_executor(list, queryset)
         # Non-QuerySet async iterables (has __aiter__)
         if hasattr(queryset, "__aiter__"):
             async for item in queryset:
                 items.append(item)
-            return items
         # Regular iterable or list
         else:
-            return list(queryset)
+            items = list(queryset)
+        if relation_loader is not None:
+            await relation_loader.aload(items)
+        return items
 
     def _model_to_dict(self, item: Any) -> Any:
         """
@@ -894,6 +901,16 @@ def _struct_page_converter(item_type: type) -> Callable[[list[Any]], list[Any]] 
             raise ResponseValidationError([exc]) from exc
 
     return convert_page
+
+
+@cache
+def _struct_relation_loader(item_type: Any) -> StructRelationLoader | None:
+    """The relation loader for a plain msgspec.Struct item type with a nested Struct, else None. Built one time per type."""
+    if not (isinstance(item_type, type) and issubclass(item_type, msgspec.Struct)):
+        return None
+    if getattr(item_type, "__is_bolt_serializer__", False):
+        return None
+    return compile_struct_relation_loader(item_type)
 
 
 def paginate(pagination_class: type[PaginationBase] = PageNumberPagination):

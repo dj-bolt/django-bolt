@@ -10,7 +10,9 @@ This module handles building kwargs for handler functions:
 from __future__ import annotations
 
 from .extractors import (
+    StructRelationLoader,
     compile_response_coercer,
+    compile_struct_relation_loader,
     compile_struct_row_readers,
     create_body_extractor,
     create_cookie_extractor,
@@ -34,7 +36,9 @@ from .runtime import extract_path_params
 
 __all__ = [
     # extractors.py
+    "StructRelationLoader",
     "compile_response_coercer",
+    "compile_struct_relation_loader",
     "compile_struct_row_readers",
     "create_body_extractor",
     "create_cookie_extractor",
