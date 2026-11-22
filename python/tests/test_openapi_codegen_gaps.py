@@ -17,10 +17,11 @@ test-driven (RED first):
 from __future__ import annotations
 
 import types
-from typing import Generic, TypeVar
+from typing import Annotated, Generic, TypeVar
 
 import msgspec
 import pytest
+from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI, ModelViewSet
 from django_bolt.openapi import OpenAPIConfig
@@ -28,11 +29,13 @@ from django_bolt.openapi.schema_generator import OpenAPIStrictError, SchemaGener
 from django_bolt.pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
 from django_bolt.responses import (
     HTML,
+    JSON,
     EventSourceResponse,
     File,
     FileResponse,
     PlainText,
     Redirect,
+    Response,
     StreamingResponse,
 )
 from django_bolt.serializers import Serializer
@@ -46,6 +49,10 @@ T = TypeVar("T")
 class UserRead(Serializer):
     id: int
     name: str
+
+
+type UserOrJSON = UserRead | JSON
+type AnyJSON = Annotated[JSON, "A JSON body."]
 
 
 class Page(Serializer, Generic[T]):  # noqa: UP046 — PEP 695 params break Serializer under PEP 563
@@ -442,6 +449,117 @@ def test_response_class_redirect_documents_3xx_without_content(declared_by):
     assert "200" not in responses
     assert "content" not in responses["307"]
     assert responses["307"]["headers"]["Location"]["schema"] == {"type": "string"}
+
+
+def _register_with_return_type(api, path, return_type, declared_by):
+    """Register a route with ``return_type`` as its return annotation or as its ``response_model``."""
+
+    async def thing():
+        pass
+
+    if declared_by == "annotation":
+        thing.__annotations__["return"] = return_type
+        api.get(path)(thing)
+    else:
+        api.get(path, response_model=return_type)(thing)
+
+
+@pytest.mark.parametrize("declared_by", ["annotation", "response_model"])
+@pytest.mark.parametrize(
+    ("return_type", "equivalent"),
+    [
+        (Annotated[PlainText, "A text body."], PlainText),
+        (Annotated[EventSourceResponse, "Events."] | None, EventSourceResponse),
+        (UserRead | JSON, UserRead),
+        (UserRead | Response | None, UserRead | None),
+        (
+            Annotated[UserRead | JSON, msgspec.Meta(description="A user.")],
+            Annotated[UserRead, msgspec.Meta(description="A user.")],
+        ),
+        (Annotated[UserRead, "A user."] | JSON | None, UserRead | None),
+        (UserOrJSON | None, UserRead | None),
+    ],
+    ids=[
+        "annotated-text",
+        "annotated-sse-or-none",
+        "body-or-json",
+        "body-or-response-or-none",
+        "annotated-union",
+        "annotated-member",
+        "alias",
+    ],
+)
+def test_response_class_in_return_type_documents_the_body_type(return_type, equivalent, declared_by):
+    """A response class names the class of the result, also in ``Annotated`` and in a union (#930).
+
+    The route documents the media type of the class and the schema of the
+    other members, as the route with only those members does.
+    """
+    api = BoltAPI(openapi_config=_config())
+    _register_with_return_type(api, "/thing", return_type, declared_by)
+    _register_with_return_type(api, "/equivalent", equivalent, declared_by)
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _ok_response(schema, "/thing")["content"] == _ok_response(schema, "/equivalent")["content"]
+
+
+@pytest.mark.parametrize("declared_by", ["annotation", "response_model"])
+@pytest.mark.parametrize(
+    ("return_type", "media_type"),
+    [
+        (JSON, "application/json"),
+        (JSON | None, "application/json"),
+        (Annotated[JSON, "A JSON body."], "application/json"),
+        (Annotated[JSON, "A JSON body."] | None, "application/json"),
+        (Response, "*/*"),
+        (Annotated[Response | None, "Any body."], "*/*"),
+        (JSON | Response, "*/*"),
+        (AnyJSON, "application/json"),
+    ],
+    ids=[
+        "json",
+        "json-or-none",
+        "annotated-json",
+        "annotated-json-or-none",
+        "response",
+        "annotated-response",
+        "json-or-response",
+        "alias",
+    ],
+)
+def test_response_class_with_no_body_type_documents_any_body(return_type, media_type, declared_by):
+    """``-> JSON`` can send any JSON value, and ``-> Response`` any media type (#930).
+
+    Thus the schema accepts each value. ``{"type": "object"}`` refused a list.
+    """
+    api = BoltAPI(openapi_config=_config())
+    _register_with_return_type(api, "/thing", return_type, declared_by)
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _ok_response(schema, "/thing")["content"] == {media_type: {"schema": {}}}
+
+
+def test_response_class_in_response_model_dict_documents_the_body_type():
+    """Each status of a ``response_model`` dict documents a response class as a return annotation does (#930)."""
+    api = BoltAPI(openapi_config=_config())
+
+    @api.get("/thing", response_model={200: Annotated[JSON, "A JSON body."], 404: UserRead | JSON})
+    async def thing():
+        pass
+
+    @api.get("/equivalent", response_model={404: UserRead})
+    async def equivalent():
+        pass
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _ok_response(schema, "/thing")["content"] == {"application/json": {"schema": {}}}
+    assert (
+        _ok_response(schema, "/thing", status="404")["content"]
+        == _ok_response(schema, "/equivalent", status="404")["content"]
+    )
 
 
 @pytest.mark.parametrize(

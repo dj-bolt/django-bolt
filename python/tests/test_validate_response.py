@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from typing import Annotated
+
 import msgspec
+import pytest
 
 from django_bolt import BoltAPI
 from django_bolt.decorators import action
@@ -12,6 +15,12 @@ from django_bolt.views import APIView, ViewSet
 class Item(msgspec.Struct):
     name: str
     price: float
+
+
+type ItemOrJSON = Item | JSON
+type AnyJSON = Annotated[JSON, "A JSON body."]
+type OptionalJSON = JSON | None
+type OptionalItem = Item | None
 
 
 def _get_meta(api: BoltAPI, path: str, method: str = "GET"):
@@ -304,3 +313,104 @@ def test_union_of_a_body_type_and_a_response_class_validates_the_body_type():
         nothing = client.get("/item-or-response-or-none")
         assert nothing.status_code == 200
         assert nothing.json() is None
+
+
+def test_annotated_response_class_return_annotation_names_the_class_of_the_result():
+    """``Annotated`` and a ``type`` alias do not change what a response class in a return annotation means (#930).
+
+    ``-> Annotated[JSON, ...]`` sends the body as it is, as ``-> JSON`` does.
+    ``-> Annotated[Item | JSON, ...]`` validates the body against ``Item``, as
+    ``-> Item | JSON`` does. A ``response_model`` gives the same result.
+    """
+    api = BoltAPI()
+
+    @api.get("/json")
+    async def annotated_json() -> Annotated[JSON, "A JSON body."]:
+        return JSON([1, 2])
+
+    @api.get("/json-or-none")
+    def annotated_json_or_none() -> Annotated[JSON, "A JSON body."] | None:
+        return JSON({"a": 1})
+
+    @api.get("/response")
+    def annotated_response() -> Annotated[Response | None, "Any body."]:
+        return {"b": 2}
+
+    @api.get("/item-or-json/{item_id}")
+    async def annotated_item_or_json(item_id: int) -> Annotated[Item | JSON, msgspec.Meta(description="An item.")]:
+        if item_id == 1:
+            return JSON({"name": "item", "price": 1.0, "password": "secret"})
+        return JSON({"name": "missing-price"})
+
+    @api.get("/model", response_model=Annotated[JSON, "A JSON body."])
+    def model_json():
+        return JSON({"c": 3})
+
+    @api.get("/alias")
+    def alias_json() -> AnyJSON | None:
+        return JSON([3])
+
+    @api.get("/item-alias")
+    async def alias_item_or_json() -> ItemOrJSON:
+        return JSON({"name": "item", "price": 4.0, "password": "secret"})
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        sent = client.get("/json")
+        assert sent.status_code == 200
+        assert sent.json() == [1, 2]
+
+        optional = client.get("/json-or-none")
+        assert optional.status_code == 200
+        assert optional.json() == {"a": 1}
+
+        plain = client.get("/response")
+        assert plain.status_code == 200
+        assert plain.json() == {"b": 2}
+
+        item = client.get("/item-or-json/1")
+        assert item.status_code == 200
+        assert item.json() == {"name": "item", "price": 1.0}
+
+        invalid = client.get("/item-or-json/2")
+        assert invalid.status_code == 500
+        assert invalid.json() == {"detail": "Response validation error"}
+
+        model = client.get("/model")
+        assert model.status_code == 200
+        assert model.json() == {"c": 3}
+
+        alias = client.get("/alias")
+        assert alias.status_code == 200
+        assert alias.json() == [3]
+
+        item_alias = client.get("/item-alias")
+        assert item_alias.status_code == 200
+        assert item_alias.json() == {"name": "item", "price": 4.0}
+
+
+@pytest.mark.parametrize("validate_response", [True, False])
+def test_none_result_of_an_annotated_or_aliased_optional_return_type_is_json_null(validate_response):
+    """A None result is the JSON null when ``Annotated`` or a ``type`` alias holds the ``| None`` (#930)."""
+    api = BoltAPI(validate_response=validate_response)
+
+    @api.get("/annotated-json")
+    def annotated_json() -> Annotated[JSON | None, "A JSON body."]:
+        return None
+
+    @api.get("/alias-json")
+    async def alias_json() -> OptionalJSON:
+        return None
+
+    @api.get("/annotated-item")
+    def annotated_item() -> Annotated[Item | None, "An item."]:
+        return None
+
+    @api.get("/alias-item")
+    async def alias_item() -> OptionalItem:
+        return None
+
+    with TestClient(api) as client:
+        for path in ("/annotated-json", "/alias-json", "/annotated-item", "/alias-item"):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert response.json() is None, path

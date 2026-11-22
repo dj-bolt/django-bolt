@@ -265,6 +265,13 @@ async def delete_article(article_id: int):
 | `StreamingResponse`, `File`, `FileResponse`, `bytes` | `application/octet-stream` |
 | `Redirect` | No body. The status is 307, or the `status_code` of the route. |
 
+A return annotation with `JSON` documents `application/json` with an empty schema.
+`Response` and a Django `HttpResponse` document `*/*` with an empty schema.
+`JSON` can hold each JSON value, and `Response` can hold each media type. Thus their empty schema accepts each body.
+To document the body, use `response_model=`, or add the body type to the annotation.
+For example, `-> Item | JSON` documents the schema of `Item`, and `-> Item | HTML` adds `text/html`.
+`Annotated` and a `type` alias do not change the result. `-> Annotated[Item | JSON, ...]` documents the same schema as `-> Annotated[Item, ...]`.
+
 ### Error responses
 
 Bolt adds the error responses that it sends itself:
