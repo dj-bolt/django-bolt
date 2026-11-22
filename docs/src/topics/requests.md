@@ -149,6 +149,10 @@ A form field takes each value of its name in the same way.
 A WebSocket route takes each value of a repeated query key in the same way.
 A header or a cookie gives a sequence of one item.
 A path, header or cookie type that cannot hold one item, such as `tuple[int, str]`, raises `TypeError` when the route registers.
+Bolt keeps the last line of a repeated header and does not split a value at a comma.
+Thus the OpenAPI schema of a path, header or cookie sequence has `maxItems: 1`.
+A default of two or more items for such a parameter raises `TypeError` when the route registers.
+The same rule applies to a sequence field of a header or cookie model.
 
 ### Constraints
 

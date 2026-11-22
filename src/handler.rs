@@ -1001,6 +1001,33 @@ async fn route_request(
                 return without_error_info(response, &state);
             }
 
+            // The path has routes, but none for this method: 405 with `Allow`
+            // (RFC 9110 section 15.5.6). This lookup runs on a miss only, and before
+            // the ASGI mounts, so a mount at "/" does not take a path of a route.
+            // The other slash form of the path gets the same check. That form
+            // redirects for a method of its routes, so the path is a route path.
+            let mut allowed_path = route_path;
+            let mut allowed_methods = router.find_all_methods(route_path);
+            let other_form = allowed_methods.is_empty();
+            if other_form && let Some(alternate_path) = &alternate_path {
+                allowed_path = alternate_path;
+                allowed_methods = router.find_all_methods(alternate_path);
+            }
+            if !allowed_methods.is_empty() {
+                // The line of this answer has the filter of the first route of the path.
+                *access_log_route = router
+                    .find(&allowed_methods[0], allowed_path)
+                    .map(|found| found.handler_id());
+                // The automatic OPTIONS answer of the route path.
+                if other_form && method == "OPTIONS" {
+                    return HttpResponse::NoContent()
+                        .insert_header(("Allow", allowed_methods.join(", ")))
+                        .insert_header(("Content-Type", "application/json"))
+                        .finish();
+                }
+                return responses::error_405(&allowed_methods);
+            }
+
             // HTTP ASGI mount fallback:
             // - only after Bolt route miss
             // - only after trailing-slash/API-method near-miss checks above
@@ -1027,32 +1054,6 @@ async fn route_request(
                     // CORS headers will be added by CorsMiddleware
                     return HttpResponse::NoContent().finish();
                 }
-            }
-
-            // The path has routes, but none for this method: 405 with `Allow`
-            // (RFC 9110 section 15.5.6). This lookup runs on a miss only.
-            // The other slash form of the path gets the same check. That form
-            // redirects for a method of its routes, so the path is a route path.
-            let mut allowed_path = route_path;
-            let mut allowed_methods = router.find_all_methods(route_path);
-            let other_form = allowed_methods.is_empty();
-            if other_form && let Some(alternate_path) = &alternate_path {
-                allowed_path = alternate_path;
-                allowed_methods = router.find_all_methods(alternate_path);
-            }
-            if !allowed_methods.is_empty() {
-                // The line of this answer has the filter of the first route of the path.
-                *access_log_route = router
-                    .find(&allowed_methods[0], allowed_path)
-                    .map(|found| found.handler_id());
-                // The automatic OPTIONS answer of the route path.
-                if other_form && method == "OPTIONS" {
-                    return HttpResponse::NoContent()
-                        .insert_header(("Allow", allowed_methods.join(", ")))
-                        .insert_header(("Content-Type", "application/json"))
-                        .finish();
-                }
-                return responses::error_405(&allowed_methods);
             }
 
             // Route not found - return 404
