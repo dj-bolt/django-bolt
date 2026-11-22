@@ -435,10 +435,14 @@ def _response_class_wire_meta(
 def _response_validation_is_required(annotation: Any) -> bool:
     if annotation is None or annotation in _VALIDATION_NOOP_TYPES:
         return False
-    # A response class, such as -> JSON or -> Response, names the class of the
-    # result and not the type of its body. Thus Bolt sends the body as it is.
-    response_type = _strip_optional(annotation)
-    return not (isinstance(response_type, type) and is_response_class(response_type))
+    # A response class, such as -> JSON or -> JSON | Redirect, names the class of
+    # the result and not the type of its body. Thus Bolt sends the body as it is.
+    # A union with a body type, such as -> Item | JSON, still validates.
+    if get_origin(annotation) in (Union, types.UnionType):
+        members = [arg for arg in get_args(annotation) if arg is not type(None)]
+    else:
+        members = [annotation]
+    return not all(isinstance(member, type) and is_response_class(member) for member in members)
 
 
 def _allows_none(annotation: Any) -> bool:

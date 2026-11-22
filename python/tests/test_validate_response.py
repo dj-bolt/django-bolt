@@ -4,7 +4,7 @@ import msgspec
 
 from django_bolt import BoltAPI
 from django_bolt.decorators import action
-from django_bolt.responses import JSON, Response
+from django_bolt.responses import JSON, Redirect, Response
 from django_bolt.testing import TestClient
 from django_bolt.views import APIView, ViewSet
 
@@ -222,3 +222,43 @@ def test_response_class_return_annotation_sends_the_body_as_it_is():
         optional = client.get("/optional")
         assert optional.status_code == 200
         assert optional.json() == {"c": 3}
+
+
+def test_union_of_response_classes_sends_the_body_as_it_is():
+    """``-> JSON | Redirect`` names two response classes, not the body (#912).
+
+    A JSON result and a plain dict go to the client as they are. A union
+    with a body type, such as ``-> Item | JSON``, still validates.
+    """
+    api = BoltAPI()
+
+    @api.get("/json-or-redirect")
+    async def json_or_redirect(go: bool = False) -> JSON | Redirect:
+        if go:
+            return Redirect("/elsewhere")
+        return JSON({"a": 1})
+
+    @api.get("/dict-or-redirect")
+    def dict_or_redirect() -> Response | Redirect | None:
+        return {"b": 2}
+
+    @api.get("/item-or-json")
+    async def item_or_json() -> Item | JSON:
+        return JSON({"name": "missing-price"})
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        sent = client.get("/json-or-redirect")
+        assert sent.status_code == 200
+        assert sent.json() == {"a": 1}
+
+        redirected = client.get("/json-or-redirect?go=true", follow_redirects=False)
+        assert redirected.status_code == 307
+        assert redirected.headers["location"] == "/elsewhere"
+
+        plain = client.get("/dict-or-redirect")
+        assert plain.status_code == 200
+        assert plain.json() == {"b": 2}
+
+        invalid = client.get("/item-or-json")
+        assert invalid.status_code == 500
+        assert invalid.json() == {"detail": "Response validation error"}
