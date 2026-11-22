@@ -36,10 +36,16 @@ from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.workers import MIB, WORKER_BOOT_ERROR, WorkerSupervisor
 
 try:
-    from django_bolt.logging.config import setup_django_logging
+    from django_bolt.logging.config import (
+        restart_queue_listener_after_fork,
+        setup_django_logging,
+        stop_queue_listener,
+    )
     from django_bolt.responses import initialize_file_response_settings
 except ImportError:
+    restart_queue_listener_after_fork = None
     setup_django_logging = None
+    stop_queue_listener = None
     initialize_file_response_settings = None
 
 try:
@@ -810,6 +816,10 @@ class Command(BaseCommand):
             os.environ["DJANGO_BOLT_PROCESS_ID"] = str(slot)
             exit_code = 0
             try:
+                # The fork does not copy the thread that writes the queued log
+                # records. Without a new one, the records of this worker are lost.
+                if restart_queue_listener_after_fork is not None:
+                    restart_queue_listener_after_fork()
                 self.start_single_process(options, process_id=slot)
             except BaseException:
                 traceback.print_exc()
@@ -818,6 +828,12 @@ class Command(BaseCommand):
                 # that did not start.
                 exit_code = 1 if _core.server_listening() else WORKER_BOOT_ERROR
             finally:
+                # os._exit() does not run atexit, so write the queued records first.
+                if stop_queue_listener is not None:
+                    try:
+                        stop_queue_listener()
+                    except BaseException:
+                        traceback.print_exc()
                 os._exit(exit_code)
             return 0  # unreachable: os._exit never returns
 

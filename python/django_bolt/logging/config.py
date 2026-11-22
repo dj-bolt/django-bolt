@@ -13,6 +13,7 @@ import atexit
 import contextlib
 import importlib
 import logging
+import os
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -316,6 +317,77 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
         _QUEUE_LISTENER = listener
 
     return queue_handler
+
+
+def _hold_listener_handlers() -> None:
+    """Take the lock of each listener handler before a fork.
+
+    A fork does not reset the lock of a stream. If the fork occurs during a
+    write of the listener, the child gets the lock of the stream in the held
+    state. Then the listener of the child waits for the lock with no end.
+    The handler lock is held during each write, so the fork waits for the write.
+    Take the module lock of ``logging`` first. ``dictConfig()`` takes the locks
+    in this order, so the two threads cannot wait for each other.
+    """
+    if _QUEUE_LISTENER is not None:
+        logging._lock.acquire()
+        for handler in _QUEUE_LISTENER.handlers:
+            handler.acquire()
+
+
+def _release_listener_handlers() -> None:
+    """Release the handler locks and the module lock in the parent after a fork.
+
+    The ``logging`` module makes new locks in the child.
+    """
+    if _QUEUE_LISTENER is not None:
+        for handler in reversed(_QUEUE_LISTENER.handlers):
+            handler.release()
+        logging._lock.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_hold_listener_handlers, after_in_parent=_release_listener_handlers)
+
+
+def restart_queue_listener_after_fork() -> None:
+    """Start a new queue listener in a forked child process.
+
+    A fork copies the queue, but not the listener thread. Without a new
+    listener, the records of the child stay in the queue, and nothing writes
+    them. Call this function in the child, immediately after the fork.
+    The function does nothing when no listener runs.
+    """
+    global _QUEUE_LISTENER  # noqa: PLW0603
+
+    if _QUEUE_LISTENER is None or _QUEUE is None:
+        return
+    # Initialize the queue again. This clears the copied records, which the
+    # listener of the parent writes. It also makes new locks, because a thread
+    # of the parent can hold a lock at the time of the fork.
+    _QUEUE.__init__(_QUEUE.maxsize)
+    listener = _BoundedQueueListener(
+        _QUEUE,
+        *_QUEUE_LISTENER.handlers,
+        respect_handler_level=_QUEUE_LISTENER.respect_handler_level,
+    )
+    listener.start()
+    _QUEUE_LISTENER = listener
+
+
+def stop_queue_listener() -> None:
+    """Write the records in the queue, then stop the queue listener.
+
+    ``os._exit()`` does not run the ``atexit`` functions. Call this function
+    before ``os._exit()``, or the records in the queue are lost.
+    The function does nothing when no listener runs.
+    """
+    global _QUEUE_LISTENER  # noqa: PLW0603
+
+    if _QUEUE_LISTENER is None:
+        return
+    _QUEUE_LISTENER.stop()
+    _QUEUE_LISTENER = None
 
 
 def setup_django_logging(force: bool = False) -> None:
