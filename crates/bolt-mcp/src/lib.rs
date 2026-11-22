@@ -19,6 +19,7 @@ pub mod state_codec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use once_cell::sync::OnceCell;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -39,6 +40,19 @@ use registry::McpRegistry;
 /// http request extensions into rmcp's `RequestContext.extensions`.
 #[derive(Clone)]
 pub struct McpAuthExt(pub Option<Arc<AuthContext>>);
+
+/// The parts of the MCP HTTP request that the gate of an exposed route reads.
+/// The bridge adds them only for a mount with such a gate.
+pub struct McpRouteRequest {
+    pub headers: AHashMap<String, String>,
+    pub method: String,
+    pub scheme: String,
+}
+
+/// Carries an `McpRouteRequest` through the http request extensions into
+/// rmcp's `RequestContext.extensions`.
+#[derive(Clone)]
+pub struct McpRouteRequestExt(pub Arc<McpRouteRequest>);
 
 /// Tier-2 OAuth resource-server hook: a Python `verify_token(token) ->
 /// principal dict | None` plus the prebuilt WWW-Authenticate challenge.
@@ -78,6 +92,9 @@ pub struct McpMount {
     pub auth_challenge: Option<HeaderValue>,
     pub guards: GuardSet,
     pub oauth: Option<McpOAuth>,
+    /// Whether a tool runs the auth and the guards of an exposed route. Only
+    /// then does the bridge copy the request headers for the handler.
+    pub route_gates: bool,
     pub service: McpService,
 }
 
@@ -204,6 +221,7 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
         config = config.with_allowed_origins(origins);
     }
 
+    let route_gates = registry.route_gates;
     let mcp_handler = McpHandler { registry };
     let service = if legacy_sessions {
         McpService::Sessions(StreamableHttpService::new(
@@ -225,6 +243,7 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
         auth_challenge,
         guards,
         oauth,
+        route_gates,
         service,
     })
 }

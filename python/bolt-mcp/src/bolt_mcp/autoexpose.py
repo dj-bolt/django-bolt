@@ -45,6 +45,26 @@ def _tool_name(handler: Callable, method: str, path: str) -> str:
     return name if name and not name.startswith("<") else _slug(method, path)
 
 
+def _route_auth(handler: Callable, route_meta: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the auth and the guards of a route for its tool, or None for a route with neither.
+
+    Rust runs them for each call of the tool, as for an HTTP request to the route.
+    A tool call cannot run middleware, so a route with protective middleware raises ``ValueError``.
+    """
+    rate_limited = any(mw.get("type") == "rate_limit" for mw in route_meta.get("middleware", ()))
+    if rate_limited or meta.get("_middleware_api") is not None:
+        raise ValueError(
+            f"Cannot expose handler {_name(handler)!r} as an MCP tool: its route has "
+            f"{'a rate limit' if rate_limited else 'Python or Django middleware'}, and a tool "
+            f"call cannot run it. Write an @mcp.tool for this operation."
+        )
+    backends = route_meta.get("auth_backends", [])
+    guards = route_meta.get("guards", [])
+    if not backends and not guards:
+        return None
+    return {"auth_backends": backends, "guards": guards}
+
+
 def expose_routes(
     mcp: MCP,
     api: Any,
@@ -103,6 +123,8 @@ def expose_routes(
                 )
             continue
 
+        route_auth = _route_auth(handler, api._handler_middleware.get(handler_id) or {}, meta)
+
         marker = marker or {}
         # Name/description derive from the route itself; @expose_as_tool only overrides.
         name = marker.get("name") or _tool_name(handler, method, path)
@@ -128,6 +150,7 @@ def expose_routes(
                 input_schema=schema.input_schema_for(args_struct),
                 is_async=inspect.iscoroutinefunction(handler),
                 injects_request=any(f.source == "request" for f in fields),
+                route_auth=route_auth,
             )
         )
 

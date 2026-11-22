@@ -470,10 +470,18 @@ api.mount_mcp(mcp, expose=[read_article])
 The tool name is the function name, and the description is the docstring.
 The path, query, header and cookie parameters, and the body, become the tool arguments.
 
-!!! warning
-    An exposed route runs without its `auth`, its guards and its middleware.
-    A client of the MCP endpoint can call it with the auth of the mount only.
-    Do not expose a route that needs a guard. Write an `@mcp.tool` with `guards=` for it.
+An exposed route keeps its `auth` and its guards, also the defaults from `BOLT_AUTHENTICATION_CLASSES` and `BOLT_DEFAULT_PERMISSION_CLASSES`.
+Each call of the tool runs them on the headers of the request to the MCP endpoint, as for an HTTP request to the route.
+The auth and the guards of the mount run first, and do not replace those of the route.
+
+- A call that the route refuses gets the error result `Permission denied for tool 'read_article'`. The handler does not run.
+- `tools/list` does not show the tool to a caller that the route refuses.
+- Tool middleware gets the principal from the auth of the route.
+
+A tool call cannot run middleware.
+Thus a route with `@rate_limit`, Python middleware or Django middleware raises `ValueError`.
+This includes the middleware of the API and of the router, and a route with `SessionAuthentication`.
+Write an `@mcp.tool` for such an operation.
 
 `mount_mcp()` exposes only the routes that you name.
 A handler that is not a route of the API, a handler with `File` or `Form` parameters, or a duplicate tool name raises `ValueError`.
