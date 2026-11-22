@@ -94,9 +94,22 @@ pub struct ScopeConfig {
     pub csp_header: Option<HeaderValue>,
     pub cache_control: Option<HeaderValue>,
     pub mode: ServeMode,
-    /// Permits the Django staticfiles-finders fallback inside `handle_file`.
-    /// Only ever true for `ServeMode::Static` AND `DEBUG=True`.
-    pub allow_django_finders: bool,
+    /// The roots of the Django staticfiles finders. `Some` turns on the
+    /// finders fallback inside `handle_file`, only for `ServeMode::Static`
+    /// with `DEBUG=True`. A file from a finder must stay inside its root.
+    pub django_finders: Option<Vec<FinderRoot>>,
+}
+
+/// The directory of one staticfiles finder location, read once at startup.
+#[derive(Clone, Debug)]
+pub struct FinderRoot {
+    /// The absolute path that the finder gives, before symlinks resolve.
+    /// A path that a finder finds in this root starts with it.
+    pub location: PathBuf,
+    /// The canonical form of `location`, resolved at startup. The canonical
+    /// path of a found file must start with it. `None` when the directory
+    /// did not exist at startup: a request then resolves it.
+    pub canonical: Option<PathBuf>,
 }
 
 pub struct AppState {

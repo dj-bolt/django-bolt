@@ -28,7 +28,7 @@ use bolt_core::state::{
     AppState, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, ROUTE_METADATA_TEMP, ScopeConfig, ServeMode,
     TASK_LOCALS, find_websocket_mount,
 };
-use bolt_core::static_files::handle_file;
+use bolt_core::static_files::{handle_file, load_finder_roots};
 use bolt_core::streaming::StreamConfig;
 use bolt_websocket::{
     GLOBAL_WEBSOCKET_ROUTER, WebSocketRouter, WsConfig, WsTarget, handle_websocket_upgrade,
@@ -476,6 +476,14 @@ fn read_cors_and_file_scopes(
     // Build static files configuration.
     // Directories are canonicalized ONCE here so the request hot path never
     // runs `canonicalize()` (a multi-syscall realpath) on the directory root.
+    // In DEBUG the finders fallback serves app static. Their roots are read
+    // and canonicalized here too, so a request checks a found file with no
+    // `canonicalize()` of a root.
+    let django_finders = if debug && static_data.is_some() {
+        Some(load_finder_roots(py)?)
+    } else {
+        None
+    };
     let static_files_config = static_data.and_then(|(url_prefix, directories)| {
         let valid_dirs = canonicalize_serve_dirs(&directories, &url_prefix, "Static files");
         // Register the scope when we have real directories to serve OR we're in
@@ -500,7 +508,7 @@ fn read_cors_and_file_scopes(
                 mode: ServeMode::Static,
                 // Finders only resolve STATICFILES_DIRS / app static dirs and
                 // only in development; never used in production or for media.
-                allow_django_finders: debug,
+                django_finders,
             }))
         }
     });
@@ -519,7 +527,7 @@ fn read_cors_and_file_scopes(
                 csp_header: csp_header.clone(),
                 cache_control: media_cache_control.clone(),
                 mode: ServeMode::Media,
-                allow_django_finders: false,
+                django_finders: None,
             }))
         }
     });
