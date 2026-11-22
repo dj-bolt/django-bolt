@@ -119,22 +119,24 @@ fn find_with_django_finders(relative_path: &str) -> Option<PathBuf> {
 /// inside the root of the finder location that found it.
 ///
 /// A finder joins the request path to the absolute path of its location, so
-/// that location is a prefix of `found`. A symlink can point out of the
-/// location. Thus the canonical file must start with the canonical root.
-/// The handler opens the canonical path, which is the path that we checked.
+/// that location is a prefix of `found`. When locations nest, the deepest
+/// prefix is the strictest choice, so Bolt checks against it. A symlink can
+/// point out of the location. Thus the canonical file must start with the
+/// canonical root. The handler opens the canonical path that we checked.
 fn contain_finder_result(found: &Path, roots: &[FinderRoot]) -> Option<PathBuf> {
+    let root = roots
+        .iter()
+        .filter(|root| found.starts_with(&root.location))
+        .max_by_key(|root| root.location.components().count())?;
     let canonical = found.canonicalize().ok()?;
-    let inside = roots.iter().any(|root| {
-        found.starts_with(&root.location)
-            && match root.canonical {
-                Some(ref root_canonical) => canonical.starts_with(root_canonical),
-                // The directory was made after startup. Resolve it now.
-                None => root
-                    .location
-                    .canonicalize()
-                    .is_ok_and(|root_canonical| canonical.starts_with(root_canonical)),
-            }
-    });
+    let inside = match root.canonical {
+        Some(ref root_canonical) => canonical.starts_with(root_canonical),
+        // The directory was made after startup. Resolve it now.
+        None => root
+            .location
+            .canonicalize()
+            .is_ok_and(|root_canonical| canonical.starts_with(root_canonical)),
+    };
     (inside && canonical.is_file()).then_some(canonical)
 }
 
@@ -246,20 +248,26 @@ pub async fn handle_file(
         return response;
     }
 
-    let mut file_path = find_in_directories(relative_path, &config.directories);
+    // The path to open, and for a finder result the path whose name gives
+    // the content type. `None` takes the type from the opened path.
+    let mut file_path: Option<(PathBuf, Option<PathBuf>)> =
+        find_in_directories(relative_path, &config.directories).map(|path| (path, None));
 
     // Static-only: fall back to Django finders in debug mode for app static
     // files like admin. Media intentionally skips this — finders only know
     // about STATICFILES_DIRS / app static dirs, never MEDIA_ROOT.
+    // A finder result keeps the requested name for its content type, as
+    // before the containment check.
     if file_path.is_none()
         && let Some(ref roots) = config.django_finders
     {
-        file_path = find_with_django_finders(relative_path)
-            .and_then(|found| contain_finder_result(&found, roots));
+        file_path = find_with_django_finders(relative_path).and_then(|found| {
+            contain_finder_result(&found, roots).map(|canonical| (canonical, Some(found)))
+        });
     }
 
-    let mut response = if let Some(ref resolved) = file_path {
-        let mut r = serve_file(&req, resolved).await;
+    let mut response = if let Some((ref resolved, ref name)) = file_path {
+        let mut r = serve_file(&req, resolved, name.as_deref().unwrap_or(resolved)).await;
         // XSS disarm: rewrite Content-Type and force download for any media
         // upload whose extension can carry JS. Static keeps native types — a
         // CMS-served `theme.html` is admin-curated.
@@ -275,10 +283,11 @@ pub async fn handle_file(
     response
 }
 
-async fn serve_file(req: &HttpRequest, file_path: &Path) -> HttpResponse {
+/// Open `file_path`, and take the content type from the name of `name`.
+async fn serve_file(req: &HttpRequest, file_path: &Path, name: &Path) -> HttpResponse {
     // Use sync reads for files under 256KB (faster for typical static assets)
     // See: https://github.com/actix/actix-web/pull/3706
-    match NamedFile::open(file_path) {
+    match std::fs::File::open(file_path).and_then(|file| NamedFile::from_file(file, name)) {
         Ok(named) => named.read_mode_threshold(256 * 1024).into_response(req),
         Err(_) => not_found_response(),
     }
@@ -494,6 +503,31 @@ mod tests {
         );
         // A path from no known root (a finder without a storage) is refused.
         assert_eq!(contain_finder_result(&root.join("app.css"), &[]), None);
+    }
+
+    /// Nested locations: a link may not leave the deepest location that
+    /// holds the found path, also when an outer location holds the target.
+    #[cfg(unix)]
+    #[test]
+    fn nested_finder_root_is_checked_against_the_deepest_location() {
+        let temp_dir = TempDir::new().unwrap();
+        let outer = temp_dir.path().join("assets");
+        let inner = outer.join("vendor");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(outer.join(".env"), "secret").unwrap();
+        fs::write(inner.join("app.css"), "app").unwrap();
+        std::os::unix::fs::symlink(outer.join(".env"), inner.join("leak.txt")).unwrap();
+        let roots = [finder_root(&outer), finder_root(&inner)];
+
+        assert_eq!(contain_finder_result(&inner.join("leak.txt"), &roots), None);
+        assert_eq!(
+            contain_finder_result(&inner.join("app.css"), &roots),
+            Some(canon(&inner.join("app.css")))
+        );
+        assert_eq!(
+            contain_finder_result(&outer.join(".env"), &roots),
+            Some(canon(&outer.join(".env")))
+        );
     }
 
     /// A finder location that is itself a symlink to a directory is legal.

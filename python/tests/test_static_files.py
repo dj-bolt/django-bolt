@@ -1016,6 +1016,31 @@ class TestFinderSymlinkContainment:
         assert served.content == b"LATER_CSS"
         assert leak.status_code == 404
 
+    def test_symlink_out_of_a_nested_location_gives_404(self, settings, tmp_path):
+        # The link leaves the inner location that found it, but stays in the outer one.
+        outer = tmp_path / "assets"
+        inner = outer / "vendor"
+        inner.mkdir(parents=True)
+        (outer / ".env").write_text("SECRET_CONTENT")
+        (inner / "app.css").write_text("APP_CSS")
+        try:
+            (inner / "leak.txt").symlink_to(outer / ".env")
+        except OSError:
+            pytest.skip("Symlink creation not supported on this system")
+        dirs = [("outer", str(outer)), ("vendor", str(inner))]
+        leak = self._get(settings, dirs, "/static/vendor/leak.txt")
+        assert leak.status_code == 404
+        assert b"SECRET_CONTENT" not in leak.content
+        served = self._get(settings, dirs, "/static/vendor/app.css")
+        assert served.status_code == 200
+
+    def test_symlink_keeps_the_content_type_of_the_requested_name(self, settings, tree):
+        (tree / "payload.txt").write_text("body{}")
+        (tree / "style.css").symlink_to(tree / "payload.txt")
+        response = self._get(settings, [("vendor", str(tree))], "/static/vendor/style.css")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/css")
+
     def test_file_of_a_finder_without_a_storage_gives_404(self, settings, tree, capfd):
         # Bolt cannot know the root of such a finder, so it refuses its files.
         settings.STATICFILES_FINDERS = [f"{__name__}.PlainPathFinder"]
