@@ -1,152 +1,62 @@
 ---
-icon: lucide/settings
+description: Every Django setting and DJANGO_BOLT_* environment variable that Django-Bolt reads, with its type, its default and its effect.
 ---
 
-# Settings Reference
+# Settings
 
-Django-Bolt settings are configured in your Django `settings.py` file.
+Django-Bolt reads its configuration from your Django settings and from `DJANGO_BOLT_*` environment variables.
+This page lists each one. The guides explain how to use them.
 
-Bolt reads its settings at startup. A missing setting gives its default. A setting with the wrong type stops startup with `ImproperlyConfigured`. The error names the setting:
+## How Bolt reads settings
 
-- A size or a count must be an `int`, such as `10 * 1024 * 1024` or `FileSize.MB_10`. A str such as `"10485760"` is not an int. A bool is not an int.
-- A flag such as `CORS_ALLOW_CREDENTIALS` must be a `bool`.
-- `DEBUG` must be a `bool` or an `int`, as Django reads it: `DEBUG = 1` is on, and `DEBUG = 0` is off. A str such as `"False"` stops startup, because Django reads a str that is not empty as on.
-- A list setting such as `CORS_ALLOWED_ORIGINS` must be a list of str. One str is not a list.
+Bolt reads most settings one time, when the server starts. `runbolt` and `TestClient` read them with the same code.
+A change after startup has no effect, unless the entry says otherwise.
 
-Convert a value that you read from an environment variable:
+A missing setting gives its default. A setting with the wrong type stops startup with `ImproperlyConfigured`. The error names the setting and the value:
 
-```python
+```text
+django.core.exceptions.ImproperlyConfigured: BOLT_STATIC_MAX_AGE must be an int of 0 or more, got str '3600'.
+```
+
+- A size, a count or a time in seconds is an `int`. A `str` such as `"3600"` is not an `int`. A `bool` is not an `int`.
+- A flag such as `CORS_ALLOW_CREDENTIALS` is a `bool`.
+- `DEBUG` is a `bool` or an `int`. A `str` such as `"False"` stops startup, because Django reads a non-empty `str` as true.
+- A list setting is a list of `str`. One `str` is not a list.
+
+Convert a value that you read from the environment:
+
+```python title="blog/settings.py"
 import os
 
-BOLT_MAX_UPLOAD_SIZE = int(os.environ["BOLT_MAX_UPLOAD_SIZE"])
+BOLT_MAX_UPLOAD_SIZE = int(os.environ.get("BOLT_MAX_UPLOAD_SIZE", 10 * 1024 * 1024))
 ```
 
-## CORS settings
+## API discovery
 
-### CORS_ALLOWED_ORIGINS
+### BOLT_API
 
-List of allowed origins for CORS.
+Default: not set. Type: `list[str]`.
+
+The `BoltAPI` instances that `runbolt` serves, as `"module:attribute"` paths:
 
 ```python
-CORS_ALLOWED_ORIGINS = [
-    "https://example.com",
-    "https://app.example.com",
-]
+BOLT_API = ["blog.api:api", "comments.api:api"]
 ```
 
-### CORS_ALLOWED_ORIGIN_REGEXES
+When the setting is there, `runbolt` does not look for other APIs.
+An entry that does not import, or that is not a `BoltAPI`, stops startup with `CommandError`.
+Without the setting, `runbolt` looks in the `api.py` and `bolt_api.py` modules of the project and of each installed app.
+See [Routing](../topics/routing.md).
 
-List of regular expressions for allowed origins. An origin is allowed when it is in `CORS_ALLOWED_ORIGINS` or when a pattern matches it. A pattern can match a part of the origin, so start each pattern with `^` and end it with `$`. An invalid pattern or an empty pattern stops startup with `ImproperlyConfigured`. An empty pattern matches every origin. Patterns use the syntax of the Rust `regex` crate, which has no look-around and no back-references. A route with `@cors` uses its own origins and patterns in place of `CORS_ALLOWED_ORIGINS` and these patterns.
-
-```python
-CORS_ALLOWED_ORIGIN_REGEXES = [
-    r"^https://\w+\.example\.com$",
-]
-```
-
-### CORS_ALLOW_ALL_ORIGINS
-
-Allow all origins (development only).
-
-```python
-CORS_ALLOW_ALL_ORIGINS = True
-```
-
-### CORS_ALLOW_CREDENTIALS
-
-Allow credentials in CORS requests.
-
-```python
-CORS_ALLOW_CREDENTIALS = True
-```
-
-### CORS_ALLOW_METHODS
-
-Allowed HTTP methods for CORS.
-
-```python
-CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
-```
-
-### CORS_ALLOW_HEADERS
-
-Allowed headers in CORS requests. The default is `["Content-Type", "Authorization"]`.
-
-```python
-CORS_ALLOW_HEADERS = ["Content-Type", "Authorization", "X-Requested-With"]
-```
-
-### CORS_EXPOSE_HEADERS
-
-Headers exposed to the browser.
-
-```python
-CORS_EXPOSE_HEADERS = ["X-Total-Count", "X-Page-Count"]
-```
-
-### CORS_PREFLIGHT_MAX_AGE
-
-Preflight cache duration in seconds. The default is 3600.
-
-```python
-CORS_PREFLIGHT_MAX_AGE = 86400  # 24 hours
-```
-
-## Rate limiting settings
-
-### BOLT_TRUSTED_PROXIES
-
-Proxies that sit in front of Bolt, as addresses or CIDR blocks. The list is empty by default.
-
-```python
-BOLT_TRUSTED_PROXIES = ["10.0.0.0/8"]
-```
-
-Bolt uses this list to find the canonical client address for
-`@rate_limit(key="ip")` and `request.META["REMOTE_ADDR"]`:
-
-- The list is empty. Bolt keys on the peer address of the connection and ignores every forwarding header.
-- The peer is not in the list. Bolt keys on the peer address. That peer is not a declared proxy, so its headers prove nothing.
-- The peer is in the list. Bolt reads `X-Forwarded-For` from the right and takes the first entry that is not a listed proxy. When every entry is a listed proxy, the client is inside your network and Bolt takes the leftmost entry. Without the header, Bolt falls back to the last `X-Real-IP` line when it is a valid address, then the peer address. A malformed chain also falls back to the peer.
-
-Bolt uses the same list for the request scheme. Only a peer in the list can set the scheme with `X-Forwarded-Proto`. Bolt reads the rightmost value, because the proxy closest to Bolt adds it. A value other than `http` or `https` is ignored. From any other peer, the scheme is the scheme of the connection. Bolt does not end TLS, so that scheme is `http`. The scheme sets these values:
-
-- `request.scheme`, `request.is_secure()`, `request.build_absolute_uri()`, `request.META["wsgi.url_scheme"]` and the default `request.META["SERVER_PORT"]` on Bolt routes.
-- `request.scheme`, `request.is_secure()` and `request.build_absolute_uri()` of the Django request that a Django middleware gets on a Bolt route. Thus `SecurityMiddleware` and `CsrfViewMiddleware` see `https` behind a listed proxy that ends TLS.
-- The `scheme` key, and the port of the `server` key, of the ASGI scope of `mount_asgi()` and `mount_django()`. Django reads `scope["scheme"]` for `request.is_secure()`.
-
-Django's `SECURE_PROXY_SSL_HEADER` still applies on top of this scheme, in Django code and in `request.scheme`, `request.is_secure()` and `request.build_absolute_uri()`, as in Django. That setting trusts the header from every peer, so set it only when the proxy removes the header from client requests.
-
-The origin check of cookie authentication reads `X-Forwarded-Proto` from every peer. That check passes only one origin, so a value that a client sends never makes it weaker than the scheme of the connection. See [Cross-site request forgery protection](../topics/authentication.md#cross-site-request-forgery-protection).
-
-Both an address and a block are accepted. `127.0.0.1` matches one address. `10.0.0.0/8` matches the block. An invalid entry raises `ImproperlyConfigured` at startup.
-
-!!! warning "Set this when you run behind a proxy"
-    A client sends `X-Forwarded-For` itself, and a proxy appends to it. Without this setting Bolt ignores the header, so every caller behind the proxy shares one bucket. With the setting, Bolt separates them again and a client cannot pick its own bucket. Behind a proxy that ends TLS, Bolt also needs this setting to see `https`.
-
-### BOLT_RATE_LIMIT_IPV6_PREFIX
-
-The prefix length of the network that a rate limit counts an IPv6 client on. The value is an int from 0 to 128. The default is 64.
-
-```python
-BOLT_RATE_LIMIT_IPV6_PREFIX = 64
-```
-
-A provider usually gives one client a /64 network or more. With a key of the full address, that client could send each request from a new address and get a new bucket. Thus `@rate_limit(key="ip")` counts an IPv6 client per /64 network. The address fallback of `key="user"` and `key="api_key"` does the same. An IPv4 client is counted per address.
-
-Set 128 to count each IPv6 address. Do this when clients that are not related share one /64, for example virtual machines of a cloud provider. Set a smaller value, such as 56 or 48, to count a larger network as one client. The 429 log line names the network, for example `2001:db8:1:2::/64`. `request.META["REMOTE_ADDR"]` keeps the full address. An invalid value raises `ImproperlyConfigured` at startup.
-
-## File upload settings
+## Request limits
 
 ### BOLT_MAX_UPLOAD_SIZE
 
-Maximum file upload size in bytes. Requests exceeding this limit will be rejected with a 413 error **before** any per-view validation occurs.
+Default: `1048576` (1 MiB). Type: `int`, 0 or more.
 
-```python
-BOLT_MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
-```
-
-You can also use the `FileSize` enum for readability:
+The largest request body in bytes. A larger body gets `413` with `{"detail":"Payload too large"}`, before the handler runs.
+It is also the limit of each uploaded file. `File(max_size=...)` can set a smaller limit for one route, not a larger one.
+See [Requests](../topics/requests.md).
 
 ```python
 from django_bolt import FileSize
@@ -154,435 +64,337 @@ from django_bolt import FileSize
 BOLT_MAX_UPLOAD_SIZE = FileSize.MB_10
 ```
 
-!!! warning "Global vs Per-View Limits"
-    `BOLT_MAX_UPLOAD_SIZE` is a **global server limit**. You cannot override it in individual views. If a file upload exceeds this value, the request is rejected before your view handler runs.
-
-    The `max_size` argument in the `File()` parameter is for **per-view validation**. It allows you to set a stricter limit for a specific endpoint, but it can never increase the global limit. For example:
-    ```python
-    # settings.py
-    BOLT_MAX_UPLOAD_SIZE = FileSize.MB_50  # 50 MB global limit
-
-    # In your view
-    file: Annotated[UploadFile, File(max_size=FileSize.MB_1)]  # 1 MB per-view limit
-    ```
-    In this case, files over 1 MB are rejected by the view, and files over 50 MB are rejected by the server.
-
-    **If you set `File(max_size=...)` higher than `BOLT_MAX_UPLOAD_SIZE`, the global limit always takes precedence.**
-
-    This distinction is important for security and resource management. Always set `BOLT_MAX_UPLOAD_SIZE` to the maximum file size your server should ever accept, and use `File(max_size=...)` for endpoint-specific needs.
-
-## Native route settings
-
-### BOLT_NATIVE_ROUTE_TIMEOUT
-
-Maximum time (seconds) to wait for a native route handler to complete a request. At the limit, Bolt sends `504 Gateway Timeout`.
-
-```python
-BOLT_NATIVE_ROUTE_TIMEOUT = 30
-```
-
-**Default:** `30`
-
-The value must be more than 0. An int or a float is valid.
-
-## ASGI mount settings
-
-### BOLT_ASGI_MOUNT_TIMEOUT
-
-Maximum time (seconds) to wait for a mounted ASGI app to complete.
-
-```python
-BOLT_ASGI_MOUNT_TIMEOUT = 30
-```
-
-**Default:** `30`
-
-The value must be more than 0. An int or a float is valid.
-
-When exceeded, Django-Bolt returns `504 Gateway Timeout` for the mounted request.
-
 ### BOLT_MEMORY_SPOOL_THRESHOLD
 
-Size threshold before file uploads are spooled to disk. Files smaller than this are kept in memory; larger files are written to a temporary file on disk.
+Default: `1048576` (1 MiB). Type: `int`, 0 or more.
 
-```python
-BOLT_MEMORY_SPOOL_THRESHOLD = 5 * 1024 * 1024  # 5 MB
-```
+An uploaded file up to this size stays in memory. A larger file goes to a temporary file on disk.
+Bolt reads it when it registers each route.
 
-**Default:** `1048576` (1 MB)
+### BOLT_MAX_HEADER_SIZE
 
-This setting controls memory usage during file uploads:
+Default: `8192`. Type: `int`, 0 or more.
 
-- **Lower values** reduce memory usage but increase disk I/O
-- **Higher values** improve performance for medium-sized files but use more memory
-
-!!! tip "When to adjust"
-    - Set higher (e.g., 5-10 MB) if you frequently receive medium-sized files and have sufficient memory
-    - Set lower (e.g., 256 KB) on memory-constrained systems or when handling many concurrent uploads
-
-## Runtime environment variables
-
-Bolt reads its `DJANGO_BOLT_*` environment variables at startup. An unset or empty variable gives the default. A value that is not valid stops startup with `ImproperlyConfigured`. The error names the variable and the value, for example `DJANGO_BOLT_ORM_THREADS must be an int of 1 or more, got '0'.`
+The longest header value in bytes that a route reads. A longer value gets `400` with `{"detail":"Header value too large (max 8192 bytes)"}`.
+A request with more than 100 headers also gets `400`.
 
 ### DJANGO_BOLT_MAX_PARAM_LENGTH
 
-Maximum allowed size for path/query/form parameter values, in bytes. Requests that exceed this limit are rejected with HTTP `422`.
+This limit is an environment variable. See [Environment variables](#environment-variables).
 
-```bash
-export DJANGO_BOLT_MAX_PARAM_LENGTH=65536
-```
-
-**Default:** `8192`
-
-**Maximum:** `1048576` (1 MB). A larger value stops startup, so a misconfiguration can never disable the limit.
-
-The value must be an int from `1` to `1048576`.
-
-### DJANGO_BOLT_ORM_THREADS
-
-Number of threads in the ORM pool of each process. Django-Bolt evaluates the QuerySets that async handlers return on this pool. `await request.auser()` also loads the user on this pool. Django's async ORM API in async handlers without Django middleware, such as `await Model.objects.aget()`, `acount()` and `async for`, runs on this pool too. A route with Django middleware runs these calls on its request lane instead. The pool size is the number of queries in flight per process.
-
-```bash
-export DJANGO_BOLT_ORM_THREADS=8
-```
-
-**Default:** `1` when every database is SQLite, otherwise `4`.
-
-Without a connection pool, each thread holds one database connection. With a pool, a thread holds a connection only while it has work. Increase the value when one free-threaded process runs many worker threads. See [Size the database thread pools](../getting-started/deployment.md#size-the-database-thread-pools). The value must be an int of `1` or more.
-
-### DJANGO_BOLT_LANE_IDLE_SECONDS
-
-Idle time, in seconds, after which a request lane closes its database connections and stops. Routes with Django middleware use request lanes. See [Request lanes](../topics/middleware.md#request-lanes).
-
-```bash
-export DJANGO_BOLT_LANE_IDLE_SECONDS=30
-```
-
-**Default:** `10`. A fraction such as `0.5` is valid. The value must be a number more than `0`.
-
-### DJANGO_BOLT_EXECUTOR_THREADS
-
-Number of threads in the shared executor pool of each process. Blocking sync handlers and `sync_to_thread` calls run on this pool.
-
-```bash
-export DJANGO_BOLT_EXECUTOR_THREADS=16
-```
-
-**Default:** CPU count + 4, maximum `32`.
-
-The value must be an int of `1` or more.
-
-## File serving settings
-
-### BOLT_ALLOWED_FILE_PATHS
-
-Whitelist of directories for FileResponse.
-
-```python
-BOLT_ALLOWED_FILE_PATHS = [
-    "/var/app/uploads",
-    "/var/app/public",
-]
-```
-
-The setting is a list or a tuple of absolute paths. Each path is a str or a `Path`. One str is not a list, so it stops startup with `ImproperlyConfigured`. `runbolt` reads the setting at startup. Under `TestClient`, the first `FileResponse` reads it. `override_settings` changes the limit for the next `FileResponse`. A relative path, such as `""` or `"media"`, also stops startup. `None` or an empty list sets no limit.
-
-When set, `FileResponse` only serves files within these directories. For a path outside them, it raises `ResponseFileNotAllowed`, and Bolt answers 403. When the lookup of a path fails, Bolt follows its links, as `realpath` does, to the point where the lookup stops. Nothing exists below that point, so Bolt completes the path from there as text. When that path is outside these directories, Bolt answers 403, also when the path names no file. Thus a client cannot learn which regular files exist there, on Linux, macOS and Windows. A path can leave these directories with `..` and come back into them. Such a path can still show whether a directory, or a link into these directories, exists outside them.
-
-## Static and media file serving
-
-Django-Bolt serves static and media files from Rust based on your standard Django settings — `STATIC_URL` / `STATIC_ROOT` / `STATICFILES_DIRS` for static, and `MEDIA_URL` / `MEDIA_ROOT` for media. The scopes mount automatically when those settings are configured.
-
-See [Static Files](../topics/static-files.md) and [Media Files](../topics/media-files.md) for full documentation.
-
-### BOLT_STATIC_MAX_AGE
-
-`Cache-Control` max-age (seconds) for successful static responses. Emits `Cache-Control: public, max-age=N` (static assets are identical for every user, so shared caches can cache them).
-
-```python
-BOLT_STATIC_MAX_AGE = 31536000  # 1 year — safe for content-hashed assets
-```
-
-**Default:** unset (no `Cache-Control` header)
-
-### BOLT_MEDIA_MAX_AGE
-
-`Cache-Control` max-age (seconds) for successful media responses. Emits `Cache-Control: private, max-age=N` — **`private`** so shared caches don't serve one user's upload to another.
-
-```python
-BOLT_MEDIA_MAX_AGE = 3600  # 1 hour
-```
-
-**Default:** unset (no `Cache-Control` header)
-
-!!! note "Validation"
-    Both settings only emit a header on `2xx` responses. Missing, non-integer, boolean, or negative values are ignored with a startup warning. `STATIC_URL` / `MEDIA_URL` must be literal prefixes — values containing `{`/`}` are refused at startup.
-
-## Authentication settings
-
-Django-Bolt uses Django's `SECRET_KEY` for JWT signing by default.
-
-```python
-SECRET_KEY = "your-secret-key"
-```
-
-Override per-backend:
-
-```python
-JWTAuthentication(secret="custom-jwt-secret")
-```
+## Authentication and permissions
 
 ### BOLT_AUTHENTICATION_CLASSES
 
-Default authentication backends applied to all endpoints.
+Default: not set. Type: `list` of authentication backend instances.
 
-**Default:** not set. A route with no guard then has no authentication. A route with a guard that needs a user, such as `IsAuthenticated()`, then uses `JWTAuthentication()`. See [A guard with no auth backend](../topics/authentication.md#a-guard-with-no-auth-backend).
+The authentication backends of each route that has no `auth` argument.
+Without the setting, a route whose guard needs a user, such as `IsAuthenticated()`, gets `JWTAuthentication()`. Each other route gets no authentication.
+Set `[]` to give no route a default backend.
+Bolt reads the setting when it registers each route.
+See [Authentication](../topics/authentication.md).
 
-Set the setting to `[]` to give no route a default backend.
+```python
+from django_bolt.auth import JWTAuthentication
+
+BOLT_AUTHENTICATION_CLASSES = [JWTAuthentication()]
+```
 
 ### BOLT_DEFAULT_PERMISSION_CLASSES
 
-Default permission guards applied to all endpoints.
+Default: `[AllowAny()]`. Type: `list` of guard instances.
 
-**Default:** `[AllowAny()]` (all endpoints publicly accessible)
-
-See [Global authentication](../topics/authentication.md#global-authentication) for usage and examples.
-
-## Logging settings
-
-Django-Bolt integrates with Django's logging system.
+The guards of each route that has no `guards` argument.
+Bolt reads the setting when it registers each route.
+See [Permissions](../topics/permissions.md).
 
 ```python
-LOGGING = {
-    "version": 1,
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-        },
-    },
-    "loggers": {
-        "django_bolt": {
-            "handlers": ["console"],
-            "level": "INFO",
-        },
-    },
-}
+from django_bolt.auth import IsAuthenticated
+
+BOLT_DEFAULT_PERMISSION_CLASSES = [IsAuthenticated()]
 ```
 
-### BOLT_LOG_QUEUE_SIZE
+### SECRET_KEY
 
-Django-Bolt logs through a bounded, non-blocking queue (a background thread
-forwards records to the console). This sets the queue's maximum depth. When the
-queue is full — e.g. during an extreme burst of error logging — new records are
-dropped rather than accumulating in memory, preventing unbounded RAM growth under
-load. Drops are counted and surfaced with a throttled notice to `stderr`.
+Bolt uses the Django `SECRET_KEY` to sign and verify JWTs, unless the backend gets its own `secret`.
+
+## Proxies and rate limits
+
+### BOLT_TRUSTED_PROXIES
+
+Default: `[]`. Type: `list` or `tuple` of `str`.
+
+The proxies in front of Bolt, as IP addresses or CIDR blocks, such as `"127.0.0.1"` or `"10.0.0.0/8"`.
 
 ```python
-BOLT_LOG_QUEUE_SIZE = 10000
+BOLT_TRUSTED_PROXIES = ["127.0.0.1"]
 ```
 
-**Default:** `10000`
+Bolt reads `X-Forwarded-For`, `X-Real-IP` and `X-Forwarded-Proto` only from a peer in this list:
 
-### DJANGO_BOLT_LOG_SAMPLE
+- With an empty list, the client address is the peer address of the connection. Bolt ignores each forwarding header.
+- From a listed peer, Bolt reads `X-Forwarded-For` from the right. The first address that is not a listed proxy is the client.
+- From a listed peer, the rightmost `X-Forwarded-Proto` value sets the scheme, when it is `http` or `https`.
 
-The part of the 1xx to 3xx responses that write a line to the access log of `runbolt`, from `0.0` to `1.0`.
-A 4xx or a 5xx response always writes its line.
-The setting applies to each API with no `logging_config`. It is the `sample_rate` of `LoggingConfig`.
+The client address goes to `request.META["REMOTE_ADDR"]` and to `@rate_limit(key="ip")`.
+The scheme goes to `request.scheme`, `request.is_secure()` and the ASGI scope of a mounted Django app.
+An entry that is not an address or a block stops startup with `ImproperlyConfigured`.
+See [Deployment](../topics/deployment.md#run-behind-a-reverse-proxy).
+
+### BOLT_RATE_LIMIT_IPV6_PREFIX
+
+Default: `64`. Type: `int`, 0 to 128.
+
+The prefix length of the network that a rate limit counts as one IPv6 client.
+Set `128` to count each IPv6 address. An IPv4 client is always counted by its address.
+See [Rate limiting](../topics/rate-limiting.md).
+
+## CORS
+
+Bolt reads the settings of `django-cors-headers`, with the same names.
+A route with `@cors` uses its own values. See [CORS](../topics/cors.md).
+
+| Setting | Type | Default |
+| --- | --- | --- |
+| `CORS_ALLOWED_ORIGINS` | `list[str]` | `[]` |
+| `CORS_ALLOWED_ORIGIN_REGEXES` | `list[str]` | `[]` |
+| `CORS_ALLOW_ALL_ORIGINS` | `bool` | `False` |
+| `CORS_ALLOW_CREDENTIALS` | `bool` | `False` |
+| `CORS_ALLOW_METHODS` | `list[str]` | `["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "QUERY"]` |
+| `CORS_ALLOW_HEADERS` | `list[str]` | `["Content-Type", "Authorization"]` |
+| `CORS_EXPOSE_HEADERS` | `list[str]` | `[]` |
+| `CORS_PREFLIGHT_MAX_AGE` | `int`, 0 to 4294967295 | `3600` |
+
+Without `CORS_ALLOWED_ORIGINS`, `CORS_ALLOWED_ORIGIN_REGEXES` and `CORS_ALLOW_ALL_ORIGINS`, Bolt adds no CORS headers.
+A pattern in `CORS_ALLOWED_ORIGIN_REGEXES` that does not compile stops startup.
+With `CORS_ALLOW_ALL_ORIGINS` and `CORS_ALLOW_CREDENTIALS` both `True`, Bolt prints a warning and sends the origin of the request in place of `*`.
+
+## Compression
+
+### BOLT_COMPRESSION
+
+Default: not set. Type: `CompressionConfig`, `None` or `False`.
+
+The compression of each response of the server. The setting wins over the `compression` argument of `BoltAPI`.
+`None` or `False` turns compression off. Another value stops startup with `ImproperlyConfigured`.
+Without the setting, the server uses the configuration of the first API. A `BoltAPI` compresses with brotli by default.
+See [Compression](../topics/compression.md).
 
 ```python
-DJANGO_BOLT_LOG_SAMPLE = 0.05
+from django_bolt import CompressionConfig
+
+BOLT_COMPRESSION = CompressionConfig(backend="gzip", minimum_size=1000)
 ```
 
-**Default:** not set (each response writes its line)
+## Static and media files
 
-### DJANGO_BOLT_LOG_SLOW_MS
+### STATIC_URL, STATIC_ROOT and STATICFILES_DIRS
 
-A 1xx to 3xx response writes a line to the access log only when it took this number of milliseconds or more.
-A 4xx or a 5xx response always writes its line.
-The setting applies to each API with no `logging_config`. It is the `min_duration_ms` of `LoggingConfig`.
+The Django settings. With `STATIC_URL`, Bolt serves the files of `STATIC_ROOT` and then of `STATICFILES_DIRS` under that prefix.
+With `DEBUG = True`, Bolt also asks the Django staticfiles finders.
+See [Static files](../topics/static-files.md).
 
-```python
-DJANGO_BOLT_LOG_SLOW_MS = 250
-```
+### MEDIA_URL and MEDIA_ROOT
 
-**Default:** not set (each response writes its line)
+The Django settings. When `MEDIA_URL` starts with `/` and `MEDIA_ROOT` is an absolute path to a directory, Bolt serves the files of `MEDIA_ROOT` under that prefix.
+See [Media files](../topics/media-files.md).
 
-A value out of range raises `ImproperlyConfigured` at startup. See [Production settings](../topics/logging.md#production-settings).
+### BOLT_STATIC_MAX_AGE
 
-## Django signals settings
+Default: not set. Type: `int`, 0 or more, or `None`.
 
-### BOLT_EMIT_SIGNALS
+Add `Cache-Control: public, max-age=N` to each `2xx` response of a static file. `None` adds no header.
 
-Enable Django `request_started` and `request_finished` signal emission.
+### BOLT_MEDIA_MAX_AGE
 
-```python
-BOLT_EMIT_SIGNALS = True
-```
+Default: not set. Type: `int`, 0 or more, or `None`.
 
-**Default:** `False`
-
-Django-Bolt disables signals by default for maximum performance. Enable this setting when:
-
-- Using third-party packages that depend on request signals (e.g. django-debug-toolbar)
-- Implementing custom signal receivers for request lifecycle events
-
-`CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` do not need signals. Bolt runs Django's connection check on the executor thread before each call when a database sets a positive `CONN_MAX_AGE` or `CONN_HEALTH_CHECKS`. A worker thread that opened a connection runs the check before each sync request. With neither set, Bolt runs the check only after a call raises. A connection that the database closed then fails one request. The next request reconnects, and the other threads reconnect before their next call. See [Database Connection Management](../topics/signals.md#database-connection-management).
-
-See [Django Signals](../topics/signals.md) for detailed documentation.
-
-## Dev reload settings
-
-`runbolt --dev` watches two things and restarts the server when a `.py` or `.html` file changes in either:
-
-- **The project root** (`BASE_DIR`, falling back to the working directory), recursively — so newly created files, modules, and packages reload without restarting the dev server. Virtualenvs and common build/cache directories (`.git`, `__pycache__`, `node_modules`, `target`, …) are excluded.
-- **The app's import graph** — every module loaded by Django setup plus your discovered API modules and everything they transitively import, along with template directories and `manage.py`. This covers code living *outside* the project root, such as apps on `PYTHONPATH` or editable-installed packages.
-
-To watch extra locations outside both — for example a shared library next to the project that isn't imported at startup — pass `--reload-dir` (repeatable, same shape as uvicorn's flag):
-
-```bash
-python manage.py runbolt --dev --reload-dir ../shared-lib
-```
-
-Each entry is a directory (watched recursively) or a single file, resolved relative to the working directory. Entries that don't exist are skipped with a warning.
-
-### BOLT_DEV_FORCE_POLLING
-
-Force the `--dev` auto-reloader to use file-system polling instead of native OS file events.
-
-```python
-BOLT_DEV_FORCE_POLLING = True
-```
-
-**Default:** `False`
-
-Django-Bolt's dev reloader uses the `notify` crate's recommended watcher (inotify on Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows). These backends are fast but rely on kernel events, which do not propagate across some bind-mount boundaries — most notably a Linux container running on a Windows host where the source tree is mounted from the host filesystem.
-
-Enable polling when:
-
-- Running `runbolt --dev` inside a Docker container on a Windows host with the project bind-mounted from the host
-- Working on a remote / network filesystem that does not deliver native change events
-- Native file events appear to fire inconsistently for your editor or sync tool
-
-Polling is checked every 500 ms. It uses more CPU than native events on large source trees but is the only reliable option when kernel events are unavailable.
-
-This setting only affects `runbolt --dev`; production servers do not watch files.
-
-## runbolt command options
-
-The `runbolt` management command accepts these options:
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--host` | `0.0.0.0` | Bind address: an IP address, an IPv6 address in brackets, or a host name. A host name binds its first IPv4 address, so `localhost` binds `127.0.0.1`. A host name that does not resolve stops startup. |
-| `--port` | `8000` | Bind port |
-| `--workers` | `1`, or the CPU count on free-threaded Python | Actix worker threads per process. Each thread runs Python handlers. |
-| `--processes` | `1` | Number of processes |
-| `--dev` | off | Enable auto-reload |
-| `--no-admin` | off | Disable admin integration |
-| `--backlog` | `1024` | Socket listen backlog |
-| `--keep-alive` | OS default | HTTP keep-alive timeout |
-| `--skip-checks` | off | Skip the Django system checks at startup |
-
-A number out of range stops `runbolt` before startup, with an error that names the option. `--port` takes 0 to 65535. `--workers` takes 1 to 512. `--processes` takes 1 or more. `--backlog`, `--keep-alive`, `--max-rss`, `--workers-lifetime` and `--workers-kill-timeout` take 0 or more.
-
-At startup, `runbolt` runs the Django system checks and the migration check, like `runserver`. A check error stops startup. The unapplied-migration warning prints before the banner. In `--dev` mode, each reload runs the checks again. Multi-process mode runs them once, in the parent process. `--skip-checks` skips the system checks; the migration check still runs.
-
-### Examples
-
-```bash
-# Development with auto-reload
-python manage.py runbolt --dev
-
-# Production with scaling
-python manage.py runbolt --processes 4 --workers 2
-
-# Custom bind address
-python manage.py runbolt --host 127.0.0.1 --port 3000
-```
-
-The dev reloader follows a Django-style source watch list: Python modules and HTML templates are reloaded automatically, while runtime files like logs, databases, and other generated artifacts do not trigger reloads.
-
-## OpenAPI settings
-
-Configure via `OpenAPIConfig` in your api.py:
-
-```python
-from django_bolt import BoltAPI
-from django_bolt.openapi import OpenAPIConfig
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        description="API description",
-        enabled=True,
-        path="/docs",
-    )
-)
-```
-
-## Content Security Policy (CSP) settings
-
-Django-Bolt applies CSP headers to static files served by the Rust server using Django 6.0+'s native [`SECURE_CSP`](https://docs.djangoproject.com/en/6.0/ref/csp/) setting.
+Add `Cache-Control: private, max-age=N` to each `2xx` response of a media file. `None` adds no header.
 
 ### SECURE_CSP
 
-```python
-from django.utils.csp import CSP
+Default: not set. Type: `dict`.
 
-SECURE_CSP = {
-    "default-src": [CSP.SELF],
-    "script-src": [CSP.SELF],
-    "style-src": [CSP.SELF, CSP.UNSAFE_INLINE],
-    "img-src": [CSP.SELF, "data:"],
-}
-```
+The Django `SECURE_CSP` setting. Bolt sends this policy in a `Content-Security-Policy` header on each static and media response.
+Bolt removes `CSP.NONCE`, because a file has no nonce.
+A value that is not a `dict` stops startup with `ImproperlyConfigured`.
 
-See [Static Files - Content Security Policy](../topics/static-files.md#content-security-policy-csp) for full documentation.
+### BOLT_ALLOWED_FILE_PATHS
 
-## Compression settings
+Default: not set. Type: `list` or `tuple` of absolute paths, as `str` or `Path`.
 
-Configure via `CompressionConfig`:
+The directories that a `FileResponse` can serve from. A path outside them gets `403`.
+`None` or `[]` sets no limit. A relative path or one `str` stops startup with `ImproperlyConfigured`.
+`runbolt` reads the setting at startup. Under `TestClient`, the first `FileResponse` reads it, and `override_settings` changes it.
+See [Responses](../topics/responses.md).
 
 ```python
-from django_bolt import BoltAPI, CompressionConfig
-
-api = BoltAPI(
-    compression=CompressionConfig(
-        backend="brotli",      # "brotli", "gzip", or "zstd"
-        minimum_size=1000,     # Minimum size to compress (bytes)
-        gzip_fallback=True,    # Fall back to gzip
-    )
-)
+BOLT_ALLOWED_FILE_PATHS = ["/srv/blog/exports"]
 ```
 
-## All settings reference
+## Streaming and WebSocket
 
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `CORS_ALLOWED_ORIGINS` | `list[str]` | `[]` | Allowed CORS origins |
-| `CORS_ALLOWED_ORIGIN_REGEXES` | `list[str]` | `[]` | Patterns for allowed CORS origins |
-| `CORS_ALLOW_ALL_ORIGINS` | `bool` | `False` | Allow all origins |
-| `CORS_ALLOW_CREDENTIALS` | `bool` | `False` | Allow credentials |
-| `CORS_ALLOW_METHODS` | `list[str]` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `QUERY` | Allowed methods |
-| `CORS_ALLOW_HEADERS` | `list[str]` | `Content-Type`, `Authorization` | Allowed headers |
-| `CORS_EXPOSE_HEADERS` | `list[str]` | `[]` | Exposed headers |
-| `CORS_PREFLIGHT_MAX_AGE` | `int` | `3600` | Preflight cache (seconds) |
-| `BOLT_RATE_LIMIT_IPV6_PREFIX` | `int` | `64` | Network prefix that a rate limit counts an IPv6 client on |
-| `BOLT_MAX_UPLOAD_SIZE` | `int` | `1048576` | Max upload size (bytes) |
-| `BOLT_MEMORY_SPOOL_THRESHOLD` | `int` | `1048576` | Memory threshold before disk spooling (bytes) |
-| `BOLT_ALLOWED_FILE_PATHS` | `list[str \| Path]` | `None` | File serving whitelist |
-| `BOLT_STATIC_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for static (`public`) |
-| `BOLT_MEDIA_MAX_AGE` | `int` | `None` | `Cache-Control` max-age for media (`private`) |
-| `BOLT_LOG_QUEUE_SIZE` | `int` | `10000` | Max depth of the non-blocking log queue (records dropped when full) |
-| `DJANGO_BOLT_LOG_SAMPLE` | `float` | `None` | Part of the 1xx to 3xx responses in the access log (0.0 to 1.0) |
-| `DJANGO_BOLT_LOG_SLOW_MS` | `float` | `None` | Minimum duration of a 1xx to 3xx response in the access log (milliseconds) |
-| `BOLT_EMIT_SIGNALS` | `bool` | `False` | Enable Django request signals |
-| `BOLT_DEV_FORCE_POLLING` | `bool` | `False` | Force `--dev` reloader to use polling instead of native file events |
-| `SECURE_CSP` | `dict` | `None` | CSP directives for static files ([Django 6.0+](https://docs.djangoproject.com/en/6.0/ref/csp/)) |
-| `BOLT_AUTHENTICATION_CLASSES` | `list` | not set | Default authentication backends. Not set: `JWTAuthentication()` for a route with a guard that needs a user |
-| `BOLT_DEFAULT_PERMISSION_CLASSES` | `list` | `[AllowAny()]` | Default permission guards |
-| `DJANGO_BOLT_MAX_PARAM_LENGTH` | `int` (env var) | `8192` | Max path/query/form parameter size in bytes, from `1` to `1048576` (1 MB); requests over the limit return `422` |
-| `DJANGO_BOLT_ORM_THREADS` | `int` (env var) | `1` (SQLite) or `4` | Threads in the ORM pool of each process |
-| `DJANGO_BOLT_LANE_IDLE_SECONDS` | `float` (env var) | `10` | Idle time after which a request lane stops |
-| `DJANGO_BOLT_EXECUTOR_THREADS` | `int` (env var) | CPU count + 4 (max `32`) | Threads in the shared executor pool of each process |
+### BOLT_MAX_SYNC_STREAMING_THREADS
+
+Default: `1000`. Type: `int`, 1 or more.
+
+The number of sync generators that stream at the same time in one process. Each one uses one thread.
+Above the limit, a new stream sends `retry: 30000` and closes.
+`DJANGO_BOLT_MAX_SYNC_STREAMING_THREADS` wins over this setting.
+See [Server-sent events](../topics/sse.md).
+
+### WebSocket limits
+
+An environment variable with the name of the setting and the prefix `DJANGO_` wins over the setting. For example, `DJANGO_BOLT_WS_MAX_CONNECTIONS` wins over `BOLT_WS_MAX_CONNECTIONS`.
+See [WebSocket](../topics/websocket.md).
+
+| Setting | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `BOLT_WS_MAX_CONNECTIONS` | `int`, 0 or more | `10000` | Open connections in one process. A new upgrade above the limit gets `503`. |
+| `BOLT_WS_CHANNEL_SIZE` | `int`, 1 or more | `100` | Messages that wait for the handler on one connection. |
+| `BOLT_WS_HEARTBEAT_INTERVAL` | `int`, 1 or more | `5` | Seconds between two pings. |
+| `BOLT_WS_CLIENT_TIMEOUT` | `int`, 0 or more | `10` | Seconds with no message and no pong from the client before Bolt closes the connection. |
+| `BOLT_WS_MAX_MESSAGE_SIZE` | `int`, 0 or more | `1048576` | Largest message in bytes. A larger message closes the connection with code `1009`. |
+
+## Mounts and native routes
+
+### BOLT_ASGI_MOUNT_TIMEOUT
+
+Default: `30`. Type: `int` or `float`, more than 0.
+
+Seconds that a mounted ASGI app has to complete a request. After it, Bolt sends `504`.
+See [ASGI mounts](../topics/asgi-mounts.md).
+
+### BOLT_NATIVE_ROUTE_TIMEOUT
+
+Default: `30`. Type: `int` or `float`, more than 0.
+
+Seconds that a native route has to complete a request. After it, Bolt sends `504`.
+See [Native routes](../topics/native-routes.md).
+
+## Logging
+
+### LOGGING
+
+The Django setting. When your settings module defines `LOGGING`, Bolt does not change the logging configuration.
+See [Logging](../topics/logging.md).
+
+### BOLT_LOG_QUEUE_SIZE
+
+Default: `10000`. Type: `int`, 1 or more.
+
+Only without `LOGGING`. The size of the queue between the loggers and the console.
+When the queue is full, Bolt drops new records and writes `django-bolt: log queue saturated, dropped N record(s)` to stderr.
+A value that is not valid prints a warning to stderr, and Bolt uses `10000`.
+
+### DJANGO_BOLT_LOG_SAMPLE
+
+Default: not set. Type: `int` or `float`, 0.0 to 1.0.
+
+This is a Django setting, not an environment variable.
+The part of the 1xx to 3xx responses that write an access-log line. A 4xx or a 5xx response always writes its line.
+It applies to each API with no `logging_config`. It is the `sample_rate` of `LoggingConfig`.
+
+### DJANGO_BOLT_LOG_SLOW_MS
+
+Default: not set. Type: `int` or `float`, 0 or more.
+
+This is a Django setting, not an environment variable.
+A 1xx to 3xx response writes an access-log line only when it took this number of milliseconds or more.
+It applies to each API with no `logging_config`. It is the `min_duration_ms` of `LoggingConfig`.
+
+## Signals
+
+### BOLT_EMIT_SIGNALS
+
+Default: `False`. Type: `bool`.
+
+Send the Django `request_started` and `request_finished` signals for each request.
+Bolt reads the setting when you create a `BoltAPI`.
+See [Signals](../topics/signals.md).
+
+## Development
+
+### BOLT_DEV_FORCE_POLLING
+
+Default: `False`. Type: `bool`.
+
+Make `runbolt --dev` read the files every 500 ms, in place of file events.
+Use it when file events do not arrive, for example in a Docker container on a Windows host.
+See [runbolt](runbolt.md#development-mode).
+
+## Django settings that change Bolt
+
+| Setting | Effect on Bolt |
+| --- | --- |
+| `DEBUG` | Turns on the staticfiles finders for static files, error details in responses, and the `DEBUG` level of the default logging. |
+| `ROOT_URLCONF` | `runbolt` looks for the project API next to it, and finds the admin prefix in it. |
+| `MIDDLEWARE` | `BoltAPI(django_middleware=True)` loads it. See [Middleware](../topics/middleware.md). |
+| `DATABASES` | Sets the default size of the ORM thread pool. `OPTIONS["pool"]`, `CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` change how Bolt keeps connections. See [Deployment](../topics/deployment.md#configure-database-connections). |
+
+## Environment variables
+
+Bolt reads its environment variables one time, at startup. An unset or empty variable gives the default.
+A value that does not parse stops startup with `ImproperlyConfigured`. `DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT` is different: it raises `ValueError` when you create a `TestClient`.
+
+```text
+django.core.exceptions.ImproperlyConfigured: DJANGO_BOLT_ORM_THREADS must be an int of 1 or more, got '0'.
+```
+
+### Server
+
+| Variable | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `DJANGO_BOLT_WORKERS` | int, 1 or more | `1` | Worker threads in one process. `runbolt` sets it from `--workers`. |
+| `DJANGO_BOLT_BACKLOG` | int, 0 or more | `1024` | Listen queue of the socket. `runbolt` sets it from `--backlog`. |
+| `DJANGO_BOLT_KEEP_ALIVE` | int, 0 or more | no timeout | Keep-alive timeout in seconds. `--keep-alive` wins. |
+| `DJANGO_BOLT_SHUTDOWN_TIMEOUT` | int, 0 or more | `30` | Seconds that the server drains after `SIGTERM`. Wins over `--workers-kill-timeout` for the drain. |
+| `DJANGO_BOLT_REUSE_PORT` | `1`, `0`, `true` or `false` | `false` | Bind with `SO_REUSEPORT`. `runbolt` sets it in each worker of a supervisor. |
+| `DJANGO_BOLT_PROCESS_ID` | int | not set | Set by `runbolt` in each worker of a supervisor: the slot of the worker. |
+| `DJANGO_BOLT_BLOCKING_THREADS` | int, 1 or more | `1024` | Largest number of blocking threads of the Tokio runtime in one process. |
+
+See [runbolt](runbolt.md) for the options.
+
+### Thread pools and request lanes
+
+| Variable | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `DJANGO_BOLT_ORM_THREADS` | int, 1 or more | `1` when each database is SQLite, else `4` | Threads of the ORM pool of one process. It runs the QuerySets that async handlers return, `await request.auser()`, and the async ORM calls of a route with no Django middleware. |
+| `DJANGO_BOLT_EXECUTOR_THREADS` | int, 1 or more | CPU count + 4, at most `32` | Threads of the shared pool of one process. Blocking sync handlers and `sync_to_thread` calls run on it. |
+| `DJANGO_BOLT_LANE_IDLE_SECONDS` | number, more than 0 | `10` | Idle seconds after which a request lane closes its database connections and stops. |
+
+See [Async ORM](../topics/async-orm.md) and [Middleware](../topics/middleware.md).
+
+### Requests and streaming
+
+| Variable | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `DJANGO_BOLT_MAX_PARAM_LENGTH` | int, 1 to 1048576 | `8192` | Longest value in bytes of a path, query or form parameter. A longer value gets `422`. |
+| `DJANGO_BOLT_MAX_SYNC_STREAMING_THREADS` | int, 1 or more | `1000` | Wins over `BOLT_MAX_SYNC_STREAMING_THREADS`. |
+| `DJANGO_BOLT_STREAM_SYNC_BATCH_SIZE` | int, 1 or more | `5` | Items that a sync generator sends in one batch. A server-sent event stream always sends 1. |
+| `DJANGO_BOLT_STREAM_CHANNEL_CAPACITY` | int, 1 or more | `32` | Chunks that wait between a generator and the response. |
+
+A parameter that is too long gives this response:
+
+```json
+{"detail": "Query parameter 'q': Parameter too long: 9000 bytes (max 8192 bytes)"}
+```
+
+### WebSocket
+
+`DJANGO_BOLT_WS_MAX_CONNECTIONS`, `DJANGO_BOLT_WS_CHANNEL_SIZE`, `DJANGO_BOLT_WS_HEARTBEAT_INTERVAL`, `DJANGO_BOLT_WS_CLIENT_TIMEOUT` and `DJANGO_BOLT_WS_MAX_MESSAGE_SIZE` win over the `BOLT_WS_` settings with the same suffix.
+See [WebSocket limits](#websocket-limits).
+
+### Tests
+
+| Variable | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `DJANGO_BOLT_TEST_DB_LOCK_TIMEOUT` | number, more than 0 | `10` | Seconds that a thread of `TestClient` waits for the shared test database connection. |
+
+See [Testing](../topics/testing.md).
+
+## See also
+
+- [runbolt](runbolt.md)
+- [Deployment](../topics/deployment.md)
+- [Logging](../topics/logging.md)

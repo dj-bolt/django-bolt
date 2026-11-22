@@ -1,16 +1,13 @@
 ---
-icon: lucide/heart-pulse
+description: Add liveness and readiness routes to a Django-Bolt API, write your own checks, and return 503 for Kubernetes and load balancers.
 ---
 
 # Health checks
 
-Django-Bolt provides a built-in health check system for Kubernetes readiness/liveness probes and load balancer health checks.
+A health check is a route that a load balancer or Kubernetes calls to see if a process can serve.
+`django_bolt.health` gives a liveness route, a readiness route and a database check.
 
-## Quick start
-
-Register health check endpoints on your API:
-
-```python
+```python title="blog/api.py"
 from django_bolt import BoltAPI
 from django_bolt.health import register_health_checks
 
@@ -18,249 +15,179 @@ api = BoltAPI()
 register_health_checks(api)
 ```
 
-This adds two endpoints:
+`register_health_checks()` adds two `GET` routes to the API:
 
-- `GET /health` - Simple liveness probe
-- `GET /ready` - Readiness probe with service checks
+- `/health` answers when the process runs. It does no other work.
+- `/ready` runs the checks and reports each result. It returns `503 Service Unavailable` when a check fails.
 
-## Endpoints
-
-### Liveness probe (/health)
-
-Returns immediately with status `ok`:
+```bash
+curl localhost:8000/health
+```
 
 ```json
 {"status": "ok"}
 ```
 
-Use this for Kubernetes liveness probes. It confirms the application is running.
-
-### Readiness probe (/ready)
-
-Runs all registered health checks and returns aggregate status:
+```bash
+curl localhost:8000/ready
+```
 
 ```json
+{"status": "healthy", "checks": {"check_database": {"healthy": true, "message": "Database connection OK"}}}
+```
+
+`/ready` always runs `check_database`.
+This check opens a new connection to the `default` database, and closes it. Thus it finds a database that stopped since the last request.
+
+## Add a check
+
+A check is an `async` function with no arguments. It returns a tuple: `True` or `False`, and a message.
+Add it with `add_health_check()`:
+
+```python title="blog/api.py"
+from django_bolt import BoltAPI
+from django_bolt.health import add_health_check, register_health_checks
+
+api = BoltAPI()
+register_health_checks(api)
+
+
+async def check_search_index() -> tuple[bool, str]:
+    return False, "Search index is rebuilding"
+
+
+async def check_cache() -> tuple[bool, str]:
+    raise ConnectionError("cache refused the connection")
+
+
+add_health_check(check_search_index)
+add_health_check(check_cache)
+```
+
+```bash
+curl -i localhost:8000/ready
+```
+
+```http
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+
 {
-    "status": "healthy",
-    "checks": {
-        "check_database": {
-            "healthy": true,
-            "message": "Database OK"
-        },
-        "check_redis": {
-            "healthy": true,
-            "message": "Redis OK"
-        }
-    }
+  "status": "unhealthy",
+  "checks": {
+    "check_database": {"healthy": true, "message": "Database connection OK"},
+    "check_search_index": {"healthy": false, "message": "Search index is rebuilding"},
+    "check_cache": {"healthy": false, "message": "Check failed: cache refused the connection"}
+  }
 }
 ```
 
-If any check fails:
+- The checks run at the same time. The name of each check is the name of its function.
+- A check that raises an exception is unhealthy. Its message is `Check failed: ` and the text of the exception.
+- `status` is `"unhealthy"` when one check or more is unhealthy. The status code is then `503`.
+- `check_database` runs first. `add_health_check()` adds a check after it.
+- The list of checks is one list for the process. Add the checks at import time, in `api.py`.
 
-```json
-{
-    "status": "unhealthy",
-    "checks": {
-        "check_database": {
-            "healthy": true,
-            "message": "Database OK"
-        },
-        "check_redis": {
-            "healthy": false,
-            "message": "Redis connection timeout"
-        }
-    }
-}
+## Write your own health routes
+
+Kubernetes and most load balancers read only the status code. Return `503` when a check fails.
+Use `HealthCheck` to run a list of checks of your own:
+
+```python title="blog/api.py"
+from django_bolt import JSON, BoltAPI
+from django_bolt.auth import AllowAny
+from django_bolt.health import HealthCheck, check_database
+
+api = BoltAPI()
+
+readiness = HealthCheck()
+readiness.add_check(check_database)
+
+
+@api.get("/health", guards=[AllowAny()])
+async def health() -> dict:
+    return {"status": "ok"}
+
+
+@api.get("/ready", guards=[AllowAny()])
+async def ready() -> dict:
+    result = await readiness.run_checks()
+    status_code = 200 if result["status"] == "healthy" else 503
+    return JSON(result, status_code=status_code)
 ```
 
-## Built-in checks
+When the database answers:
 
-### Database check
+```http
+HTTP/1.1 200 OK
+content-type: application/json
 
-Django-Bolt includes a database check:
-
-```python
-from django_bolt.health import check_database
-
-# Runs: await connection.ensure_connection()
-healthy, message = await check_database()
+{"status":"healthy","checks":{"check_database":{"healthy":true,"message":"Database connection OK"}}}
 ```
 
-This check is not automatically registered. Add it manually if needed.
+When Django cannot open the database, here an SQLite file in a directory that does not exist:
 
-## Custom health checks
+```http
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
 
-### Adding global checks
-
-Add checks that run on every `/ready` request:
-
-```python
-from django_bolt.health import add_health_check
-
-async def check_redis():
-    """Check Redis connectivity."""
-    try:
-        # Your Redis check logic
-        redis_client.ping()
-        return True, "Redis OK"
-    except Exception as e:
-        return False, f"Redis error: {e}"
-
-async def check_external_api():
-    """Check external API availability."""
-    try:
-        # Your API check logic
-        return True, "API OK"
-    except Exception as e:
-        return False, f"API unavailable: {e}"
-
-add_health_check(check_redis)
-add_health_check(check_external_api)
+{"status":"unhealthy","checks":{"check_database":{"healthy":false,"message":"Database error: unable to open database file"}}}
 ```
 
-### Health check function signature
+`HealthCheck` has two methods: `add_check(check)` and `await run_checks()`.
+`run_checks()` returns the dict that `/ready` sends.
 
-Health check functions must:
+## Keep health routes public
 
-1. Be async (`async def`)
-2. Take no arguments
-3. Return a tuple of `(bool, str)` - (healthy, message)
+A health route gets the default guards, as each other route does.
+With `BOLT_DEFAULT_PERMISSION_CLASSES = [IsAuthenticated()]`, the routes of `register_health_checks()` need a user:
 
-```python
-async def my_check() -> tuple[bool, str]:
-    # Your check logic
-    return True, "Check passed"
+```bash
+curl -i localhost:8000/health
 ```
 
-### Using HealthCheck class directly
+```http
+HTTP/1.1 401 Unauthorized
+content-type: application/json
 
-For more control, use the `HealthCheck` class:
-
-```python
-from django_bolt.health import HealthCheck
-
-health_check = HealthCheck()
-
-async def check_database():
-    return True, "Database OK"
-
-async def check_cache():
-    return True, "Cache OK"
-
-health_check.add_check(check_database)
-health_check.add_check(check_cache)
-
-# Run all checks
-results = await health_check.run_checks()
-# {
-#     "status": "healthy",
-#     "checks": {
-#         "check_database": {"healthy": True, "message": "Database OK"},
-#         "check_cache": {"healthy": True, "message": "Cache OK"}
-#     }
-# }
+{"detail":"Authentication required"}
 ```
 
-## Exception handling
+A probe sends no credentials. Write the routes yourself with `guards=[AllowAny()]`, as in [Write your own health routes](#write-your-own-health-routes).
+See [Permissions](permissions.md).
 
-Health checks catch exceptions automatically:
+## Configure Kubernetes probes
 
-```python
-async def failing_check():
-    raise RuntimeError("Something broke")
-
-health_check.add_check(failing_check)
-results = await health_check.run_checks()
-# {
-#     "status": "unhealthy",
-#     "checks": {
-#         "failing_check": {
-#             "healthy": False,
-#             "message": "Something broke"
-#         }
-#     }
-# }
-```
-
-## Kubernetes configuration
-
-### Liveness probe
+Use `/health` for the liveness probe and `/ready` for the readiness probe:
 
 ```yaml
 livenessProbe:
   httpGet:
     path: /health
     port: 8000
-  initialDelaySeconds: 5
   periodSeconds: 10
-```
-
-### Readiness probe
-
-```yaml
 readinessProbe:
   httpGet:
     path: /ready
     port: 8000
-  initialDelaySeconds: 10
   periodSeconds: 5
   failureThreshold: 3
 ```
 
-## Example: Complete setup
+Do not run database checks in the liveness probe. A database outage then restarts each pod, and a restart does not fix the database.
+Each call of `check_database` opens a database connection. Choose a `periodSeconds` that your database can serve for each pod.
 
-```python
-from django_bolt import BoltAPI
-from django_bolt.health import register_health_checks, add_health_check
+Set `terminationGracePeriodSeconds` above the `--workers-kill-timeout` of `runbolt`. See [Deployment](deployment.md#stop-the-server-gracefully).
 
-api = BoltAPI()
+## Health checks and the access log
 
-# Register health endpoints
-register_health_checks(api)
+An API with no `logging_config` writes no access-log line for `/health`, `/ready` and `/metrics`.
+The match is on the complete path. With `BoltAPI(prefix="/api")`, the path is `/api/health`, and its lines appear.
+Add the path to `skip_paths` to remove them. See [Logging](logging.md#skip-paths-and-status-codes).
 
-# Add database check
-async def check_database():
-    try:
-        from django.db import connection
-        await connection.ensure_connection()
-        return True, "Database OK"
-    except Exception as e:
-        return False, f"Database error: {e}"
+## See also
 
-# Add Redis check
-async def check_redis():
-    try:
-        import redis
-        r = redis.Redis()
-        r.ping()
-        return True, "Redis OK"
-    except Exception as e:
-        return False, f"Redis error: {e}"
-
-# Add message queue check
-async def check_celery():
-    try:
-        from celery import current_app
-        current_app.control.ping(timeout=1)
-        return True, "Celery OK"
-    except Exception as e:
-        return False, f"Celery error: {e}"
-
-add_health_check(check_database)
-add_health_check(check_redis)
-add_health_check(check_celery)
-```
-
-## Excluding from logs
-
-By default, health check paths are excluded from logging:
-
-```python
-from django_bolt.logging import LoggingConfig
-
-config = LoggingConfig()
-print(config.skip_paths)
-# {'/health', '/ready', '/metrics'}
-```
-
-See the [Logging](logging.md) guide for more details.
+- [Deployment](deployment.md)
+- [Logging](logging.md)
+- [Permissions](permissions.md)
+- [Responses](responses.md)

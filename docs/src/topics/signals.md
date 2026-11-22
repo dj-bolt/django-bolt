@@ -1,95 +1,123 @@
 ---
-icon: lucide/radio
+description: Send Django's request_started and request_finished signals for Django-Bolt requests with the BOLT_EMIT_SIGNALS setting.
 ---
 
-# Django Signals
+# Signals
 
-Django Bolt supports optional Django signal emission for compatibility with Django ecosystem features that depend on `request_started` and `request_finished` signals.
+By default, Django-Bolt does not send Django's request signals. Set `BOLT_EMIT_SIGNALS = True` to send `request_started` and `request_finished` for each request that reaches a handler. Use it when a receiver of these signals must see Bolt requests, for example an audit log.
 
-For more information on Django signals, see the [Django Signals documentation](https://docs.djangoproject.com/en/stable/topics/signals/).
+The other Django signals do not need this setting. The ORM sends `pre_save`, `post_save` and the other model signals, and `django.contrib.auth` sends its signals, as in Django.
 
-## Why Signals Are Optional
+## Turn on the request signals
 
-Django Bolt is designed for maximum performance. Django's signal system adds overhead to every request, which matters for high-throughput APIs. Django Bolt disables signals by default to eliminate this overhead.
+Add the setting:
 
-## Enabling Signals
-
-Add to your Django settings:
-
-```python
-# settings.py
+```python title="mysite/settings.py"
 BOLT_EMIT_SIGNALS = True
 ```
 
-## When You Need Signals
+Connect receivers as in Django:
 
-### Database Connection Management
+```python title="audit/api.py"
+from django.core.signals import request_finished, request_started
+from django.dispatch import receiver
 
-Django Bolt keeps database connections open across requests. Bolt does not need the request signals to manage them:
+from django_bolt import BoltAPI
 
-- Always: a handler, a QuerySet evaluation, or the load of `request.user` on the executor pool can raise. Bolt then runs `close_if_unusable_or_obsolete()` on that thread. Bolt drops the dead connection, and the next request reconnects. The request that met the dead connection fails: the connection looks fine until it is used. Bolt skips a connection inside an open `atomic` block. The next check after the block ends drops it.
-- Always: a database restart or failover kills the connection of each thread at once. When Bolt drops a connection that does not answer, every thread closes its older connections to that database before its next call, and reconnects. Connections to other databases stay open. A request lane does this when its request starts. Thus the first request that meets a dead connection fails, and so can requests that run on other threads at that time. The requests after it serve, on every thread. One restart makes one reconnect: a thread that meets a dead connection from before the first reconnect closes only its own. A query that fails on a connection that still answers, for example on a missing table, closes nothing on the other threads.
-- With a positive `CONN_MAX_AGE` or with `CONN_HEALTH_CHECKS`: Bolt runs the same check before each executor call too, and before each sync request on a worker thread that opened a connection. Timed recycling and health checks then work as in Django. A health check finds a dead connection before the query and replaces it, so no request fails.
+api = BoltAPI()
 
-Neither setting is on by default. A project that sets neither gets the first two tiers. After a database failover or a restart of PostgreSQL, the first request that meets a dead connection fails. Set `CONN_HEALTH_CHECKS = True` to serve that one too. With the default `CONN_MAX_AGE` of `0`, the same check closes the connection as obsolete before every call, so each call reconnects. Set a positive `CONN_MAX_AGE` as well to keep connections between calls.
 
-```python
-# settings.py
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": "mydb",
-        "CONN_MAX_AGE": 600,  # Recycle connections older than 600s
-        "CONN_HEALTH_CHECKS": True,  # Ping before the first query of a request
-    }
-}
+@receiver(request_started)
+def on_request_started(sender, scope, **kwargs):
+    print(f"started: {scope['method']} {scope['path']} ({sender.__name__})")
+
+
+@receiver(request_finished)
+def on_request_finished(sender, **kwargs):
+    print("finished")
+
+
+@api.get("/articles/{article_id}")
+async def get_article(article_id: int) -> dict:
+    print(f"handler: article {article_id}")
+    return {"id": article_id}
 ```
 
-The check before each call costs about 2 µs per open connection. Leave both settings unset to skip it. For PostgreSQL, a connection pool is the better option. See [Database connections](../getting-started/deployment.md#database-connections) in the deployment guide.
-
-With Django's connection pool (`OPTIONS["pool"]`), `CONN_MAX_AGE` must be `0`. A thread of Bolt then holds a pooled connection only while it has work. A worker of a Bolt thread pool gives the connection back when its queue is empty. A request lane gives it back at the end of each request, and a sync streaming body when the body ends. A worker thread gives it back at the end of a sync request that ran on it. A call on another thread, such as the event loop, gives it back when the call ends. A thread that kept its connection would hold a pool slot while it is idle. A thread that your code starts keeps its connection until it closes the connection. The check before each call skips a pooled database: the pool checks its own connections.
-
-Leave `CONN_HEALTH_CHECKS` off for a pooled database, and do not set `check` in `OPTIONS["pool"]`. Either one makes the pool run a check on each checkout. A worker checks out a connection again after each idle time, so many ORM calls get one more round trip. Bolt logs a warning at startup when a pool has a check.
-
-Bolt also keeps the pool clean after a database restart. The restart killed the idle connections of the pool too. Without a check, the pool gives each dead idle connection to a request, and that request fails. With a check, the pool tests idle connections one at a time, and it sleeps after each one that fails: 0, 1, 2, 4 s and so on. Thus, when Bolt finds the first dead connection of a pool, it runs `drain()` of that pool. The pool closes its idle connections and opens new ones. It also drops each older connection that a thread gives back. `drain()` sends nothing on the network, so a network partition cannot make the thread wait.
-
-`drain()` is in psycopg_pool 3.3 and later. The `pool` extra installs it: `pip install "django-bolt[pool]"`. With an older psycopg_pool, Bolt logs a warning at startup and does not drain the pool. After a restart, each dead idle connection of the pool then fails one request.
-
-A forked process inherits the open connections of its parent. Two processes that use one connection read the results of each other's queries. `runbolt --processes N` closes the connections and the pools of its parent before it starts each worker. When a close fails, `runbolt` stops with the error and starts no worker.
-
-### Third-Party Packages
-
-Some Django packages rely on signals:
-
-- **django-debug-toolbar** - Uses signals for request tracking
-- **django-silk** - Profiling middleware uses signals
-- **Custom audit logging** - May hook into request signals
-
-If you use such packages, enable signals:
-
-```python
-BOLT_EMIT_SIGNALS = True
+```bash
+curl localhost:8000/articles/3
 ```
 
-## The scope of `request_started`
+The output of `runbolt`:
+
+```text
+started: GET /articles/3 (BoltAPI)
+handler: article 3
+finished
+```
+
+The `sender` of the two signals is the `BoltAPI` class.
+
+Bolt reads `BOLT_EMIT_SIGNALS` when you create a `BoltAPI`. In a test, change the setting before you create the API:
+
+<!-- fragment -->
+```python
+with override_settings(BOLT_EMIT_SIGNALS=True):
+    api = BoltAPI()
+```
+
+## Read the request in `request_started`
 
 A receiver of `request_started` gets a `scope` dict:
 
 | Key | Value |
-|-----|-------|
+| --- | --- |
 | `type` | `"http"` |
-| `method` | The HTTP method |
-| `path` | The request path |
-| `query_string` | The query string as `bytes`, still encoded. It is `b""` for a request with no query. |
-| `headers` | A dict of the request headers. Each name is in lower case. |
+| `method` | The HTTP method, for example `"GET"`. |
+| `path` | The request path, for example `"/articles/3"`. |
+| `query_string` | The query string as `bytes`, still encoded, for example `b"a=1&b=x%20y"`. It is `b""` for a request with no query. |
+| `headers` | A `dict` of the request headers. Each name is in lower case. |
 
-With signals on, Bolt keeps the query string and the headers of each request, also for a route that reads no query and no header.
+`request_finished` has no `scope`.
 
-## Summary
+## Know which requests send the signals
 
-| Setting | Performance | Use Case |
-|---------|-------------|----------|
-| `BOLT_EMIT_SIGNALS=False` (default) | Maximum | Most APIs with connection pooling |
-| `BOLT_EMIT_SIGNALS=True` | Slight overhead | Debug tools, signal receivers |
+Bolt sends the signals around the Python part of a request. A request that Bolt answers in Rust sends no signal.
+A 404, a 405, a 401 or a 403 of Rust goes through Python when the route has Python or Django middleware. This includes the middleware of the API and of a router. See [Responses from Rust](middleware.md#responses-from-rust).
 
-**Rule of thumb:** Use connection pooling and keep signals disabled unless you have a specific reason to enable them.
+| Request | Signals |
+| --- | --- |
+| The handler returns a response. | Both |
+| The handler raises an error, for example `HTTPException` or an unexpected error that gives 500. | Both |
+| A JSON body fails validation (422). | Both |
+| A form field is missing (422). | Both |
+| A form field has the wrong type (422). Rust checks the type. | None |
+| No route matches the path (404), or the path has no route for the method (405). | Both when the API has middleware. Else none. |
+| Authentication or a guard refuses the request (401, 403). | Both when the route has middleware. Else none. |
+| A rate limit refuses the request (429). | None |
+| A CORS preflight, or an automatic `OPTIONS` response. | None |
+| A path or query value has the wrong type (422). | None |
+| A static file or a media file. | None |
+| A WebSocket connection. | None |
+
+An app that you mount with `api.mount_django()`, for example the Django admin, is a Django ASGI application. Django sends both signals for its requests, with the sender `ASGIHandler`. This does not depend on `BOLT_EMIT_SIGNALS`.
+
+Bolt never sends `got_request_exception`.
+
+## Know when the signals run
+
+Bolt sends the two signals with `Signal.asend()`. A sync receiver runs in a thread of the Bolt ORM pool, not in the thread of the handler. Thus `threading.local` data of the handler is not visible in a receiver.
+
+`request_started` runs before the handler. `request_finished` runs when the handler returns. For a streaming response, `request_finished` runs before Bolt sends the body. The generator of the body runs after the signal.
+
+## Know the cost
+
+With the signals on, each request awaits the two signal sends. Bolt also cannot use its fast path, which runs a handler with no event loop. Thus each request goes through the event loop. Turn the setting on only when a receiver needs it.
+
+You do not need the signals for the database connections. Bolt manages the connections of its threads itself. See [Configure database connections](deployment.md#configure-database-connections).
+
+## See also
+
+- [Settings reference](../ref/settings.md): `BOLT_EMIT_SIGNALS`.
+- [Lifespan](lifespan.md): run code when the server starts and stops.
+- [Middleware](middleware.md): run code around each request.
+- [Django signals](https://docs.djangoproject.com/en/stable/topics/signals/)

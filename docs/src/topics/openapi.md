@@ -1,356 +1,413 @@
 ---
-icon: lucide/file-code-2
+description: Generate an OpenAPI schema from your handlers, serve it with five docs UIs at /docs, protect or turn off the docs, and generate client code.
 ---
 
-# OpenAPI Documentation
+# OpenAPI
 
-Django-Bolt automatically generates OpenAPI documentation for your API. This guide covers how to configure and customize the documentation.
+Django-Bolt makes an OpenAPI 3.1 schema from your routes, type hints and docstrings. `runbolt` serves the schema and five docs UIs at `/docs`. You do not write the schema by hand.
 
-## Accessing the documentation
+## Open the docs
 
-By default, Django-Bolt serves multiple documentation UIs automatically:
+Each `BoltAPI` has docs by default. Pass an `OpenAPIConfig` to set the title, the version and the description:
 
-| Path | UI |
-|------|-----|
-| `/docs` | Swagger UI (default) |
-| `/docs/redoc` | Redoc |
+```python title="articles/api.py"
+import msgspec
+
+from django_bolt import BoltAPI
+from django_bolt.openapi import OpenAPIConfig
+
+openapi_config = OpenAPIConfig(
+    title="Publishing API",
+    version="1.0.0",
+    description="Read and write articles.",
+)
+api = BoltAPI(openapi_config=openapi_config)
+
+
+class Article(msgspec.Struct):
+    id: int
+    title: str
+    published: bool
+
+
+class ArticleIn(msgspec.Struct):
+    title: str
+    body: str
+
+
+@api.get("/articles/{article_id}")
+async def get_article(article_id: int) -> Article:
+    """Get one article.
+
+    Return the article with this ID, also when it is a draft.
+    """
+    return Article(id=article_id, title="Hello", published=True)
+
+
+@api.post("/articles", status_code=201)
+async def create_article(data: ArticleIn) -> Article:
+    """Create a draft article."""
+    return Article(id=1, title=data.title, published=False)
+```
+
+Start the server and open `http://localhost:8000/docs`:
+
+```bash
+python manage.py runbolt
+```
+
+| URL | Content |
+| --- | --- |
+| `/docs` | Swagger UI |
+| `/docs/redoc` | ReDoc |
 | `/docs/scalar` | Scalar |
 | `/docs/rapidoc` | RapiDoc |
 | `/docs/stoplight` | Stoplight Elements |
-| `/docs/openapi.json` | Raw JSON schema |
-| `/docs/openapi.yaml` | Raw YAML schema |
+| `/docs/openapi.json` | The schema as JSON, with the media type `application/vnd.oai.openapi+json` |
+| `/docs/openapi.yaml`, `/docs/openapi.yml` | The schema as YAML |
 
-Start your server and visit any of these URLs to browse your API documentation.
+The schema has the routes, the parameters, the request bodies and the responses:
 
-## Configuring OpenAPI
+```bash
+curl -s localhost:8000/docs/openapi.json | jq '.paths["/articles/{article_id}"].get | {tags, summary, description, operationId}'
+```
 
-Customize the documentation using `OpenAPIConfig`:
+```json
+{
+  "tags": [
+    "Articles"
+  ],
+  "summary": "Get one article.",
+  "description": "Return the article with this ID, also when it is a draft.",
+  "operationId": "get_get_article"
+}
+```
+
+`runbolt` adds the docs routes when it starts. `TestClient` does not serve them. The docs paths do not get the `prefix` of the `BoltAPI`.
+
+When `runbolt` finds more than one `BoltAPI`, one schema covers the routes of all of them. It uses the `OpenAPIConfig` of the first API that it finds. That is the API of the `BOLT_API` setting, or else the API of the project package, or else the first app in `INSTALLED_APPS`.
+
+## Configure the document
+
+`OpenAPIConfig` is a dataclass. `title` and `version` are required.
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `title` | `str` | required | The `info.title` of the document. |
+| `version` | `str` | required | The `info.version` of the document. |
+| `description` | `str \| None` | `None` | The `info.description`. |
+| `summary` | `str \| None` | `None` | The `info.summary`. |
+| `contact` | `Contact \| None` | `None` | The `info.contact`. |
+| `license` | `License \| None` | `None` | The `info.license`. |
+| `terms_of_service` | `str \| None` | `None` | A URL, the `info.termsOfService`. |
+| `external_docs` | `ExternalDocumentation \| None` | `None` | A link to more documentation. |
+| `servers` | `list[Server]` | `[Server(url="/")]` | The servers that the UIs send requests to. |
+| `tags` | `list[Tag] \| None` | `None` | Tags with a description. See [Group operations with tags](#group-operations-with-tags). |
+| `security` | `list[SecurityRequirement] \| None` | `None` | The security requirements of the whole document. |
+| `components` | `Components` | `Components()` | Components to add, for example your own security schemes. |
+| `webhooks` | `dict[str, PathItem \| Reference] \| None` | `None` | The webhooks of the document. |
+| `use_handler_docstrings` | `bool` | `True` | Make the summary and the description from the docstring of the handler. |
+| `path` | `str` | `"/docs"` | The base path of the docs routes. |
+| `render_plugins` | `list[OpenAPIRenderPlugin]` | the five UIs | The docs UIs. See [Choose the docs UIs](#choose-the-docs-uis). |
+| `exclude_paths` | `list[str]` | `["/admin", "/static"]` | Path prefixes to leave out of the schema. |
+| `include_error_responses` | `bool` | `True` | Add the 422, 401, 403 and 302 responses that Bolt can send. |
+| `strict` | `bool` | `False` | Raise an error for a schema that client generators cannot type. See [Check the schema in CI](#check-the-schema-in-ci). |
+| `enabled` | `bool` | `True` | Serve the docs routes. |
+| `auth` | `list[BaseAuthentication] \| None` | `None` | The authentication backends of the docs routes. |
+| `guards` | `list[Guard] \| None` | `None` | The guards of the docs routes. |
+
+Import `Contact`, `License`, `ExternalDocumentation`, `Server`, `Tag` and `Components` from `django_bolt.openapi.spec`:
+
+```python title="articles/api.py"
+from django_bolt import BoltAPI
+from django_bolt.openapi import OpenAPIConfig
+from django_bolt.openapi.spec import Contact, License, Server
+
+api = BoltAPI(
+    openapi_config=OpenAPIConfig(
+        title="Publishing API",
+        version="2.1.0",
+        contact=Contact(name="API team", email="api@example.com"),
+        license=License(name="MIT", identifier="MIT"),
+        servers=[Server(url="https://api.example.com", description="Production")],
+    )
+)
+```
+
+Without an `OpenAPIConfig`, the title is the `PROJECT_NAME` setting, or the `SITE_NAME` setting, or `"API"`. The version is `"1.0.0"`.
+
+## Describe an operation
+
+Bolt makes the summary and the description of an operation from the docstring of the handler. The first line is the summary. The other lines are the description. The `get_article` handler above shows this.
+
+To set them yourself, pass `summary` and `description` to the route decorator. These arguments win over the docstring:
+
+```python
+@api.get("/articles", summary="List articles", description="Return the published articles, newest first.")
+async def list_articles() -> list[Article]:
+    return []
+```
+
+Set `use_handler_docstrings=False` in the `OpenAPIConfig` to keep docstrings out of the schema.
+
+The `operationId` is the HTTP method and the function name: `get_list_articles`. When two routes get the same ID, Bolt adds `_2`, `_3` and so on to the later ones. Client generators use this ID as the name of a function.
+
+### Group operations with tags
+
+Without `tags`, an operation gets one tag from the module of its handler. A handler in `articles/api.py` gets the tag `Articles`.
+
+Set `tags` on a route or on a `Router`. A `tags` value on a route replaces the tags of its router:
+
+```python
+from django_bolt import Router
+
+router = Router(prefix="/comments", tags=["Comments"])
+
+
+@router.get("/{comment_id}")
+async def get_comment(comment_id: int) -> dict:
+    return {"id": comment_id}
+
+
+api.include_router(router)
+```
+
+To give a tag a description, add a `Tag` to `OpenAPIConfig(tags=...)`:
+
+<!-- fragment -->
+```python
+OpenAPIConfig(
+    title="Publishing API",
+    version="1.0.0",
+    tags=[Tag(name="Comments", description="Read and write comments.")],
+)
+```
+
+### Describe parameters and fields
+
+Pass `description` to `Query`, `Path`, `Header`, `Cookie` or `Body`. Constraints such as `ge` show in the schema too:
+
+```python
+from typing import Annotated
+
+from django_bolt.params import Query
+
+
+@api.get("/articles")
+async def list_articles(
+    page: Annotated[int, Query(description="The page number, from 1.", ge=1)] = 1,
+) -> list[Article]:
+    return []
+```
+
+```json
+{"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1, "default": 1}, "description": "The page number, from 1.", "required": false, "deprecated": false, "allowEmptyValue": false, "allowReserved": false}
+```
+
+For a field of a `msgspec.Struct`, use `msgspec.Meta`. The docstring of the struct is the description of its schema:
+
+```python
+from typing import Annotated
+
+import msgspec
+
+
+class Article(msgspec.Struct):
+    """A published article."""
+
+    id: int
+    title: Annotated[str, msgspec.Meta(description="The headline of the article.", max_length=200)]
+```
+
+```json
+{"properties": {"id": {"type": "integer"}, "title": {"type": "string", "maxLength": 200, "description": "The headline of the article."}}, "type": "object", "required": ["id", "title"], "title": "Article", "description": "A published article."}
+```
+
+For a Bolt `Serializer`, use `field(description=...)`. See [Serializers](serializers.md).
+
+## Document responses
+
+The return annotation of the handler is the schema of the success response. `response_model` does the same and wins over the annotation. `status_code` sets the status of the success response. The default is 200.
+
+A handler with no return annotation and no `response_model` gets the schema `{"type": "object"}`. Client generators cannot type such a response. Add an annotation.
+
+### One schema for each status
+
+Pass a `dict` to `response_model` to document more than one status:
+
+```python
+class Error(msgspec.Struct):
+    detail: str
+
+
+@api.get("/articles/{article_id}", response_model={200: Article, 404: Error})
+async def get_article(article_id: int):
+    ...
+
+
+@api.delete("/articles/{article_id}", status_code=204, response_model={204: None})
+async def delete_article(article_id: int):
+    ...
+```
+
+- A key `...` (Ellipsis) gives the `default` response: each status that the dict does not list.
+- A value `None` gives a response with no body.
+
+### Responses that are not JSON
+
+`response_class` sets the media type. A return annotation with one of these classes has the same effect:
+
+| `response_class` or return type | Media type in the schema |
+| --- | --- |
+| `HTML` | `text/html` |
+| `PlainText`, `str` | `text/plain` |
+| `EventSourceResponse` | `text/event-stream` |
+| `StreamingResponse`, `File`, `FileResponse`, `bytes` | `application/octet-stream` |
+| `Redirect` | No body. The status is 307, or the `status_code` of the route. |
+
+### Error responses
+
+Bolt adds the error responses that it sends itself:
+
+- **422** for a route with a path, query, header or cookie parameter, or a request body. The body is `{"detail": ...}`.
+- **401** for a route with an authentication backend and a guard, when the first guard is not `AllowAny`.
+- **403** for a route with `Requires`.
+- **302** in place of the 401 for a route with `SessionAuthentication(login_url=...)`.
+
+With `BoltAPI(error_formatter=...)`, the error bodies have the schema of the formatter. See [Error handling](error-handling.md).
+
+Set `include_error_responses=False` in the `OpenAPIConfig` to document only the success responses.
+
+## Mark a route as deprecated
+
+Pass `deprecated=True`. The operation gets `"deprecated": true`, and the UIs show it as deprecated. The server still serves the route:
+
+```python
+@api.get("/v1/articles", deprecated=True)
+async def list_articles_v1() -> list[Article]:
+    return []
+```
+
+The route decorators of `BoltAPI` and `Router`, `@api.view()`, `@api.viewset()` and `@action` take `deprecated`. On `@api.viewset()`, it marks each route of the viewset, its actions included.
+
+## Leave a route out of the schema
+
+Pass `include_in_schema=False`. The server still serves the route:
+
+```python
+@api.get("/internal/stats", include_in_schema=False)
+async def stats() -> dict:
+    return {"articles": 2}
+```
+
+You can set `include_in_schema` at three levels. The most specific level that is not `None` wins:
+
+1. A route decorator, or an `@action`.
+2. `@api.view()` or `@api.viewset()`, or the `include_in_schema` attribute of the view class.
+3. `BoltAPI(include_in_schema=...)`. A mounted API without a value takes the value of its parent. The root API uses `True`.
+
+This hides each route of a mounted API, except one:
+
+```python
+ops_api = BoltAPI(include_in_schema=False)
+
+
+@ops_api.get("/stats")
+async def ops_stats() -> dict:
+    return {}
+
+
+@ops_api.get("/status", include_in_schema=True)
+async def ops_status() -> dict:
+    return {}
+
+
+api.mount("/ops", ops_api)
+```
+
+`OpenAPIConfig(exclude_paths=[...])` leaves out each path under a prefix. A prefix matches whole path segments: `/admin` matches `/admin` and `/admin/users`, not `/administrators`. The default is `["/admin", "/static"]`. The docs path is always left out.
+
+## Document authentication
+
+A route with `auth` gets a `security` requirement, with one entry for each backend. A request needs one of them. Bolt adds each scheme to `components.securitySchemes`:
+
+| Backend | Scheme name | Scheme |
+| --- | --- | --- |
+| `JWTAuthentication()` | `BearerAuth` | `http`, `bearer`, format `JWT` |
+| `JWTAuthentication(cookie="...")` | `JWTCookieAuth` | `apiKey` in that cookie |
+| `JWTAuthentication(header="...")`, not `Authorization` | `JWTHeaderAuth` | `apiKey` in that header |
+| `APIKeyAuthentication()` | `ApiKeyAuth` | `apiKey` in the header of the backend, `x-api-key` by default |
+| `SessionAuthentication()` | `SessionAuth` | `apiKey` in the cookie `SESSION_COOKIE_NAME` |
+
+```python
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
+
+
+@api.get("/drafts", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+async def drafts() -> list[Article]:
+    return []
+```
+
+```bash
+curl -s localhost:8000/docs/openapi.json | jq -c '.paths["/drafts"].get | {security, responses: (.responses | keys)}'
+```
+
+```json
+{"security":[{"BearerAuth":[]}],"responses":["200","401"]}
+```
+
+Two backends of one kind that read different places get two schemes, for example `ApiKeyAuth` and `ApiKeyAuth2`. A scheme with one of these names in `OpenAPIConfig(components=...)` stays as you wrote it.
+
+## Choose the docs UIs
+
+`render_plugins` replaces the five default UIs. Each plugin takes a `path`, relative to `OpenAPIConfig.path`. The docs root (`/docs`) shows the plugin whose path is `"/"`, or else the first plugin:
 
 ```python
 from django_bolt import BoltAPI
+from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, ScalarRenderPlugin
+
+api = BoltAPI(
+    openapi_config=OpenAPIConfig(
+        title="Publishing API",
+        version="1.0.0",
+        path="/api-docs",
+        render_plugins=[ScalarRenderPlugin(path="/"), RedocRenderPlugin()],
+    )
+)
+```
+
+This serves Scalar at `/api-docs` and ReDoc at `/api-docs/redoc`. The JSON and YAML schema routes are always there: `/api-docs/openapi.json`, `/api-docs/openapi.yaml` and `/api-docs/openapi.yml`.
+
+The `path` column gives the default of the constructor. The default UIs of `OpenAPIConfig` pass their own paths, as the URL table above shows.
+
+| Plugin | Default `path` | Other arguments |
+| --- | --- | --- |
+| `SwaggerRenderPlugin` | `"/swagger"` | `version="5.32.9"`, `js_url`, `css_url`, `standalone_preset_js_url` |
+| `RedocRenderPlugin` | `"/redoc"` | `version="2.5.3"`, `js_url`, `google_fonts=True` |
+| `ScalarRenderPlugin` | `["/scalar", "/"]` | `version="latest"`, `js_url`, `css_url`, `options` (a `dict` of Scalar settings) |
+| `RapidocRenderPlugin` | `"/rapidoc"` | `version="9.3.4"`, `js_url` |
+| `StoplightRenderPlugin` | `"/elements"` | `version="7.7.18"`, `js_url`, `css_url` |
+| `JsonRenderPlugin` | `"/openapi.json"` | |
+| `YamlRenderPlugin` | `["/openapi.yaml", "/openapi.yml"]` | |
+
+`path` takes a string or a list of strings. Bolt adds the leading slash and removes the trailing slash. Each plugin also takes `favicon` (an HTML `<link>` tag) and `style` (an HTML `<style>` tag).
+
+The UI pages load their JavaScript and CSS from jsDelivr or unpkg. Without access to these CDNs, or with a strict Content Security Policy, host the files yourself and pass `js_url` and `css_url`.
+
+## Protect the docs
+
+The docs routes take `auth` and `guards`, as each route does. Without them, the docs use `BOLT_AUTHENTICATION_CLASSES` and `BOLT_DEFAULT_PERMISSION_CLASSES`.
+
+A browser does not send a token. For docs that people open in a browser, use `SessionAuthentication`. This example lets in the staff users who logged in to the Django admin:
+
+```python
+from django_bolt import BoltAPI
+from django_bolt.auth import Requires, SessionAuthentication
 from django_bolt.openapi import OpenAPIConfig
 
 api = BoltAPI(
     openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        description="API for my application",
-        enabled=True,
-    )
-)
-```
-
-## Available options
-
-```python
-OpenAPIConfig(
-    title="My API",              # API title
-    version="1.0.0",             # API version
-    description="Description",   # API description
-    enabled=True,                # Enable/disable docs
-    path="/docs",                # Docs URL. The schema is at {path}/openapi.json
-    auth=None,                   # Auth backends for the docs routes
-    guards=None,                 # Guards for the docs routes
-    strict=False,                # Fail generation on untypeable shapes (see below)
-)
-```
-
-### Strict mode
-
-Set `OpenAPIConfig(strict=True)` to make schema generation fail on shapes that
-client code generators cannot type. `SchemaGenerator.generate()` raises
-`OpenAPIStrictError`. The error lists all problems at the same time. These are
-the problems:
-
-- A route has the success response `{"type": "object"}`. The route has no
-  return annotation and no `response_model`.
-- A component name uses the long form `module.qualname`. This occurs when two
-  types have the same short name.
-- The `error_formatter` of the API has no `error_schema`, and a route has a 422,
-  401 or 403 response. See [OpenAPI schema](error-handling.md#openapi-schema).
-
-Routes with `include_in_schema=False` are not problems. Routes with a non-JSON
-`response_class` are not problems. Run strict mode in CI to keep the generated
-clients correct.
-
-## Documenting endpoints
-
-### Summary and description
-
-```python
-@api.get(
-    "/users/{user_id}",
-    summary="Get a user",
-    description="Retrieve a user by their unique ID.",
-    tags=["users"]
-)
-async def get_user(user_id: int):
-    """
-    This docstring also appears in the documentation.
-
-    Additional details about the endpoint can go here.
-    """
-    return {"user_id": user_id}
-```
-
-### Tags
-
-Group endpoints using tags:
-
-```python
-@api.get("/users", tags=["users"])
-async def list_users():
-    return []
-
-@api.post("/users", tags=["users"])
-async def create_user():
-    return {}
-
-@api.get("/articles", tags=["articles"])
-async def list_articles():
-    return []
-```
-
-Tags appear as sections in the Swagger UI.
-
-### Response models
-
-Document response schemas:
-
-```python
-import msgspec
-
-class User(msgspec.Struct):
-    id: int
-    username: str
-    email: str
-
-@api.get("/users/{user_id}", response_model=User)
-async def get_user(user_id: int):
-    return {"id": user_id, "username": "john", "email": "john@example.com"}
-```
-
-The schema is automatically generated from the `msgspec.Struct`.
-
-### Per-status-code response schemas
-
-When `response_model` is a dict mapping status codes to types, the OpenAPI schema generates a separate response entry for each status code:
-
-```python
-@api.get("/items/{item_id}", response_model={200: Item, 404: Error})
-async def get_item(item_id: int):
-    ...
-```
-
-This produces OpenAPI responses with both `200` and `404` entries, each with their own schema.
-
-Using `...` (ellipsis) as a key emits a `"default"` response entry in the OpenAPI spec, which represents any status code not explicitly listed:
-
-```python
-@api.get("/items/{item_id}", response_model={200: Item, ...: Error})
-async def get_item(item_id: int):
-    ...
-```
-
-Using `{204: None}` generates a response entry with no content body, appropriate for No Content responses.
-
-### Request body schemas
-
-Request bodies are documented automatically:
-
-```python
-class CreateUser(msgspec.Struct):
-    username: str
-    email: str
-    password: str
-
-@api.post("/users")
-async def create_user(user: CreateUser):
-    return {"id": 1, "username": user.username}
-```
-
-A `Serializer` has two schemas if its input and its output do not have the same fields. The request body schema has no `read_only` field and no computed field. The response schema has no `write_only` field. It marks each `read_only` field and each computed field `readOnly: true`. If the API uses the serializer for the two, the response uses the component `<Name>` and the request body uses the component `<Name>Input`. See [Read-only fields](serializers.md#read-only-fields).
-
-### Status codes
-
-Document the default status code:
-
-```python
-@api.post("/users", status_code=201)
-async def create_user():
-    return {"id": 1}
-```
-
-### Error responses
-
-The schema shows a 422 response for each route whose input Bolt validates.
-Such a route has a path, query, header or cookie parameter, or a request body.
-A route with no parameter and no body has no 422. Set
-`OpenAPIConfig(include_error_responses=False)` to remove these responses.
-
-Without a formatter, the 422 body is `{"detail": ...}`. For a route with only a
-JSON body, `detail` is a list of field errors. For a route with a parameter or
-a form field, `detail` is a list of field errors or a text. Bolt sends the text
-for a missing value and for a value of the wrong type. With
-`BoltAPI(error_formatter=...)`, the 422 shows the body of the formatter. A route
-that declares its own 422 in `response_model` keeps it. The 422 also shows the
-validation body when the API has no formatter, or a formatter with
-`error_schema`. See [OpenAPI schema](error-handling.md#openapi-schema).
-
-### Authentication
-
-A route with an auth backend gets a `security` requirement. The list has one
-entry for each backend of the route. A request needs only one of them. Each
-scheme is in `components.securitySchemes`:
-
-| Backend | Scheme name | Scheme |
-|---|---|---|
-| `JWTAuthentication()` | `BearerAuth` | `http`, `bearer`, format `JWT` |
-| `JWTAuthentication(cookie="name")` | `JWTCookieAuth` | `apiKey` in the cookie `name` |
-| `JWTAuthentication(header="X-Token")` | `JWTHeaderAuth` | `apiKey` in the header `X-Token` |
-| `APIKeyAuthentication()` | `ApiKeyAuth` | `apiKey` in the header of the backend |
-| `SessionAuthentication()` | `SessionAuth` | `apiKey` in the session cookie |
-
-Two backends of one kind can read from different places, for example two API
-key headers. The second place gets its own scheme, such as `ApiKeyAuth2`. A
-scheme in `OpenAPIConfig(components=...)` with one of these names stays as you
-wrote it.
-
-The schema also shows the error responses that the guards of such a route can
-send:
-
-- 401 for a route with `IsAuthenticated` or `Requires`. The response has the
-  `WWW-Authenticate` header.
-- 403 for a route with `Requires`. This guard can deny a user.
-- 302 in place of the 401 for a route with
-  `SessionAuthentication(login_url=...)`. The response has the `Location`
-  header.
-
-The body is `{"detail": "<message>"}`, or the body of the `error_formatter` of
-the API. A route with no auth backend has none of these responses. A route with
-no guard, or with `AllowAny` as its first guard, has none of them.
-`OpenAPIConfig(include_error_responses=False)` removes them.
-
-## Customizing documentation UIs
-
-By default, all documentation UIs are served automatically. To serve only specific UIs, provide a custom `render_plugins` list:
-
-### Swagger UI only
-
-```python
-from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        render_plugins=[SwaggerRenderPlugin(path="/")],
-    )
-)
-```
-
-### ReDoc only
-
-```python
-from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        render_plugins=[RedocRenderPlugin(path="/")],
-    )
-)
-```
-
-### Scalar only
-
-```python
-from django_bolt.openapi import OpenAPIConfig, ScalarRenderPlugin
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        render_plugins=[ScalarRenderPlugin(path="/")],
-    )
-)
-```
-
-### Stoplight Elements only
-
-```python
-from django_bolt.openapi import OpenAPIConfig, StoplightRenderPlugin
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        render_plugins=[StoplightRenderPlugin(path="/")],
-    )
-)
-```
-
-### RapiDoc only
-
-```python
-from django_bolt.openapi import OpenAPIConfig, RapidocRenderPlugin
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        render_plugins=[RapidocRenderPlugin(path="/")],
-    )
-)
-```
-
-### Multiple UIs at custom paths
-
-```python
-from django_bolt.openapi import (
-    OpenAPIConfig,
-    SwaggerRenderPlugin,
-    RedocRenderPlugin,
-)
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        render_plugins=[
-            SwaggerRenderPlugin(path="/"),      # /docs
-            RedocRenderPlugin(path="/redoc"),   # /docs/redoc
-        ],
-    )
-)
-```
-
-Bolt gives the path of `OpenAPIConfig` and the path of each plugin a leading slash. Thus `OpenAPIConfig(path="docs")` with `RedocRenderPlugin(path="redoc")` serves `/docs/redoc`.
-
-## Raw OpenAPI JSON/YAML
-
-The raw OpenAPI specification is always available at:
-
-- `/docs/openapi.json` - JSON format
-- `/docs/openapi.yaml` - YAML format (requires `pyyaml` package)
-
-## Protecting documentation
-
-The docs routes take `auth` and `guards`, as every route does. Without them, the docs use `BOLT_AUTHENTICATION_CLASSES` and `BOLT_DEFAULT_PERMISSION_CLASSES`.
-
-### Django session authentication
-
-A browser does not send a token. Use `SessionAuthentication` for docs that people open in a browser. Bolt adds Django's session and auth middleware to the docs routes.
-
-This example gives the docs to staff users who logged in to the Django admin:
-
-```python
-from django_bolt.auth import Requires, SessionAuthentication
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
+        title="Publishing API",
         version="1.0.0",
         auth=[SessionAuthentication(login_url="/admin/login/")],
         guards=[Requires("is_staff", True)],
@@ -358,168 +415,85 @@ api = BoltAPI(
 )
 ```
 
-- An anonymous user goes to the admin login page. After the login, Django sends the user back to the docs.
+- An anonymous user gets a 302 to `/admin/login/?next=/docs`. After the login, Django sends the user back to the docs.
 - A logged-in user who is not staff gets 403.
 - Without `login_url`, an anonymous user gets 401.
 
-To let any logged-in user see the docs, use `guards=[IsAuthenticated()]`.
+To let in each logged-in user, use `guards=[IsAuthenticated()]`. For docs that a program reads, use `auth=[JWTAuthentication()]` or an API key, with `guards=[IsAuthenticated()]`. A request with no valid token then gets 401. `auth` with no `guards` uses `BOLT_DEFAULT_PERMISSION_CLASSES`. With the default `[AllowAny()]`, the docs stay open.
 
-### Token authentication
+## Turn off the docs in production
 
-Protect the docs with a JWT or an API key. A request with no valid token gets 401 or 403, with no redirect:
-
-```python
-from django_bolt.auth import JWTAuthentication, IsAuthenticated
-
-api = BoltAPI(
-    openapi_config=OpenAPIConfig(
-        title="My API",
-        version="1.0.0",
-        auth=[JWTAuthentication()],
-        guards=[IsAuthenticated()],
-    )
-)
-```
-
-### Disabling documentation
-
-Disable documentation in production:
+Set `enabled=False`. `runbolt` then adds no docs routes, and `/docs` gives 404:
 
 ```python
 import os
 
+from django_bolt import BoltAPI
+from django_bolt.openapi import OpenAPIConfig
+
 api = BoltAPI(
     openapi_config=OpenAPIConfig(
-        title="My API",
-        enabled=os.environ.get("DEBUG", "false").lower() == "true",
+        title="Publishing API",
+        version="1.0.0",
+        enabled=os.environ.get("ENABLE_API_DOCS") == "1",
     )
 )
 ```
 
-## Parameter documentation
+## Check the schema in CI
 
-Parameters are documented automatically from function signatures:
+Client generators need a typed schema. `strict=True` makes schema generation raise `OpenAPIStrictError` for each of these problems:
 
-```python
-@api.get("/search")
-async def search(
-    q: str,           # Required query parameter
-    page: int = 1,    # Optional with default
-    limit: int = 20,  # Optional with default
-):
-    """
-    Search for items.
+- A route has a JSON success response with no type: no return annotation and no `response_model`.
+- Two types have the same short name, so a component name falls back to `module.qualname`.
+- The `error_formatter` of the API has no `error_schema`, and a route has a 422, 401 or 403 response.
 
-    - **q**: Search query string (required)
-    - **page**: Page number (default: 1)
-    - **limit**: Items per page (default: 20)
-    """
-    return {"query": q, "page": page, "limit": limit}
+Routes with `include_in_schema=False` and routes that do not send JSON are not problems.
+
+With `strict=True` on the served config, `/docs/openapi.json` gives a 500 for a schema with problems. Run the check in a test instead. Generate the schema with `SchemaGenerator` and a strict copy of the config:
+
+```python title="tests/test_openapi.py"
+from dataclasses import replace
+
+from articles.api import api, openapi_config
+from django_bolt.openapi.schema_generator import SchemaGenerator
+
+
+def test_schema_has_no_untyped_shapes():
+    strict_config = replace(openapi_config, strict=True)
+    SchemaGenerator(api, strict_config).generate()
 ```
 
-## Hiding endpoints
+For a route `GET /stats` with no return annotation, the test fails with this error. It lists each problem:
 
-Set `include_in_schema=False` to remove endpoints from the documentation. The
-server continues to serve them. The flag is layered. You can set it on a route,
-on a view class, or on a `BoltAPI`. The most specific layer wins:
-
-```python
-@api.get("/internal", include_in_schema=False)
-async def internal():
-    return {"internal": True}
-
-
-@api.view("/admin", include_in_schema=False)
-class AdminView(APIView):
-    async def get(self):
-        return {}
-
-
-class InternalViewSet(ViewSet):
-    include_in_schema = False  # the class attribute is the middle layer
-    ...
-
-
-# Hide a whole sub-API. A route with include_in_schema=True stays visible.
-internal_api = BoltAPI(include_in_schema=False)
-api.mount("/internal", internal_api)
+```text
+django_bolt.openapi.schema_generator.OpenAPIStrictError: OpenAPI strict mode: routes with an untyped JSON response (add a return annotation or response_model): GET /stats
 ```
 
-The default value at each layer is `None`. `None` inherits from the outer layer.
-The root `BoltAPI` resolves `None` to `True`.
+## Generate client code
 
-## Deprecating endpoints
+Get the schema from a running server:
 
-Set `deprecated=True` to mark an endpoint as deprecated in the documentation.
-The operation gets `deprecated: true`. The docs UIs show it as deprecated, and
-client generators mark its function. The server continues to serve the
-endpoint. An endpoint that is not deprecated has no `deprecated` key:
-
-```python
-@api.get("/v1/users", deprecated=True)
-async def list_users_v1():
-    return []
-
-
-@api.view("/v1/profile", deprecated=True)  # each method of the view
-class ProfileView(APIView):
-    async def get(self, request):
-        return {}
-
-
-@api.viewset("/items")
-class ItemViewSet(ViewSet):
-    @action(methods=["GET"], detail=False, deprecated=True)  # only this action
-    async def legacy(self, request):
-        return []
+```bash
+curl -o openapi.json http://localhost:8000/docs/openapi.json
 ```
 
-The route decorators of `BoltAPI` and `Router`, `@api.view()`, `@api.viewset()`
-and `@action` take `deprecated`. On `@api.viewset()`, it applies to each route
-of the viewset, and also to its `@action` routes.
+Then give the file to a client generator. For example, for TypeScript and for Python:
 
-## Non-JSON responses
-
-`response_class` sets the media type in the documentation. The default is
-`application/json`. A return annotation with one of these classes, for example
-`-> StreamingResponse`, has the same effect:
-
-| `response_class` | Media type | Schema |
-|---|---|---|
-| `HTML` | `text/html` | string |
-| `PlainText` | `text/plain` | string |
-| `File`, `FileResponse`, `StreamingResponse` | `application/octet-stream` | string / binary |
-| `EventSourceResponse` | `text/event-stream` | string |
-| `Redirect` | none (status 307, or the `status_code` of the route) | `Location` header only |
-
-```python
-@api.get("/report.csv", response_class=File)
-async def report():
-    return File("/srv/report.csv")
+```bash
+npx @hey-api/openapi-ts -i openapi.json -o src/client
+openapi-python-client generate --path openapi.json
 ```
 
-A route with the return type `str` shows `text/plain`. A route with the return
-type `bytes` shows `application/octet-stream`. Bolt sends these values as they
-are, not as JSON.
+The function names come from the `operationId` values, and the type names come from the component names. Run [the strict check](#check-the-schema-in-ci) so that each response has a type.
 
-A union shows one media type for each kind of result. For example,
-`-> str | None` shows `text/plain` for the string and `application/json` for
-`null`, and `-> str | Item` shows `text/plain` and `application/json` with the
-schema of `Item`. An entry of a `response_model` dict follows the same rules:
-`{200: str, 404: Error}` shows `text/plain` for the status 200.
+An API with a `QUERY` route gets an OpenAPI 3.2.0 document, because OpenAPI 3.1 has no `query` operation. Each other API gets 3.1.0. Some generators do not read 3.2.0 yet.
 
-Each parametrization of a generic response model gets its own component name.
-This is the same as msgspec. `Page[UserRead]` becomes the component
-`Page_UserRead_`. Its title is `Page[UserRead]`.
+## See also
 
-## OpenAPI extensions
-
-The generated OpenAPI spec follows the OpenAPI 3.1.0 specification and includes:
-
-- Path parameters with types
-- Query parameters with defaults
-- Request body schemas from `msgspec.Struct`
-- Response schemas from `response_model`
-- Authentication requirements from `auth=` and `guards=`
-- Tag grouping
-- Operation summaries and descriptions
+- [BoltAPI reference](../ref/api.md): the `openapi_config` and `include_in_schema` arguments, and the route decorators.
+- [Routing](routing.md)
+- [Responses](responses.md)
+- [Error handling](error-handling.md)
+- [Authentication](authentication.md)
+- [Testing](testing.md)

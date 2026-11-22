@@ -24,9 +24,13 @@ PAGES = check_doc_snippets.pages()
 
 
 def test_the_docs_have_python_examples():
-    """A wrong path would find no page, and the test below would check nothing."""
+    """A wrong path would find no page, and the test below would check nothing.
+
+    The docs have about 350 Python blocks. The floor is below that count, so a
+    page can lose an example without a failure here.
+    """
     assert len(PAGES) > 20
-    assert sum(len(list(check_doc_snippets.python_blocks(page.read_text(encoding="utf-8")))) for page in PAGES) > 400
+    assert sum(len(list(check_doc_snippets.python_blocks(page.read_text(encoding="utf-8")))) for page in PAGES) > 300
 
 
 @pytest.mark.parametrize("page", PAGES, ids=[str(page.relative_to(check_doc_snippets.ROOT)) for page in PAGES])

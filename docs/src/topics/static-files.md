@@ -1,260 +1,184 @@
 ---
-icon: lucide/file-image
+description: Serve CSS, JavaScript and admin assets from Django-Bolt with STATIC_URL, STATIC_ROOT and collectstatic, with cache headers for production.
 ---
 
-# Static Files
+# Static files
 
-For production deployments, we recommend letting **Nginx** handle static files at the reverse proxy layer — this offloads static traffic entirely so Django-Bolt focuses on API requests. That said, Django-Bolt also serves static files directly from Rust using Actix-files, delivering high-performance static file serving without Python overhead — a solid option when you want a simpler setup without configuring static file handling in your reverse proxy.
+Django-Bolt serves static files from Rust, with no call to Python.
+It reads the Django settings that you already have: `STATIC_URL`, `STATIC_ROOT` and `STATICFILES_DIRS`.
 
-!!! tip "Serving user uploads?"
-    This page covers **static assets** (CSS, JS, admin) from `STATIC_ROOT` / `STATICFILES_DIRS`. For user-uploaded media (`MEDIA_ROOT`), see [Media Files](media-files.md) — it shares this handler but applies stricter, upload-specific defaults.
-
-## Overview
-
-Static files are served with:
-
-- **Streaming responses** - Memory efficient for large files
-- **ETag and Last-Modified headers** - Automatic caching support
-- **Conditional requests** - 304 Not Modified responses
-- **Range requests** - Resumable downloads
-- **Content-Type detection** - Automatic MIME type handling
-- **Content Security Policy** - Configurable CSP headers
-
-## Configuration
-
-Django-Bolt reads your existing Django static files settings:
-
-```python
-# settings.py
-
-# URL prefix for static files
+```python title="blog/settings.py"
 STATIC_URL = "/static/"
-
-# Directory where collectstatic gathers files (primary lookup)
 STATIC_ROOT = BASE_DIR / "staticfiles"
-
-# Additional directories to search (optional)
-STATICFILES_DIRS = [
-    BASE_DIR / "static",
-]
+STATICFILES_DIRS = [BASE_DIR / "static"]
 ```
-
-## File lookup order
-
-When a static file is requested, Django-Bolt searches in this order:
-
-1. **STATIC_ROOT** - Collected static files (fastest)
-2. **STATICFILES_DIRS** - Additional configured directories
-3. **Django staticfiles finders** (debug mode only) - App-level static files (e.g., admin)
-
-The first match is returned. Files in `STATIC_ROOT` take priority.
-
-!!! note "Finders disabled in production"
-    For security, Django's staticfiles finders fallback is only enabled when `DEBUG=True`. In production, only files in `STATIC_ROOT` and `STATICFILES_DIRS` are served. Run `collectstatic` to copy app-level static files (like admin assets) into `STATIC_ROOT`.
-
-## Django admin integration
-
-In development (`DEBUG=True`), Django admin static files are automatically served via Django's staticfiles finders — no extra configuration needed.
-
-In production (`DEBUG=False`), you must run `collectstatic` so admin assets are copied into `STATIC_ROOT`:
 
 ```bash
-python manage.py collectstatic
+curl -i localhost:8000/static/css/site.css
 ```
 
-```python
-# Admin works out of the box in development
+```http
+HTTP/1.1 200 OK
+content-length: 23
+last-modified: Sun, 22 Nov 2026 01:59:05 GMT
+etag: "bc6d7:17:6b024c69:2ea3cb0b"
+x-content-type-options: nosniff
+content-type: text/css; charset=utf-8
+accept-ranges: bytes
+content-disposition: inline; filename="site.css"
+
+body { color: black; }
+```
+
+The `{% static %}` template tag gives the same URLs, as in each Django project.
+Bolt serves `GET` and `HEAD`. Static responses do not appear in the access log.
+
+## How Bolt finds a file
+
+For a request to `/static/css/site.css`, Bolt looks for `css/site.css` in this order:
+
+1. `STATIC_ROOT`.
+2. Each directory of `STATICFILES_DIRS`, in order. Bolt does not read a `(prefix, path)` entry. With `DEBUG = False`, run `collectstatic` to copy its files into `STATIC_ROOT`.
+3. With `DEBUG = True` only: the Django staticfiles finders, for example the `static/` directory of each app.
+
+The first file found wins. A request with no file gets `404` with the body `File not found`.
+
+Bolt reads the settings one time, at startup. It ignores a directory that does not exist, and prints a warning:
+
+```text
+[django-bolt] Warning: Static files: cannot resolve directory for /static: /srv/blog/staticfiles (No such file or directory (os error 2))
+```
+
+## Serve static files in development
+
+With `DEBUG = True`, the staticfiles finders serve the files of your apps and of the Django admin.
+You do not need `collectstatic`. Add `django.contrib.staticfiles` to `INSTALLED_APPS`:
+
+```python title="blog/settings.py"
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.staticfiles",
     # ...
+    "django_bolt",
 ]
 ```
 
-## Security
-
-### Directory traversal protection
-
-Django-Bolt blocks directory traversal attacks:
-
-- Paths containing `..` are rejected with `400`
-- Symlink targets are verified to stay within allowed directories
-- Only files (not directories) are served
-
-### Dotfile deny
-
-Any request whose path has a leading-dot component — `.env`, `.git/config`, `.htaccess`, `.ssh/id_rsa` — returns `404`, matching the nginx/Apache default. This keeps stray dotfiles left in `STATIC_ROOT` from being reachable over HTTP. Backslash-separated components (`foo\.env`) are caught as well.
-
-### nosniff
-
-`X-Content-Type-Options: nosniff` is applied to **every** response, including 404s, so a crafted miss can't be MIME-sniffed into HTML/JS execution.
-
-!!! note "User uploads need more"
-    Static files keep their native content types because they're admin-curated. **Media** uploads are untrusted, so the media handler additionally force-downloads script-bearing files (`.html`, `.svg`, `.js`, …). See [Media Files — Security model](media-files.md#security-model).
-
-### Content Security Policy (CSP)
-
-Django-Bolt applies CSP headers to all static file responses. This protects against XSS attacks in HTML files and ensures scripts/styles are loaded only from trusted sources.
-
-Configure CSP using Django 6.0+'s native [`SECURE_CSP`](https://docs.djangoproject.com/en/6.0/ref/csp/) setting:
-
-```python
-# settings.py
-from django.utils.csp import CSP
-
-SECURE_CSP = {
-    "default-src": [CSP.SELF],
-    "script-src": [CSP.SELF],
-    "style-src": [CSP.SELF, CSP.UNSAFE_INLINE],
-    "img-src": [CSP.SELF, "data:"],
-}
-```
-
-You can also use raw strings:
-
-```python
-SECURE_CSP = {
-    "default-src": ["'self'"],
-    "script-src": ["'self'"],
-    "style-src": ["'self'", "'unsafe-inline'"],
-    "img-src": ["'self'", "data:"],
-}
-```
-
-#### CSP constants
-
-Django provides constants via `django.utils.csp.CSP`:
-
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `CSP.SELF` | `'self'` | Same origin only |
-| `CSP.NONE` | `'none'` | Block all resources |
-| `CSP.UNSAFE_INLINE` | `'unsafe-inline'` | Allow inline scripts/styles |
-| `CSP.UNSAFE_EVAL` | `'unsafe-eval'` | Allow `eval()` |
-| `CSP.STRICT_DYNAMIC` | `'strict-dynamic'` | Trust scripts loaded by trusted scripts |
-
-#### How CSP works
-
-- CSP configuration is read once at server startup
-- The header is pre-built for performance (no per-request overhead)
-- Bolt builds the header with the rules of Django. `True` gives a directive with no value, such as `"upgrade-insecure-requests": True`. `None`, `False` and an empty list skip the directive. A set is sorted, and one str is one value.
-- `CSP.NONCE` values are automatically filtered out (static files cannot inject nonces)
-- A `SECURE_CSP` that is not a dict, or that does not give a valid header, stops startup with `ImproperlyConfigured`
-- Media files get the same header
-
-!!! note "Nonces not supported"
-    `CSP.NONCE` requires per-request nonce injection which isn't possible for static files. Use `CSP.NONCE` only for dynamic responses served by your Django views.
-
-#### Common CSP directives
-
-| Directive | Purpose | Example |
-|-----------|---------|---------|
-| `default-src` | Default policy for all content | `[CSP.SELF]` |
-| `script-src` | JavaScript sources | `[CSP.SELF, "https://cdn.example.com"]` |
-| `style-src` | CSS sources | `[CSP.SELF, CSP.UNSAFE_INLINE]` |
-| `img-src` | Image sources | `[CSP.SELF, "data:", "https:"]` |
-| `font-src` | Font sources | `[CSP.SELF, "https://fonts.gstatic.com"]` |
-| `connect-src` | XHR/WebSocket destinations | `[CSP.SELF, "https://api.example.com"]` |
-| `frame-ancestors` | Who can embed this page | `[CSP.NONE]` |
-| `upgrade-insecure-requests` | Upgrade HTTP to HTTPS | `True` (directive with no value) |
-| `block-all-mixed-content` | Block mixed HTTP/HTTPS | `True` (directive with no value) |
-
-## Using with templates
-
-The Django `{% static %}` template tag works as expected:
-
-```html
-{% load static %}
-<!DOCTYPE html>
-<html>
-<head>
-    <link rel="stylesheet" href="{% static 'css/style.css' %}">
-</head>
-<body>
-    <img src="{% static 'img/logo.png' %}" alt="Logo">
-    <script src="{% static 'js/app.js' %}"></script>
-</body>
-</html>
-```
-
-## Caching
-
-Set `BOLT_STATIC_MAX_AGE` (seconds) to emit a `Cache-Control` header on successful static responses:
-
-```python
-# settings.py
-BOLT_STATIC_MAX_AGE = 31536000  # 1 year — safe for content-hashed assets
-```
-
-This produces `Cache-Control: public, max-age=31536000`. Static uses **`public`** (unlike media's `private`) because assets are identical for every user, so CDNs and shared proxies can cache them aggressively.
-
-- The header is only set on `2xx` responses — a `404` is never cached with a long `max-age`.
-- A missing `BOLT_STATIC_MAX_AGE`, or `None`, gives no `Cache-Control` header. This is the default.
-- A value that is not an int of 0 or more stops startup with `ImproperlyConfigured`. A str such as `"3600"` and a bool are not valid.
-- This is independent of the ETag / Last-Modified validators, which are always sent.
-
-## Performance
-
-Static file serving runs primarily in Rust:
-
-- **No Python GIL for configured directories** - Files in `STATIC_ROOT` and `STATICFILES_DIRS` are served without touching Python
-- **Django finders fallback** (debug mode only) - App-level static files (like admin) require a Python call; disabled in production for security
-- **Async I/O** - Non-blocking file reads via Actix
-- **Smart read modes** - Sync reads for small files (<256KB), async for large files
-- **Efficient caching** - Proper HTTP caching headers reduce server load
-
-
-## Production deployment
-
-For production, collect static files (including admin assets) into `STATIC_ROOT`:
-
 ```bash
-python manage.py collectstatic
+curl -I localhost:8000/static/admin/css/base.css
 ```
 
-Then run Django-Bolt:
-
-```bash
-python manage.py runbolt --host 0.0.0.0 --port 8000 --processes 4
+```http
+HTTP/1.1 200 OK
+content-type: text/css; charset=utf-8
 ```
 
-Static files are served from `STATIC_ROOT` with async I/O, ETag caching, and range request support.
+## Serve static files in production
 
-## Troubleshooting
-
-### Static files not found
-
-1. Verify `STATIC_ROOT` is set and contains files:
-   ```bash
-   python manage.py collectstatic
-   ls -la $(python -c "from django.conf import settings; print(settings.STATIC_ROOT)")
-   ```
-
-2. Check `STATIC_URL` matches your requests:
-   ```python
-   # settings.py
-   STATIC_URL = "/static/"  # Requests should be /static/css/style.css
-   ```
-
-3. For development without collectstatic, ensure `STATICFILES_DIRS` is configured.
-
-### Admin styles missing
-
-Ensure `django.contrib.staticfiles` is in `INSTALLED_APPS` and run `collectstatic`:
+With `DEBUG = False`, Bolt does not run the finders. Copy all static files into `STATIC_ROOT` before you start the server:
 
 ```bash
 python manage.py collectstatic --noinput
 ```
 
-### CSP blocking resources
+```text
+131 static files copied to '/srv/blog/staticfiles'.
+```
 
-Check browser console for CSP violations. Adjust your CSP directives to allow required sources:
+Without `collectstatic`, the admin has no CSS, because its files are not in `STATIC_ROOT`:
 
-```python
+```bash
+curl -I localhost:8000/static/admin/css/base.css
+```
+
+```http
+HTTP/1.1 404 Not Found
+x-content-type-options: nosniff
+```
+
+When `STATIC_ROOT` and `STATICFILES_DIRS` give no directory and `DEBUG = False`, Bolt does not serve `STATIC_URL`. It prints this warning:
+
+```text
+[django-bolt] Warning: Static files: No valid directories found for /static and DEBUG=False — not serving /static. Run collectstatic to populate STATIC_ROOT.
+```
+
+A reverse proxy or a CDN can also serve `STATIC_ROOT`. Then the static requests never reach Bolt. See [Deployment](deployment.md#run-behind-a-reverse-proxy).
+
+## Cache static files
+
+Each response has an `ETag` and a `Last-Modified` header.
+A browser that sends the `ETag` back in `If-None-Match` gets `304 Not Modified` with no body.
+A `Range` request gets `206 Partial Content`.
+
+To let browsers and CDNs keep the files, set `BOLT_STATIC_MAX_AGE` in seconds:
+
+```python title="blog/settings.py"
+BOLT_STATIC_MAX_AGE = 31536000  # 1 year
+```
+
+```http
+HTTP/1.1 200 OK
+cache-control: public, max-age=31536000
+content-type: text/css; charset=utf-8
+```
+
+- Bolt adds `Cache-Control` only to a `2xx` response. A `404` is not cached.
+- Without the setting, or with `None`, Bolt adds no `Cache-Control` header.
+- A value that is not an `int` of 0 or more stops startup with `ImproperlyConfigured`.
+
+A long `max-age` is safe only when the name of a file changes with its content.
+Use `ManifestStaticFilesStorage`. `collectstatic` then writes copies with a hash in the name, such as `css/site.55e7cbb9ba48.css`, and `{% static %}` gives those names:
+
+```python title="blog/settings.py"
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.ManifestStaticFilesStorage"},
+}
+```
+
+When compression is on, Bolt compresses a static file for a client that accepts it, as for each other response. See [Compression](compression.md).
+
+## Add a Content-Security-Policy header
+
+Set Django's `SECURE_CSP` setting. Bolt sends the policy on each static and media response:
+
+```python title="blog/settings.py"
 from django.utils.csp import CSP
 
 SECURE_CSP = {
-    "script-src": [CSP.SELF, "https://trusted-cdn.com"],
-    "style-src": [CSP.SELF, CSP.UNSAFE_INLINE],  # Allow inline styles
+    "default-src": [CSP.SELF],
+    "img-src": [CSP.SELF, "data:"],
 }
 ```
+
+```http
+content-security-policy: default-src 'self'; img-src 'self' data:
+```
+
+- Bolt builds the header with the rules of Django. `True` gives a directive with no value, such as `"upgrade-insecure-requests": True`.
+- Bolt removes `CSP.NONCE`, because a file has no nonce.
+- A `SECURE_CSP` that is not a dict stops startup with `ImproperlyConfigured`.
+- `django.utils.csp` exists in Django 6.0 and later. On Django 5.2, write the values as strings, such as `"'self'"`. Bolt sends the header on each version.
+
+## Security
+
+Bolt applies these rules to each static request:
+
+- A path with `..` gets `400` with the body `Invalid path`.
+- A path with a part that starts with a dot, such as `.env` or `.git/config`, gets `404`.
+- A symbolic link that points out of the directory gives `404`. With `DEBUG = True`, the Django finders can still find the file of such a link. Do not expose a server with `DEBUG = True`.
+- Each response, also a `404`, has `X-Content-Type-Options: nosniff`.
+
+Bolt sends a static file with its own content type, also an `.html` or `.svg` file. Put only files that you trust in `STATIC_ROOT`. For files that users upload, see [Media files](media-files.md).
+
+## Limits of STATIC_URL
+
+- A `STATIC_URL` of `/` is not served. It would hide each route.
+- A `STATIC_URL` with `{` or `}` is not served. Bolt prints a warning.
+- A `STATIC_URL` that is a complete URL, such as `https://cdn.example.com/static/`, is not served by Bolt. The CDN serves it.
+
+## See also
+
+- [Media files](media-files.md)
+- [Deployment](deployment.md)
+- [Settings reference](../ref/settings.md#static-and-media-files)
+- [Django: Managing static files](https://docs.djangoproject.com/en/stable/howto/static-files/)

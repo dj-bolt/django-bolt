@@ -1,253 +1,384 @@
-# Server-Sent Events (SSE)
+---
+description: Send Server-Sent Events and other streaming responses from async or sync generators, with keep-alive pings and cleanup on disconnect.
+---
 
-Server-Sent Events is a standard for pushing real-time updates from server to client over HTTP. Django-Bolt provides `EventSourceResponse` with automatic SSE framing, compression skipping, and keep-alive pings.
+# Server-Sent Events and streaming
 
-## Quick start
+A streaming response sends its body in parts while the handler runs.
+Use Server-Sent Events (SSE) to push updates to a browser over one HTTP response.
+Use a plain stream for a large export, for example CSV or JSON lines.
 
-```python
-from collections.abc import AsyncIterable
+Write the handler as a generator and set `response_class=EventSourceResponse`:
+
+```python title="blog/api.py"
+import asyncio
+from collections.abc import AsyncIterator
+
 from django_bolt import BoltAPI
 from django_bolt.responses import EventSourceResponse
 
 api = BoltAPI()
 
-@api.get("/events", response_class=EventSourceResponse)
-async def events() -> AsyncIterable[dict]:
-    for i in range(10):
-        yield {"count": i}
+
+@api.get("/articles/{article_id}/live", response_class=EventSourceResponse)
+async def article_live(article_id: int) -> AsyncIterator[dict]:
+    for readers in range(1, 4):
+        yield {"article_id": article_id, "readers": readers}
         await asyncio.sleep(1)
 ```
 
-That's it. Yielded objects are automatically:
+```bash
+curl -N localhost:8000/articles/7/live
+```
 
-- JSON-serialized
-- Wrapped in SSE `data:` framing
-- Sent without compression (handled at the Rust level)
-- Kept alive with `: ping` comments every 15 seconds
+```text
+data: {"article_id":7,"readers":1}
 
-## Two patterns
+data: {"article_id":7,"readers":2}
 
-### Implicit (recommended)
+data: {"article_id":7,"readers":3}
 
-The handler itself is a generator. Set `response_class=EventSourceResponse` on the decorator:
+```
+
+Each event arrives one second after the previous event.
+Bolt encodes each yielded object as JSON and puts it in a `data:` line.
+The response ends when the generator ends.
+
+An SSE response has these headers:
+
+```text
+content-type: text/event-stream
+cache-control: no-cache, no-store, must-revalidate
+x-accel-buffering: no
+pragma: no-cache
+expires: 0
+```
+
+`x-accel-buffering: no` tells nginx to send each event at once.
+
+## Read the events in a browser
+
+Use the browser `EventSource` API:
+
+```javascript
+const source = new EventSource("/articles/7/live");
+source.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log(data.readers);
+};
+```
+
+When the response ends, the browser connects again after a short time.
+To stop, call `source.close()`.
+
+## Set the event name, id and retry time
+
+Yield a `ServerSentEvent` to set the other SSE fields:
 
 ```python
-@api.get("/prices", response_class=EventSourceResponse)
-async def stock_prices() -> AsyncIterable[StockPrice]:
-    while True:
-        yield StockPrice(symbol="AAPL", price=await get_price("AAPL"))
-        await asyncio.sleep(1)
+from django_bolt.responses import ServerSentEvent
+
+
+@api.get("/articles/feed", response_class=EventSourceResponse)
+async def article_feed() -> AsyncIterator[ServerSentEvent]:
+    yield ServerSentEvent(retry=10000)
+    yield ServerSentEvent(data={"id": 1, "title": "Hello Bolt"}, event="published", id="1")
+    yield ServerSentEvent(data={"id": 1}, event="deleted", id="2")
 ```
 
-Works with any serializable type: dicts, msgspec Structs, lists.
+```text
+retry: 10000
 
-### Explicit
-
-Return `EventSourceResponse` directly when you need control over status code, headers, or ping interval:
-
-```python
-from django_bolt.responses import EventSourceResponse
-
-@api.get("/stream")
-async def stream():
-    async def generate():
-        yield {"message": "hello"}
-        yield {"message": "world"}
-
-    return EventSourceResponse(generate(), ping_interval=30.0)
-```
-
-## ServerSentEvent
-
-For full control over SSE fields (event type, ID, retry, comments), yield `ServerSentEvent` objects:
-
-```python
-from django_bolt.responses import EventSourceResponse, ServerSentEvent
-
-@api.get("/sse-events", response_class=EventSourceResponse)
-async def sse_events() -> AsyncIterable[ServerSentEvent]:
-    for i in range(5):
-        yield ServerSentEvent(
-            data={"count": i},
-            event="update",
-            id=str(i),
-        )
-        await asyncio.sleep(0.5)
-```
-
-Client receives:
-
-```
-event: update
-data: {"count":0}
-id: 0
-
-event: update
-data: {"count":1}
+event: published
+data: {"id":1,"title":"Hello Bolt"}
 id: 1
+
+event: deleted
+data: {"id":1}
+id: 2
+
 ```
 
-### Fields
+In the browser, listen for a named event with `source.addEventListener("published", ...)`.
+`onmessage` gets only the events that have no name.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `data` | `Any` | `None` | JSON-serialized event payload |
-| `raw_data` | `str \| None` | `None` | Raw string payload (mutually exclusive with `data`) |
-| `event` | `str \| None` | `None` | Event type (maps to `addEventListener` in browser) |
-| `id` | `str \| None` | `None` | Event ID for reconnection (`Last-Event-ID` header) |
-| `retry` | `int \| None` | `None` | Reconnection time in milliseconds |
-| `comment` | `str \| None` | `None` | Comment line (`: ` prefix, ignored by EventSource clients) |
+| Field | Type | Default | Wire format |
+| --- | --- | --- | --- |
+| `data` | any JSON value | `None` | `data:` line with the JSON of the value |
+| `raw_data` | `str \| None` | `None` | `data:` line with the text as it is |
+| `event` | `str \| None` | `None` | `event:` line |
+| `id` | `str \| None` | `None` | `id:` line. The browser sends it back in `Last-Event-ID` when it connects again. |
+| `retry` | `int \| None` | `None` | `retry:` line. The time in milliseconds that the browser waits before it connects again. |
+| `comment` | `str \| None` | `None` | `:` line. The browser ignores it. |
 
-### Mixing yield types
+Text with line breaks becomes one `data:` line for each line.
+`ServerSentEvent` raises `ValueError` in these cases:
 
-You can mix plain objects and `ServerSentEvent` in a single stream:
+- You set both `data` and `raw_data`.
+- `id` contains a null character.
+- `retry` is less than 0.
+
+A stream can mix the two kinds of item.
+Bolt frames a `dict`, a `list` or a `msgspec.Struct` as one `data:` line.
+A `str` or `bytes` item goes out as it is, with no SSE framing.
+
+## Return an EventSourceResponse
+
+Return an `EventSourceResponse` to set the status code, the headers or the ping interval.
+Give it a generator object, not the generator function:
 
 ```python
-@api.get("/mixed", response_class=EventSourceResponse)
-async def mixed():
-    yield {"status": "started"}                          # auto-framed as data:
-    yield ServerSentEvent(data={"n": 1}, event="tick")   # full SSE event
-    yield ServerSentEvent(comment="keepalive")            # comment only
-    yield ServerSentEvent(data="done", event="complete")  # string data
+@api.post("/articles/{article_id}/publish")
+async def publish_article(article_id: int) -> EventSourceResponse:
+    async def steps():
+        yield {"step": "check"}
+        await asyncio.sleep(2)
+        yield {"step": "publish"}
+
+    return EventSourceResponse(steps(), status_code=202, ping_interval=1.0)
 ```
 
-### raw_data
-
-Use `raw_data` to send pre-formatted strings without JSON encoding:
-
-```python
-yield ServerSentEvent(raw_data="plain text line")
-# Produces: data: plain text line
+```bash
+curl -N -X POST localhost:8000/articles/7/publish
 ```
 
-Compare with `data`:
+```text
+data: {"step":"check"}
 
-```python
-yield ServerSentEvent(data="plain text line")
-# Produces: data: "plain text line"   (JSON-encoded with quotes)
+: ping
+
+data: {"step":"publish"}
+
 ```
 
-## Sync generators
+An SSE stream works with each HTTP method.
 
-Both sync and async generators work:
-
+<!-- fragment -->
 ```python
-@api.get("/sync-sse", response_class=EventSourceResponse)
-def sync_sse():
-    for i in range(5):
-        yield {"sync_message": i}
-        time.sleep(0.1)
+EventSourceResponse(
+    content,
+    *,
+    status_code: int = 200,
+    headers: dict[str, str] | None = None,
+    ping_interval: float | None = 15.0,
+)
 ```
 
-## Cleanup on disconnect
+`EventSourceResponse(steps, ...)` with the function `steps` raises `TypeError`.
 
-Use try/finally for resource cleanup when clients disconnect:
+## Keep the connection open
+
+A proxy or a load balancer can close a connection that sends no data.
+When the generator sends no event for `ping_interval` seconds, Bolt sends the comment `: ping`.
+`EventSource` ignores comments.
+
+The default interval is 15 seconds.
+A handler with `response_class=EventSourceResponse` always uses the default.
+To change the interval, return an `EventSourceResponse` with `ping_interval`.
+`ping_interval=None` or `0` turns off the pings.
+
+## Clean up when the client leaves
+
+Put the cleanup code in a `finally` block:
 
 ```python
-@api.get("/sse-with-cleanup", response_class=EventSourceResponse)
-async def sse_with_cleanup():
+@api.get("/articles/{article_id}/views", response_class=EventSourceResponse)
+async def view_counter(article_id: int) -> AsyncIterator[dict]:
+    sent = 0
     try:
-        yield {"status": "START"}
-        for i in range(100):
-            yield {"chunk": i}
-            await asyncio.sleep(0.1)
+        while True:
+            sent += 1
+            yield {"article_id": article_id, "views": sent * 10}
+            await asyncio.sleep(1)
     finally:
-        print("Client disconnected, cleaning up")
+        print(f"Reader left after {sent} events")
 ```
 
-## Keep-alive pings
+A client that stays for 2.5 seconds gets 3 events.
+The server then prints `Reader left after 4 events`.
 
-`EventSourceResponse` sends `: ping` comments every 15 seconds when the generator is idle. This prevents proxies and load balancers from closing the connection.
+Bolt finds the disconnect when the generator yields the next item.
+It then closes the generator, and the `finally` block runs.
+A generator that waits a long time between items keeps its resources for that time.
 
-Configure or disable:
+## Use a sync generator
+
+A `def` generator also works:
 
 ```python
-# Custom interval (seconds)
-return EventSourceResponse(generate(), ping_interval=30.0)
+import time
+from collections.abc import Iterator
 
-# Disable keep-alive
-return EventSourceResponse(generate(), ping_interval=None)
+
+@api.get("/import/progress", response_class=EventSourceResponse)
+def import_progress() -> Iterator[dict]:
+    for done in (25, 50, 75, 100):
+        time.sleep(0.1)
+        yield {"percent": done}
 ```
 
-Keep-alive runs in Rust — no GIL overhead.
+```text
+data: {"percent":25}
 
-## Compression
+data: {"percent":50}
 
-`EventSourceResponse` automatically skips compression. Compression buffers the entire response before sending, which defeats streaming. No `@no_compress` decorator needed.
+data: {"percent":75}
 
-This also applies to legacy `StreamingResponse(media_type="text/event-stream")` — all SSE streams skip compression automatically at the Rust level.
+data: {"percent":100}
 
-## EventSourceResponse parameters
+```
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `content` | generator | required | Generator instance |
-| `status_code` | `int` | `200` | HTTP status code |
-| `headers` | `dict` | `None` | Additional response headers |
-| `ping_interval` | `float \| None` | `15.0` | Keep-alive interval in seconds (`None` to disable) |
+Each sync stream runs on its own thread for the time of the response.
+Thus a blocking call in the generator does not stop other requests.
+At the end of the stream, Bolt closes the database connections of that thread.
 
-## format_sse_event
+The `BOLT_MAX_SYNC_STREAMING_THREADS` setting limits the sync streams of one process.
+The default is 1000.
+The `DJANGO_BOLT_MAX_SYNC_STREAMING_THREADS` environment variable overrides the setting.
+At the limit, a new sync stream gets only `retry: 30000` and ends.
+Use an `async def` generator for many long streams.
 
-Low-level function to build SSE wire-format bytes manually:
+## Stream other content
+
+A generator handler without `response_class` gives a plain stream.
+The return annotation sets the format.
+
+### Stream JSON lines
+
+Annotate the handler with a stream of a JSON type, for example `AsyncIterator[Article]`:
 
 ```python
-from django_bolt.responses import format_sse_event
+import msgspec
 
-# Data-only event
-format_sse_event(data_str='{"count": 1}')
-# b'data: {"count": 1}\n\n'
 
-# Pre-encoded bytes (avoids decode/encode round-trip)
-format_sse_event(data_bytes=b'{"count": 1}')
-# b'data: {"count": 1}\n\n'
+class Article(msgspec.Struct):
+    id: int
+    title: str
 
-# Full event with all fields
-format_sse_event(data_str="payload", event="update", id="42", retry=5000)
-# b'event: update\ndata: payload\nid: 42\nretry: 5000\n\n'
+
+@api.get("/articles/export")
+async def export_articles() -> AsyncIterator[Article]:
+    for article_id in range(1, 4):
+        yield Article(id=article_id, title=f"Article {article_id}")
 ```
 
-## Raw SSE with StreamingResponse
+```text
+{"id":1,"title":"Article 1"}
+{"id":2,"title":"Article 2"}
+{"id":3,"title":"Article 3"}
+```
 
-If you need manual control over SSE wire framing, use `StreamingResponse` directly:
+The content type is `application/x-ndjson`.
+Bolt validates each item against the item type, as for a normal response.
+
+### Stream raw text or bytes
+
+A generator with no annotation, or with `Iterator[str]` or `Iterator[bytes]`, sends each item as it is.
+The content type is `application/octet-stream`.
+To set the content type or a header, return a `StreamingResponse`:
 
 ```python
 from django_bolt import StreamingResponse
-from django_bolt.middleware import no_compress
 
-@api.get("/raw-sse")
-@no_compress
-async def raw_sse():
-    async def generate():
-        for i in range(10):
-            yield f"event: update\nid: {i}\ndata: {{\"count\": {i}}}\n\n"
-            await asyncio.sleep(1)
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+@api.get("/articles/export.csv")
+async def export_csv() -> StreamingResponse:
+    async def rows():
+        yield "id,title\n"
+        for article_id in range(1, 4):
+            yield f"{article_id},Article {article_id}\n"
+
+    return StreamingResponse(
+        rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="articles.csv"'},
+    )
 ```
 
-!!! note
-    With `StreamingResponse` you must manually format SSE frames and add `@no_compress`.
-    Prefer `EventSourceResponse`.
+```bash
+curl -i localhost:8000/articles/export.csv
+```
 
-## Testing
+```text
+HTTP/1.1 200 OK
+transfer-encoding: chunked
+content-disposition: attachment; filename="articles.csv"
+vary: Accept-Encoding
+content-type: text/csv
+
+id,title
+1,Article 1
+2,Article 2
+3,Article 3
+```
+
+`StreamingResponse` takes `content`, and the keyword arguments `status_code` (default `200`), `media_type` (default `application/octet-stream`) and `headers`.
+In a plain stream, a sync generator sends its items in groups of 5.
+An SSE stream sends each event at once.
+
+## Compress a stream
+
+Bolt compresses a stream when the client accepts the encoding and compression is on.
+It flushes each chunk, so each event still arrives at once.
+`curl` sends no `Accept-Encoding` header, so the examples on this page show plain text.
+
+To turn off compression for one route, use `@no_compress`:
 
 ```python
-from django_bolt import BoltAPI
-from django_bolt.responses import EventSourceResponse
+from django_bolt.middleware import no_compress
+
+
+@api.get("/articles/{article_id}/plain-live", response_class=EventSourceResponse)
+@no_compress
+async def plain_live(article_id: int) -> AsyncIterator[dict]:
+    yield {"article_id": article_id}
+```
+
+A `Content-Encoding` header that you set on a `StreamingResponse` also turns off Bolt compression for that response.
+See [Compression](compression.md).
+
+## Errors in a stream
+
+Bolt sends the status and the headers before the first item.
+Thus an exception in the generator cannot change the status code.
+Bolt ends the body and logs the exception on the `django_bolt.streaming` logger.
+The message is `The body of a streaming response raised an error. The response body ends here.`
+
+A typed item that fails validation also ends the body in this way.
+To report an error to an SSE client, yield an event for it, for example `ServerSentEvent(event="error", data=...)`.
+
+## Test a stream
+
+`TestClient` reads the full body before it returns the response.
+Thus the stream must end. Give an endless generator a limit for the test, for example a query parameter.
+
+```python title="blog/tests.py"
 from django_bolt.testing import TestClient
 
-api = BoltAPI()
+from blog.api import api
 
-@api.get("/sse", response_class=EventSourceResponse)
-async def sse():
-    yield {"message": "hello"}
-    yield {"message": "world"}
 
-with TestClient(api) as client:
-    response = client.get("/sse")
+def test_article_live_sends_three_events():
+    with TestClient(api) as client:
+        response = client.get("/articles/7/live")
+
     assert response.status_code == 200
-    assert "text/event-stream" in response.headers["content-type"]
-    body = response.content.decode()
-    assert 'data: {"message":"hello"}' in body
-    assert 'data: {"message":"world"}' in body
+    assert response.headers["content-type"] == "text/event-stream"
+    events = [line for line in response.text.splitlines() if line.startswith("data: ")]
+    assert events == [
+        'data: {"article_id":7,"readers":1}',
+        'data: {"article_id":7,"readers":2}',
+        'data: {"article_id":7,"readers":3}',
+    ]
 ```
+
+`client.get(url, stream=True)` adds `iter_lines()` and `iter_content()` to the response.
+They read the body that the client already received.
+
+## See also
+
+- [Responses](responses.md)
+- [Response classes reference](../ref/responses.md)
+- [WebSocket](websocket.md)
+- [Compression](compression.md)
+- [Testing](testing.md)

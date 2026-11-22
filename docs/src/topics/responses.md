@@ -1,698 +1,500 @@
 ---
-icon: lucide/arrow-up-from-line
+description: Return data, set status codes and headers, validate the response type, and send text, HTML, redirects, files, streams and cookies.
 ---
 
 # Responses
 
-This guide covers all the response types available in Django-Bolt and how to use them.
+A handler returns data or a response object. Bolt converts the return value to an HTTP response.
+Return a `dict`, a `list` or a `msgspec.Struct` for JSON. Return a response class for other content.
 
-## JSON responses
+```python title="blog/api.py"
+import msgspec
 
-Returning a dict, list, or `msgspec.Struct` automatically creates a JSON response:
+from django_bolt import BoltAPI
 
-```python
-@api.get("/data")
-async def get_data():
-    return {"message": "Hello", "count": 42}
+api = BoltAPI()
 
-@api.get("/items")
-async def get_items():
-    return [{"id": 1}, {"id": 2}]
+
+class ArticleOut(msgspec.Struct):
+    id: int
+    title: str
+
+
+@api.get("/articles/{article_id}")
+async def get_article(article_id: int) -> ArticleOut:
+    return ArticleOut(id=article_id, title="Hello")
 ```
 
-A scalar is also a JSON response. Return an `int`, a `float`, a `bool`, a `Decimal`, a `UUID`, an `Enum` member, or a `date`, `time`, `datetime` or `timedelta`:
-
-```python
-@api.get("/count")
-async def count() -> int:
-    return 3  # Body: 3, Content-Type: application/json
+```bash
+curl -i localhost:8000/articles/1
 ```
 
-`None` is the JSON `null` when the response type allows it, such as `-> None` or `-> int | None`. With no such response type, a `None` result is an error, because the handler has no `return`. A `-> None` route validates its result: a result that is not `None` is a response validation error. A response object, such as `JSON(...)` or `Response(...)`, has its own body and is not validated on a `-> None` route. A `str` and `bytes` are not JSON, see [Returning strings and bytes](#returning-strings-and-bytes).
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"id":1,"title":"Hello"}
+```
+
+## Return data
+
+Bolt chooses the content type from the type of the value:
+
+| Return value | Content type | Body |
+| --- | --- | --- |
+| `dict`, `list` | `application/json` | JSON |
+| `msgspec.Struct` | `application/json` | JSON object |
+| A dataclass, on a route with that return type | `application/json` | JSON object |
+| `int`, `float`, `bool`, `Decimal`, `UUID`, `datetime`, `date`, `time`, `Enum` | `application/json` | JSON value |
+| `str` | `text/plain; charset=utf-8` | The text |
+| `bytes` | `application/octet-stream` | The bytes |
+| A `QuerySet` or a model instance, with a response type | `application/json` | See [Declare the response type](#declare-the-response-type) |
+| `None`, on a route with `-> None` | `application/json` | `null` |
+
+Bolt encodes `datetime` as ISO 8601, `Decimal` as a string and `UUID` as a string:
+
+```python
+import datetime
+import decimal
+import uuid
+
+
+@api.get("/orders/{order_id}")
+async def get_order(order_id: int) -> dict:
+    return {
+        "id": uuid.UUID(int=order_id),
+        "total": decimal.Decimal("9.50"),
+        "created_at": datetime.datetime(2026, 1, 2, 3, 4, 5),
+    }
+```
+
+```json
+{"id": "00000000-0000-0000-0000-000000000001", "total": "9.50", "created_at": "2026-01-02T03:04:05"}
+```
+
+A handler with no return annotation that returns `None` gets a 500 response, because Bolt cannot tell if a `return` is missing.
 
 ### Values in a JSON response
 
-A dict, a list or a `msgspec.Struct` can contain these values. The table gives the JSON form of each value.
+A dict, a list or a `msgspec.Struct` can contain these values:
 
 | Value | JSON |
 | --- | --- |
-| `str`, `int`, `float`, `bool`, `None` | the same JSON value |
-| `Decimal`, `Fraction` | a string, such as `"1.50"` or `"1/3"` |
-| `UUID`, `Path`, an IP address or network, a compiled `re.Pattern`, `UserString` | a string |
-| `date`, `time`, `datetime`, `timedelta` | an ISO 8601 string |
-| `Enum` member | its value |
-| `bytes`, `bytearray` | a base64 string |
-| `dict`, `ChainMap`, `MappingProxyType`, `UserDict` | an object |
-| `list`, `tuple`, `set`, `frozenset`, `deque`, `UserList`, `range`, `array.array`, a dict view (`d.keys()`, `d.values()`, `d.items()`) | an array |
-| a generator, a `map` object, a `zip` object | an array of the items that it gives |
+| `str`, `int`, `float`, `bool`, `None` | The same JSON value |
+| `Decimal`, `Fraction` | A string, such as `"1.50"` or `"1/3"` |
+| `UUID`, `Path`, an IP address or network, a compiled `re.Pattern`, `UserString` | A string |
+| `date`, `time`, `datetime`, `timedelta` | An ISO 8601 string |
+| An `Enum` member | Its value |
+| `bytes`, `bytearray` | A base64 string |
+| `dict`, `ChainMap`, `MappingProxyType`, `UserDict` | An object |
+| `list`, `tuple`, `set`, `frozenset`, `deque`, `UserList`, `range`, `array.array`, a dict view | An array |
+| A generator, a `map` object, a `zip` object | An array of the items that it gives |
 
-A subclass of a type in the table has the JSON form of its base type. The items of a container go through the same rules. A typed response validates first. Then a value must match the declared type, so `-> list[int]` refuses a `range`.
+A subclass of a type in the table has the JSON form of its base type. The items of a container follow the same rules.
+On a route with a response type, Bolt validates first. A value must then match the type, so `-> list[int]` refuses a `range`.
 
-Bolt refuses a value with no clear JSON form, such as a `ZoneInfo`, a `datetime.timezone`, a `SimpleNamespace` or a `complex`. Django's `DjangoJSONEncoder` also refuses these values. The response is then a 500 with `TypeError: Unsupported type`. Convert such a value before you return it, for example `str(zone)` or `vars(namespace)`.
+Bolt refuses a value with no clear JSON form, such as a `ZoneInfo`, a `datetime.timezone`, a `SimpleNamespace` or a `complex`.
+Django's `DjangoJSONEncoder` refuses these values too. The response is a 500 with `TypeError: Unsupported type`.
+Convert such a value before you return it, for example `str(zone)` or `vars(namespace)`.
 
-### Custom status codes and headers
+## Set the status code
 
-Use the `JSON` class for more control:
-
-```python
-from django_bolt import JSON
-
-@api.post("/users")
-async def create_user():
-    return JSON(
-        {"id": 1, "username": "john"},
-        status_code=201,
-        headers={"X-Created-By": "django-bolt"}
-    )
-```
-
-### Status code constants and helpers
-
-You can use built-in status code constants for readability:
+The default status is 200. Set another default on the decorator:
 
 ```python
 from django_bolt import status
 
-@api.post("/users", status_code=status.HTTP_201_CREATED)
-async def create_user():
-    ...
+
+@api.post("/articles", status_code=status.HTTP_201_CREATED)
+async def create_article() -> dict:
+    return {"id": 2, "title": "New"}
 ```
 
-Code classification helpers are also available:
+`status_code=201` is the same. The `django_bolt.status` module has a constant for each status, and the helpers `is_success()`, `is_redirect()`, `is_client_error()` and `is_server_error()`.
+
+To choose the status in the handler, return a response object, such as `JSON(data, status_code=202)`.
+A status must be from 200 to 599. A `status_code` outside this range raises `ValueError` at the decorator.
+
+## Declare the response type
+
+The return annotation is the response type. Bolt converts the return value to this type before it encodes it:
 
 ```python
-if status.is_client_error(response.status_code):
-    ...
+from django.contrib.auth.models import User
 
-if status.is_server_error(response.status_code):
-    ...
+
+class AuthorOut(msgspec.Struct):
+    id: int
+    username: str
+
+
+@api.get("/authors")
+async def list_authors() -> list[AuthorOut]:
+    return User.objects.order_by("id")
+
+
+@api.get("/authors/{author_id}")
+async def get_author(author_id: int) -> AuthorOut:
+    return await User.objects.aget(id=author_id)
 ```
 
-## Plain text
+```bash
+curl localhost:8000/authors
+```
 
-Return plain text responses:
+```json
+[{"id": 1, "username": "ana"}, {"id": 2, "username": "ben"}]
+```
+
+The conversion does three things:
+
+- It reads model instances and QuerySets. A `QuerySet` loads only the fields of the type. Return the `QuerySet` and do not iterate it in an async handler.
+- It removes fields that the type does not declare. Thus a handler cannot leak a field by accident. A response object that Bolt does not validate, for example `JSON(...)` with another status, keeps all its fields.
+- It validates the value. A value that does not match gets a 500 response.
+
+`response_model=` on the decorator sets the response type in place of the annotation:
 
 ```python
-from django_bolt.responses import PlainText
-
-@api.get("/hello")
-async def hello():
-    return PlainText("Hello, World!")
-
-@api.get("/status")
-async def status():
-    return PlainText("OK", status_code=200, headers={"X-Status": "healthy"})
+@api.get("/authors/{author_id}/profile", response_model=AuthorOut)
+async def get_author_profile(author_id: int):
+    return {"id": author_id, "username": "ana", "password": "hash"}
 ```
 
-## HTML
+```json
+{"id": 1, "username": "ana"}
+```
 
-Return HTML content:
+### Turn off response validation
+
+`validate_response=False` on the decorator sends the value with no conversion. `BoltAPI(validate_response=False)` sets the default for each route of the API.
+The type then only documents the response in the [OpenAPI document](openapi.md).
+
+### Validation of response objects
+
+A `JSON` or `Response` object is validated only when its status is the default status of the route:
 
 ```python
-from django_bolt.responses import HTML
+from django_bolt import JSON
 
-@api.get("/page")
-async def page():
-    return HTML("<h1>Welcome</h1><p>This is HTML content.</p>")
 
-@api.get("/template")
-async def template():
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head><title>My Page</title></head>
-    <body><h1>Hello</h1></body>
-    </html>
-    """
-    return HTML(html)
+@api.post("/tags", status_code=201)
+async def create_tag(name: str) -> AuthorOut:
+    if name == "taken":
+        return JSON({"name": ["Already taken."]}, status_code=400)  # not validated
+    return JSON({"id": 1, "username": name}, status_code=201)  # validated as AuthorOut
 ```
 
-### Django templates
+### Document more than one status
 
-Use the `render()` function to render Django templates. It works like [Django's `render()` shortcut](https://docs.djangoproject.com/en/dev/topics/http/shortcuts/#render):
+Give `response_model` a `dict` from status code to type. Return a `(status, data)` tuple to choose the status:
+
+```python
+class Error(msgspec.Struct):
+    detail: str
+
+
+@api.get("/articles/{article_id}/summary", response_model={200: ArticleOut, 404: Error})
+async def get_summary(article_id: int):
+    if article_id != 1:
+        return 404, {"detail": "Article not found"}
+    return 200, {"id": 1, "title": "Hello"}
+```
+
+```bash
+curl -i localhost:8000/articles/2/summary
+```
+
+```http
+HTTP/1.1 404 Not Found
+content-type: application/json
+
+{"detail":"Article not found"}
+```
+
+Bolt does not validate the data of a status map. The map documents the responses in the OpenAPI document.
+
+- A bare return value gets the `status_code` of the decorator, or else the lowest 2xx code of the map.
+- `{204: None}` with `return 204, None` sends no body.
+- A `...` key documents each status that the map does not list, for example `{200: ArticleOut, ...: Error}`.
+- The data of the tuple can be a response object. Bolt sends it with the status of the tuple.
+
+A `(status, data)` tuple works only on a route with a status map. On another route, it gets a 500 response.
+
+## Return a response object
+
+Use a response class to set the content type, the status or the headers.
+Each class takes `status_code` and `headers`:
+
+```python
+from django_bolt import JSON, Response
+from django_bolt.responses import HTML, PlainText, Redirect
+
+
+@api.get("/health")
+async def health():
+    return PlainText("OK", headers={"Cache-Control": "no-store"})
+
+
+@api.get("/welcome")
+async def welcome():
+    return HTML("<h1>Welcome</h1>")
+
+
+@api.post("/articles/import")
+async def import_articles():
+    return JSON({"queued": 12}, status_code=202, headers={"X-Job-Id": "42"})
+
+
+@api.get("/feed.xml")
+async def feed():
+    return Response("<rss/>", media_type="application/rss+xml")
+```
+
+```bash
+curl -i localhost:8000/articles/import -X POST
+```
+
+```http
+HTTP/1.1 202 Accepted
+content-type: application/json
+x-job-id: 42
+
+{"queued":12}
+```
+
+| Class | Content type | Use |
+| --- | --- | --- |
+| `JSON(data)` | `application/json` | JSON with a status or headers |
+| `PlainText(text)` | `text/plain; charset=utf-8` | Text |
+| `HTML(html)` | `text/html; charset=utf-8` | HTML |
+| `Response(content, media_type=...)` | `media_type`, default `application/json` | Any content type |
+| `Redirect(url)` | (no body) | A redirect |
+| `File(path)`, `FileResponse(path)` | From the file name | A file |
+| `StreamingResponse(content)` | `media_type`, default `application/octet-stream` | A body in chunks |
+
+`Response` encodes `content` as JSON when `media_type` is `application/json`. With another `media_type`, it sends `str` content as UTF-8 text.
+It sends `bytes` content with no change for each media type.
+
+!!! note
+    A response class in the return annotation names the class of the result, not the type of the body.
+    `-> JSON`, `-> Response` and `-> JSON | Redirect` send the body as it is. Bolt does not validate it.
+    `-> Item | JSON` validates the body against `Item`, as `-> Item` does.
+    To validate the body of a `-> JSON` handler, use `response_model=`, or annotate the type of the data, as in [Validation of response objects](#validation-of-response-objects).
+
+### Redirect
+
+`Redirect` sends `307 Temporary Redirect` by default. The method and the body stay the same on the next request:
+
+```python
+@api.get("/posts/{article_id}")
+async def old_article_url(article_id: int):
+    return Redirect(f"/articles/{article_id}", status_code=301)
+```
+
+```http
+HTTP/1.1 301 Moved Permanently
+location: /articles/3
+```
+
+### Send a file
+
+`File` reads the file into memory. `FileResponse` streams the file from disk, and Python does not read it.
+Use `FileResponse` for large files:
+
+```python
+from django_bolt.responses import FileResponse
+
+
+@api.get("/reports/{year}")
+async def download_report(year: int):
+    return FileResponse(f"/var/app/reports/{year}.csv", filename=f"report-{year}.csv")
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: text/csv
+content-disposition: attachment; filename="report-2026.csv"
+```
+
+- Bolt guesses the content type from the file name. Set `media_type` to choose it.
+- `filename` adds a `Content-Disposition: attachment` header.
+- A path that is not a regular file gets 404 `{"detail": "File not found"}`. The response does not show the path.
+
+!!! warning
+    A path that comes from the request can point at any file that the server can read.
+    Set `BOLT_ALLOWED_FILE_PATHS` to a list of absolute directories. `FileResponse` then sends only files in them.
+    A path outside them gets 403 `{"detail": "Permission denied"}`. `File` does not check this setting.
+
+### Stream a response
+
+Give `StreamingResponse` a generator or an async generator. Bolt sends each item as a chunk:
+
+```python
+from django_bolt import StreamingResponse
+
+
+@api.get("/articles/export.csv")
+async def export_csv():
+    async def rows():
+        yield "id,title\n"
+        for article_id in range(1, 4):
+            yield f"{article_id},Article {article_id}\n"
+
+    return StreamingResponse(rows(), media_type="text/csv")
+```
+
+```text
+id,title
+1,Article 1
+2,Article 2
+3,Article 3
+```
+
+Pass the generator object, `rows()`, not the function `rows`. A function raises `TypeError`.
+Bolt sends the status and headers before the first chunk. An exception in the generator thus ends the body early, and the status stays 200.
+Bolt logs the exception to the `django_bolt.streaming` logger.
+
+A handler can also be an async generator. Annotate it with `AsyncIterator[T]`, and Bolt sends each item as one JSON line:
+
+```python
+from collections.abc import AsyncIterator
+
+
+@api.get("/articles/stream")
+async def stream_articles() -> AsyncIterator[ArticleOut]:
+    for article_id in range(1, 3):
+        yield ArticleOut(id=article_id, title=f"Article {article_id}")
+```
+
+```text
+{"id":1,"title":"Article 1"}
+{"id":2,"title":"Article 2"}
+```
+
+The content type is `application/x-ndjson`.
+
+For Server-Sent Events, see [Server-Sent Events](sse.md).
+
+## Set headers
+
+Pass `headers` to a response class:
+
+```python
+@api.get("/articles/{article_id}/cached")
+async def cached_article(article_id: int):
+    return JSON({"id": article_id}, headers={"Cache-Control": "max-age=60"})
+```
+
+Each header value must be a `str`. A value of another type gets a 500 response.
+
+Each response copies its `headers` dict. A change to `response.headers` does not change the dict that you give.
+Thus many responses can share one module-level dict:
+
+```python
+COMMON_HEADERS = {"X-Service": "blog"}
+
+
+@api.get("/articles/{article_id}/counted")
+async def counted_article(article_id: int):
+    response = JSON({"id": article_id}, headers=COMMON_HEADERS)
+    response.headers["X-Count"] = "1"  # COMMON_HEADERS does not change
+    return response
+```
+
+## Set and delete cookies
+
+Each response class has `set_cookie()` and `delete_cookie()`. Each call returns the response, so you can chain calls:
+
+```python
+@api.post("/sessions")
+async def start_session():
+    return (
+        JSON({"ok": True})
+        .set_cookie("session", "abc123", max_age=3600, httponly=True, secure=True)
+        .set_cookie("theme", "dark")
+    )
+
+
+@api.delete("/sessions")
+async def end_session():
+    return JSON({"ok": True}).delete_cookie("session")
+```
+
+```http
+HTTP/1.1 200 OK
+set-cookie: session=abc123; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=3600
+set-cookie: theme=dark; SameSite=Lax; Path=/
+```
+
+`set_cookie()` takes the arguments of Django's `HttpResponse.set_cookie()`: `name`, `value`, `max_age`, `expires`, `path`, `domain`, `secure`, `httponly` and `samesite`.
+The default `samesite` is `"Lax"`. Pass `samesite=False` to leave out the attribute. Another value than `"Strict"`, `"Lax"` or `"None"` raises `ValueError`.
+
+`delete_cookie(name, path="/", domain=None)` sends the cookie with `Max-Age=0`. Give the `path` and `domain` that you set the cookie with.
+
+`django_bolt.Cookie` is the class of a response cookie. It is not the `Cookie()` marker of `django_bolt.params`, which reads a request cookie.
+
+## Render a template
+
+`django_bolt.shortcuts.render()` renders a Django template, as `django.shortcuts.render()` does:
 
 ```python
 from django_bolt import Request
 from django_bolt.shortcuts import render
 
-@api.get("/page")
-async def show_page(request: Request):
-    return render(request, "myapp/page.html", {
-        "title": "My Page",
-        "items": ["item1", "item2"],
-    })
+
+@api.get("/articles/{article_id}/page")
+async def article_page(request: Request, article_id: int):
+    article = {"title": "Hello", "body": "First post"}
+    return render(request, "blog/article.html", {"article": article})
 ```
 
-The `auth` context processor gives the template the `user` of the request. In an async handler, a template that reads `{{ user }}` loads the user, and the event loop waits for the query. To not block the loop, load the user first:
-
-```python
-@api.get("/account")
-async def account(request: Request):
-    await request.auser()  # the template then reads the loaded user
-    return render(request, "myapp/account.html")
+```html title="blog/templates/blog/article.html"
+<h1>{{ article.title }}</h1>
+<p>{{ article.body }}</p>
 ```
 
-### Template responses
+The response is `text/html; charset=utf-8`. Pass `content_type` and `status` to change them.
+A template that reads `{{ user }}` loads the user with a blocking query. In an async handler, call `await request.auser()` before `render()`.
 
-`render()` renders the template at once. To render it later, return a `TemplateResponse`. It is the `TemplateResponse` class of Django, with the same arguments:
+### Render a template later
+
+`render()` renders the template at once. To render it after the handler returns, return a `TemplateResponse`.
+It is the `TemplateResponse` class of Django, with the same arguments: `status`, `content_type` and `headers`.
 
 ```python
 from django_bolt import Request
 from django_bolt.responses import TemplateResponse
 
-@api.get("/page")
-async def show_page(request: Request):
-    return TemplateResponse(request, "myapp/page.html", {"title": "My Page"})
+
+@api.get("/articles/{article_id}/preview")
+async def article_preview(request: Request, article_id: int):
+    article = {"title": "Hello", "body": "First post"}
+    return TemplateResponse(request, "blog/article.html", {"article": article})
 ```
 
-Bolt renders the template after the handler returns. A route behind Django middleware first calls the `process_template_response` hook of each middleware. A hook can change `template_name` and `context_data` before the render. See [Django middleware integration](middleware.md#django-middleware-integration). A route with no Django middleware renders it with no hooks.
+On a route with Django middleware, Bolt first calls the `process_template_response` hook of each middleware.
+A hook can change `template_name` and `context_data` before the render. See [Middleware](middleware.md#run-django-middleware).
+A route with no Django middleware renders the response with no hooks.
 
-Pass `status`, `content_type` and `headers` as in Django.
+The render can read a QuerySet in the context, also in an async handler. Bolt renders where a sync ORM call can run.
 
-The render can read a QuerySet in the context, also in an async handler. Bolt runs the hooks and the render where a sync ORM call can run.
+## Send an empty response
 
-Use standard Django templates - nothing special required:
-
-```html
-<!-- templates/myapp/page.html -->
-<!DOCTYPE html>
-<html>
-<head><title>{{ title }}</title></head>
-<body>
-    <h1>{{ title }}</h1>
-    <ul>
-    {% for item in items %}
-        <li>{{ item }}</li>
-    {% endfor %}
-    </ul>
-</body>
-</html>
-```
-
-Parameters:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `request` | `Request` | required | The request object |
-| `template_name` | `str` | required | Path to the template file |
-| `context` | `dict` | `None` | Template context variables |
-| `content_type` | `str` | `None` | Response content type |
-| `status` | `int` | `200` | HTTP status code |
-| `using` | `str` | `None` | Template engine to use |
-
-## Redirects
-
-Redirect to another URL:
+Return `None` on a route with a 204 status:
 
 ```python
-from django_bolt.responses import Redirect
-
-@api.get("/old-page")
-async def old_page():
-    return Redirect("/new-page")
-
-@api.get("/external")
-async def external():
-    return Redirect("https://example.com", status_code=302)
+@api.delete("/articles/{article_id}", status_code=204)
+async def delete_article(article_id: int) -> None:
+    return None
 ```
 
-Redirect status codes:
-
-- `301` - Permanent redirect
-- `302` - Temporary redirect (Found)
-- `303` - See Other
-- `307` - Temporary redirect (default, preserves method)
-- `308` - Permanent redirect (preserves method)
-
-## File downloads
-
-### In-memory files
-
-Use `File` for small files that can be loaded into memory:
-
-```python
-from django_bolt.responses import File
-
-@api.get("/download")
-async def download():
-    return File(
-        "/path/to/file.pdf",
-        filename="document.pdf",
-        media_type="application/pdf"
-    )
-```
-
-### Streaming files
-
-Use `FileResponse` for larger files that should be streamed:
-
-```python
-from django_bolt.responses import FileResponse
-
-@api.get("/video")
-async def video():
-    return FileResponse(
-        "/path/to/video.mp4",
-        filename="video.mp4",
-        media_type="video/mp4"
-    )
-```
-
-`FileResponse` streams the file directly without loading it entirely into memory.
-
-### File security
-
-Configure allowed directories in `settings.py`:
-
-```python
-BOLT_ALLOWED_FILE_PATHS = [
-    "/var/app/uploads",
-    "/var/app/public",
-]
-```
-
-When configured, `FileResponse` only serves files within these directories, preventing path traversal attacks.
-
-A `FileResponse` for a path outside these directories raises `ResponseFileNotAllowed`, and Bolt answers 403, also when the path names no file. When the lookup fails, Bolt follows the links of the path, as `realpath` does, to where the lookup stops. Then it completes the path from there as text. A `FileResponse` for a path that names no regular file raises `ResponseFileNotFound`, and Bolt answers 404. Examples are a missing file, a directory and a path that is too long. The path often comes from the request, so a client does not get a 500 for it. The errors subclass `PermissionError` and `FileNotFoundError`. The 404 and 403 responses do not show the path. Bolt answers 500 for a `FileNotFoundError` or a `PermissionError` of other code, because it is a server fault.
-
-## Streaming responses
-
-Stream data incrementally using generators:
-
-```python
-from django_bolt import StreamingResponse
-
-@api.get("/stream")
-async def stream():
-    def generate():
-        for i in range(100):
-            yield f"chunk {i}\n"
-
-    return StreamingResponse(generate(), media_type="text/plain")
-```
-
-### Async generators
-
-For async operations, use async generators:
-
-```python
-import asyncio
-
-@api.get("/async-stream")
-async def async_stream():
-    async def generate():
-        for i in range(10):
-            await asyncio.sleep(0.1)
-            yield f"data: {i}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-```
-
-### Errors in a stream
-
-Bolt sends the status and the headers before the first chunk.
-Thus an error in the generator cannot become a 500.
-The body ends at the error, and the client gets the chunks before it.
-Bolt logs the error with its traceback to the `django_bolt.streaming` logger, at level ERROR.
-
-### Server-Sent Events (SSE)
-
-For SSE endpoints, see the dedicated [Server-Sent Events guide](sse.md). Django-Bolt provides `EventSourceResponse` with automatic SSE framing, compression skipping, and keep-alive pings:
-
-```python
-from collections.abc import AsyncIterable
-from django_bolt.responses import EventSourceResponse
-
-@api.get("/events", response_class=EventSourceResponse)
-async def events() -> AsyncIterable[dict]:
-    for i in range(10):
-        yield {"count": i}
-        await asyncio.sleep(1)
-```
-
-## Response with custom headers
-
-Use the `Response` class for complete control:
-
-```python
-from django_bolt import Response
-
-@api.options("/items")
-async def options_items():
-    return Response(
-        {},
-        status_code=204,
-        headers={"Allow": "GET, POST, PUT, DELETE"}
-    )
-```
-
-Each response copies its `headers` dict.
-A change through `response.headers` does not change the dict that you gave.
-Thus many responses can use one module-level dict.
-
-```python
-from django_bolt import JSON
-
-COMMON_HEADERS = {"X-Service": "api"}
-
-@api.get("/items")
-async def list_items():
-    response = JSON({"items": []}, headers=COMMON_HEADERS)
-    response.headers["X-Count"] = "0"  # COMMON_HEADERS does not change
-    return response
-```
-
-## Setting cookies
-
-Use the `.set_cookie()` method on any response type:
-
-```python
-from django_bolt import Response, JSON
-
-@api.post("/login")
-async def login():
-    return Response({"logged_in": True}).set_cookie("session", "abc123")
-```
-
-Bolt writes the value as Django `set_cookie` writes it.
-A value with a space, a quote, `;` or another unsafe character gets double quotes and escapes.
-`request.cookies` and `Cookie()` remove them again, so a handler reads the value that Bolt sets.
-Bolt does not set a value that has a control character or a character above U+00FF, and logs a warning.
-Django cannot send these values either.
-To keep other text in a cookie, encode it first, for example with `urllib.parse.quote()`.
-
-### Cookie options
-
-Pass additional options to control cookie behavior:
-
-```python
-@api.post("/login")
-async def login():
-    return JSON({"message": "Logged in"}).set_cookie(
-        name="session",
-        value="abc123",
-        max_age=3600,           # Expires in 3600 seconds
-        path="/",               # Cookie path (default: "/")
-        domain=".example.com",  # Cookie domain
-        secure=True,            # Only send over HTTPS
-        httponly=True,          # Not accessible via JavaScript
-        samesite="Lax",         # CSRF protection: "Strict", "Lax", or "None"
-    )
-```
-
-Cookie attributes:
-
-| Attribute | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `name` | `str` | required | Cookie name |
-| `value` | `str` | `""` | Cookie value |
-| `max_age` | `int` | `None` | Seconds until expiration |
-| `expires` | `datetime \| str` | `None` | Expiration date |
-| `path` | `str` | `"/"` | Cookie path |
-| `domain` | `str` | `None` | Cookie domain |
-| `secure` | `bool` | `False` | HTTPS only |
-| `httponly` | `bool` | `False` | No JavaScript access |
-| `samesite` | `str \| False` | `"Lax"` | `"Strict"`, `"Lax"`, `"None"`, or `False` to omit |
-
-The letter case of `samesite` has no meaning, so `"lax"` gives `SameSite=Lax`. Another value raises `ValueError` when you set the cookie, as `HttpResponse.set_cookie()` of Django does.
-
-### Multiple cookies
-
-Chain multiple `.set_cookie()` calls:
-
-```python
-@api.post("/login")
-async def login():
-    return Response({"logged_in": True}) \
-        .set_cookie("session", "abc123", httponly=True) \
-        .set_cookie("preferences", "dark-mode", max_age=86400 * 365)
-```
-
-### Deleting cookies
-
-Use `.delete_cookie()` to remove a cookie:
-
-```python
-@api.post("/logout")
-async def logout():
-    return Response({"logged_out": True}).delete_cookie("session")
-```
-
-With path and domain (must match the original cookie):
-
-```python
-@api.post("/logout")
-async def logout():
-    return Response({"logged_out": True}).delete_cookie(
-        "session",
-        path="/app",
-        domain=".example.com"
-    )
-```
-
-A name that starts with `__Secure-` or `__Host-` gets the `Secure` flag, as in Django.
-A browser ignores the delete of such a cookie without this flag.
-
-### Set and delete in one response
-
-```python
-@api.post("/refresh")
-async def refresh():
-    return Response({"refreshed": True}) \
-        .delete_cookie("old_session") \
-        .set_cookie("new_session", "xyz789", httponly=True)
-```
-
-### Cookies on all response types
-
-The `.set_cookie()` and `.delete_cookie()` methods work on all response types:
-
-```python
-from django_bolt import Response, JSON, StreamingResponse
-from django_bolt.responses import HTML, PlainText, Redirect
-
-# JSON
-JSON({"ok": True}).set_cookie("api_token", "secret")
-
-# HTML
-HTML("<h1>Welcome</h1>").set_cookie("visited", "true")
-
-# PlainText
-PlainText("OK").set_cookie("status", "checked")
-
-# Redirect with cookie (e.g., after login)
-Redirect("/dashboard").set_cookie("just_logged_in", "1", max_age=5)
-
-# Streaming response
-StreamingResponse(generate()).set_cookie("stream_id", "12345")
-```
-
-### Using the Cookie class directly
-
-For advanced use cases, create `Cookie` objects directly:
-
-```python
-from django_bolt import Cookie
-
-cookie = Cookie(
-    name="session",
-    value="abc123",
-    max_age=3600,
-    secure=True,
-    httponly=True,
-    samesite="Strict",
-)
-
-# Get the Set-Cookie header value
-header_value = cookie.to_header_value()
-# "session=abc123; Max-Age=3600; Path=/; Secure; HttpOnly; SameSite=Strict"
-```
-
-## Response validation
-
-Validate response data against a schema using `response_model`:
-
-```python
-import msgspec
-
-class User(msgspec.Struct):
-    id: int
-    username: str
-    email: str
-
-@api.get("/users/{user_id}", response_model=User)
-async def get_user(user_id: int):
-    return {"id": user_id, "username": "john", "email": "john@example.com"}
-```
-
-If the response doesn't match the schema, a 500 error is returned.
-
-You can also use return type annotations:
-
-```python
-@api.get("/users/{user_id}")
-async def get_user(user_id: int) -> User:
-    return {"id": user_id, "username": "john", "email": "john@example.com"}
-```
-
-The schema describes the body of the default status code of the route. Bolt validates a `JSON` or `Response` only when its status code is that default. A response with another status code, such as a 400 with a map of field errors, is encoded as-is. To document other status codes, use the per-status-code form below. It does not validate them either.
-
-```python
-@api.post("/users", status_code=201)
-async def create_user(body: UserCreate) -> User:
-    if await username_taken(body.username):
-        return JSON({"username": ["Already taken."]}, status_code=400)  # not validated
-    return JSON(await create(body), status_code=201)  # validated as User
-```
-
-### Per-status-code response schemas
-
-`response_model` also accepts a dict mapping status codes to types. Each code gets its own OpenAPI response entry. Bolt encodes the body as-is and does not validate it.
-
-```python
-import msgspec
-
-class Item(msgspec.Struct):
-    id: int
-    name: str
-
-class Error(msgspec.Struct):
-    detail: str
-
-@api.get("/items/{item_id}", response_model={200: Item, 404: Error})
-async def get_item(item_id: int):
-    item = await find_item(item_id)
-    if item is None:
-        return 404, {"detail": "Item not found"}
-    return 200, {"id": item.id, "name": item.name}
-```
-
-**Tuple return** — Return `(status_code, data)` to select the schema by code:
-
-```python
-return 200, {"id": 1, "name": "Alice"}   # documented as Item
-return 404, {"detail": "Not found"}       # documented as Error
-```
-
-The status of the tuple must be an int from 200 to 599. A bool is not a status: `return True, data` gives a 500.
-
-The data of the tuple can be a response object. Bolt sends the response object with the status of the tuple. The body, the headers and the cookies come from the response object:
-
-```python
-return 404, JSON({"detail": "Not found"}, headers={"X-Reason": "missing"})  # sent as 404
-return 404, PlainText("gone")                                               # text/plain, sent as 404
-```
-
-**JSON() return** — `JSON(data, status_code=...)` also selects the schema:
-
-```python
-return JSON({"detail": "Not found"}, status_code=404)
-```
-
-**Bare return** — A plain dict or list uses the default status code. That is the `status_code` of the decorator, or else the lowest 2xx code in the map. A map with no 2xx code, such as `{404: Error}`, keeps the default status 200:
-
-```python
-@api.get("/items", response_model={200: list[Item], 400: Error})
-async def list_items():
-    return [{"id": 1, "name": "Alice"}]  # documented as list[Item] at 200
-```
-
-**204 No Content** — Use `{204: None}` with `return (204, None)` for empty body responses:
-
-```python
-@api.delete("/items/{item_id}", response_model={204: None, 404: Error})
-async def delete_item(item_id: int):
-    deleted = await try_delete(item_id)
-    if not deleted:
-        return 404, {"detail": "Item not found"}
-    return 204, None
-```
-
-**Ellipsis catch-all** — Use `...` as a key to document any unmapped status code:
-
-```python
-@api.get("/items/{item_id}", response_model={200: Item, ...: Error})
-async def get_item(item_id: int):
-    ...  # any non-200 status code is documented as Error
-```
-
-A key is an integer status code or `...`. The dict needs one integer key or more. Each other key, for example `"404"`, `404.0` or `True`, stops registration with `TypeError`.
-
-**Explicit status_code** — Override the auto-detected default status code:
-
-```python
-@api.post("/items", response_model={201: Item, 400: Error}, status_code=201)
-async def create_item():
-    return {"id": 1, "name": "New"}  # bare return uses 201 instead of auto-detected
-```
-
-**Typed error bodies** — Raise `HTTPException` with `body=` to send a typed body from anywhere. The handler return annotation stays the success type, so type checkers can check it:
-
-```python
-@api.post("/plans/{pk}/start", response_model={200: Plan, 400: Error})
-async def start_plan(request, pk: int) -> Plan:
-    if not healthy:
-        raise HTTPException(400, body=Error(detail="not healthy"))
-    return Plan(id=pk)
-```
-
-`body` replaces the default `{"detail": ...}` envelope. Bolt encodes it as-is and does not validate it. An unmapped status code is sent as-is too.
-
-## Setting default status codes
-
-Set a default status code for an endpoint:
-
-```python
-@api.post("/users", status_code=201)
-async def create_user():
-    return {"id": 1, "username": "john"}
-```
-
-OpenAPI documents this status code even when the handler has no response annotation.
-
-A response status must be an int from 200 to 599 ([RFC 9110, section 15](https://www.rfc-editor.org/rfc/rfc9110#section-15)). A 1xx status is interim and cannot be the status of a response. A `status_code=` of a route outside this range raises `ValueError` at the decorator. A status outside this range from a handler, for example `JSON(data, status_code=700)` or `HTTPException(status_code=100)`, gives a 500, and the log names the status.
-
-## Returning strings and bytes
-
-Returning a string creates a plain text response:
-
-```python
-@api.get("/text")
-async def text():
-    return "Hello"  # Content-Type: text/plain
-```
-
-Returning bytes creates an octet-stream response:
-
-```python
-@api.get("/bytes")
-async def bytes_response():
-    return b"binary data"  # Content-Type: application/octet-stream
-```
-
-A response type that names `str` or `bytes` allows such a result with no check, for example `-> str`, `-> str | None` or `-> bytes | Item`. Each other response type validates the result:
-
-```python
-@api.get("/count")
-async def count() -> int:
-    return "abc"  # 500: response validation error
-```
-
-A `str` that the response type converts is JSON. For example, `-> UUID` with a `str` result sends the UUID in quotes as `application/json`.
-
-This applies to `-> dict` and `-> list` too. A `-> dict` route takes a `dict`. A `-> list` route takes a `list`, a `tuple` or a QuerySet. Each other result is a response validation error, for each kind of handler. Examples are a `str`, a number, a list for `-> dict`, a dict for `-> list`, and a `Struct` or a generator. A response object, such as `JSON(...)`, has no such check.
-A `-> list[UserSerializer]` route validates that the result is a list. A result such as `3` or a `dict` is a response validation error, and `None` is the empty list.
-A route with `validate_response=False` does no such check. It sends a `str` as `text/plain` and `bytes` as `application/octet-stream`.
-
-## Empty responses
-
-For 204 No Content responses:
-
-```python
-from django_bolt import Response
-
-@api.delete("/items/{item_id}", status_code=204)
-async def delete_item(item_id: int):
-    # ... delete the item ...
-    return Response(status_code=204)
-```
+A 204 response has no body.
+
+## See also
+
+- [Responses reference](../ref/responses.md)
+- [Error handling](error-handling.md)
+- [Serializers](serializers.md)
+- [Async and the ORM](async-orm.md)
+- [Server-Sent Events](sse.md)
+- [Compression](compression.md)

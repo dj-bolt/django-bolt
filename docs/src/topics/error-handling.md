@@ -1,351 +1,265 @@
 ---
-icon: lucide/triangle-alert
+description: Raise HTTP errors from handlers, read the 422 and 500 error bodies, map your own exceptions, and change the error format.
 ---
 
 # Error handling
 
-Django-Bolt provides a structured exception hierarchy for HTTP errors and automatic error response formatting.
+Raise an `HTTPException`, or one of its subclasses, to stop a handler and send an error response.
+Bolt also turns validation errors, Django exceptions and unhandled exceptions into JSON error responses.
 
-## Exception classes
+```python title="blog/api.py"
+from django_bolt import BoltAPI
+from django_bolt.exceptions import NotFound
 
-### HTTPException
+api = BoltAPI()
 
-The base class for all HTTP errors:
+
+@api.get("/articles/{article_id}")
+async def get_article(article_id: int) -> dict:
+    if article_id != 1:
+        raise NotFound(f"Article {article_id} not found")
+    return {"id": 1, "title": "Hello"}
+```
+
+```bash
+curl -i localhost:8000/articles/7
+```
+
+```http
+HTTP/1.1 404 Not Found
+content-type: application/json
+
+{"detail":"Article 7 not found"}
+```
+
+## Raise an HTTP error
+
+`django_bolt.exceptions` has one class for each common error status:
+
+| Class | Status |
+| --- | --- |
+| `BadRequest` | 400 |
+| `Unauthorized` | 401 |
+| `Forbidden` | 403 |
+| `NotFound` | 404 |
+| `MethodNotAllowed` | 405 |
+| `NotAcceptable` | 406 |
+| `Conflict` | 409 |
+| `Gone` | 410 |
+| `UnprocessableEntity` | 422 |
+| `TooManyRequests` | 429 |
+| `InternalServerError` | 500 |
+| `NotImplemented` | 501 |
+| `BadGateway` | 502 |
+| `ServiceUnavailable` | 503 |
+| `GatewayTimeout` | 504 |
+
+For another status, raise `HTTPException` with the status:
 
 ```python
 from django_bolt.exceptions import HTTPException
 
-raise HTTPException(status_code=400, detail="Bad request")
+raise HTTPException(status_code=451, detail="Unavailable in your country")
 ```
 
-Parameters:
+The first argument of a subclass is the `detail`. `NotFound("Article not found")` is the same as `NotFound(detail="Article not found")`.
+Without a detail, the detail is the standard phrase of the status, for example `"Not Found"`.
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `status_code` | `int` | required | HTTP status code |
-| `detail` | `str`, `dict` or `list` | HTTP phrase | Error message |
-| `headers` | `dict` | `{}` | Response headers |
-| `extra` | `dict` | `None` | Additional error data |
+### Send structured data
 
-A `dict` or a `list` detail goes to the response as a JSON value:
+A `dict` or a `list` detail goes to the client as JSON:
 
 ```python
-raise HTTPException(status_code=400, detail={"code": "out_of_stock", "items": [3, 7]})
-# body: {"detail": {"code": "out_of_stock", "items": [3, 7]}}
+from django_bolt.exceptions import Conflict
+
+
+@api.post("/articles/{slug}")
+async def create_article(slug: str) -> dict:
+    raise Conflict(detail={"code": "duplicate_slug", "slug": slug})
 ```
-
-A detail of another type becomes its text, so `detail=42` gives `"42"`. An empty detail, such as `""`, `{}` or `[]`, gives the HTTP phrase of the status. Each value in the dict or the list must be a value that Bolt can encode as JSON.
-
-### Specialized exceptions
-
-Django-Bolt provides pre-configured exceptions for common status codes:
-
-```python
-from django_bolt.exceptions import (
-    # 4xx Client Errors
-    BadRequest,           # 400
-    Unauthorized,         # 401
-    Forbidden,            # 403
-    NotFound,             # 404
-    MethodNotAllowed,     # 405
-    NotAcceptable,        # 406
-    Conflict,             # 409
-    Gone,                 # 410
-    UnprocessableEntity,  # 422
-    TooManyRequests,      # 429
-
-    # 5xx Server Errors
-    InternalServerError,  # 500
-    BadGateway,           # 502
-    ServiceUnavailable,   # 503
-    GatewayTimeout,       # 504
-)
-```
-
-Usage:
-
-```python
-@api.get("/users/{user_id}")
-async def get_user(user_id: int):
-    user = await User.objects.filter(id=user_id).afirst()
-    if not user:
-        raise NotFound(detail="User not found")
-    return {"id": user.id, "username": user.username}
-```
-
-### Custom headers
-
-Add headers to error responses:
-
-```python
-raise Unauthorized(
-    detail="Authentication required",
-    headers={"WWW-Authenticate": "Bearer"}
-)
-```
-
-### Extra data
-
-Include additional information in the error response:
-
-```python
-raise BadRequest(
-    detail="Invalid input",
-    extra={
-        "field": "email",
-        "value": "invalid@",
-        "reason": "Invalid email format"
-    }
-)
-```
-
-Response:
 
 ```json
-{
-    "detail": "Invalid input",
-    "extra": {
-        "field": "email",
-        "value": "invalid@",
-        "reason": "Invalid email format"
-    }
-}
+{"detail": {"code": "duplicate_slug", "slug": "hello"}}
 ```
+
+An empty `dict` or `list` is the same as no detail. The client gets the standard phrase of the status.
+
+`extra` adds an `extra` key next to `detail`:
+
+```python
+from django_bolt.exceptions import BadRequest
+
+
+@api.get("/reports")
+async def reports(start: str, end: str) -> dict:
+    raise BadRequest("Invalid date range", extra={"start": start, "end": end})
+```
+
+```json
+{"detail": "Invalid date range", "extra": {"start": "2026-02-01", "end": "2026-01-01"}}
+```
+
+### Add headers
+
+`headers` adds response headers. A number value becomes a string:
+
+```python
+from django_bolt.exceptions import TooManyRequests
+
+
+@api.post("/articles/{article_id}/publish")
+async def publish_article(article_id: int) -> dict:
+    raise TooManyRequests("Publish limit reached", headers={"Retry-After": 30})
+```
+
+```http
+HTTP/1.1 429 Too Many Requests
+content-type: application/json
+retry-after: 30
+
+{"detail":"Publish limit reached"}
+```
+
+### Send a typed error body
+
+`body` replaces the `{"detail": ...}` object. Declare its type in `response_model` so that the OpenAPI document shows it:
+
+```python
+import msgspec
+
+
+class Rejected(msgspec.Struct):
+    reason: str
+    retry: bool
+
+
+@api.post("/articles/{article_id}/review", response_model={200: dict, 409: Rejected})
+async def submit_for_review(article_id: int) -> dict:
+    raise HTTPException(409, body=Rejected(reason="Already in review", retry=False))
+```
+
+```json
+{"reason": "Already in review", "retry": false}
+```
+
+Bolt encodes `body` with no validation.
 
 ## Validation errors
 
-### RequestValidationError
+A request value that fails validation gets a 422 response. The handler does not run.
+[Requests](requests.md#validation-errors) shows the two forms of the body.
 
-Raised when request validation fails. Django-Bolt's Serializer **automatically collects all validation errors** from `@field_validator` and `@model_validator` before raising, so users see all issues at once:
-
-```python
-from django_bolt.serializers import Serializer, field_validator
-
-class UserSerializer(Serializer):
-    email: str
-    age: int
-
-    @field_validator("email")
-    def validate_email(cls, value):
-        if "@" not in value:
-            raise ValueError("Invalid email format")
-        return value
-
-    @field_validator("age")
-    def validate_age(cls, value):
-        if value < 0:
-            raise ValueError("Must be positive")
-        return value
-
-# Both fields fail - ALL errors returned, not just the first
-UserSerializer(email="invalid", age=-5)
-# Raises RequestValidationError with both errors
-```
-
-You can also raise manually:
+To report your own validation error in the same form, raise `RequestValidationError` with a list of errors:
 
 ```python
 from django_bolt.exceptions import RequestValidationError
 
-errors = [
-    {
-        "loc": ["body", "email"],
-        "msg": "Invalid email format",
-        "type": "value_error"
-    },
-    {
-        "loc": ["body", "age"],
-        "msg": "Must be positive",
-        "type": "value_error"
-    }
-]
-raise RequestValidationError(errors)
-```
 
-Response (422 Unprocessable Entity):
+@api.post("/tags")
+async def create_tag(name: str) -> dict:
+    if name == "django":
+        raise RequestValidationError(
+            [{"loc": ["query", "name"], "msg": "Tag already exists", "type": "value_error"}]
+        )
+    return {"name": name}
+```
 
 ```json
-{
-    "detail": [
-        {
-            "loc": ["body", "email"],
-            "msg": "Invalid email format",
-            "type": "value_error"
-        },
-        {
-            "loc": ["body", "age"],
-            "msg": "Must be positive",
-            "type": "value_error"
-        }
-    ]
-}
+{"detail": [{"loc": ["query", "name"], "msg": "Tag already exists", "type": "value_error"}]}
 ```
 
-### ResponseValidationError
+## Response validation errors
 
-Raised when response validation fails (returns 500):
-
-```python
-from django_bolt.exceptions import ResponseValidationError
-
-errors = [
-    {
-        "loc": ["response", "id"],
-        "msg": "Field required",
-        "type": "missing"
-    }
-]
-raise ResponseValidationError(errors)
-```
-
-Response validation errors indicate a server bug, so they return 500 Internal Server Error.
-
-The validation errors name the model, the fields and the types of your handler. With `DEBUG=False`, the body is only `{"detail": "Response validation error"}`. Bolt writes the validation errors to the server log. With `DEBUG=True`, the body also has `extra.validation_errors`. The `loc` of each error has `response` and then the path of the field, for example `["response", "id"]`.
-
-## Error handlers
-
-Django-Bolt provides built-in error handlers:
-
-### http_exception_handler
-
-Handles `HTTPException` and its subclasses:
-
-```python
-from django_bolt.error_handlers import http_exception_handler
-
-exc = NotFound(detail="User not found")
-status, headers, body = http_exception_handler(exc)
-# status: 404
-# body: b'{"detail": "User not found"}'
-```
-
-### request_validation_error_handler
-
-Handles `RequestValidationError`:
-
-```python
-from django_bolt.error_handlers import request_validation_error_handler
-
-errors = [{"loc": ["body"], "msg": "Invalid", "type": "value_error"}]
-exc = RequestValidationError(errors)
-status, headers, body = request_validation_error_handler(exc)
-# status: 422
-```
-
-### generic_exception_handler
-
-Handles unexpected exceptions:
-
-```python
-from django_bolt.error_handlers import generic_exception_handler
-
-exc = ValueError("Something went wrong")
-
-# Production mode - hide details
-status, headers, body = generic_exception_handler(exc, debug=False)
-# body: b'{"detail": "Internal Server Error"}'
-
-# Debug mode - show Django error page
-status, headers, body = generic_exception_handler(exc, debug=True)
-# Returns HTML error page with traceback
-```
-
-### handle_exception
-
-The main entry point that routes to appropriate handlers. It maps some Django exceptions as Django does:
-
-- `PermissionDenied` gives 403.
-- `Http404`, also from `get_object_or_404`, gives 404. With `DEBUG=False`, the detail is `Not Found`.
-- `SuspiciousOperation`, for example `DisallowedHost`, gives 400. Bolt logs it to the `django.security.<class name>` logger, as Django does. With `DEBUG=False`, the detail is `Bad Request`.
-
-```python
-from django_bolt.error_handlers import handle_exception
-
-# Automatically detects exception type
-status, headers, body = handle_exception(some_exception)
-```
-
-## Debug mode
-
-In debug mode (`DEBUG=True` in Django settings), unhandled exceptions return Django's HTML error page with full traceback:
-
-```python
-# debug=True: Full HTML traceback page
-status, headers, body = handle_exception(exc, debug=True)
-# content-type: text/html
-
-# debug=False: JSON error response
-status, headers, body = handle_exception(exc, debug=False)
-# content-type: application/json
-```
-
-The debug parameter defaults to Django's `DEBUG` setting.
-
-## msgspec validation errors
-
-Django-Bolt converts `msgspec.ValidationError` to the standard error format:
-
-```python
-from django_bolt.error_handlers import msgspec_validation_error_to_dict
-
-try:
-    msgspec.json.decode(b'{"age": "invalid"}', type=MyStruct)
-except msgspec.ValidationError as e:
-    errors = msgspec_validation_error_to_dict(e)
-    # [{"loc": [...], "msg": "...", "type": "..."}]
-```
-
-A missing field has the type `missing_field` at any depth. Its `loc` ends with the field name. For a missing `zip` in the `address` struct, the error is:
-
-```python
-{"loc": ["body", "address", "zip"], "msg": "Object missing required field `zip`", "type": "missing_field"}
-```
-
-For an array item, `loc` has the index as a string, for example `["body", "items", "0", "zip"]`.
-
-## Error response format
-
-All errors follow a consistent format:
+A return value that does not match the response type of the route gets a 500 response.
+The client sees only this body when `DEBUG` is `False`:
 
 ```json
-{
-    "detail": "Error message",
-    "extra": {}
-}
+{"detail": "Response validation error"}
 ```
 
-For validation errors:
+When `DEBUG` is `True`, the body also has the errors:
 
 ```json
-{
-    "detail": [
-        {
-            "loc": ["body", "field_name"],
-            "msg": "Error message",
-            "type": "error_type"
-        }
-    ]
-}
+{"detail": "Response validation error", "extra": {"validation_errors": [{"loc": ["response", "id"], "msg": "Response validation failed for ArticleOut: Expected `int`, got `str`", "type": "validation_error"}]}}
 ```
 
-## Error formatter
+Bolt always logs the errors. See [Responses](responses.md#declare-the-response-type).
 
-An error formatter changes the body of each error response that the framework makes. One function formats the errors from all layers:
+## Django exceptions
 
-- The Rust core:
-  - 401 and 403 from guards, 404 for no route, and 405 for a route path with no route for the method.
-  - 413, and 400 for bad headers.
-  - 422 from path, query, header, cookie and form values.
-  - 429 from rate limits.
-  - A `FileResponse` whose file Rust cannot open or read when it sends the response.
-  - 500 and 504 that Bolt makes for a native route. The formatter does not change a response from the native handler.
-- Python: request and response validation, `HTTPException`, and unhandled exceptions.
+Bolt answers the Django exceptions as Django does:
 
-Without a formatter, the errors keep their default body.
+| Exception | Status | `detail` |
+| --- | --- | --- |
+| `django.http.Http404`, also from `get_object_or_404()` | 404 | `"Not Found"`. The message when `DEBUG` is `True` |
+| `django.core.exceptions.PermissionDenied` | 403 | The message, or `"Permission denied"` |
+| `django.core.exceptions.SuspiciousOperation`, for example `DisallowedHost` | 400 | `"Bad Request"`. The message when `DEBUG` is `True` |
 
-### RFC 9457 Problem Details
+```python
+from django.contrib.auth.models import User
+from django.shortcuts import aget_object_or_404
 
-Use the built-in `problem_details` formatter:
+
+@api.get("/authors/{author_id}")
+async def get_author(author_id: int) -> dict:
+    author = await aget_object_or_404(User, id=author_id)
+    return {"username": author.username}
+```
+
+```json
+{"detail": "Not Found"}
+```
+
+## Unhandled exceptions
+
+Bolt logs an unhandled exception with its traceback and sends a 500 response.
+
+- When `DEBUG` is `False`, the body is `{"detail": "Internal Server Error"}`. The client does not see the exception.
+- When `DEBUG` is `True`, the body is the Django debug page, as HTML.
+
+A `FileNotFoundError` or a `PermissionError` of your own code is also a 500. Only the file responses of Bolt answer 404 or 403 for a missing or forbidden file.
+
+## Map your own exceptions to responses
+
+Catch an exception in a middleware and return a response. The middleware applies to each route of the API:
+
+```python
+from django_bolt import JSON
+from django_bolt.middleware import BaseMiddleware
+
+
+class ArticleLocked(Exception):
+    pass
+
+
+class ArticleLockedMiddleware(BaseMiddleware):
+    async def process_request(self, request):
+        try:
+            return await self.get_response(request)
+        except ArticleLocked as exc:
+            return JSON({"detail": str(exc)}, status_code=423)
+
+
+api = BoltAPI(middleware=[ArticleLockedMiddleware])
+
+
+@api.put("/articles/{article_id}")
+async def edit_article(article_id: int) -> dict:
+    raise ArticleLocked(f"Article {article_id} is locked for editing")
+```
+
+```json
+{"detail": "Article 7 is locked for editing"}
+```
+
+A Python middleware runs for each request of its routes. See [Middleware](middleware.md).
+
+## Change the error format
+
+`BoltAPI(error_formatter=...)` sets one function that formats each error response that Bolt makes.
+This covers the errors of the Rust layer (404, 405, 401 and 403 from guards, 422, 429) and of Python (`HTTPException`, validation, unhandled exceptions).
+
+### Use RFC 9457 problem details
 
 ```python
 from django_bolt import BoltAPI
@@ -354,33 +268,24 @@ from django_bolt.error_handlers import problem_details
 api = BoltAPI(error_formatter=problem_details)
 ```
 
-A request with no token to a route with `IsAuthenticated()` then gets this response:
+```bash
+curl -i localhost:8000/articles/x
+```
 
 ```http
-HTTP/1.1 401 Unauthorized
+HTTP/1.1 422 Unprocessable Entity
 content-type: application/problem+json
-www-authenticate: Bearer
 
-{"type": "about:blank", "title": "Unauthorized", "status": 401,
- "detail": "Authentication required", "instance": "/private"}
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"Request validation failed","instance":"/articles/x","errors":[{"loc":["path","article_id"],"msg":"Invalid integer 'x': invalid digit found in string","type":"validation_error"}]}
 ```
 
-An error with field errors also has `"errors"`, a list of `{"loc", "msg", "type"}` objects. Some objects also have `"ctx"`. The keys of `error.extra` become extension members, for example `"retry_after"` for a 429. A key does not replace a standard member. Bolt does not use an `"errors"` key of `error.extra`, because `"errors"` holds only field errors. The `title` is the RFC 9110 name of the status, on each Python version.
+The body has `type`, `title`, `status`, `detail` and `instance`. It has `errors` when the error has field errors.
+The keys of `extra` become more members of the body.
+`detail` is always a string. The keys of a `dict` detail become more members, and `detail` is then the title.
 
-`"detail"` is a string, as RFC 9457 specifies. A `dict` or a `list` detail of an `HTTPException` goes to extension members, by the rules of `error.extra`:
+### Write a formatter
 
-```python
-raise HTTPException(status_code=400, detail={"code": "out_of_stock", "items": [3, 7]})
-# body: {"type": "about:blank", "title": "Bad Request", "status": 400,
-#        "detail": "Bad Request", "instance": "/order",
-#        "code": "out_of_stock", "items": [3, 7]}
-```
-
-The keys of a `dict` detail become extension members. A `list` detail becomes the `"extra"` member. `"detail"` is then the title. A key of `error.extra` wins over the same key of the detail.
-
-### Your own formatter
-
-A formatter gets a `BoltError` and the request. It returns a `Response`, `JSON`, `PlainText` or `HTML`:
+A formatter takes a `BoltError` and the request. It returns a `Response`, `JSON`, `PlainText` or `HTML`:
 
 ```python
 from django_bolt import BoltAPI
@@ -392,179 +297,44 @@ def format_error(error: BoltError, request) -> Response:
     body = {"code": error.kind, "message": error.detail}
     if error.errors:
         body["fields"] = error.errors
-    return Response(body, status_code=error.status, media_type="application/vnd.error+json")
+    return Response(body, status_code=error.status)
 
 
 api = BoltAPI(error_formatter=format_error)
+```
+
+```json
+{"code": "not_found", "message": "Article 7 not found"}
 ```
 
 `BoltError` has these attributes:
 
-| Attribute | Description |
-|-----------|-------------|
-| `status` | The HTTP status code. |
-| `kind` | A stable name for the error. See the table below. |
-| `detail` | A message for a human. Bolt does not put internal data, such as a file path, in it. It is a `dict` or a `list` when an `HTTPException` has such a detail. |
-| `errors` | The field errors. Each one has `loc`, `msg` and `type`. Some also have `ctx`. A `response_validation` error has no `errors` when `DEBUG=False`. Read `error.exception.errors()` for them. |
-| `headers` | The headers that the error needs, for example `WWW-Authenticate` or `Retry-After`. |
-| `extra` | The `extra` of an `HTTPException`, or `{"retry_after": n}` for a rate limit. |
-| `exception` | The Python exception. It is `None` for an error of the Rust core. |
+| Attribute | Value |
+| --- | --- |
+| `status` | The HTTP status code |
+| `kind` | A fixed name, for example `"not_found"`, `"validation"`, `"rate_limited"` or `"internal_error"` |
+| `detail` | A message for a person. A `dict` or `list` when an `HTTPException` has one |
+| `errors` | The field errors. Each one has `loc`, `msg` and `type` |
+| `headers` | Headers that the error needs, for example `WWW-Authenticate` |
+| `extra` | The `extra` of an `HTTPException` |
+| `exception` | The Python exception, or `None` for an error of the Rust layer |
 
-| Kind | Status | Source |
-|------|--------|--------|
-| `bad_request` | 400 | Too many headers, a header that is too large, a body that Bolt cannot read, or a Django `SuspiciousOperation`, such as `DisallowedHost` |
-| `not_authenticated` | 401 | A guard, or an `HTTPException(401)` |
-| `forbidden` | 403 | A guard, the CSRF origin check of Bolt, `PermissionDenied`, a `FileResponse` outside `BOLT_ALLOWED_FILE_PATHS` or an `HTTPException(403)` |
-| `not_found` | 404 | No route, Django's `Http404` (also from `get_object_or_404`), a `FileResponse` or a `File` whose path names no regular file, or an `HTTPException(404)` |
-| `method_not_allowed` | 405 | A path that has routes, but none for the method of the request, or an `HTTPException(405)` |
-| `payload_too_large` | 413 | A body over `BOLT_MAX_UPLOAD_SIZE` |
-| `validation` | 422 | A value that fails validation, in Rust or in Python |
-| `rate_limited` | 429 | A rate limit |
-| `response_validation` | 500 | A handler return value that fails validation |
-| `internal_error` | 500 | An unhandled exception, also a `FileNotFoundError` or `PermissionError` of handler code, a file in `BOLT_ALLOWED_FILE_PATHS` that the server cannot read, a directory on the way to them that the server cannot search, or a failure in the Rust core |
-| `gateway_timeout` | 504 | A native route handler that does not complete within `BOLT_NATIVE_ROUTE_TIMEOUT` |
+Rules for a formatter:
 
-An `HTTPException` gets its kind from its status, for example `conflict` for 409. A status with no name gives `http_error`.
+- It must be a sync function. An `async` function raises `TypeError`.
+- It must return a status from 400 to 599. It cannot set cookies.
+- Bolt adds `error.headers` to the response. A header that the response sets wins.
+- When the formatter raises or returns a bad response, Bolt logs the problem and sends the default response.
+- An `HTTPException` with a `body`, or with a status below 400, does not go through the formatter.
+- With a formatter, Bolt does not send the Django debug page.
+- With more than one API, set the same formatter on each, or on one. Two different formatters stop the startup.
 
-Bolt adds `error.headers` to the response of the formatter. A header that the response sets wins. Thus a 401 keeps `WWW-Authenticate`, and a 429 keeps `Retry-After`.
+To show the body of your formatter in the OpenAPI document, decorate it with `error_schema`. See the [exceptions reference](../ref/exceptions.md#error-formatters).
 
-For a 401 that your code raises on a route with auth backends, Bolt adds the `WWW-Authenticate` header of the route after the formatter runs. Thus `error.headers` does not have this header, but the response has it. A 401 of the Rust core has the header in `error.headers`.
+## See also
 
-An `HTTPException` with a typed `body` keeps its body. The route declares that body, so the formatter does not get the error.
-
-On the request of an error from the Rust core, `method`, `path`, `headers` and `get_full_path()` work. `query` is empty, so use `get_full_path()` to read the query string. The other request data is empty.
-
-The formatter runs only for an error, and only when the app has a formatter. A request that succeeds does not call Python. With a formatter, each error of the Rust core calls Python, also a 404 or a 429. A flood of these errors then competes for the GIL with the other requests.
-
-The formatter must be a sync callable. Bolt raises `TypeError` for an async one. The response of the formatter must have a status from 400 to 599. Each header name and value must be a `str`. The response cannot set cookies. When the formatter raises an exception or returns a response that is not valid, Bolt logs the error and sends the default response.
-
-An `HTTPException` with a status below 400, such as a redirect, is not an error. Bolt does not call the formatter for it, and sends the default `{"detail": ...}` response.
-
-Bolt logs each error that it answers with a 500 by default, also when the formatter gives another status. Bolt does not log an error that it answers with a 4xx by default, also when the formatter gives a 5xx. An `HTTPException` is a planned response, so Bolt does not log it.
-
-With more than one API in a project, `runbolt` uses one formatter for all of them. Set the same formatter on each API, or set it on one API. Two different formatters stop startup.
-
-`mount()` follows the same rule. The parent API takes the formatter of the mounted API. Two different formatters raise `ValueError`.
-
-The formatter runs on the thread of the request, also for an async handler. Keep it fast. Do not use the database or the network in it.
-
-With a formatter, Bolt does not send the Django debug page for a 500 error when `DEBUG=True`. Use `error.exception` to show the details.
-
-The formatter does not change a response that a handler or a middleware returns. It does not change the responses of a WebSocket handshake, an ASGI mount, an MCP mount, or a static file.
-
-### OpenAPI schema
-
-The OpenAPI schema shows a 422 response for each route with a parameter or a request body. The body of this 422 follows the formatter of the API:
-
-| Formatter | Media type | Schema |
-|-----------|------------|--------|
-| None | `application/json` | `{"detail": [...]}`. For a route with a parameter or a form field, `detail` is a list or a text |
-| `problem_details` | `application/problem+json` | The `ProblemDetails` component, with `errors` |
-| A formatter with `error_schema` | The declared media type | The declared type |
-| A formatter without `error_schema` | None | None |
-
-Use `error_schema` to declare the body of your own formatter:
-
-```python
-import msgspec
-
-from django_bolt import BoltAPI
-from django_bolt.error_handlers import BoltError, error_schema
-from django_bolt.responses import Response
-
-
-class ErrorBody(msgspec.Struct):
-    code: str
-    message: str
-    fields: list[dict] = []
-
-
-@error_schema(ErrorBody, media_type="application/vnd.error+json")
-def format_error(error: BoltError, request) -> Response:
-    body = {"code": error.kind, "message": error.detail, "fields": error.errors}
-    return Response(body, status_code=error.status, media_type="application/vnd.error+json")
-
-
-api = BoltAPI(error_formatter=format_error)
-```
-
-The 401 and the 403 of a route with an auth backend and a guard show the same media type and schema. Without a formatter, their body is `{"detail": "<message>"}`.
-
-A formatter without `error_schema` gets a 422 with a description and no content. Bolt cannot know the media type or the shape of its body. A wrong media type or shape makes generated clients fail when they parse the error. A response with no content is valid OpenAPI and makes no claim about the body. `OpenAPIConfig(strict=True)` reports a formatter without `error_schema`.
-
-The formatter does not change the entries of `response_model`. For example, `response_model={409: Conflict}` keeps its `application/json` schema. This agrees with the response, because an `HTTPException` with a typed `body` skips the formatter.
-
-A route with a parameter or a request body can declare its own 422, for example `response_model={422: Rejected}`. Such a route can send two 422 bodies: its own body and the validation body. The schema shows both, unless the formatter has no `error_schema`. Then the entry shows only the body of the route. When the two bodies have the same media type, the schema joins them with `anyOf`. The entry keeps the description of the route.
-
-## Example: Custom error handling
-
-```python
-from django_bolt import BoltAPI
-from django_bolt.exceptions import HTTPException, NotFound, BadRequest
-
-api = BoltAPI()
-
-@api.get("/users/{user_id}")
-async def get_user(user_id: int):
-    if user_id < 1:
-        raise BadRequest(
-            detail="Invalid user ID",
-            extra={"user_id": user_id, "reason": "Must be positive"}
-        )
-
-    user = await User.objects.filter(id=user_id).afirst()
-    if not user:
-        raise NotFound(detail=f"User {user_id} not found")
-
-    return {"id": user.id, "username": user.username}
-
-@api.post("/orders")
-async def create_order(data: OrderCreate):
-    try:
-        order = await Order.objects.acreate(**data.__dict__)
-        return {"id": order.id}
-    except IntegrityError:
-        raise BadRequest(
-            detail="Order creation failed",
-            extra={"reason": "Duplicate order reference"}
-        )
-```
-
-## Chaining exceptions
-
-Preserve the original exception context:
-
-```python
-try:
-    result = some_operation()
-except ValueError as e:
-    raise InternalServerError(detail=str(e))
-```
-
-The original traceback is preserved for debugging.
-
-## Exception reference
-
-### Client errors (4xx)
-
-| Exception | Status Code | Default Message |
-|-----------|-------------|-----------------|
-| `BadRequest` | 400 | Bad Request |
-| `Unauthorized` | 401 | Unauthorized |
-| `Forbidden` | 403 | Forbidden |
-| `NotFound` | 404 | Not Found |
-| `MethodNotAllowed` | 405 | Method Not Allowed |
-| `NotAcceptable` | 406 | Not Acceptable |
-| `Conflict` | 409 | Conflict |
-| `Gone` | 410 | Gone |
-| `UnprocessableEntity` | 422 | Unprocessable Entity |
-| `TooManyRequests` | 429 | Too Many Requests |
-
-### Server errors (5xx)
-
-| Exception | Status Code | Default Message |
-|-----------|-------------|-----------------|
-| `InternalServerError` | 500 | Internal Server Error |
-| `BadGateway` | 502 | Bad Gateway |
-| `ServiceUnavailable` | 503 | Service Unavailable |
-| `GatewayTimeout` | 504 | Gateway Timeout |
+- [Exceptions reference](../ref/exceptions.md)
+- [Requests](requests.md#validation-errors)
+- [Responses](responses.md)
+- [Middleware](middleware.md)
+- [Logging](logging.md)

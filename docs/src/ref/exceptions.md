@@ -1,362 +1,280 @@
 ---
-icon: lucide/alert-triangle
+description: Reference for the exception classes in django_bolt.exceptions and for the error formatter API in django_bolt.error_handlers.
 ---
 
-# Exceptions Reference
+# Exceptions
 
-All exceptions are importable from `django_bolt.exceptions`.
+Raise an `HTTPException` subclass in a handler to send an error response.
+For a task-based introduction, see [Error handling](../topics/error-handling.md).
 
 ```python
-from django_bolt.exceptions import (
-    HTTPException,
-    RequestValidationError,
-    ResponseValidationError,
-    BadRequest,
-    NotFound,
-    # ... etc
-)
+from django_bolt.exceptions import HTTPException, NotFound
 ```
 
-## HTTP Exceptions
+**Example**
 
-### HTTPException
+```python
+from django_bolt import BoltAPI
+from django_bolt.exceptions import NotFound
 
-Base class for all HTTP error responses.
+api = BoltAPI()
+
+
+@api.get("/articles/{article_id}")
+async def get_article(article_id: int) -> dict:
+    raise NotFound(f"Article {article_id} not found", headers={"Cache-Control": "no-store"})
+```
+
+```http
+HTTP/1.1 404 Not Found
+cache-control: no-store
+content-type: application/json
+
+{"detail":"Article 7 not found"}
+```
+
+## HTTPException
 
 <!-- fragment -->
 ```python
-HTTPException(
-    status_code: int = 500,
-    detail: str | dict | list = "",
-    headers: dict[str, str] = None,
-    extra: dict | list = None,
-)
+HTTPException(status_code=None, detail=None, headers=None, extra=None, *, body=None)
 ```
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `status_code` | `int` | HTTP status code |
-| `detail` | `str` | Error message (defaults to HTTP phrase) |
-| `headers` | `dict` | Headers to include in response. A number value, such as `{"Retry-After": 30}`, becomes a `str`. A value of another type raises `TypeError`. |
-| `extra` | `dict \| list` | Additional data in response |
+The base class of the HTTP errors. Bolt answers it with its status and the body `{"detail": detail}`, or `{"detail": detail, "extra": extra}`.
 
-A `str` in the first position is the detail. Thus `NotFound("User not found")` is the same as `NotFound(detail="User not found")`, and `HTTPException("Storage is down")` is a 500.
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `status_code` | `int \| str \| None` | `None` | The status. `None` uses the `status_code` of the class, which is 500 for `HTTPException`. A `str` in this position is the `detail`. |
+| `detail` | `Any` | `None` | The message. A `dict` or a `list` goes to the client as JSON. Another value becomes its `str()`. An empty value gives the standard phrase of the status. |
+| `headers` | `dict[str, str] \| None` | `None` | Response headers. An `int` or `float` value becomes a `str`. |
+| `extra` | `dict \| list \| None` | `None` | Data for the `extra` key of the body. |
+| `body` | `Any` | `None` | A body that replaces the `{"detail": ...}` object, for example a `msgspec.Struct`. Bolt encodes it with no validation. |
 
-A status with no standard phrase, such as 499, gets the detail `Client Error` (4xx) or `Server Error` (5xx).
+**Attributes**
 
-**Response format:**
+`status_code`, `detail`, `headers`, `extra` and `body`. `detail` holds the standard phrase when you give no detail.
 
-```json
-{
-    "detail": "Error message",
-    "extra": { }
-}
-```
+**Errors**
 
-## Client Errors (4xx)
+- `TypeError`: the first argument is a `str` and `detail` is also set.
+- `TypeError`: a header name is not a `str`, or a header value is not a `str` or a number.
 
-| Exception | Status | Description |
-|-----------|--------|-------------|
-| `BadRequest` | 400 | Invalid request syntax or parameters |
-| `Unauthorized` | 401 | Authentication required or failed |
-| `Forbidden` | 403 | Insufficient permissions |
-| `NotFound` | 404 | Resource not found |
-| `MethodNotAllowed` | 405 | HTTP method not supported |
-| `NotAcceptable` | 406 | Cannot produce requested format |
-| `Conflict` | 409 | Request conflicts with current state |
-| `Gone` | 410 | Resource permanently deleted |
-| `UnprocessableEntity` | 422 | Semantic validation error |
-| `TooManyRequests` | 429 | Rate limit exceeded |
+A status from 200 to 399 is not an error. Bolt sends it with the same body, and the error formatter does not change it.
+A status outside 200 to 599 gets a 500 response.
 
-**Usage:**
+## Client errors
 
-```python
-from django_bolt.exceptions import NotFound, BadRequest
+Each class is an `HTTPException` with a fixed `status_code`. It takes the arguments of `HTTPException`.
+The first argument is the `detail`: `NotFound("Article not found")`.
 
-@api.get("/users/{user_id}")
-async def get_user(user_id: int):
-    if user_id < 1:
-        raise BadRequest(detail="Invalid user ID")
+| Class | Status | Default `detail` |
+| --- | --- | --- |
+| `ClientException` | 400 | `"Bad Request"` |
+| `BadRequest` | 400 | `"Bad Request"` |
+| `Unauthorized` | 401 | `"Unauthorized"` |
+| `Forbidden` | 403 | `"Forbidden"` |
+| `NotFound` | 404 | `"Not Found"` |
+| `MethodNotAllowed` | 405 | `"Method Not Allowed"` |
+| `NotAcceptable` | 406 | `"Not Acceptable"` |
+| `Conflict` | 409 | `"Conflict"` |
+| `Gone` | 410 | `"Gone"` |
+| `UnprocessableEntity` | 422 | `"Unprocessable Content"`. On Python 3.12 it is `"Unprocessable Entity"` |
+| `TooManyRequests` | 429 | `"Too Many Requests"` |
 
-    user = await User.objects.filter(id=user_id).afirst()
-    if not user:
-        raise NotFound(detail="User not found")
+`ClientException` is the base class of the other classes in this table.
 
-    return {"id": user.id}
-```
+## Server errors
 
-## Server Errors (5xx)
+| Class | Status | Default `detail` |
+| --- | --- | --- |
+| `ServerException` | 500 | `"Internal Server Error"` |
+| `InternalServerError` | 500 | `"Internal Server Error"` |
+| `NotImplemented` | 501 | `"Not Implemented"` |
+| `BadGateway` | 502 | `"Bad Gateway"` |
+| `ServiceUnavailable` | 503 | `"Service Unavailable"` |
+| `GatewayTimeout` | 504 | `"Gateway Timeout"` |
 
-| Exception | Status | Description |
-|-----------|--------|-------------|
-| `InternalServerError` | 500 | Unexpected server error |
-| `NotImplemented` | 501 | Feature not implemented |
-| `BadGateway` | 502 | Invalid upstream response |
-| `ServiceUnavailable` | 503 | Server temporarily unavailable |
-| `GatewayTimeout` | 504 | Upstream server timeout |
+`ServerException` is the base class of the other classes in this table.
+`NotImplemented` has the name of a Python built-in constant. Import the module to keep both names: `from django_bolt import exceptions`, then `raise exceptions.NotImplemented()`.
 
-## Validation Errors
-
-### RequestValidationError
-
-Raised when request data fails validation. Returns **422 Unprocessable Entity**.
+## RequestValidationError
 
 <!-- fragment -->
 ```python
-RequestValidationError(
-    errors: list[dict],
-    body: Any = None,
-)
+RequestValidationError(errors, *, body=None)
 ```
 
-**Multi-error collection:** Django-Bolt collects all `@field_validator` and `@model_validator` errors before raising, so users see all issues at once:
+A request value is not valid. Bolt answers 422 with `{"detail": errors}`.
 
-```python
-# Access all errors
-try:
-    serializer = MySerializer(email="bad", password="short")
-except RequestValidationError as e:
-    all_errors = e.errors()  # Returns list of error dicts
-    print(str(e))  # "body.email: Invalid email; body.password: Too short"
-```
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `errors` | `Sequence` | (required) | The errors. Each error is a `dict` with `loc`, `msg` and `type`. |
+| `body` | `Any` | `None` | The request body that is not valid. |
 
-**Response format:**
+`exc.errors()` returns `errors`. `str(exc)` joins the `loc` and `msg` of each error.
 
-```json
-{
-    "detail": [
-        {
-            "loc": ["body", "email"],
-            "msg": "Invalid email",
-            "type": "value_error"
-        },
-        {
-            "loc": ["body", "password"],
-            "msg": "Password too short",
-            "type": "value_error"
-        }
-    ]
-}
-```
-
-### ResponseValidationError
-
-Raised when handler return value fails validation. Returns **500 Internal Server Error**. With `DEBUG=False`, the response body does not show the validation errors. Bolt writes them to the server log.
+## ResponseValidationError
 
 <!-- fragment -->
 ```python
-ResponseValidationError(
-    errors: list[dict],
-    body: Any = None,
-)
+ResponseValidationError(errors, *, body=None)
 ```
 
-## FileResponse errors
+A return value does not match the response type of the route. Bolt raises it. Bolt answers 500 with `{"detail": "Response validation error"}`.
+When `DEBUG` is `True`, the body also has `extra.validation_errors`. Bolt always logs the errors.
 
-`FileResponse` raises these errors when it gets the path of the file. `File` raises `ResponseFileNotFound` when it reads the file. Only these errors give a 404 or a 403, and the 404 and 403 responses do not show the path. A `FileNotFoundError` or a `PermissionError` of other code gives a 500. To answer 404 or 403 from handler code, raise `NotFound` or `Forbidden`.
+The parameters are the parameters of `RequestValidationError`.
 
-| Exception | Subclass of | Status | When raised |
-|-----------|-------------|--------|-------------|
-| `ResponseFileNotFound` | `FileNotFoundError` | 404 | The path names no regular file: it does not exist, it is a directory, or it is not valid |
-| `ResponseFileNotAllowed` | `PermissionError` | 403 | The path is outside `BOLT_ALLOWED_FILE_PATHS`, also when it names no file or the server cannot read it |
+## ValidationException
 
-## Validation Layers
+<!-- fragment -->
+```python
+ValidationException(errors)
+```
 
-Django-Bolt's Serializer has two validation layers:
+The base class of `RequestValidationError` and `ResponseValidationError`. It is a `ValueError`.
+Bolt answers an instance of this class itself as a `RequestValidationError`.
 
-| Layer | Source | Raw msgspec | With `model_validate()` |
-|-------|--------|-------------|-------------------------|
-| **Meta constraints** | `Meta(min_length, pattern, ge, le, ...)` | Fail-fast | **Collects all errors** |
-| **Custom validators** | `@field_validator`, `@model_validator` | N/A | **Collects all errors** |
+## BoltException
 
-### Multi-error collection
+<!-- fragment -->
+```python
+BoltException(*args, detail="")
+```
 
-When using `model_validate()` or `model_validate_json()`, **all errors are collected** before raising `RequestValidationError`:
+The base class of each exception in this module, except the file errors. The first non-empty argument is the `detail` when you do not give `detail`.
+
+## SerializationError
+
+A `Serializer` is used in a way that it does not support. It is a `BoltException` and a `ValueError`. Bolt answers it with a 500 response.
+
+`UnloadedRelationError` is a `SerializationError`. A sync serializer needs a Django relation that is not loaded. See [Serializers](../topics/serializers.md).
+
+## ResponseFileNotFound
+
+The path of a `FileResponse` or a `File` names no regular file. It is a `FileNotFoundError`. Bolt answers 404 with `{"detail": "File not found"}`.
+A `FileNotFoundError` of your own code gets a 500 response.
+
+## ResponseFileNotAllowed
+
+The path of a `FileResponse` is outside `BOLT_ALLOWED_FILE_PATHS`. It is a `PermissionError`. Bolt answers 403 with `{"detail": "Permission denied"}`.
+A `PermissionError` of your own code gets a 500 response.
+
+## Other exceptions
+
+Bolt answers these exceptions of Django and msgspec:
+
+| Exception | Status | `detail` |
+| --- | --- | --- |
+| `django.http.Http404` | 404 | `"Not Found"`. The message when `DEBUG` is `True` |
+| `django.core.exceptions.PermissionDenied` | 403 | The message, or `"Permission denied"` |
+| `django.core.exceptions.SuspiciousOperation` | 400 | `"Bad Request"`. The message when `DEBUG` is `True` |
+| `msgspec.ValidationError` | 422 | A list of errors |
+| Each other exception | 500 | `"Internal Server Error"`. The Django debug page when `DEBUG` is `True` |
+
+## Error formatters
+
+`BoltAPI(error_formatter=...)` takes a function that formats each error response of the framework. These names are in `django_bolt.error_handlers`.
 
 ```python
-# Both Meta constraints AND custom validators collect errors
-try:
-    UserSerializer.model_validate({
-        "name": "X",        # Meta: min_length=2 violated
-        "email": "bad",     # Meta: pattern violated
-        "age": 200          # Meta: le=150 violated
-    })
-except RequestValidationError as e:
-    print(len(e.errors()))  # 3 errors, not just 1
+from django_bolt.error_handlers import BoltError, error_schema, problem_details
 ```
 
-This approach is inspired by [Litestar](https://litestar.dev/) - when validation fails, each field is validated individually to collect all errors.
+### BoltError
 
-### When to expect which exception
-
-| How you validate | Exception | Multi-error? |
-|------------------|-----------|--------------|
-| `Serializer.model_validate(dict)` | `RequestValidationError` | Yes |
-| `Serializer.model_validate_json(json)` | `RequestValidationError` | Yes |
-| `Serializer(field=value)` (direct) | `RequestValidationError` | Yes (custom only) |
-| `msgspec.convert(data, Serializer)` | `msgspec.ValidationError` | No (fail-fast) |
-| `msgspec.json.decode(json, type=Serializer)` | `msgspec.ValidationError` | No (fail-fast) |
-
-**Note**: Direct instantiation (`Serializer(field=value)`) runs custom validators but **bypasses Meta constraints** - this is msgspec's design for performance.
-
-## Validation Error Types
-
-When validation fails, Django-Bolt returns structured errors with these types:
-
-| Type | Description | Example Message |
-|------|-------------|-----------------|
-| `missing_field` | Required field not provided, at any depth | `Object missing required field 'price'` |
-| `validation_error` | Type mismatch or Meta constraint violation | `Expected 'int', got 'str'` |
-| `json_invalid` | Malformed JSON | `Invalid JSON at line 2, column 5` |
-| `value_error` | Custom `@field_validator` or `@model_validator` failure | `Invalid email format` |
-
-### Error Location (`loc`)
-
-The `loc` field indicates where the error occurred:
-
-| Location | Format | Example |
-|----------|--------|---------|
-| Request body | `["body", "field"]` | `["body", "email"]` |
-| Nested field | `["body", "user", "name"]` | `["body", "address", "city"]` |
-| Array item | `["body", "0", "field"]` | `["body", "0", "id"]` |
-| Query param | `["query", "param"]` | `["query", "page"]` |
-| Path param | `["path", "param"]` | `["path", "user_id"]` |
-| Header | `["header", "name"]` | `["header", "authorization"]` |
-
-The `loc` of a `missing_field` error ends with the name of the missing field, also in a nested struct or in an array item. The `msg` names the field and has no path. The index of an array item in `loc` is a string, such as `"0"`.
-
-### Example Validation Errors
-
-**Missing required field:**
-
-```json
-{
-    "detail": [
-        {
-            "loc": ["body", "price"],
-            "msg": "Object missing required field `price`",
-            "type": "missing_field"
-        }
-    ]
-}
+<!-- fragment -->
+```python
+BoltError(*, status, kind, detail, errors=[], headers={}, extra=None, exception=None)
 ```
 
-**Missing field in a nested struct:**
+The error that the formatter gets. It is a frozen `msgspec.Struct`.
 
-For `User(name: str, address: Address)` and `Address(city: str, zip: str)`, the body `{"name": "Ada", "address": {"city": "Paris"}}` gives:
+| Field | Type | Description |
+| --- | --- | --- |
+| `status` | `int` | The HTTP status. |
+| `kind` | `str` | A fixed name for the error. See the table below. |
+| `detail` | `str \| dict \| list` | A message for a person. A `dict` or `list` when an `HTTPException` has one. |
+| `errors` | `list[dict]` | The field errors. Each one has `loc`, `msg` and `type`, and some have `ctx`. A `response_validation` error has none when `DEBUG` is `False`. |
+| `headers` | `dict[str, str]` | Headers that the error needs, for example `WWW-Authenticate` or `Retry-After`. Bolt adds them to the response of the formatter, unless the response sets the same header. |
+| `extra` | `Any` | The `extra` of an `HTTPException`, or `{"retry_after": n}` for a rate limit. |
+| `exception` | `BaseException \| None` | The Python exception. `None` for an error of the Rust layer. |
 
-```json
-{
-    "detail": [
-        {
-            "loc": ["body", "address", "zip"],
-            "msg": "Object missing required field `zip`",
-            "type": "missing_field"
-        }
-    ]
-}
+| `kind` | Status | Source |
+| --- | --- | --- |
+| `bad_request` | 400 | A bad request, or a `SuspiciousOperation` |
+| `not_authenticated` | 401 | A guard, or `HTTPException(401)` |
+| `forbidden` | 403 | A guard, `PermissionDenied`, `ResponseFileNotAllowed`, or `HTTPException(403)` |
+| `not_found` | 404 | No route, `Http404`, `ResponseFileNotFound`, or `HTTPException(404)` |
+| `method_not_allowed` | 405 | No route for the method, or `HTTPException(405)` |
+| `payload_too_large` | 413 | A body over `BOLT_MAX_UPLOAD_SIZE` |
+| `validation` | 422 | A request value that is not valid |
+| `rate_limited` | 429 | A rate limit |
+| `response_validation` | 500 | A return value that does not match the response type |
+| `internal_error` | 500 | An unhandled exception |
+| `gateway_timeout` | 504 | A [native route](../topics/native-routes.md) that does not complete in time |
+
+An `HTTPException` gets the kind of its status: `not_acceptable` (406), `conflict` (409), `gone` (410), `not_implemented` (501), `bad_gateway` (502), `service_unavailable` (503), or one of the kinds above. Another status gives `http_error`.
+
+### The formatter function
+
+<!-- fragment -->
+```python
+def formatter(error: BoltError, request) -> Response | JSON | PlainText | HTML: ...
 ```
 
-For a list of `Address` items, `{"items": [{"city": "Paris"}]}` gives `"loc": ["body", "items", "0", "zip"]`.
+- It must be a sync function. `BoltAPI` raises `TypeError` for an async function.
+- The response must have a status from 400 to 599. It cannot set cookies. Each header name and value must be a `str`.
+- When the formatter raises or returns a response that is not valid, Bolt logs the problem and sends the default response.
+- For an error of the Rust layer, `request.method`, `request.path`, `request.headers` and `request.get_full_path()` work. `request.query` is empty.
 
-**Type mismatch:**
+### problem_details()
 
-```json
-{
-    "detail": [
-        {
-            "loc": ["body", "age"],
-            "msg": "Expected `int`, got `str`",
-            "type": "validation_error"
-        }
-    ]
-}
+<!-- fragment -->
+```python
+problem_details(error: BoltError, request) -> Response
 ```
 
-**Invalid JSON:**
+A formatter for RFC 9457 Problem Details. The content type is `application/problem+json`.
+The body has `type` (`"about:blank"`), `title`, `status`, `detail` and `instance` (the request path).
+It has `errors` when the error has field errors. The keys of `error.extra` are more members. A key does not replace a standard member.
+`detail` is a string. A `dict` detail goes to more members, a `list` detail goes to an `extra` member, and `detail` is then the title.
 
-```json
-{
-    "detail": [
-        {
-            "loc": ["body", 2, 15],
-            "msg": "Invalid JSON at line 2, column 15: unexpected character",
-            "type": "json_invalid"
-        }
-    ]
-}
+The OpenAPI document shows the body as the `ProblemDetails` schema, with `ProblemFieldError` items.
+
+### error_schema()
+
+<!-- fragment -->
+```python
+error_schema(schema, *, media_type="application/json")
 ```
 
-**Multiple errors:**
-
-```json
-{
-    "detail": [
-        {
-            "loc": ["body", "email"],
-            "msg": "Expected `str`, got `int`",
-            "type": "validation_error"
-        },
-        {
-            "loc": ["body", "age"],
-            "msg": "Object missing required field `age`",
-            "type": "missing_field"
-        }
-    ]
-}
-```
-
-## Adding Custom Headers
+A decorator for your formatter. The OpenAPI document then shows `schema` and `media_type` for the error responses.
+Without it, the 422 response of a route with a custom formatter has no content in the OpenAPI document.
 
 ```python
-raise Unauthorized(
-    detail="Token expired",
-    headers={"WWW-Authenticate": "Bearer"}
-)
+import msgspec
+
+from django_bolt import BoltAPI
+from django_bolt.error_handlers import BoltError, error_schema
+from django_bolt.responses import Response
+
+
+class ErrorBody(msgspec.Struct):
+    code: str
+    message: str
+
+
+@error_schema(ErrorBody)
+def format_error(error: BoltError, request) -> Response:
+    return Response({"code": error.kind, "message": str(error.detail)}, status_code=error.status)
+
+
+api = BoltAPI(error_formatter=format_error)
 ```
 
-## Adding Extra Data
+## See also
 
-```python
-raise BadRequest(
-    detail="Validation failed",
-    extra={
-        "field": "email",
-        "value": "invalid@",
-        "suggestion": "Enter a valid email address"
-    }
-)
-```
-
-**Response:**
-
-```json
-{
-    "detail": "Validation failed",
-    "extra": {
-        "field": "email",
-        "value": "invalid@",
-        "suggestion": "Enter a valid email address"
-    }
-}
-```
-
-## Status Code Summary
-
-| Code | Exception | When Raised |
-|------|-----------|-------------|
-| 400 | `BadRequest` | Explicit raise only |
-| 401 | `Unauthorized` | Authentication failed |
-| 403 | `Forbidden` | Guard/permission denied |
-| 404 | `NotFound` | Resource not found, Django's `Http404`, `ResponseFileNotFound` from `FileResponse` |
-| 405 | `MethodNotAllowed` | Wrong HTTP method |
-| 406 | `NotAcceptable` | Cannot produce requested format |
-| 409 | `Conflict` | State conflict |
-| 410 | `Gone` | Resource deleted |
-| 422 | `UnprocessableEntity` | **Validation errors**, missing required params (automatic) |
-| 429 | `TooManyRequests` | Rate limit exceeded |
-| 500 | `InternalServerError` | Unhandled exceptions, response validation |
-| 501 | `NotImplemented` | Feature not implemented |
-| 502 | `BadGateway` | Upstream error |
-| 503 | `ServiceUnavailable` | Server unavailable |
-| 504 | `GatewayTimeout` | Upstream timeout |
+- [Error handling](../topics/error-handling.md)
+- [Responses reference](responses.md)
+- [BoltAPI reference](api.md)
+- [OpenAPI](../topics/openapi.md)

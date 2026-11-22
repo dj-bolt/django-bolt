@@ -1,542 +1,366 @@
 ---
-icon: lucide/boxes
+description: Group handlers in classes with APIView, ViewSet and ModelViewSet, add custom actions with @action, and register them with api.view() and api.viewset().
 ---
 
-# Class-Based Views
+# Class-based views
 
-Django-Bolt supports class-based views for organizing related endpoints. This guide covers `APIView`, `ViewSet`, and `ModelViewSet`.
+A class-based view groups the handlers of one resource in a class. Bolt has three base classes:
 
-## APIView
+- `APIView`: one path, one method for each HTTP method.
+- `ViewSet`: a collection path and a detail path, with methods named after actions, such as `list` and `retrieve`.
+- `ModelViewSet`: a `ViewSet` with ready create, read, update and delete actions for a Django model.
 
-Use `APIView` to group HTTP methods for a single resource:
+Each method is a handler. It takes typed parameters, dependencies and a return type, as a function handler does.
+
+## Write an APIView
+
+Register the class with `@api.view(path)`. Bolt makes one route for each method of the class that has the name of an HTTP method:
 
 ```python
-from django_bolt import BoltAPI
-from django_bolt.views import APIView
+from django_bolt import APIView, BoltAPI
+
+from blog.models import Article
 
 api = BoltAPI()
 
-@api.view("/hello")
-class HelloView(APIView):
-    async def get(self, request):
-        return {"message": "Hello"}
 
-    async def post(self, request, name: str):
-        return {"message": f"Hello, {name}"}
+@api.view("/articles/{article_id}/title")
+class ArticleTitleView(APIView):
+    async def get(self, article_id: int) -> dict:
+        article = await Article.objects.aget(id=article_id)
+        return {"title": article.title}
+
+    async def put(self, article_id: int, title: str) -> dict:
+        updated = await Article.objects.filter(id=article_id).aupdate(title=title)
+        return {"updated": updated}
 ```
 
-This creates:
-
-- `GET /hello` - Calls the `get` method
-- `POST /hello` - Calls the `post` method
-
-Bolt passes the request to the parameter with the name `request` or `req`, at each position. `self.request` is the same request. A method with no such parameter can still read `self.request`:
-
-```python
-@api.view("/whoami")
-class WhoAmIView(APIView):
-    async def get(self):
-        return {"path": self.request.path}
+```bash
+curl localhost:8000/articles/1/title
 ```
 
-### Available methods
-
-Implement any of these methods:
-
-```python
-@api.view("/resource")
-class ResourceView(APIView):
-    async def get(self, request):
-        """Handle GET requests"""
-        return {"method": "GET"}
-
-    async def post(self, request):
-        """Handle POST requests"""
-        return {"method": "POST"}
-
-    async def put(self, request):
-        """Handle PUT requests"""
-        return {"method": "PUT"}
-
-    async def patch(self, request):
-        """Handle PATCH requests"""
-        return {"method": "PATCH"}
-
-    async def delete(self, request):
-        """Handle DELETE requests"""
-        return {"method": "DELETE"}
-
-    async def query(self, request):
-        """Handle QUERY requests (a read that takes a request body)"""
-        return {"method": "QUERY"}
+```json
+{"title": "Hello Bolt"}
 ```
 
-### Class-level configuration
+```bash
+curl -X PUT "localhost:8000/articles/1/title?title=Renamed"
+```
 
-Set authentication and permissions at the class level:
+```json
+{"updated": 1}
+```
+
+The method names are `get`, `post`, `put`, `patch`, `delete`, `head`, `options` and `query`. A request with another method gets `405`.
+
+A method can take the request as a parameter named `request` or `req`. It can also read `self.request`.
+
+!!! warning
+    Bolt makes one instance of the view class for each route, at startup. All requests share it. Do not keep request data on `self`. Use local variables, `self.request` and dependencies.
+
+### Set options for all methods
+
+Class attributes apply to each method of the class:
 
 ```python
-from django_bolt.auth import JWTAuthentication, IsAuthenticated
+from django_bolt import APIView, BoltAPI, Request
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
 
-@api.view("/protected")
-class ProtectedView(APIView):
+api = BoltAPI()
+
+
+@api.view("/me")
+class ProfileView(APIView):
     auth = [JWTAuthentication()]
     guards = [IsAuthenticated()]
 
-    async def get(self, request):
-        return {"user_id": request.user.id}
+    async def get(self, request: Request) -> dict:
+        user = await request.auser()
+        return {"username": user.username}
 ```
 
-### Path parameters
+| Attribute | Default | Effect |
+| --- | --- | --- |
+| `auth` | `None` | The authentication backends of each route. |
+| `guards` | `None` | The guards of each route. |
+| `status_code` | `None` | The status code of a successful response. |
+| `validate_response` | `None` | Turn response validation on or off. |
+| `include_in_schema` | `None` | `False` leaves the routes out of the OpenAPI schema. |
+| `http_method_names` | all methods above | The method names that Bolt looks for. |
 
-Handle path parameters in your methods:
+`None` means "use the value of the API". An argument of `api.view()` wins over the class attribute.
 
-```python
-@api.view("/users/{user_id}")
-class UserView(APIView):
-    async def get(self, request, user_id: int):
-        return {"user_id": user_id}
+`api.view()` takes `path`, `name`, `methods`, `guards`, `auth`, `status_code`, `validate_response`, `tags`, `include_in_schema` and `deprecated`. Use `methods=["GET"]` to register some methods only.
 
-    async def put(self, request, user_id: int, data: UserUpdate):
-        return {"user_id": user_id, "updated": True}
-```
+## Write a ViewSet
 
-## ViewSet
+A `ViewSet` serves a collection path and a detail path. Register it with `@api.viewset(path)`. Bolt makes a route for each action method that the class has:
 
-`ViewSet` provides a higher-level abstraction for CRUD operations:
-
-```python
-from django_bolt.views import ViewSet
-
-@api.viewset("/items")
-class ItemViewSet(ViewSet):
-    async def list(self, request) -> list[dict]:
-        """GET /items"""
-        return [{"id": 1}, {"id": 2}]
-
-    async def retrieve(self, request, pk: int) -> dict:
-        """GET /items/{pk}"""
-        return {"id": pk}
-
-    async def create(self, request, item: ItemCreate) -> dict:
-        """POST /items"""
-        return {"id": 1, "created": True}
-
-    async def update(self, request, pk: int, item: ItemUpdate) -> dict:
-        """PUT /items/{pk}"""
-        return {"id": pk, "updated": True}
-
-    async def partial_update(self, request, pk: int, item: ItemPatch) -> dict:
-        """PATCH /items/{pk}"""
-        return {"id": pk, "patched": True}
-
-    async def destroy(self, request, pk: int):
-        """DELETE /items/{pk}"""
-        return None
-```
-
-This creates:
-
-| Method | URL | Action |
-|--------|-----|--------|
-| GET | `/items` | `list` |
-| POST | `/items` | `create` |
-| GET | `/items/{pk}` | `retrieve` |
-| PUT | `/items/{pk}` | `update` |
-| PATCH | `/items/{pk}` | `partial_update` |
-| DELETE | `/items/{pk}` | `destroy` |
-
-An action can be `async def` or `def`. Bolt registers only the actions that the class defines.
-
-Set `pagination_class` on a `ViewSet`, `ReadOnlyModelViewSet`, or `ModelViewSet`
-to have the `list()` action paginated automatically. Use `@paginate(...)` when
-you want per-method control instead.
-
-## ModelViewSet
-
-`ModelViewSet` provides built-in Django ORM integration:
+| Method | Route | Status |
+| --- | --- | --- |
+| `list` | `GET /path` | `200` |
+| `create` | `POST /path` | `201` |
+| `retrieve` | `GET /path/{pk}` | `200` |
+| `update` | `PUT /path/{pk}` | `200` |
+| `partial_update` | `PATCH /path/{pk}` | `200` |
+| `destroy` | `DELETE /path/{pk}` | `204` |
 
 ```python
-from django_bolt import ModelViewSet, PageNumberPagination
+from django_bolt import BoltAPI, ViewSet
 from django_bolt.serializers import Serializer
-from myapp.models import Article
 
-class ArticleSchema(Serializer):
+from blog.models import Article
+
+api = BoltAPI()
+
+
+class ArticleOut(Serializer):
     id: int
     title: str
-    content: str
 
-class ArticleCreateSchema(Serializer):
-    title: str
-    content: str
 
 @api.viewset("/articles")
-class ArticleViewSet(ModelViewSet):
-    queryset = Article.objects.all()
-    serializer_class = ArticleSchema
-    create_serializer_class = ArticleCreateSchema
-    pagination_class = PageNumberPagination
+class ArticleViewSet(ViewSet):
+    queryset = Article.objects.order_by("id")
+    serializer_class = ArticleOut
+
+    async def list(self) -> list[ArticleOut]:
+        return await self.get_queryset()
+
+    async def retrieve(self, pk: int) -> ArticleOut:
+        return await self.get_object(pk)
 ```
 
-The `create` action only inserts. A primary key or a unique value that a row already has answers 409 Conflict, and the row does not change. `perform_create()` saves with `force_insert=True`. If you override `perform_create()`, call `super().perform_create(obj)` or save with `force_insert=True` to keep this.
-
-### Serializer output
-
-When `serializer_class` is a `Serializer`, generated `list` and `retrieve`
-actions render models through `from_model()` + `dump()`. This preserves computed
-fields, inherited fields, `write_only` exclusions, aliases, `source` mapping,
-and nested serializers.
-
-Plain `msgspec.Struct` response models still use the faster `QuerySet.values()`
-projection path for raw column output. A nested `Struct` field of a foreign key or
-a one-to-one relation reads the related row in the same query.
-
-### Request body errors
-
-The generated `create`, `update` and `partial_update` actions validate the
-request body as a function route does for a body parameter of the same
-serializer. A bad body gives the same 422 response. The response reports the
-first error of the body:
+```bash
+curl localhost:8000/articles/2
+```
 
 ```json
-{
-    "detail": [
-        {
-            "loc": ["body", "title"],
-            "msg": "Object missing required field `title`",
-            "type": "missing_field"
-        }
-    ]
-}
+{"id": 2, "title": "Async ORM"}
 ```
 
-### get_queryset
+```bash
+curl localhost:8000/articles/99
+```
 
-Override to customize the queryset:
+```json
+{"detail": "Not found"}
+```
 
+`get_queryset()` returns a new copy of `queryset` for each call. `get_object()` returns the row with the lookup value, or raises `HTTPException` with `404`. A value that the field cannot hold, such as `abc` for an integer key, is also not found.
+Here `retrieve` declares `pk: int`, so Bolt checks the type before the handler runs. `/articles/abc` then gets `422`.
+
+`get_object()` takes one of these forms:
+
+- `get_object()` reads the lookup value from the path of the request.
+- `get_object(value)` uses `value` for the lookup field.
+- `get_object(field=value)` filters by the keyword arguments.
+
+### Set the lookup field
+
+The lookup field names the path parameter and the model field that `get_object()` filters on. The default is `pk`. Set `lookup_field` on the class, or pass it to `api.viewset()`. The registration argument wins:
+
+<!-- fragment -->
 ```python
-@api.viewset("/my-articles")
-class MyArticleViewSet(ModelViewSet):
-    queryset = Article.objects.all()
+@api.viewset("/articles", lookup_field="id")
+class ArticleViewSet(ViewSet):
+    ...
+```
 
+The detail routes are then `/articles/{id}`. The value must be a model field, because `get_object()` filters on it.
+
+### Filter the QuerySet for each request
+
+Override `get_queryset()` or `filter_queryset()`. Both are `async`. Read the request from `self.request`, and the action name from `self.action`:
+
+<!-- fragment -->
+```python
     async def get_queryset(self):
-        qs = await super().get_queryset()
-        return qs.filter(author_id=self.request.user.id)
+        queryset = await super().get_queryset()
+        if self.action == "list" and "published" in self.request.query:
+            queryset = queryset.filter(published=self.request.query["published"] == "true")
+        return queryset
 ```
 
-### get_object
+`get_object()` uses `get_queryset()` and then `filter_queryset()`. Thus a filter there also limits the detail routes.
 
-Get a single object by primary key:
+## Add a custom action
+
+Decorate a method with `@action`. `detail=True` makes a route under the detail path. `detail=False` makes a route under the collection path:
 
 ```python
-async def retrieve(self, request):
-    article = await self.get_object()  # Raises 404 if not found
-    return ArticleSchema.from_model(article)
+from django_bolt import BoltAPI, ViewSet, action
+from django_bolt.serializers import Serializer
+
+from blog.models import Article
+
+api = BoltAPI()
+
+
+class ArticleOut(Serializer):
+    id: int
+    title: str
+
+
+@api.viewset("/articles")
+class ArticleViewSet(ViewSet):
+    queryset = Article.objects.order_by("id")
+    serializer_class = ArticleOut
+
+    @action(methods=["POST"], detail=True)
+    async def publish(self, pk: int) -> ArticleOut:
+        article = await self.get_object(pk)
+        article.published = True
+        await article.asave(update_fields=["published"])
+        return article
+
+    @action(methods=["GET"], detail=False)
+    async def drafts(self) -> list[ArticleOut]:
+        return (await self.get_queryset()).filter(published=False)
 ```
 
-By default, `get_object()` reads the current lookup value from `self.request.params`.
-A value that the lookup field cannot hold, such as `abc` for an integer primary key, also raises 404.
-If you need to resolve an object manually, explicit lookups still work:
-
-```python
-article = await self.get_object(pk)
-article = await self.get_object(id=id)
+```bash
+curl -X POST localhost:8000/articles/3/publish
 ```
 
-### Custom lookup field
+```json
+{"id": 3, "title": "Draft"}
+```
 
-Use a different field for lookups:
+The routes are `POST /articles/{pk}/publish` and `GET /articles/drafts`.
+
+`@action` takes these arguments:
+
+| Argument | Default | Effect |
+| --- | --- | --- |
+| `methods` | required | The HTTP methods, for example `["GET", "POST"]`. |
+| `detail` | required | `True` for `/path/{pk}/<name>`, `False` for `/path/<name>`. |
+| `path` | the method name | The last path segment. |
+| `name` | the method name | The suffix of the route name. |
+| `auth`, `guards`, `status_code`, `validate_response`, `tags` | `None` | Options of the route. Each wins over the class and the registration. |
+| `response_model` | none | The response type, in place of the return type. |
+| `summary`, `description`, `deprecated` | `None`, `None`, `False` | OpenAPI fields of the operation. |
+
+`@action` works with `api.viewset()` only. `api.view()` raises `ValueError` for a class with an action.
+
+Bolt makes a new instance of the class for each request to a custom action.
+
+## Use a ModelViewSet
+
+`ModelViewSet` implements the six actions for the model of `queryset`. Give it the model and a serializer:
 
 ```python
+from django_bolt import BoltAPI, ModelViewSet, PageNumberPagination
+from django_bolt.serializers import Serializer, field
+
+from blog.models import Article
+
+api = BoltAPI()
+
+
+class ArticleSerializer(Serializer):
+    id: int = field(read_only=True, default=0)
+    title: str
+    body: str
+    author_id: int
+    published: bool = False
+
+
+class ArticleListItem(Serializer):
+    id: int
+    title: str
+
+
+class ArticlePages(PageNumberPagination):
+    page_size = 2
+
+
 @api.viewset("/articles")
 class ArticleViewSet(ModelViewSet):
-    queryset = Article.objects.all()
-    lookup_field = "slug"  # Use slug instead of pk
-
-    async def retrieve(self, request):
-        article = await self.get_object()
-        return {"slug": article.slug}
-```
-
-You can also give the lookup field at registration. This value has priority over the class attribute and applies to this registration only:
-
-```python
-@api.viewset("/articles-by-slug", lookup_field="slug")
-class ArticleBySlugViewSet(ModelViewSet):
-    queryset = Article.objects.all()
+    queryset = Article.objects.order_by("id")
     serializer_class = ArticleSerializer
+    list_serializer_class = ArticleListItem
+    pagination_class = ArticlePages
 ```
 
-### Serializer Priority
+```bash
+curl -X POST localhost:8000/articles -H "Content-Type: application/json" \
+  -d '{"id": 99, "title": "New", "body": "Text", "author_id": 2}'
+```
 
-| Action                      | Validation                                                                                | Response                                            |
-|-----------------------------|-------------------------------------------------------------------------------------------|-----------------------------------------------------|
-| `list`                      |                                                                                           | `list_serializer_class` </br> or `serializer_class` |
-| `retrieve`                  |                                                                                           | `serializer_class`                                  |
-| `create`                    | `create_serializer_class` </br> or `serializer_class`                                     | `serializer_class`                                  |
-| `update` / `partial_update` | `update_serializer_class` </br> or `create_serializer_class`  </br> or `serializer_class` | `serializer_class`                                  |
+```json
+{"id": 4, "title": "New", "body": "Text", "author_id": 2, "published": false}
+```
 
-!!! warning
+```bash
+curl -X PATCH localhost:8000/articles/4 -H "Content-Type: application/json" -d '{"published": true}'
+```
 
-    Automatic response-model inference needs either a return type annotation or
-    an available serializer class. Default CRUD helpers still require the
-    corresponding serializer class when they validate request data.
+```json
+{"id": 4, "title": "New", "body": "Text", "author_id": 2, "published": true}
+```
 
-## Custom actions
+```bash
+curl localhost:8000/articles
+```
 
-Add custom actions using the `@action` decorator to create endpoints beyond standard CRUD operations.
+```json
+{"items": [{"id": 1, "title": "Hello Bolt"}, {"id": 2, "title": "Async ORM"}], "total": 4, "has_next": true, "has_previous": false, "page": 1, "page_size": 2, "total_pages": 2, "next_page": 2}
+```
 
-### Basic actions
+`DELETE /articles/4` answers `204` with no body.
 
+The actions work like this:
+
+- `create` validates the body with `create_serializer_class`, or `serializer_class`. It does not set `read_only` fields. It does not set the primary key when the database makes it. A unique value that a row already has gives `409`.
+- `update` (PUT) validates the full body with `update_serializer_class`, then `create_serializer_class`, then `serializer_class`. It writes each field except `read_only` fields, the primary key and the lookup field.
+- `partial_update` (PATCH) writes only the fields of the body. It validates the merged object with the update serializer.
+- `list` uses `list_serializer_class`, or `serializer_class`, for each item. With `pagination_class`, Bolt paginates it.
+- `retrieve`, `create`, `update` and `partial_update` return the object with `serializer_class`.
+- `destroy` deletes the row and answers `204`.
+
+A field for a `ForeignKey` or a `OneToOneField` can hold the primary key of the related row, as `author: int` or `author_id: int`. `create`, `update` and `partial_update` write the key to the column attribute `author_id`, as `Serializer.to_model()` does.
+
+`ReadOnlyModelViewSet` has only `list` and `retrieve`. The mixins `ListMixin`, `RetrieveMixin`, `CreateMixin`, `UpdateMixin`, `PartialUpdateMixin` and `DestroyMixin` give one action each. Combine them with `ViewSet`:
+
+<!-- fragment -->
 ```python
-from django_bolt import action
+from django_bolt import CreateMixin, ListMixin, ViewSet
 
-@api.viewset("/articles")
-class ArticleViewSet(ViewSet):
-    queryset = Article.objects.all()
 
-    @action(methods=["GET"], detail=False)
-    async def published(self, request):
-        """Collection action: GET /articles/published"""
-        articles = []
-        async for article in Article.objects.filter(is_published=True):
-            articles.append({"id": article.id, "title": article.title})
-        return articles
-
-    @action(methods=["POST"], detail=True)
-    async def publish(self, request, pk: int):
-        """Instance action: POST /articles/{pk}/publish"""
-        article = await self.get_object()
-        article.is_published = True
-        await article.asave()
-        return {"published": True, "article_id": article.id}
+@api.viewset("/comments")
+class CommentViewSet(ListMixin, CreateMixin, ViewSet):
+    ...
 ```
 
-### Action parameters
+### Customize the write steps
 
-| Parameter        | Required | Description                                                                              |
-|------------------|----------|------------------------------------------------------------------------------------------|
-| `methods`        | yes      | List of HTTP methods: `["GET"]`, `["POST"]`, etc.                                        |
-| `detail`         | yes      | `True` for instance actions (`/{pk}/action`), `False` for collection actions (`/action`) |
-| `path`           | no       | Custom URL path (defaults to function name)                                              |
-| `name`           | no       | URL-reverse suffix; combined with the viewset base as `{base}-{name}` (see below)        |
-| `auth`           | no       | List of authentication backends (overrides class-level `auth`)                           |
-| `guards`         | no       | List of permission guards (overrides class-level `guards`)                               |
-| `response_model` | no       | Response model for serialization                                                         |
-| `status_code`    | no       | HTTP status code                                                                         |
-| `tags`           | no       | List of tags for OpenAPI documentation                                                   |
-| `summary`        | no       | Summary for OpenAPI documentation                                                        |
-| `description`    | no       | Detailed description for OpenAPI documentation                                           |
+Override these `async` methods to change how the actions save:
 
-An action with no `auth`, `guards`, `status_code`, `validate_response` or `tags` uses the value of `@api.viewset(...)`. For `auth`, `guards`, `status_code` and `validate_response`, the class attribute comes next.
+- `perform_create(obj)` saves a new object. The default is `await obj.asave(force_insert=True)`.
+- `perform_update(obj)` saves a changed object. The default is `await obj.asave()`.
+- `perform_destroy(obj)` deletes an object. The default is `await obj.adelete()`.
 
+<!-- fragment -->
 ```python
-@api.viewset("/articles", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
-class ArticleViewSet(ViewSet):
-    @action(methods=["POST"], detail=True)
-    async def publish(self, request, pk: int):  # Needs a valid token
-        ...
-
-    @action(methods=["GET"], detail=False, auth=[], guards=[AllowAny()])
-    async def featured(self, request):  # Public
-        ...
+    async def perform_create(self, obj):
+        obj.author_id = (await self.request.auser()).id
+        await obj.asave(force_insert=True)
 ```
 
-### Custom path
+Override `get_serializer_class(action=None)` to choose a serializer at run time. Bolt also calls it at startup, with `self.action` set to `"list"` or `"retrieve"`, to find the response types. `self.request` is not available at startup.
 
-Override the URL path:
+## Name the routes
 
-```python
-@action(methods=["POST"], detail=True, path="custom-action-name")
-async def some_method_name(self, request, pk: int):
-    """POST /articles/{pk}/custom-action-name"""
-    return {"action": "custom-action-name", "article_id": pk}
-```
+Bolt names each route of a ViewSet `<base>-<action>`. The base is the `name` argument of `api.viewset()`, or the class name. For example, `ArticleViewSet-list` and `ArticleViewSet-publish`. The routes of an `APIView` get the class name, or the `name` argument. See [Routing](routing.md) for reverse lookups.
 
-### URL reversing
+Bolt has no router objects for ViewSets, as Django REST Framework has. `api.viewset()` makes the routes. A `Router` holds function routes only.
 
-`view()`, `viewset()`, and `@action` all accept `name=` for URL reversing. A viewset names each route `{base}-{action}` (e.g. `user-list`, `user-recent`). See [URL names and reversing](routing.md#url-names-and-reversing) for the full reference.
+## See also
 
-### Actions with query parameters
-
-```python
-@action(methods=["GET"], detail=False)
-async def search(self, request, query: str, limit: int = 10):
-    """GET /articles/search?query=xxx&limit=5"""
-    articles = []
-    async for article in Article.objects.filter(title__icontains=query)[:limit]:
-        articles.append({"id": article.id, "title": article.title})
-    return {"query": query, "limit": limit, "results": articles}
-```
-
-### Actions with request body
-
-```python
-import msgspec
-
-class StatusUpdate(msgspec.Struct):
-    is_published: bool
-
-@action(methods=["POST"], detail=True, path="status")
-async def update_status(self, request, pk: int, data: StatusUpdate):
-    """POST /articles/{pk}/status with JSON body"""
-    article = await self.get_object()
-    article.is_published = data.is_published
-    await article.asave()
-    return {"updated": True, "is_published": article.is_published}
-```
-
-### Multiple methods on same path
-
-Create separate actions for different HTTP methods on the same path:
-
-```python
-@action(methods=["GET"], detail=True, path="status")
-async def get_status(self, request, pk: int):
-    """GET /articles/{pk}/status"""
-    article = await self.get_object()
-    return {"is_published": article.is_published}
-
-@action(methods=["POST"], detail=True, path="status")
-async def update_status(self, request, pk: int, data: StatusUpdate):
-    """POST /articles/{pk}/status"""
-    article = await self.get_object()
-    article.is_published = data.is_published
-    await article.asave()
-    return {"updated": True}
-```
-
-### Custom lookup field with actions
-
-Actions respect the ViewSet's `lookup_field`:
-
-```python
-@api.viewset("/articles")
-class ArticleViewSet(ViewSet):
-    queryset = Article.objects.all()
-    lookup_field = 'id'  # Use 'id' instead of 'pk'
-
-    async def retrieve(self, request):
-        """GET /articles/{id}"""
-        article = await self.get_object()
-        return {"id": article.id, "title": article.title}
-
-    @action(methods=["POST"], detail=True)
-    async def feature(self, request, id: int):
-        """POST /articles/{id}/feature"""
-        return {"featured": True, "article_id": id}
-```
-
-### Important: Actions require api.viewset()
-
-The `@action` decorator only works with `api.viewset()`, not `api.view()`:
-
-```python
-# CORRECT: Use api.viewset()
-@api.viewset("/articles")
-class ArticleViewSet(ViewSet):
-    @action(methods=["POST"], detail=False)
-    async def custom_action(self, request):
-        return {"ok": True}
-
-# WRONG: Will raise ValueError
-@api.view("/articles", methods=["GET"])
-class ArticleView(ViewSet):
-    @action(methods=["POST"], detail=False)  # Error!
-    async def custom_action(self, request):
-        return {"ok": True}
-```
-
-## Mixins
-
-Use mixins to compose functionality:
-
-```python
-from django_bolt.views import (
-    ListMixin,
-    RetrieveMixin,
-    CreateMixin,
-    UpdateMixin,
-    PartialUpdateMixin,
-    DestroyMixin,
-    ViewSet,
-)
-
-# Read-only viewset
-@api.viewset("/readonly-items")
-class ReadOnlyItemViewSet(ListMixin, RetrieveMixin, ViewSet):
-    queryset = Item.objects.all()
-    serializer_class = ItemSerializer
-
-# Full CRUD viewset
-@api.viewset("/items")
-class ItemViewSet(
-    ListMixin,
-    RetrieveMixin,
-    CreateMixin,
-    UpdateMixin,
-    PartialUpdateMixin,
-    DestroyMixin,
-    ViewSet,
-):
-    queryset = Item.objects.all()
-    serializer_class = ItemSerializer
-```
-
-Available mixins:
-
-| Mixin | Action | URL | Method |
-|-------|--------|-----|--------|
-| `ListMixin` | `list` | `/items` | GET |
-| `RetrieveMixin` | `retrieve` | `/items/{pk}` | GET |
-| `CreateMixin` | `create` | `/items` | POST |
-| `UpdateMixin` | `update` | `/items/{pk}` | PUT |
-| `PartialUpdateMixin` | `partial_update` | `/items/{pk}` | PATCH |
-| `DestroyMixin` | `destroy` | `/items/{pk}` | DELETE |
-
-The write actions do not take each field from the request body:
-
-- `update` and `partial_update` write to the object that `get_object()` returns. They do not write the primary key, the lookup field or a `read_only` serializer field. Thus the body cannot move the write to a row outside `get_queryset()`.
-- `create` does not write a `read_only` serializer field. It does not write the primary key when the database gives the primary key (`AutoField`, `BigAutoField`).
-
-## ReadOnlyModelViewSet
-
-A convenient shortcut for read-only access:
-
-```python
-from django_bolt.views import ReadOnlyModelViewSet
-
-@api.viewset("/public-articles")
-class PublicArticleViewSet(ReadOnlyModelViewSet):
-    queryset = Article.objects.filter(published=True)
-    serializer_class = ItemSerializer
-```
-
-This provides only `list` and `retrieve` actions.
-
-## Sync handlers
-
-APIView support synchronous handlers:
-
-```python
-@api.view("/sync-resource")
-class SyncResourceView(APIView):
-    def get(self, request):  # Note: not async
-        return {"sync": True}
-```
-
-`@action` decorators on `ViewSet` and `ModelViewSet` also support synchronous handlers:
-
-```python
-@api.viewset("/sync-items")
-class SyncItemViewSet(ViewSet):
-    @action(methods=["GET"], detail=False)
-    def sync(self, request):
-        return {"sync": True}
-```
-
-Sync handlers are automatically wrapped to run in a thread pool.
-
-!!! warning
-
-    CRUD methods on ViewSets (`list`, `retrieve`, `create`, `update`, `partial_update`, `destroy`) currently do not support synchronous handlers.
+- [Views reference](../ref/views.md)
+- [Serializers](serializers.md)
+- [Pagination](pagination.md)
+- [Dependencies](dependencies.md)
+- [Permissions](permissions.md)
+- [Routing](routing.md)
