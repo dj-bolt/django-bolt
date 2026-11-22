@@ -1220,9 +1220,13 @@ async fn route_request(
     // Max parameter length resolved once at startup; read the plain field here.
     let max_param_length = state.max_param_length;
 
+    // A no-route answer has no handler, so no query value is checked for it.
+    // Thus a 422 cannot take the place of the 404 or the 405.
+    let check_query = rust_answer.is_none();
+
     // A sequence query parameter takes each value of its repeated key.
     let query_sequences = match route_metadata {
-        Some(route_meta) if needs_query => match query_sequences(
+        Some(route_meta) if needs_query && check_query => match query_sequences(
             req.uri().query(),
             &route_meta.query_seq_fields,
             max_param_length,
@@ -1234,20 +1238,21 @@ async fn route_request(
     };
 
     // Type validation for path and query parameters (Rust-native, no GIL)
-    let (path_coerced, query_coerced) = if let Some(route_meta) = route_metadata {
-        match validate_and_cache_typed_params(
-            path_params.as_ref(),
-            query_params.as_ref(),
-            &route_meta.path_types,
-            &route_meta.query_types,
-            max_param_length,
-        ) {
-            Ok(cached) => cached,
-            Err(response) => return response,
-        }
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let (path_coerced, query_coerced) =
+        if let Some(route_meta) = route_metadata.filter(|_| check_query) {
+            match validate_and_cache_typed_params(
+                path_params.as_ref(),
+                query_params.as_ref(),
+                &route_meta.path_types,
+                &route_meta.query_types,
+                max_param_length,
+            ) {
+                Ok(cached) => cached,
+                Err(response) => return response,
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     let needs_headers = plan.is_none_or(|p| p.needs_headers());
     let needs_cookies = plan.is_none_or(|p| p.needs_cookies());

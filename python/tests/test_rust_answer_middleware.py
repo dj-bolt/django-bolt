@@ -279,6 +279,17 @@ def test_a_429_does_not_reach_the_python_middleware(layout, kind):
     )
 
 
+def test_a_query_value_over_the_length_limit_keeps_the_answer_of_rust():
+    """No handler gets the query of an answer of Rust, so its length gives no 422."""
+    query = {"q": "a" * 9000}
+    with TestClient(_api(_LAYOUTS["bolt"]())) as client:
+        no_route = client.get("/no-route", params=query)
+        wrong_method = client.post("/open", params=query)
+
+    assert (no_route.status_code, wrong_method.status_code) == (404, 405)
+    assert no_route.headers[_HEADER["bolt"]] == "bolt-rid"
+
+
 def test_a_middleware_can_answer_a_request_with_no_route():
     with TestClient(_api([MaintenanceMiddleware])) as client:
         response = client.get("/no-route")
