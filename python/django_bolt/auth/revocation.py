@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 from django.apps import apps
 from django.core.cache import caches
-from django.core.cache.backends.base import BaseCache
+from django.core.cache.backends.base import BaseCache, InvalidCacheKey
 from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError
 from django.db.models import F
@@ -28,8 +28,10 @@ _ORM_RESERVED_PREFIXES = ("family:", "version:")
 
 
 class ReservedJtiError(ValueError):
-    """A store refuses a ``jti`` that starts with one of its reserved prefixes.
+    """A store refuses a ``jti``, a family or a user id that it cannot keep.
 
+    A ``jti`` that starts with a reserved prefix gets this error. A key that the
+    storage cannot keep also gets it, for example a key longer than the column.
     Authentication and ``JWTAuthViews`` count such a token as revoked.
     """
 
@@ -41,6 +43,11 @@ def _check_jti(jti: str, reserved: tuple[str, ...]) -> None:
             f"jti {jti!r} starts with a reserved prefix ({', '.join(reserved)}). "
             "The store uses these prefixes for families and user versions."
         )
+
+
+def _refused_cache_key(error: InvalidCacheKey) -> ReservedJtiError:
+    """Return the error for a key that the cache backend refuses, for example memcached."""
+    return ReservedJtiError(f"The cache backend cannot keep this key: {error}")
 
 
 def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS, *, leeway: int) -> int:
@@ -328,8 +335,12 @@ class DjangoCacheRevocation(RevocationStore):
     async def is_revoked(self, jti: str) -> bool:
         _check_jti(jti, _CACHE_RESERVED_PREFIXES)
         key = f"{self.key_prefix}{jti}"
-        # Django cache get is sync, but fast
-        return self.cache.get(key) is not None
+        # Django cache get is sync, but fast. A memcached backend refuses a key with a space
+        # or a key over 250 characters.
+        try:
+            return self.cache.get(key) is not None
+        except InvalidCacheKey as exc:
+            raise _refused_cache_key(exc) from exc
 
     async def revoke(self, jti: str, *, exp: int | None = None) -> None:
         """
@@ -345,10 +356,14 @@ class DjangoCacheRevocation(RevocationStore):
         seconds (set on the constructor).
 
         A ``jti`` that starts with ``fam:`` or ``ver:`` raises ``ReservedJtiError``.
+        A key that the cache backend refuses also raises ``ReservedJtiError``.
         """
         _check_jti(jti, _CACHE_RESERVED_PREFIXES)
         key = f"{self.key_prefix}{jti}"
-        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        try:
+            self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        except InvalidCacheKey as exc:
+            raise _refused_cache_key(exc) from exc
 
     def _require_atomic_cache(self) -> None:
         cache_type = type(self.cache)
@@ -373,10 +388,16 @@ class DjangoCacheRevocation(RevocationStore):
         if ttl == 0:
             # Django deletes an entry with a timeout of 0, so its marker cannot block a replay.
             return False
-        return bool(self.cache.add(key, "1", timeout=ttl))
+        try:
+            return bool(self.cache.add(key, "1", timeout=ttl))
+        except InvalidCacheKey as exc:
+            raise _refused_cache_key(exc) from exc
 
     async def get_user_version(self, user_id: str) -> int:
-        return int(self.cache.get(f"{self.key_prefix}ver:{user_id}") or 0)
+        try:
+            return int(self.cache.get(f"{self.key_prefix}ver:{user_id}") or 0)
+        except InvalidCacheKey as exc:
+            raise _refused_cache_key(exc) from exc
 
     async def bump_user_version(self, user_id: str) -> int:
         # User-version keys never expire — they are the source of truth for
@@ -385,6 +406,9 @@ class DjangoCacheRevocation(RevocationStore):
         key = f"{self.key_prefix}ver:{user_id}"
         try:
             return self.cache.incr(key)
+        except InvalidCacheKey as exc:
+            # InvalidCacheKey is a ValueError, but the key is not missing: the backend refuses it.
+            raise _refused_cache_key(exc) from exc
         except ValueError:
             # Seed atomically. If another caller won the add race, increment
             # its value so no concurrent logout event is lost.
@@ -394,10 +418,16 @@ class DjangoCacheRevocation(RevocationStore):
 
     async def revoke_family(self, fam: str, *, exp: int | None = None) -> None:
         key = f"{self.key_prefix}fam:{fam}"
-        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        try:
+            self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        except InvalidCacheKey as exc:
+            raise _refused_cache_key(exc) from exc
 
     async def is_family_revoked(self, fam: str) -> bool:
-        return self.cache.get(f"{self.key_prefix}fam:{fam}") is not None
+        try:
+            return self.cache.get(f"{self.key_prefix}fam:{fam}") is not None
+        except InvalidCacheKey as exc:
+            raise _refused_cache_key(exc) from exc
 
 
 class DjangoORMRevocation(RevocationStore):
@@ -479,6 +509,8 @@ class DjangoORMRevocation(RevocationStore):
         self.default_ttl = default_ttl
         self.leeway = _checked_leeway("DjangoORMRevocation", leeway)
         self._model = None
+        # The max_length of the jti field of the model. It is None until the model loads.
+        self._max_key_length: int | None = None
 
     @property
     def model(self):
@@ -488,12 +520,29 @@ class DjangoORMRevocation(RevocationStore):
             if len(parts) != 2 or not all(parts):
                 raise ValueError(f"model must be 'app_label.ModelName', got '{self.model_path}'")
             app_label, model_name = parts
-            self._model = apps.get_model(app_label, model_name)
+            model = apps.get_model(app_label, model_name)
+            self._max_key_length = model._meta.get_field("jti").max_length
+            self._model = model
         return self._model
+
+    def _model_for(self, key: str):
+        """Return the model. Raise ``ReservedJtiError`` when its ``jti`` column cannot keep ``key``.
+
+        PostgreSQL raises ``DataError`` for a key that is too long or that has a NUL
+        character. MySQL without strict mode cuts a long key short, so two keys can
+        share one row. Thus the store refuses such a key before the query.
+        """
+        model = self.model
+        limit = self._max_key_length
+        if limit is not None and len(key) > limit:
+            raise ReservedJtiError(f"The key has {len(key)} characters. The jti column keeps at most {limit}.")
+        if "\x00" in key:
+            raise ReservedJtiError("The key has a NUL character. The jti column cannot keep it.")
+        return model
 
     async def is_revoked(self, jti: str) -> bool:
         _check_jti(jti, _ORM_RESERVED_PREFIXES)
-        return await self.model.objects.filter(jti=jti).aexists()
+        return await self._model_for(jti).objects.filter(jti=jti).aexists()
 
     async def revoke(self, jti: str, *, exp: int | None = None) -> None:
         """
@@ -509,6 +558,7 @@ class DjangoORMRevocation(RevocationStore):
         self.default_ttl`` (set on the constructor).
 
         A ``jti`` that starts with ``family:`` or ``version:`` raises ``ReservedJtiError``.
+        A ``jti`` that the ``jti`` column cannot keep also raises ``ReservedJtiError``.
         """
         _check_jti(jti, _ORM_RESERVED_PREFIXES)
         await self._upsert(jti, exp)
@@ -517,10 +567,11 @@ class DjangoORMRevocation(RevocationStore):
         # Read the TTL first: expires_at is then never before the end of exp + leeway.
         ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
         expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
-        await self.model.objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
+        await self._model_for(jti).objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
         _check_jti(jti, _ORM_RESERVED_PREFIXES)
+        model = self._model_for(jti)
         ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
         if ttl == 0:
             # The cleanup task deletes an expired row, and a later consume would then
@@ -528,7 +579,7 @@ class DjangoORMRevocation(RevocationStore):
             return False
         expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
         try:
-            await self.model.objects.acreate(jti=jti, expires_at=expires_at)
+            await model.objects.acreate(jti=jti, expires_at=expires_at)
         except IntegrityError:
             return False
         return True
@@ -537,10 +588,12 @@ class DjangoORMRevocation(RevocationStore):
         await self._upsert(f"family:{fam}", exp)
 
     async def is_family_revoked(self, fam: str) -> bool:
-        return await self.model.objects.filter(jti=f"family:{fam}").aexists()
+        key = f"family:{fam}"
+        return await self._model_for(key).objects.filter(jti=key).aexists()
 
     async def get_user_version(self, user_id: str) -> int:
-        rows = self.model.objects.filter(jti=f"version:{user_id}")
+        key = f"version:{user_id}"
+        rows = self._model_for(key).objects.filter(jti=key)
         return await rows.values_list("version", flat=True).afirst() or 0
 
     async def bump_user_version(self, user_id: str) -> int:
@@ -549,8 +602,9 @@ class DjangoORMRevocation(RevocationStore):
         A concurrent bump can make the returned version larger than this bump alone.
         """
         key = f"version:{user_id}"
-        await self.model.objects.aget_or_create(jti=key, defaults={"expires_at": _NEVER_EXPIRES})
-        await self.model.objects.filter(jti=key).aupdate(version=F("version") + 1)
+        model = self._model_for(key)
+        await model.objects.aget_or_create(jti=key, defaults={"expires_at": _NEVER_EXPIRES})
+        await model.objects.filter(jti=key).aupdate(version=F("version") + 1)
         return await self.get_user_version(user_id)
 
 

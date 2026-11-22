@@ -103,13 +103,20 @@ class JWTAuthViews:
         response.delete_cookie(self.refresh_cookie, path=self._refresh_path)
         return response
 
-    async def _token_revoked(self, jti: str) -> bool:
+    async def _token_live(self, claims: dict[str, Any], user_id: str) -> bool:
+        # The Rust layer gives ``fam`` as a str and ``ver`` as an int, or leaves the claim out.
+        fam = claims.get("fam")
         try:
-            return await self.store.is_revoked(jti)
+            return bool(
+                fam
+                and not await self.store.is_revoked(claims["jti"])
+                and not await self.store.is_family_revoked(fam)
+                and claims.get("ver", 0) == await self.store.get_user_version(user_id)
+            )
         except ReservedJtiError:
-            # The store refuses this jti, for example a jti with a reserved prefix.
+            # The store refuses the jti, the family or the user id, for example a key that it cannot keep.
             # Such a token is not live, so it gets the same 401 as a revoked token.
-            return True
+            return False
 
     async def _require_live_refresh(self, request: Any) -> dict[str, Any]:
         """Reject a refresh token that ``/refresh`` also rejects.
@@ -118,14 +125,7 @@ class JWTAuthViews:
         The refresh route cannot rotate a token with no family, so this token gets the same 401.
         """
         claims = request["context"]["auth_claims"]
-        # The Rust layer gives ``fam`` as a str and ``ver`` as an int, or leaves the claim out.
-        fam = claims.get("fam")
-        if (
-            not fam
-            or await self._token_revoked(claims["jti"])
-            or await self.store.is_family_revoked(fam)
-            or claims.get("ver", 0) != await self.store.get_user_version(request["context"]["user_id"])
-        ):
+        if not await self._token_live(claims, request["context"]["user_id"]):
             raise HTTPException(status_code=401, detail="Invalid token")
         return claims
 
