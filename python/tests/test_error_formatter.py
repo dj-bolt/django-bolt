@@ -111,7 +111,7 @@ def _routes(api: BoltAPI) -> BoltAPI:
 
 @pytest.fixture
 def recorded():
-    with TestClient(_routes(BoltAPI(error_formatter=_record))) as client:
+    with TestClient(_routes(BoltAPI(error_formatter=_record)), raise_server_exceptions=False) as client:
         yield client
 
 
@@ -441,7 +441,7 @@ def test_response_validation_error_of_a_handler_gives_each_error_a_location_unde
     async def invalid() -> dict:
         raise ResponseValidationError(["plain text", msgspec.ValidationError("Bad - at `$.id`")])
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/invalid")
 
     assert response.status_code == 500

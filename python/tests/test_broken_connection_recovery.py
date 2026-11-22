@@ -111,7 +111,7 @@ def test_blocking_sync_handler_recovers_after_dead_connection(single_thread_pool
         time.sleep(0)
         return {"value": _select_one()}
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         assert client.get("/break").status_code == 500
         response = client.get("/ping")
         assert response.status_code == 200
@@ -131,7 +131,7 @@ def test_orm_executor_recovers_after_dead_connection(single_thread_pool):
     async def ping():
         return {"value": await concurrency.run_in_orm_executor(_select_one)}
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         assert client.get("/break").status_code == 500
         response = client.get("/ping")
         assert response.status_code == 200
@@ -156,7 +156,7 @@ def test_sync_to_async_recovers_after_dead_connection(single_thread_pool):
     async def ping():
         return {"value": await sync_to_async(_select_one)()}
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         assert client.get("/break").status_code == 500
         response = client.get("/ping")
         assert response.status_code == 200
@@ -545,7 +545,7 @@ def test_user_load_on_the_orm_pool_after_dead_connection(
     setting, the request after the failure reconnects. Without the drop in
     ``_call_guarded``, every later request on that thread fails.
     """
-    with TestClient(_user_api()) as client:
+    with TestClient(_user_api(), raise_server_exceptions=False) as client:
         assert client.get("/me", headers=pooled_user_headers).json() == {"username": "pooled"}
         assert client.get("/kill").json() == {"killed": True}
 

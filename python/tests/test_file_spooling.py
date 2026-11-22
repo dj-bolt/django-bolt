@@ -124,7 +124,7 @@ class TestFileAutoCleanup:
             file_states.append(file)
             raise ValueError("Handler error!")
 
-        with TestClient(api) as client:
+        with TestClient(api, raise_server_exceptions=False) as client:
             response = client.post(
                 "/upload-error",
                 files={"file": ("test.txt", b"will error", "text/plain")},
