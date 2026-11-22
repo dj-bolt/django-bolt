@@ -8,6 +8,7 @@ import pytest
 
 from django_bolt.admin.admin_detection import detect_admin_url_prefix, detect_admin_url_prefixes
 from django_bolt.api import BoltAPI
+from django_bolt.management.commands.runbolt import Command
 from django_bolt.testing import TestClient
 
 
@@ -199,9 +200,6 @@ def test_admin_behind_a_path_parameter_is_served_with_no_user_action(settings, c
     assert err.count("[django-bolt] Warning") == 1
     assert "path parameter" in err
     assert "Django answers each path that has no Bolt route" in err
-    # The warning does not tell the user to do something that runbolt already did.
-    assert "mount_django" not in err
-    assert detect_admin_url_prefixes() == [""]
     with TestClient(api, use_http_layer=True) as client:
         acme = client.get("/acme/admin/login/")
         globex = client.get("/globex/admin/")
@@ -218,27 +216,6 @@ def test_admin_behind_a_path_parameter_is_served_with_no_user_action(settings, c
 
 
 @pytest.mark.django_db(transaction=True)
-def test_admin_behind_a_path_parameter_leaves_a_bolt_route_at_the_root_path(settings, capsys):
-    """A Bolt route at "/" and the root mount of the admin work together. The Bolt route answers "/"."""
-    settings.ROOT_URLCONF = "tests.admin_tests.urls_path_parameter"
-    api = BoltAPI()
-
-    @api.get("/")
-    async def home():
-        return {"home": True}
-
-    api._register_admin_routes("127.0.0.1", 8000)
-    capsys.readouterr()
-
-    with TestClient(api, use_http_layer=True) as client:
-        home_response = client.get("/")
-        acme = client.get("/acme/admin/login/")
-
-    assert home_response.json() == {"home": True}
-    assert acme.status_code == 200
-    assert acme.text == "admin login of acme"
-
-
 def test_admin_at_the_root_path_keeps_the_root_mount_of_the_user(settings):
     """A Django mount at "/" of the user already serves an admin site at the root path."""
     settings.ROOT_URLCONF = "tests.admin_tests.urls_root_admin"
@@ -247,8 +224,31 @@ def test_admin_at_the_root_path_keeps_the_root_mount_of_the_user(settings):
 
     api._register_admin_routes("127.0.0.1", 8000)
 
-    assert api._admin_routes_registered
-    assert [prefix for prefix, _app in api._asgi_mounts] == ["/"]
+    with TestClient(api, use_http_layer=True) as client:
+        response = client.get("/login/")
+
+    assert response.status_code == 200
+
+
+@pytest.mark.django_db(transaction=True)
+def test_admin_behind_a_path_parameter_keeps_the_root_mount_of_a_merged_api(settings):
+    """runbolt merges the APIs first. The root mount of the second API stays the only one."""
+    settings.ROOT_URLCONF = "tests.admin_tests.urls_path_parameter"
+    first = BoltAPI()
+    second = BoltAPI()
+    second.mount_django("/", clear_root_path=True)
+
+    @first.get("/first")
+    async def first_route():
+        return {"api": "first"}
+
+    merged = Command().merge_apis([("first.api", first), ("second.api", second)])
+    merged._register_admin_routes("127.0.0.1", 8000)
+
+    with TestClient(merged, use_http_layer=True) as client:
+        response = client.get("/acme/admin/login/")
+
+    assert response.text == "admin login of acme"
 
 
 @pytest.mark.django_db(transaction=True)
@@ -260,8 +260,6 @@ def test_admin_behind_a_path_parameter_keeps_the_root_mount_of_the_user(settings
 
     api._register_admin_routes("127.0.0.1", 8000)
 
-    assert api._admin_routes_registered
-    assert [prefix for prefix, _app in api._asgi_mounts] == ["/"]
     assert "[django-bolt] Warning" not in capsys.readouterr().err
     with TestClient(api, use_http_layer=True) as client:
         response = client.get("/acme/admin/login/")

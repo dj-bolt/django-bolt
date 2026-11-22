@@ -633,7 +633,10 @@ def test_runbolt_allows_a_root_mount_with_a_route_at_the_root_path():
 
 
 def test_testclient_serves_a_route_at_the_root_path_and_a_root_mount():
-    """The route answers "/", and the root mount answers each other path."""
+    """The route answers "/", and the root mount answers each path with no route.
+
+    A path of a route with another method gets 405, not the mount.
+    """
     api = BoltAPI()
 
     @api.get("/")
@@ -649,9 +652,12 @@ def test_testclient_serves_a_route_at_the_root_path_and_a_root_mount():
 
     with TestClient(api, use_http_layer=True) as client:
         home_response = client.get("/")
+        wrong_method = client.post("/")
         mounted = client.get("/other/path")
 
     assert home_response.json() == {"home": True}
+    assert wrong_method.status_code == 405
+    assert wrong_method.headers["allow"] == "GET, OPTIONS"
     assert mounted.status_code == 200
     assert mounted.text.endswith("/other/path")
 

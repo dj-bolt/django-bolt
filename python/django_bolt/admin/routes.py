@@ -39,16 +39,14 @@ class AdminRouteRegistrar:
             self.api._admin_routes_registered = True
             return
 
-        if admin_url_needs_path_parameter():
-            print(
-                "[django-bolt] Warning: the URL pattern of the admin site has a path parameter. "
-                "Bolt mounts Django at the root path for it. "
-                "Django answers each path that has no Bolt route.",
-                file=sys.stderr,
+        if "" in admin_prefixes:
+            where = (
+                "the URL pattern of the admin site has a path parameter"
+                if admin_url_needs_path_parameter()
+                else "the admin site is at the root path"
             )
-        elif "" in admin_prefixes:
             print(
-                "[django-bolt] Warning: the admin site is at the root path. "
+                f"[django-bolt] Warning: {where}, so Bolt mounts Django at the root path. "
                 "Django answers each path that has no Bolt route.",
                 file=sys.stderr,
             )

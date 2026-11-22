@@ -143,7 +143,7 @@ An admin site in `i18n_patterns()` has one prefix for each language of `settings
 
 A prefix with a path parameter, such as `path("<tenant>/admin/", site.urls)`, is not a static path. A mount path must be static, so `runbolt` mounts Django at the root path for it. Bolt routes answer first. Django answers each path that has no Bolt route, so `/acme/admin/` goes to the admin. `runbolt` prints a warning about this wider mount. An admin site at the root path, `path("", admin.site.urls)`, gets the same mount and a warning.
 
-The mount at the root path costs nothing for a request to a Bolt route. Bolt reads the mounts only when no Bolt route matches. A path that has no Bolt route gets the answer of Django, for example a Django 404 page, not the 404 of Bolt.
+The mount at the root path costs nothing for a request to a Bolt route. Bolt reads the mounts only when no Bolt route matches. A path that has no Bolt route gets the answer of Django, for example a Django 404 page, not the 404 of Bolt. A path of a Bolt route with another method gets 405 from Bolt, not the mount.
 
 If you call `api.mount_django("/", ...)` yourself, `runbolt` keeps your mount and does not add one.
 
@@ -153,7 +153,7 @@ If you call `api.mount_django("/", ...)` yourself, `runbolt` keeps your mount an
 - Prefixes are normalized (leading slash, no trailing slash except `/`).
 - Duplicate exact mount prefixes are rejected.
 - Exact collisions between Bolt route paths and mount prefixes are rejected.
-- A mount at `/` and a Bolt route at `/` can exist together. The route answers `/`, and the mount gets each path with no route.
+- A mount at `/` and a Bolt route at `/` can exist together. The route answers `/`, and the mount gets each request that no route matches.
 - Non-exact prefix overlap is allowed.
 - Longest prefix wins when multiple mounts match.
 

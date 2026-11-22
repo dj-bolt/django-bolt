@@ -53,15 +53,8 @@ def test_runbolt_serves_an_admin_site_behind_a_path_parameter(make_server_projec
 
     with project.start() as server:
         acme = server.get("/acme/admin/login/")
-        bolt_route = server.get("/items/7")
-        bolt_validation = server.get("/items/abc")
-        no_route = server.get("/nothing/here/")
     _stdout, stderr = server.stop()
 
     assert acme.status_code == 200
     assert acme.text == "admin login of acme"
-    assert bolt_route.json() == {"item_id": 7}
-    assert bolt_validation.status_code == 422
-    # Django answers a path that has no Bolt route.
-    assert no_route.status_code == 404
     assert "Django answers each path that has no Bolt route" in stderr

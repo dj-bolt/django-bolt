@@ -397,7 +397,7 @@ def _validate_asgi_mount_conflicts(
             raise error_cls(f"Duplicate ASGI mount prefix: {mount_prefix}")
         seen_mounts.add(mount_prefix)
 
-        # A mount at "/" gets only the paths with no route, so a route at "/" answers first.
+        # A mount at "/" gets only the requests that no route matches, so a route at "/" answers first.
         if mount_prefix != "/" and mount_prefix in route_paths:
             raise error_cls(
                 f"ASGI mount prefix {mount_prefix} conflicts with an existing HTTP route "
