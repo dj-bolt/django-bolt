@@ -318,7 +318,7 @@ Then the request path has no logging code.
 This includes the 308 redirect and the automatic `OPTIONS` answer of a route path.
 The 308 redirect uses the values of the route at the other slash form.
 The automatic `OPTIONS` answer uses the values of the route for the first method in its `Allow` header.
-The `Allow` header lists the methods in a fixed order: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, `QUERY`.
+That method is the first of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD` and `QUERY` that the path has.
 The logger name also comes from that route.
 
 ## Example: Complete production setup
