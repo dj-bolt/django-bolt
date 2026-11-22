@@ -924,7 +924,8 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
         # Python 3.14 keeps the current task for each thread. The read also
         # hides it, so that a loop which fn starts on this thread can run tasks.
         # A callback of the loop has no task, and Python 3.12 refuses to swap
-        # out a task that is not there.
+        # out a task that is not there. Swap only while loop is the running
+        # loop of the thread: Python 3.14 swaps the task of that loop only.
         task = asyncio.current_task(loop)
         if task is not None:
             _swap_current_task(loop, None)

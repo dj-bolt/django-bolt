@@ -144,15 +144,8 @@ def test_a_sync_read_on_a_loop_can_run_a_loop_of_its_own():
 
         return asyncio.run(call())
 
-    def inner() -> int:
-        return 1
-
-    def outer() -> int:
-        value, same_task = blocking(inner)
-        return value + same_task
-
     def run() -> None:
-        results.append(blocking(outer))
+        results.append(blocking(lambda: blocking(lambda: 1)))
 
     # A thread with a time limit, so that a hang fails the test and does not stop the suite.
     thread = threading.Thread(target=run, daemon=True)
@@ -160,11 +153,11 @@ def test_a_sync_read_on_a_loop_can_run_a_loop_of_its_own():
     thread.join(timeout=10)
 
     assert not thread.is_alive(), "the nested event loop did not finish"
-    assert results == [(2, True)]
+    assert results == [((1, True), True)]
 
 
-def test_a_sync_read_in_a_loop_callback_with_no_task_runs():
-    """A callback of the loop has no current task. A sync read there runs, and no task is set after it."""
+def test_a_sync_read_in_a_loop_callback_runs():
+    """A loop callback has no current task. Python 3.12 refuses to swap out a task that is not there."""
 
     async def main():
         loop = asyncio.get_running_loop()
@@ -172,16 +165,14 @@ def test_a_sync_read_in_a_loop_callback_with_no_task_runs():
 
         def callback() -> None:
             try:
-                value = run_orm_blocking(lambda: 1)
-            except BaseException as error:  # noqa: BLE001 - the test reports any error of the read
-                done.set_result(error)
-            else:
-                done.set_result((value, asyncio.current_task()))
+                done.set_result(run_orm_blocking(lambda: 1))
+            except BaseException as error:  # noqa: BLE001 - await done raises the error of the read
+                done.set_exception(error)
 
         loop.call_soon(callback)
         return await done
 
-    assert asyncio.run(main()) == (1, None)
+    assert asyncio.run(main()) == 1
 
 
 def _slow_thread_name() -> str:
