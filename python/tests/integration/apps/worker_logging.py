@@ -1,6 +1,6 @@
 """App under test: handlers that write log records, for the multi-process logging test.
 
-``/warn`` writes a WARNING record. ``/boom`` raises, so Bolt logs the traceback.
+``/pid`` gives the PID of the worker that answers. ``/warn`` writes a WARNING record. ``/boom`` raises, so Bolt logs the traceback.
 When the worker stops, the lifespan writes ``SHUTDOWN_RECORDS`` WARNING records.
 The worker exits immediately after them, so a record that is still in the queue is lost.
 The project has no ``LOGGING`` setting, so Bolt sets up its queue-based handlers.
@@ -9,6 +9,7 @@ The project has no ``LOGGING`` setting, so Bolt sets up its queue-based handlers
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from django_bolt import BoltAPI
@@ -30,6 +31,11 @@ api = BoltAPI(lifespan=lifespan)
 @api.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@api.get("/pid")
+async def pid():
+    return {"pid": os.getpid()}
 
 
 @api.get("/warn")
