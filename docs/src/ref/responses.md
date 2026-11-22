@@ -25,7 +25,7 @@ async def create_article():
     return JSON({"id": 1}, status_code=201, headers={"Location": "/articles/1"}).set_cookie("last_article", "1")
 ```
 
-A handler with `-> JSON` or `-> Response` sends the body as it is. Bolt does not validate it. `-> Item | JSON` validates the body against `Item`.
+A handler with `-> JSON` or `-> Response` sends the body as it is. Bolt does not validate it. `-> Item | JSON` validates the body against `Item`. `Annotated` and a `type` alias do not change this.
 
 ## Shared behavior
 

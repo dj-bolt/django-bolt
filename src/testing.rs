@@ -30,6 +30,7 @@ use bolt_core::router::{Router, normalize_request_path};
 use bolt_core::state::{
     AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS, find_websocket_mount_in_slice,
 };
+use bolt_core::static_files::load_finder_roots;
 use bolt_websocket::WebSocketRouter;
 use bolt_websocket::handler::build_asgi_scope_from_parts;
 
@@ -409,13 +410,18 @@ fn static_scope_from_dict(
     if directories.is_empty() && !debug {
         return Ok(None);
     }
+    let django_finders = if debug {
+        Some(load_finder_roots(static_dict.py())?)
+    } else {
+        None
+    };
     Ok(Some(Arc::new(ScopeConfig {
         url_prefix,
         directories,
         csp_header,
         cache_control,
         mode: ServeMode::Static,
-        allow_django_finders: debug,
+        django_finders,
     })))
 }
 
