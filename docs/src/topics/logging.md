@@ -4,34 +4,29 @@ icon: lucide/scroll-text
 
 # Logging
 
-Django-Bolt provides a comprehensive logging system with queue-based non-blocking logging, configurable log levels, request/response logging, and header obfuscation.
+Bolt logs each request in the Rust server: the access log of `runbolt`.
+`LoggingConfig` sets the logger of the access log and the lines that it writes.
+Bolt also logs the exceptions that give a 5xx response.
 
 ## Quick start
 
-Create a logging middleware with default settings:
+Give a `LoggingConfig` to the API:
 
 ```python
-from django_bolt.logging import create_logging_middleware
-
-middleware = create_logging_middleware()
-```
-
-Or configure it with custom options:
-
-```python
-from django_bolt.logging import LoggingConfig, LoggingMiddleware
+from django_bolt import BoltAPI
+from django_bolt.logging import LoggingConfig
 
 config = LoggingConfig(
     logger_name="myapp.api",
     skip_paths={"/health", "/metrics"},
     sample_rate=0.1,  # Log 10% of successful requests
 )
-middleware = LoggingMiddleware(config)
+api = BoltAPI(logging_config=config)
 ```
 
 ## LoggingConfig
 
-The `LoggingConfig` class controls all logging behavior.
+`LoggingConfig` sets the access log and exception logging of an API.
 
 ### Basic options
 
@@ -42,9 +37,6 @@ config = LoggingConfig(
     # Logger name (default: "django.server")
     logger_name="myapp.api",
 
-    # Log level (default: "INFO")
-    log_level="DEBUG",
-
     # Skip these paths (default includes health checks)
     skip_paths={"/health", "/ready", "/metrics"},
 
@@ -52,6 +44,38 @@ config = LoggingConfig(
     skip_status_codes={204, 304},
 )
 ```
+
+### Logger name
+
+The access log writes the lines of the routes of an API to the logger `logger_name`.
+The default is `django.server`, the logger of Django's `runserver`.
+Each API has its own logger, also after `mount()`.
+`log_exception()` uses the same logger.
+
+```python
+from django_bolt import BoltAPI
+from django_bolt.logging import LoggingConfig
+
+api = BoltAPI(logging_config=LoggingConfig(logger_name="myapp.api"))
+```
+
+Set the level and the handlers of that logger in `LOGGING`:
+
+```python
+# settings.py
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {
+        "myapp.api": {"handlers": ["console"], "level": "INFO"},
+    },
+}
+```
+
+Bolt reads the level of each logger once, at startup. See [Access log](#access-log).
+
+### Skip paths and status codes
 
 Give the config to the API to apply `skip_paths` and `skip_status_codes` to the [access log](#access-log) of `runbolt`:
 
@@ -69,95 +93,9 @@ The two options apply to each status class, also to a 4xx and a 5xx.
 An API with no `logging_config` has the default `skip_paths`: `/health`, `/ready` and `/metrics`.
 To log these paths, use `LoggingConfig(skip_paths=set())`.
 
-The access log of `runbolt` applies four options: `skip_paths`, `skip_status_codes`, `sample_rate` and `min_duration_ms`.
+The access log of `runbolt` applies five options: `logger_name`, `skip_paths`, `skip_status_codes`, `sample_rate` and `min_duration_ms`.
 Its line always contains the method, the path, the status and the duration.
-The field options, the obfuscation options and `log_request_body` do not change that line.
-They apply only to the records that your code writes with `log_request()` and `log_response()` of [LoggingMiddleware](#loggingmiddleware).
-
-### Request logging fields
-
-Control which request fields are logged:
-
-```python
-config = LoggingConfig(
-    request_log_fields={
-        "method",      # HTTP method
-        "path",        # Request path
-        "query",       # Query parameters
-        "headers",     # Request headers (obfuscated)
-        "body",        # Request body
-        "client_ip",   # Client IP address
-        "user_agent",  # User agent string
-    }
-)
-```
-
-Default: `{"method", "path", "status_code"}`
-
-### Response logging fields
-
-Control which response fields are logged:
-
-```python
-config = LoggingConfig(
-    response_log_fields={
-        "status_code",  # HTTP status code
-        "duration",     # Response time in ms
-        "size",         # Response size in bytes
-    }
-)
-```
-
-### Security: Header obfuscation
-
-Sensitive headers are automatically obfuscated:
-
-```python
-config = LoggingConfig(
-    obfuscate_headers={
-        "authorization",
-        "cookie",
-        "x-api-key",
-        "x-auth-token",
-    }
-)
-```
-
-These headers appear as `"***"` in logs:
-
-```
-POST /api/users - headers: {"authorization": "***", "content-type": "application/json"}
-```
-
-### Security: Cookie obfuscation
-
-Sensitive cookies are also obfuscated:
-
-```python
-config = LoggingConfig(
-    obfuscate_cookies={
-        "sessionid",
-        "csrftoken",
-    }
-)
-```
-
-### Request body logging
-
-Enable request body logging with size limits:
-
-```python
-config = LoggingConfig(
-    log_request_body=True,
-    max_body_log_size=1000,  # Skip bodies larger than 1KB
-)
-```
-
-Binary data is logged as size information:
-
-```
-POST /api/upload - body: "<binary data, 1024 bytes>"
-```
+To log more fields of a request, use a [middleware](middleware.md) of your own.
 
 ## Production settings
 
@@ -194,7 +132,7 @@ DJANGO_BOLT_LOG_SLOW_MS = 250   # min_duration_ms
 
 Without the settings, the access log has no limit.
 A `sample_rate` out of 0.0 to 1.0, or a negative `min_duration_ms`, stops startup.
-The level of the `django.server` logger applies first. See [Access log](#access-log).
+The level of the logger of the API applies first. See [Access log](#access-log).
 
 ### Sample rate
 
@@ -220,51 +158,17 @@ config = LoggingConfig(min_duration_ms=250)
 
 A request that completes in 100ms won't be logged unless it's an error.
 
-## Log levels
-
-Django-Bolt uses appropriate log levels based on status codes:
-
-| Status Code | Log Level | Description |
-|-------------|-----------|-------------|
-| 2xx | INFO | Successful requests |
-| 3xx | INFO | Redirects |
-| 4xx | WARNING | Client errors |
-| 5xx | ERROR | Server errors |
-
-Requests are logged at DEBUG level (before processing). Responses are logged at the level above.
-
 ## LoggingMiddleware
 
-### Using with handlers
-
-```python
-from django_bolt import BoltAPI
-from django_bolt.logging import LoggingConfig, LoggingMiddleware
-
-config = LoggingConfig(
-    logger_name="myapp.api",
-    skip_paths={"/health"},
-)
-middleware = LoggingMiddleware(config)
-
-# Log request
-middleware.log_request({
-    "method": "POST",
-    "path": "/api/users",
-    "headers": {"content-type": "application/json"},
-})
-
-# Log response
-middleware.log_response(
-    request={"method": "POST", "path": "/api/users"},
-    status_code=201,
-    duration=0.05,  # seconds
-)
-```
+Each API with logging has a `LoggingMiddleware`. It holds the `LoggingConfig` and its logger.
 
 ### Exception logging
 
 ```python
+from django_bolt.logging import LoggingConfig, LoggingMiddleware
+
+middleware = LoggingMiddleware(LoggingConfig(logger_name="myapp.api"))
+
 try:
     # handler code
     pass
@@ -293,22 +197,6 @@ config = LoggingConfig(
 ```
 
 Bolt calls the handler only when the default response for the exception is a 5xx, as it does `log_exception`.
-
-## Client IP extraction
-
-The middleware extracts client IP from proxy headers:
-
-1. `X-Forwarded-For` (first IP in chain)
-2. `X-Real-IP`
-3. Falls back to connection IP
-
-```python
-config = LoggingConfig(
-    request_log_fields={"method", "path", "client_ip"}
-)
-
-# Logs: GET /api/users - client_ip: 192.168.1.1
-```
 
 ## Queue-based logging
 
@@ -387,7 +275,8 @@ If no `LOGGING` is configured, Django-Bolt sets up sensible defaults with queue-
 
 ### Access log
 
-The Rust server writes one line for each response from a matched route to the `django.server` logger:
+The Rust server writes one line for each response from a matched route to the logger of its API.
+That is `django.server`, or the `logger_name` of the `LoggingConfig` of the API:
 
 ```text
 GET /items/7 200 0.4ms
@@ -399,7 +288,8 @@ Bolt also writes a line for three answers about a route path: the 308 redirect t
 With an `error_formatter`, the line has the status of the formatted response.
 
 Bolt also writes a line for the 404 of a path with no route.
-The line uses the `skip_paths`, `skip_status_codes` and `sample_rate` of the API.
+The line goes to the logger of the API.
+It uses the `skip_paths`, `skip_status_codes` and `sample_rate` of the API.
 When `runbolt` serves more than one API, it uses the config of the first API.
 Bolt takes the GIL to write each 404 line, and the limit of 429 lines below does not apply to it.
 Thus a scanner that sends many requests to paths with no route costs a GIL call for each request.
@@ -408,8 +298,8 @@ To write no 404 line, add 404 to `skip_status_codes`. The filter runs in Rust, b
 Bolt writes no line for a mounted ASGI app or MCP server, for a static or media file, and for a [native route](native-routes.md).
 
 A flood of 429 responses does not fill the log.
-Each worker thread writes one line for the first 429 response of each second.
-The next 429 line of that worker has the number of 429 responses that wrote no line:
+Each worker thread writes one line to each logger for the first 429 response of each second.
+The next 429 line of that worker and logger has the number of 429 responses that wrote no line:
 
 ```text
 GET /items/7 429 0.1ms | suppressed: 41
@@ -426,11 +316,18 @@ The log level follows the status code, the same as Django's `runserver`:
 | 4xx | `WARNING` |
 | 5xx | `ERROR` |
 
-Set `django.server` to `WARNING` to keep only the 4xx and 5xx lines. Set it above `WARNING` to turn the access log off. The check runs once at startup. When the log is off, the request path has no logging code.
+Set the logger to `WARNING` to keep only the 4xx and 5xx lines. Set it to `ERROR` to keep only the 5xx lines. Set it above `ERROR` to remove all its lines.
+Bolt reads the level of each logger once, at startup.
+When no route writes to a logger with a level of `ERROR` or lower, the access log is off.
+Then the request path has no logging code.
 
 `skip_paths` and `skip_status_codes` remove the lines of some paths and status codes. See [Basic options](#basic-options).
 `sample_rate` and `min_duration_ms` remove lines of 1xx to 3xx responses. See [Production settings](#production-settings).
-This includes the 308 redirect and the automatic `OPTIONS` answer of a route path. They use the values of the API of that route.
+This includes the 308 redirect and the automatic `OPTIONS` answer of a route path.
+The 308 redirect uses the values of the route at the other slash form.
+The automatic `OPTIONS` answer uses the values of the route for the first method in its `Allow` header.
+That method is the first of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD` and `QUERY` that the path has.
+The logger name also comes from that route.
 
 ## Example: Complete production setup
 

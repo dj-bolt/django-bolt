@@ -304,6 +304,8 @@ pub struct Router {
     head: MethodRouter,
     options: MethodRouter,
     query: MethodRouter,
+    /// The handler id of each route, in the order of registration.
+    handler_ids: Vec<usize>,
     /// The route of a request that matches no route. Its metadata holds the
     /// access-log filter of the API. When its plan runs Python middleware,
     /// the 404 or the 405 goes through the middleware of the API.
@@ -327,6 +329,7 @@ impl Router {
             head: MethodRouter::new(),
             options: MethodRouter::new(),
             query: MethodRouter::new(),
+            handler_ids: Vec::new(),
             no_route: None,
         }
     }
@@ -353,6 +356,11 @@ impl Router {
     #[inline]
     pub fn no_route(&self) -> Option<&Route> {
         self.no_route.as_ref()
+    }
+
+    /// The handler id of each route. A native route has `NATIVE_HANDLER_ID`.
+    pub fn handler_ids(&self) -> &[usize] {
+        &self.handler_ids
     }
 
     pub fn register(
@@ -413,6 +421,7 @@ impl Router {
             }
         };
 
+        let handler_id = route.handler_id;
         // The lookup gets the request path in the form of `normalize_request_path`.
         let path = &*encode_route_path(path);
 
@@ -440,6 +449,7 @@ impl Router {
                     ))
                 })?;
         }
+        self.handler_ids.push(handler_id);
 
         Ok(())
     }
@@ -758,6 +768,7 @@ mod tests {
             );
         });
         assert_eq!(lookup(&router, "GET", "/items"), Some((0, None)));
+        assert_eq!(router.handler_ids(), [0]);
     }
 
     #[test]

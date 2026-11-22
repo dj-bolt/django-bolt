@@ -20,8 +20,7 @@ class TestMergedAPILoggingPreservation:
         # Create API 1 with custom logging
         logging_config_1 = LoggingConfig(
             logger_name="api1_logger",
-            request_log_fields={"path", "client_ip"},
-            response_log_fields={"status_code"},
+            skip_status_codes={204},
         )
         api1 = BoltAPI(logging_config=logging_config_1)
 
@@ -32,8 +31,7 @@ class TestMergedAPILoggingPreservation:
         # Create API 2 with different logging
         logging_config_2 = LoggingConfig(
             logger_name="api2_logger",
-            request_log_fields={"method", "path"},
-            response_log_fields={"duration"},
+            skip_status_codes={304},
         )
         api2 = BoltAPI(logging_config=logging_config_2)
 
@@ -85,8 +83,8 @@ class TestMergedAPILoggingPreservation:
         assert mapped_api1._logging_middleware.config.logger_name == "api1_logger", (
             "api1's logger name must be preserved"
         )
-        assert mapped_api1._logging_middleware.config.request_log_fields == {"path", "client_ip"}, (
-            "api1's request log fields must be preserved"
+        assert mapped_api1._logging_middleware.config.skip_status_codes == {204}, (
+            "api1's skip_status_codes must be preserved"
         )
 
         # Verify handler 1 (from api2) maps to api2
@@ -103,8 +101,8 @@ class TestMergedAPILoggingPreservation:
         assert mapped_api2._logging_middleware.config.logger_name == "api2_logger", (
             "api2's logger name must be preserved"
         )
-        assert mapped_api2._logging_middleware.config.request_log_fields == {"method", "path"}, (
-            "api2's request log fields must be preserved"
+        assert mapped_api2._logging_middleware.config.skip_status_codes == {304}, (
+            "api2's skip_status_codes must be preserved"
         )
 
     def test_merged_api_with_different_skip_paths(self):
@@ -375,31 +373,6 @@ class TestAPIDeduplication:
 
 class TestLoggingWithHandlerCalls:
     """Test that logging actually works when handlers are called."""
-
-    def test_logging_middleware_logs_on_handler_call(self, caplog):
-        """Logging middleware should log when handler is invoked."""
-        config = LoggingConfig(logger_name="test.api", min_duration_ms=None)
-        api = BoltAPI(logging_config=config)
-
-        @api.get("/test")
-        async def test_handler():
-            return {"result": "success"}
-
-        # Simulate calling the handler (simplified)
-        request = {
-            "method": "GET",
-            "path": "/test",
-            "query_params": {},
-            "headers": {},
-        }
-
-        # Log the response manually (simulating what BoltAPI.call_handler does)
-        with caplog.at_level(logging.INFO, logger="test.api"):
-            api._logging_middleware.log_response(request, 200, 0.1)
-
-        # Should have logged
-        assert len(caplog.records) > 0, "Handler response should be logged"
-        assert caplog.records[0].status_code == 200
 
     def test_logging_middleware_logs_exceptions(self, caplog):
         """Logging middleware should log exceptions."""

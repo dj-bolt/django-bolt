@@ -527,23 +527,6 @@ fn read_cors_and_file_scopes(
     Ok((global_cors_config, static_files_config, media_files_config))
 }
 
-/// Read each access-log level once, before workers start.
-fn read_access_logger(py: Python<'_>) -> PyResult<(u8, Option<Py<PyAny>>)> {
-    let logger = py
-        .import("logging")?
-        .call_method1("getLogger", ("django.server",))?;
-    let mut levels = 0;
-    for (bit, level) in [(1, 20), (2, 30), (4, 40)] {
-        if logger
-            .call_method1("isEnabledFor", (level,))?
-            .extract::<bool>()?
-        {
-            levels |= bit;
-        }
-    }
-    Ok((levels, (levels != 0).then(|| logger.unbind())))
-}
-
 /// Give each route without its own CORS config the global config, unless the
 /// route skips CORS. `runbolt` and the test client both call this.
 pub(crate) fn inject_global_cors(
@@ -791,11 +774,37 @@ pub fn start_server(
     });
 
     let max_payload_size = config.max_payload_size;
-    let (access_log_levels, access_logger_obj) = read_access_logger(py)?;
-    let access_log_enabled = access_log_levels != 0;
-
     let mut metadata = ROUTE_METADATA_TEMP.get().cloned().unwrap_or_default();
     inject_global_cors(&mut metadata, config.global_cors_config.as_ref());
+    // Read each access-log logger and its levels once, before workers start.
+    let access_loggers = bolt_core::access_log::read_access_loggers(
+        py,
+        metadata
+            .values_mut()
+            .map(|meta| &mut meta.access_log_filter),
+    )?;
+    // A logger counts only when a route writes to it. A route with no
+    // metadata writes to django.server. The no-route route writes the 404
+    // and the 405 of a path with no route.
+    let router = GLOBAL_ROUTER.get().expect("checked at the start");
+    let access_log_enabled = bolt_core::access_log::access_log_on(
+        &access_loggers,
+        router
+            .handler_ids()
+            .iter()
+            .copied()
+            .chain(router.no_route().map(|route| route.handler_id))
+            .map(|id| {
+                metadata
+                    .get(&id)
+                    .map_or(0, |meta| meta.access_log_filter.logger)
+            }),
+    );
+    let access_loggers = if access_log_enabled {
+        access_loggers
+    } else {
+        Vec::new()
+    };
     let route_metadata = Arc::new(RouteMetadataStore::from_map(metadata));
 
     let global_compression_config = match compression_config {
@@ -831,8 +840,7 @@ pub fn start_server(
         },
         static_files_config: config.static_files_config,
         media_files_config: config.media_files_config,
-        access_logger: access_logger_obj,
-        access_log_levels,
+        access_loggers,
         error_renderer,
     });
 
