@@ -284,6 +284,19 @@ def test_each_event_that_ends_the_connections_drains_the_pool_one_time(pooled, f
             assert pooled.wait_for_backends(SIZE) >= new
 
 
+@pytest.fixture
+def bolt_logs_reach_caplog(monkeypatch):
+    """Make ``django_bolt`` records propagate before the test runs.
+
+    An earlier test can leave Bolt's logging setup in place, which stops the
+    records at its own handler. pytest then attaches the ``caplog`` handler to
+    ``django_bolt`` when the test starts. A patch inside the test sends each
+    record to that handler and to the root handler, so ``caplog`` gets it two
+    times. A fixture patches before pytest attaches its handlers.
+    """
+    monkeypatch.setattr(logging.getLogger("django_bolt"), "propagate", True)
+
+
 @pytest.mark.parametrize(
     ("pool", "health_checks", "warning"),
     [
@@ -295,7 +308,7 @@ def test_each_event_that_ends_the_connections_drains_the_pool_one_time(pooled, f
     ],
 )
 def test_check_pool_environment_warns_only_for_a_pool_with_a_check(
-    pooled, monkeypatch, caplog, pool, health_checks, warning
+    pooled, monkeypatch, caplog, bolt_logs_reach_caplog, pool, health_checks, warning
 ):
     """The startup check logs one warning for a pool whose checkouts run a check, and nothing for other databases.
 
@@ -305,8 +318,6 @@ def test_check_pool_environment_warns_only_for_a_pool_with_a_check(
     caplog.set_level(logging.WARNING, logger="django_bolt")
     # The settings go back before the fixture closes the pool of this database.
     with monkeypatch.context() as patch:
-        # An earlier test can leave Bolt's logging setup in place, which stops the records at its own handler.
-        patch.setattr(logging.getLogger("django_bolt"), "propagate", True)
         patch.setitem(connections.settings[ALIAS], "OPTIONS", options)
         patch.setitem(connections.settings[ALIAS], "CONN_HEALTH_CHECKS", health_checks)
         concurrency.check_pool_environment()
@@ -380,7 +391,9 @@ def test_each_connection_check_reaches_the_database_after_the_first_one(pooled, 
         shutdown_closing_connections(b)
 
 
-def test_a_pooled_connection_that_stays_does_not_keep_the_one_of_another_pool(pooled, second_pool, monkeypatch, caplog):
+def test_a_pooled_connection_that_stays_does_not_keep_the_one_of_another_pool(
+    pooled, second_pool, caplog, bolt_logs_reach_caplog
+):
     """A thread gives its pooled connections back one database at a time, in no fixed order.
 
     A connection inside an ``atomic`` block stays, and a return can fail. In
@@ -411,8 +424,6 @@ def test_a_pooled_connection_that_stays_does_not_keep_the_one_of_another_pool(po
             raw._pool = None
 
     caplog.set_level(logging.ERROR, logger="django_bolt")
-    # An earlier test can leave Bolt's logging setup in place, which stops the records at its own handler.
-    monkeypatch.setattr(logging.getLogger("django_bolt"), "propagate", True)
     try:
         blocking(lose_both_pools)
     finally:
