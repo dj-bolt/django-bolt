@@ -1525,8 +1525,8 @@ class BoltAPI:
             name: Optional base URL-reverse name. Standard actions are named
                 ``{name}-{action}`` (e.g. "user-list", "user-retrieve"); custom
                 @action routes are named ``{name}-{action_name}``. When omitted,
-                the base defaults to the slugified ViewSet class name, so
-                ``UserViewSet`` yields "user-view-set-list", "user-view-set-retrieve",
+                the base is the ViewSet class name as written, so
+                ``UserViewSet`` yields "UserViewSet-list", "UserViewSet-retrieve",
                 etc. -- reverse() works without an explicit name (a derived base is
                 non-explicit, so it loses collisions to explicitly named routes).
             guards: Optional guards to apply to all routes. An @action that sets

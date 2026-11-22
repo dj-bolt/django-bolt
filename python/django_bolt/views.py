@@ -887,7 +887,8 @@ class ModelViewSet(
     implement DRF-style action methods (list, retrieve, create, update, etc.).
 
     Example:
-        from django_bolt import BoltAPI, ModelViewSet, Serializer
+        from django_bolt import BoltAPI, ModelViewSet
+        from django_bolt.pagination import PageNumberPagination
         from django_bolt.serializers import Serializer
         from myapp.models import Article
 

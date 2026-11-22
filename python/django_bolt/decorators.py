@@ -127,7 +127,7 @@ def action(
         detail: True for instance-level (requires pk), False for collection-level
         path: Optional custom path segment (defaults to function name)
         name: Optional URL-reverse suffix override. Combined with the viewset's
-            base name as ``{base}-{name}``; defaults to the path/function name.
+            base name as ``{base}-{name}``; defaults to the function name, not ``path``.
         auth: Optional authentication backends (overrides class-level auth)
         guards: Optional permission guards (overrides class-level guards)
         response_model: Optional response model for serialization
@@ -168,7 +168,7 @@ def action(
 
     Notes:
         - Actions inherit class-level auth and guards unless explicitly overridden
-        - The function must be async
+        - The function can be async or sync
         - Path parameters are automatically extracted from the route
         - For detail=True actions, the lookup field parameter (e.g., 'id', 'pk') is required
     """
