@@ -46,7 +46,7 @@ except ImportError:
     connections = None  # type: ignore
 
 
-_docs_routes_lock = threading.Lock()
+_prepare_api_lock = threading.Lock()
 
 
 def _frozen(value: Any) -> Any:
@@ -67,34 +67,50 @@ def _config_key(config: Any) -> tuple[Any, ...] | None:
     return tuple(_frozen(getattr(config, field.name)) for field in dataclasses.fields(config))
 
 
+def _prepare_api(api: BoltAPI) -> list[tuple[Any, ...]]:
+    """Add the routes that a test client makes on ``api``. Return the docs routes.
+
+    Clients of one API can start in parallel threads. A client adds routes to
+    the API, and another client reads the dicts of the API. Thus one client at
+    a time does the additions, before it reads the API. The first client of an
+    API adds the routes. A later client finds them, and changes nothing.
+    """
+    with _prepare_api_lock:
+        # Rust answers a request with no route through this route.
+        api._no_route_handler()
+        docs_routes = _docs_routes(api)
+        # A new client generates the schema again, so it has the routes added before it.
+        api._openapi_schema = None
+        return docs_routes
+
+
 def _docs_routes(api: BoltAPI) -> list[tuple[Any, ...]]:
-    """Return the docs routes of a test client of ``api``.
+    """Return the docs routes of a test client of ``api``. Call it with ``_prepare_api_lock`` held.
 
     runbolt adds the docs routes to ``api._routes`` at startup, after each
     ``mount()``. A test client can come before a mount, and ``mount()`` copies
     ``api._routes``. Thus a client keeps its docs routes out of ``api._routes``.
-    The registration occurs one time for each ``OpenAPIConfig`` of ``api``.
+    The registration occurs one time for each set of values of the ``OpenAPIConfig``.
     """
-    # Clients of one API can start in parallel threads. The registration
-    # changes api._routes for a short time, so one thread at a time does it.
-    with _docs_routes_lock:
-        if api._openapi_routes_registered:
-            # runbolt, or the test, added the docs routes to api._routes.
-            return []
-        cached = api._client_docs_routes
-        # The values of the config are the key, so a changed value registers again.
-        key = _config_key(api._openapi_config)
-        if cached is None or cached[0] != key:
-            start = len(api._routes)
-            # The code of runbolt. A disabled config adds no route.
-            api._register_openapi_routes()
-            routes = api._routes[start:]
-            del api._routes[start:]
-            api._openapi_routes_registered = False
-            cached = api._client_docs_routes = (key, routes)
-        # A new client generates the schema again, so it has the routes added before it.
-        api._openapi_schema = None
+    if api._openapi_routes_registered:
+        # runbolt, or the test, added the docs routes to api._routes.
+        return []
+    # The values of the config are the key, so a changed value registers again.
+    key = _config_key(api._openapi_config)
+    cached = api._client_docs_routes
+    if cached is not None and cached[0] == key:
         return cached[1]
+    start = len(api._routes)
+    try:
+        # The code of runbolt. A disabled config adds no route.
+        api._register_openapi_routes()
+        routes = api._routes[start:]
+    finally:
+        # Also when the registration raises, api._routes stays as it was.
+        del api._routes[start:]
+        api._openapi_routes_registered = False
+    api._client_docs_routes = (key, routes)
+    return routes
 
 
 class BoltTestClientWarning(RuntimeWarning):
@@ -415,7 +431,7 @@ class TestClient(httpx.Client):
         _ = use_http_layer
 
         # runbolt registers the docs routes before it validates the routes. Do the same.
-        docs_routes = _docs_routes(api)
+        docs_routes = _prepare_api(api)
 
         # Validate before allocating native test-app state. A failed constructor
         # has no client instance available to release that state. Route
@@ -750,7 +766,7 @@ class AsyncTestClient(httpx.AsyncClient):
             **kwargs: Additional arguments passed to httpx.AsyncClient
         """
         # Register the docs routes as TestClient does.
-        docs_routes = _docs_routes(api)
+        docs_routes = _prepare_api(api)
 
         # Validate before allocating native test-app state. A failed constructor
         # has no client instance available to release that state. Route

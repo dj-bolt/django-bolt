@@ -348,18 +348,33 @@ def test_a_plugin_added_to_the_docs_config_applies_to_the_next_client():
         assert client.get("/docs/extra").status_code == 200
 
 
+def test_a_docs_registration_that_raises_leaves_the_api_as_it_was():
+    bad_plugin = SwaggerRenderPlugin(path="/{x}/{x}")
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", render_plugins=[bad_plugin]))
+    with pytest.raises(ValueError):
+        TestClient(local_api)
+
+    local_api._openapi_config.render_plugins = [SwaggerRenderPlugin()]
+
+    with TestClient(local_api) as client:
+        assert client.get("/docs/openapi.json").status_code == 200
+
+
 def _get_docs_after(barrier: threading.Barrier, local_api: BoltAPI, results: list[object]) -> None:
     barrier.wait()
     try:
         with TestClient(local_api) as client:
-            results.append(client.get("/docs/openapi.json").status_code)
+            results.append((client.get("/items").status_code, client.get("/docs/openapi.json").status_code))
     except Exception as error:  # noqa: BLE001 - the test reports the error below
         results.append(error)
 
 
-def test_clients_created_at_the_same_time_all_serve_the_docs():
-    """Threads that create clients of one API at the same time must each get the docs routes."""
-    for _ in range(20):
+def test_clients_created_at_the_same_time_all_serve_the_routes_and_the_docs():
+    """Threads that create clients of one API at the same time must each get its routes and the docs routes.
+
+    A client adds routes to the API at its creation. Another client must not read the API meanwhile.
+    """
+    for _ in range(50):
         local_api = _docs_api()
         barrier = threading.Barrier(8)
         results: list[object] = []
@@ -368,4 +383,4 @@ def test_clients_created_at_the_same_time_all_serve_the_docs():
             thread.start()
         for thread in threads:
             thread.join()
-        assert results == [200] * 8
+        assert results == [(200, 200)] * 8
