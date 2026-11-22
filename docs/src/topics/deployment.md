@@ -48,9 +48,6 @@ On macOS, the kernel sends each connection to one process, so more processes add
 Each process loads your project and holds its own database connections.
 Measure memory and database connections when you add processes.
 
-In a container, `os.cpu_count()` gives the CPUs of the host, not the CPU limit of the container.
-Set `--processes` and `--workers` to fit the limit.
-
 For a free-threaded Python, see [Run on free-threaded Python](#run-on-free-threaded-python).
 
 ## Recycle workers
@@ -394,9 +391,11 @@ With the GIL disabled, each worker thread runs Python in parallel.
 python3.14t manage.py runbolt --host 127.0.0.1
 ```
 
+The default is `os.cpu_count()`. In a container, that is the CPU count of the host, not the CPU limit of the container. Set `--workers` to fit the limit.
+
 The banner shows the mode, for example `Workers  1 process · 8 threads each · free-threaded`.
 
-On a free-threaded build, one process can replace several processes:
+On a free-threaded build, one process can replace several processes. Check these points first:
 
 - Each worker thread has its own asyncio loop. Do not share an `asyncio.Lock`, an `asyncio.Queue` or a future between handlers on different threads.
 - Each worker thread and each pool thread holds its own database connection.

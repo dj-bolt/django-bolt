@@ -344,7 +344,9 @@ Each value must be an integer of 1 or more. `runbolt` checks both variables at s
 DJANGO_BOLT_ORM_THREADS=8 python manage.py runbolt --processes 4
 ```
 
-Each thread keeps its own database connection. A process can thus open up to `DJANGO_BOLT_ORM_THREADS + DJANGO_BOLT_EXECUTOR_THREADS` connections, plus one for each request with Django middleware. Multiply by the number of processes, and keep the total below the connection limit of your database.
+On a route with Django middleware, the ORM calls of a request run on the thread of that request, not on the ORM pool. See [Middleware](middleware.md).
+
+Each thread that runs a query keeps its own database connection. These are the threads of the two pools, the worker threads, and one thread for each running request with Django middleware. Add up the threads of all processes. Keep the total below the connection limit of your database.
 
 SQLite gets one ORM thread by default, because SQLite has one writer and a file lock. PostgreSQL and MySQL can serve parallel queries, so they get four.
 
