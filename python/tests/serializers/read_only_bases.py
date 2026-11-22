@@ -21,3 +21,18 @@ class TaggedBase(Serializer):
     tags: list[str] = []
     user_id: int = msgspec.field(name="userId", default=0)
     name: str
+
+
+class AuthoredBase(Serializer):
+    author: Author | None = None
+
+
+class AuthoredChild(AuthoredBase):
+    """``Author`` is not defined yet, and the class does not forbid unknown fields."""
+
+    class Config:
+        read_only = {"author"}
+
+
+class Author(Serializer):
+    name: str = ""
