@@ -38,11 +38,13 @@ from django.core.exceptions import FieldError
 from django.db.models import QuerySet
 from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
+from django.template.response import SimpleTemplateResponse, TemplateResponse
 
 from . import _json
 from ._kwargs import compile_response_coercer, compile_struct_row_readers
 from ._response_dump import compile_serializer_dumper
-from .concurrency import run_in_orm_executor
+from ._template_response import render_template_response
+from .concurrency import run_in_orm_executor, run_orm_blocking
 from .cookies import Cookie
 from .exceptions import ResponseValidationError, UnloadedRelationError
 from .responses import (
@@ -1323,6 +1325,9 @@ def _response_base_class(result: Any) -> type:
     for cls in _BOLT_RESPONSE_TYPES:
         if isinstance(result, cls):
             return cls
+    # A subclass of a template response renders before it serializes.
+    if isinstance(result, SimpleTemplateResponse):
+        return SimpleTemplateResponse
     # serialize_response sends only the response types, and Django's is the last of them.
     return DjangoHttpResponse
 
@@ -1449,6 +1454,39 @@ def serialize_redirect_response(result: Redirect) -> ResponseWireV1:
     return _wire_bytes(result.status_code, resp_meta, b"")
 
 
+def django_cookie_tuples(response: DjangoHttpResponse) -> list[CookieTuple] | None:
+    """Return the cookies of a Django response as raw tuples for Rust, or None."""
+    if not response.cookies:
+        return None
+    raw_cookies = []
+    for morsel in response.cookies.values():
+        max_age = morsel.get("max-age")
+        raw_cookies.append(
+            (
+                morsel.key,
+                morsel.value,
+                morsel.get("path") or "/",
+                int(max_age) if max_age else None,
+                morsel.get("expires") or None,
+                morsel.get("domain") or None,
+                bool(morsel.get("secure")),
+                bool(morsel.get("httponly")),
+                morsel.get("samesite") or None,
+            )
+        )
+    return raw_cookies
+
+
+def _django_wire_meta(
+    response_type: str, headers: dict[str, str], result: DjangoHttpResponse
+) -> ResponseMetaTuple | int:
+    raw_cookies = django_cookie_tuples(result)
+    if raw_cookies is None:
+        return _build_wire_meta(response_type, headers, None)
+    response_type, custom_ct, headers_list, _ = _build_response_meta(response_type, headers, None)
+    return (response_type, custom_ct, headers_list, raw_cookies)
+
+
 def serialize_django_response(result: DjangoHttpResponse) -> ResponseWireV1:
     """Serialize Django HttpResponse types (e.g., from @login_required decorator).
 
@@ -1464,17 +1502,26 @@ def serialize_django_response(result: DjangoHttpResponse) -> ResponseWireV1:
         for key, value in result.items():
             if key.lower() != "location":
                 headers[key] = value
-        return _wire_bytes(result.status_code, _build_wire_meta("redirect", headers, None), b"")
+        return _wire_bytes(result.status_code, _django_wire_meta("redirect", headers, result), b"")
 
     # Generic Django HttpResponse - extract content and headers. Rust and the
     # middleware bridges read an unknown response type as "octetstream".
     headers = dict(result.items())
-    meta = _build_wire_meta(
+    meta = _django_wire_meta(
         "octetstream",  # pragma: no mutate
         headers,
-        None,
+        result,
     )
     return _wire_bytes(result.status_code, meta, result.content)
+
+
+def serialize_template_response(result: SimpleTemplateResponse) -> ResponseWireV1:
+    """Render a TemplateResponse, then serialize it as a Django response.
+
+    The process_template_response hooks of the Django middleware run before the render.
+    The render can query the database, so it runs where a sync ORM call can run.
+    """
+    return serialize_django_response(run_orm_blocking(render_template_response, result))
 
 
 def serialize_file_response(result: File) -> ResponseWireV1:
@@ -1551,6 +1598,8 @@ _RESPONSE_SERIALIZERS: dict[type, Callable[[Any], ResponseWireV1]] = {
     StreamingResponse: _to_stream_wire,
     EventSourceResponse: _to_stream_wire,
     DjangoHttpResponse: serialize_django_response,
+    SimpleTemplateResponse: serialize_template_response,
+    TemplateResponse: serialize_template_response,
 }
 # The exact classes that the route handlers dispatch on.
 _RESPONSE_CLASSES = frozenset((JSON, ResponseClass, *_RESPONSE_SERIALIZERS))
