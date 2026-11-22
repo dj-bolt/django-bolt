@@ -4,7 +4,7 @@ import msgspec
 
 from django_bolt import BoltAPI
 from django_bolt.decorators import action
-from django_bolt.responses import JSON, Response
+from django_bolt.responses import JSON, Redirect, Response
 from django_bolt.testing import TestClient
 from django_bolt.views import APIView, ViewSet
 
@@ -164,3 +164,143 @@ def test_return_annotation_validates_only_the_default_status():
         assert sync_bad.status_code == 400
         assert sync_bad.json() == {"price": ["Must be positive."]}
         assert client.get("/sync-items").status_code == 200
+
+
+def test_response_class_return_annotation_sends_the_body_as_it_is():
+    """``-> JSON`` and ``-> Response`` name the response class, not the body (#912).
+
+    Bolt does not validate the body against the class, at the default
+    status code or at another one.
+    """
+    api = BoltAPI()
+
+    @api.get("/json")
+    async def json_default() -> JSON:
+        return JSON({"a": 1})
+
+    @api.post("/json-created", status_code=201)
+    async def json_created() -> JSON:
+        return JSON({"a": 1}, status_code=201)
+
+    @api.get("/json-sync")
+    def json_sync() -> JSON:
+        return JSON([1, 2])
+
+    @api.get("/response")
+    async def response_default() -> Response:
+        return Response({"b": 2})
+
+    @api.post("/response-created", status_code=201)
+    def response_created() -> Response:
+        return Response({"b": 2}, status_code=201)
+
+    @api.get("/optional")
+    async def optional_json() -> JSON | None:
+        return JSON({"c": 3})
+
+    with TestClient(api) as client:
+        default = client.get("/json")
+        assert default.status_code == 200
+        assert default.json() == {"a": 1}
+
+        created = client.post("/json-created")
+        assert created.status_code == 201
+        assert created.json() == {"a": 1}
+
+        sync = client.get("/json-sync")
+        assert sync.status_code == 200
+        assert sync.json() == [1, 2]
+
+        response = client.get("/response")
+        assert response.status_code == 200
+        assert response.json() == {"b": 2}
+
+        response_created = client.post("/response-created")
+        assert response_created.status_code == 201
+        assert response_created.json() == {"b": 2}
+
+        optional = client.get("/optional")
+        assert optional.status_code == 200
+        assert optional.json() == {"c": 3}
+
+
+def test_union_of_response_classes_sends_the_body_as_it_is():
+    """``-> JSON | Redirect`` names two response classes, not the body (#912).
+
+    A JSON result and a plain dict go to the client as they are.
+    """
+    api = BoltAPI()
+
+    @api.get("/json-or-redirect")
+    async def json_or_redirect(go: bool = False) -> JSON | Redirect:
+        if go:
+            return Redirect("/elsewhere")
+        return JSON({"a": 1})
+
+    @api.get("/dict-or-redirect")
+    def dict_or_redirect() -> Response | Redirect | None:
+        return {"b": 2}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        sent = client.get("/json-or-redirect")
+        assert sent.status_code == 200
+        assert sent.json() == {"a": 1}
+
+        redirected = client.get("/json-or-redirect?go=true", follow_redirects=False)
+        assert redirected.status_code == 307
+        assert redirected.headers["location"] == "/elsewhere"
+
+        plain = client.get("/dict-or-redirect")
+        assert plain.status_code == 200
+        assert plain.json() == {"b": 2}
+
+
+def test_union_of_a_body_type_and_a_response_class_validates_the_body_type():
+    """``-> Item | JSON`` gave a 500 for each result: msgspec cannot validate a union with ``JSON``.
+
+    The response class names the class of the result. Thus Bolt validates the
+    body against ``Item``, as for ``-> Item``. A field that ``Item`` does not
+    declare does not reach the client.
+    """
+    api = BoltAPI()
+
+    @api.get("/item-or-json/{item_id}")
+    async def item_or_json(item_id: int) -> Item | JSON:
+        if item_id == 1:
+            return Item(name="item", price=1.0)
+        if item_id == 2:
+            return JSON({"name": "item", "price": 2.0, "password": "secret"})
+        if item_id == 3:
+            return {"name": "item", "price": 3.0, "password": "secret"}
+        if item_id == 4:
+            return JSON({"name": "missing-price"})
+        return JSON({"detail": "not found"}, status_code=404)
+
+    @api.get("/item-or-response-or-none")
+    def item_or_response_or_none() -> Item | Response | None:
+        return None
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        item = client.get("/item-or-json/1")
+        assert item.status_code == 200
+        assert item.json() == {"name": "item", "price": 1.0}
+
+        wrapped = client.get("/item-or-json/2")
+        assert wrapped.status_code == 200
+        assert wrapped.json() == {"name": "item", "price": 2.0}
+
+        plain = client.get("/item-or-json/3")
+        assert plain.status_code == 200
+        assert plain.json() == {"name": "item", "price": 3.0}
+
+        invalid = client.get("/item-or-json/4")
+        assert invalid.status_code == 500
+        assert invalid.json() == {"detail": "Response validation error"}
+
+        missing = client.get("/item-or-json/5")
+        assert missing.status_code == 404
+        assert missing.json() == {"detail": "not found"}
+
+        nothing = client.get("/item-or-response-or-none")
+        assert nothing.status_code == 200
+        assert nothing.json() is None
