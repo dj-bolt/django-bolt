@@ -24,8 +24,10 @@ from django_bolt.auth import (
     APIKeyAuthentication,
     IsAuthenticated,
     JWTAuthentication,
+    SessionAuthentication,
 )
 from django_bolt.exceptions import HTTPException
+from django_bolt.middleware import DjangoMiddlewareStack
 from django_bolt.testing import TestClient
 
 
@@ -365,6 +367,75 @@ class TestJWTUserLoading:
             "auser": anonymous if handler_is_async else None,
             "same": True,
         }
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize("handler_is_async", [True, False], ids=["async", "sync"])
+    @pytest.mark.parametrize(
+        ("route_kind", "headers"),
+        [
+            ("no-auth", {}),
+            ("jwt", {}),
+            ("api-key", {"X-API-Key": "valid-key-123"}),
+            ("session", {}),
+            ("lane", {}),
+        ],
+        ids=["no-auth", "jwt-no-token", "api-key-valid", "session-no-login", "lane-no-auth"],
+    )
+    def test_an_is_authenticated_check_denies_an_anonymous_request(self, route_kind, headers, handler_is_async):
+        """The migration of #916: ``if not request.user.is_authenticated`` denies a request with no user.
+
+        A valid token for an existing user passes the same check, so the check does not deny everything.
+        """
+        user = User.objects.create_user(username="checked")
+        stack = [
+            DjangoMiddlewareStack(
+                [
+                    "django.contrib.sessions.middleware.SessionMiddleware",
+                    "django.contrib.auth.middleware.AuthenticationMiddleware",
+                ]
+            )
+        ]
+        api = BoltAPI(middleware=stack) if route_kind == "lane" else BoltAPI()
+        auth = {
+            "no-auth": None,
+            "jwt": [JWTAuthentication(secret="test-secret")],
+            "api-key": [APIKeyAuthentication(api_keys={"valid-key-123"})],
+            "session": [SessionAuthentication()],
+            "lane": None,
+        }[route_kind]
+
+        if handler_is_async:
+
+            @api.get("/check", auth=auth)
+            async def check(request):
+                if not request.user.is_authenticated:
+                    raise HTTPException(status_code=401, detail="Sign in")
+                if not (await request.auser()).is_authenticated:
+                    raise HTTPException(status_code=401, detail="Sign in")
+                return {"ok": True}
+
+        else:
+
+            @api.get("/check", auth=auth)
+            def check(request):
+                if not request.user.is_authenticated:
+                    raise HTTPException(status_code=401, detail="Sign in")
+                return {"ok": True}
+
+        @api.get("/control", auth=[JWTAuthentication(secret="test-secret")])
+        def control(request):
+            if not request.user.is_authenticated:
+                raise HTTPException(status_code=401, detail="Sign in")
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            anonymous = client.get("/check", headers=headers)
+            signed_in = client.get(
+                "/control", headers={"Authorization": f"Bearer {create_jwt_token(user_id=str(user.id))}"}
+            )
+
+        assert anonymous.status_code == 401, anonymous.text
+        assert signed_in.status_code == 200, signed_in.text
 
     def test_without_the_auth_app_both_forms_give_none(self):
         """Without django.contrib.auth there is no user model: both forms give None, and neither raises.
