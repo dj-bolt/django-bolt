@@ -267,7 +267,7 @@ DjangoMiddleware(middleware_class: type | str, **init_kwargs)
 
 Runs one Django middleware class in a Bolt `middleware` list. A string is the dotted path of the class. Bolt passes `init_kwargs` to the constructor of the class.
 
-Bolt runs `process_request`, `process_view`, `process_response` and `process_exception`, and the `__call__` of a new-style middleware. It does not run `process_template_response`.
+Bolt runs `process_request`, `process_view`, `process_template_response`, `process_response` and `process_exception`, and the `__call__` of a new-style middleware.
 `process_view` gets the handler as the view. On a request thread (a lane), Bolt makes a second instance of the class in sync mode.
 
 **Errors.** `TypeError` for a callable that is not a class. `ImportError` for a dotted path that does not import. `RuntimeError` for a class with `sync_capable` and `async_capable` both false.

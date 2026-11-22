@@ -323,6 +323,15 @@ ImproperlyConfigured: UserSerializer.id is read_only and has no default. Input c
 ```
 
 With `forbid_unknown_fields=True` on the class, an input value for a `read_only` field is an error, not ignored.
+This is also true for a field with a `msgspec.field()` default, and for a field of a base class.
+For a field of a base class, the serializer declares the field again in the class that has the `Config`. The field keeps its type, default and JSON name.
+Class creation raises `ImproperlyConfigured` when it cannot declare the field again:
+
+- An annotation of the base class uses a name that is not defined yet.
+- The type uses a type parameter with no type argument.
+- The field is positional in the base class and keyword-only in the subclass, or the opposite.
+
+In these cases, declare the field in the class that has the `Config`, with `field(read_only=True, default=...)`.
 
 You can also list field names in the inner `Config` class: `read_only = {"id"}` and `write_only = {"password"}`. See [Config options](#config-options).
 

@@ -256,6 +256,11 @@ curl localhost:8000/articles/export -H "X-Api-Key: secret" -H "X-Page-Size: abc"
 
 To read all the headers, use `request.headers`. It is a `dict` with lower-case names.
 
+A header that the request sends more than once gives its last line. Bolt does not split a value at a comma.
+Thus a sequence type, such as `list[str]`, gives a list of one item for a header, a cookie or a path parameter.
+The OpenAPI schema of such a parameter has `maxItems: 1`.
+A default of two or more items raises `TypeError` when the route registers. This rule also applies to a sequence field of a header or cookie model.
+
 ## Read cookies
 
 Use `Cookie()`. Without an `alias`, Bolt reads the cookie with the argument name:

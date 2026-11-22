@@ -244,8 +244,18 @@ async def payment_webhook(request: Request) -> dict:
     return {"received": True}
 ```
 
-Bolt runs the hooks `process_request`, `process_view`, `process_response` and `process_exception` of a Django middleware. It does not run `process_template_response`.
+Bolt runs the five hooks of a Django middleware: `process_request`, `process_view`, `process_template_response`, `process_response` and `process_exception`.
 `process_view` gets the handler as the view, so view decorators such as `@csrf_exempt` and `@login_not_required` work.
+
+When a handler returns a `TemplateResponse`, Bolt calls `process_template_response` of each middleware, as Django does:
+
+- The last middleware runs first.
+- A hook can change `response.template_name` and `response.context_data`. It must return a response. If it returns `None`, Bolt raises `ValueError`.
+- Bolt renders the response after the last hook. Then `process_response` of each middleware gets the rendered response.
+- `process_exception` does not get an error of a hook. It gets an error of the render.
+- A `TemplateResponse` from `process_view` or `process_exception` goes through the same hooks.
+
+See [Render a template later](responses.md#render-a-template-later).
 
 ### Read what a Django middleware sets
 

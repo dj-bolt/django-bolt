@@ -120,9 +120,16 @@ To turn this off, run `python manage.py runbolt --no-admin`.
 An admin site in `i18n_patterns()` has one prefix for each language of `settings.LANGUAGES`, for example `/en/admin` and `/fr/admin`.
 `runbolt` mounts each prefix. Set `LANGUAGES` to the languages that you use, because each language adds a mount.
 
-An admin prefix with a path parameter, for example `path("<tenant>/admin/", admin.site.urls)`, is not a static path.
-`runbolt` then prints a warning and mounts nothing.
-Use `api.mount_django("/", clear_root_path=True)` to serve such an admin.
+An admin prefix with a path parameter, for example `path("<tenant>/admin/", site.urls)`, is not a static path.
+A mount path must be static, so `runbolt` mounts Django at the root path for it, and prints a warning.
+Bolt routes answer first. Django answers each path that has no Bolt route, so `/acme/admin/` goes to the admin.
+An admin site at the root path, `path("", admin.site.urls)`, gets the same mount and the same warning.
+
+This mount costs nothing for a request to a Bolt route, because Bolt reads the mounts only when no route matches.
+Each path that has no Bolt route gets the answer of Django, for example a Django 404 page.
+A path of a Bolt route with another method still gets 405 from Bolt.
+
+If you call `api.mount_django("/", ...)` yourself, `runbolt` keeps your mount and does not add one.
 
 ## Mount another ASGI app
 
@@ -226,6 +233,7 @@ For a request to a mount:
 - The `prefix` of the `BoltAPI` comes before the mount path.
 - Two mounts at the same path raise `ValueError`.
 - A mount at the exact path of a Bolt route stops startup with `ValueError`. A Bolt route under the mount path, as `/legacy/health` above, is valid.
+- A mount at `/` and a Bolt route at `/` can exist together. The route answers `/`, and the mount gets each request that no route matches.
 - When two mounts match, the longer prefix wins.
 
 ## Test a mounted app

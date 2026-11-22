@@ -74,6 +74,29 @@ async def get_order(order_id: int) -> dict:
 
 A handler with no return annotation that returns `None` gets a 500 response, because Bolt cannot tell if a `return` is missing.
 
+### Values in a JSON response
+
+A dict, a list or a `msgspec.Struct` can contain these values:
+
+| Value | JSON |
+| --- | --- |
+| `str`, `int`, `float`, `bool`, `None` | The same JSON value |
+| `Decimal`, `Fraction` | A string, such as `"1.50"` or `"1/3"` |
+| `UUID`, `Path`, an IP address or network, a compiled `re.Pattern`, `UserString` | A string |
+| `date`, `time`, `datetime`, `timedelta` | An ISO 8601 string |
+| An `Enum` member | Its value |
+| `bytes`, `bytearray` | A base64 string |
+| `dict`, `ChainMap`, `MappingProxyType`, `UserDict` | An object |
+| `list`, `tuple`, `set`, `frozenset`, `deque`, `UserList`, `range`, `array.array`, a dict view | An array |
+| A generator, a `map` object, a `zip` object | An array of the items that it gives |
+
+A subclass of a type in the table has the JSON form of its base type. The items of a container follow the same rules.
+On a route with a response type, Bolt validates first. A value must then match the type, so `-> list[int]` refuses a `range`.
+
+Bolt refuses a value with no clear JSON form, such as a `ZoneInfo`, a `datetime.timezone`, a `SimpleNamespace` or a `complex`.
+Django's `DjangoJSONEncoder` refuses these values too. The response is a 500 with `TypeError: Unsupported type`.
+Convert such a value before you return it, for example `str(zone)` or `vars(namespace)`.
+
 ## Set the status code
 
 The default status is 200. Set another default on the decorator:
@@ -413,6 +436,28 @@ async def article_page(request: Request, article_id: int):
 
 The response is `text/html; charset=utf-8`. Pass `content_type` and `status` to change them.
 A template that reads `{{ user }}` loads the user with a blocking query. In an async handler, call `await request.auser()` before `render()`.
+
+### Render a template later
+
+`render()` renders the template at once. To render it after the handler returns, return a `TemplateResponse`.
+It is the `TemplateResponse` class of Django, with the same arguments: `status`, `content_type` and `headers`.
+
+```python
+from django_bolt import Request
+from django_bolt.responses import TemplateResponse
+
+
+@api.get("/articles/{article_id}/preview")
+async def article_preview(request: Request, article_id: int):
+    article = {"title": "Hello", "body": "First post"}
+    return TemplateResponse(request, "blog/article.html", {"article": article})
+```
+
+On a route with Django middleware, Bolt first calls the `process_template_response` hook of each middleware.
+A hook can change `template_name` and `context_data` before the render. See [Middleware](middleware.md#run-django-middleware).
+A route with no Django middleware renders the response with no hooks.
+
+The render can read a QuerySet in the context, also in an async handler. Bolt renders where a sync ORM call can run.
 
 ## Send an empty response
 
