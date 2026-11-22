@@ -78,7 +78,7 @@ The code after a plain `yield` does not run when an error occurs. Errors can occ
 - The startup of a lifespan raises an error. `runbolt` then exits with status 1 and serves no request. The lifespans that started before it get the error at their `yield`.
 - The server stops with an error.
 
-On `SIGTERM`, the server stops accepting connections and lets the requests in progress end. Then the shutdown code runs. On `SIGINT` (Ctrl+C), the server stops at once, and the shutdown code runs. On `SIGKILL` or a crash, no shutdown code runs.
+On `SIGTERM`, the server stops accepting connections and lets the requests in progress end. Then the shutdown code runs. On `SIGINT` (Ctrl+C), the server stops at once, and the shutdown code runs. On `SIGKILL` or a crash, no shutdown code runs. See [Stop the server gracefully](deployment.md#stop-the-server-gracefully).
 
 ## Run a background task
 

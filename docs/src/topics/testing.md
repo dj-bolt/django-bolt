@@ -401,7 +401,7 @@ async def test_comments_socket():
         assert await ws.receive_json() == {"comment": "Nice article"}
 ```
 
-Bolt checks the path, authentication and guards of the connection in Rust, as on the server. See [WebSocket](websocket.md) for the routes, and the [testing reference](../ref/testing.md#websockettestclient) for each method.
+Bolt checks the path, authentication and guards of the connection in Rust, as on the server. See [Test a WebSocket route](websocket.md#test-a-websocket-route) for more cases, and the [testing reference](../ref/testing.md#websockettestclient) for each method.
 
 ## Change settings in a test
 

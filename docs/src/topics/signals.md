@@ -110,7 +110,7 @@ Bolt sends the two signals with `Signal.asend()`. A sync receiver runs in a thre
 
 With the signals on, each request awaits the two signal sends. Bolt also cannot use its fast path, which runs a handler with no event loop. Thus each request goes through the event loop. Turn the setting on only when a receiver needs it.
 
-You do not need the signals for the database connections. Bolt manages the connections of its threads itself. See [Deployment](deployment.md).
+You do not need the signals for the database connections. Bolt manages the connections of its threads itself. See [Configure database connections](deployment.md#configure-database-connections).
 
 ## See also
 
