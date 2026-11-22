@@ -2,8 +2,7 @@
 
 This module provides optimized JSON encoding/decoding using msgspec with:
 - Thread-local cached encoder/decoder instances (thread-safe buffer reuse)
-- Support for common non-JSON-native types (datetime, Path, Decimal, UUID, IP addresses, deque,
-  ChainMap, UserDict, range, dict views)
+- Support for standard types (see DEFAULT_TYPE_ENCODERS)
 - Automatic Serializer.dump() for write_only, computed_field support
 - Type-safe decoding with validation
 - Custom encoder/decoder hooks
@@ -83,12 +82,11 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
     # A compiled regular expression is its pattern text.
     re.Pattern: lambda v: v.pattern,
     # A mapping is a JSON object. A sequence, a dict view or an iterator is a JSON array.
-    # The items go through the encoder again. The keys of the lookup table are exact
-    # types, so a new type does not make the lookup of a known type slower.
+    # The items go through the encoder again.
     ChainMap: dict,
     MappingProxyType: dict,
-    UserDict: lambda v: v.data,
-    UserList: lambda v: v.data,
+    UserDict: dict,
+    UserList: list,
     UserString: lambda v: v.data,
     range: list,
     array: array.tolist,
@@ -97,8 +95,6 @@ DEFAULT_TYPE_ENCODERS: dict[type, Callable[[Any], Any]] = {
     type({}.items()): list,
     map: list,
     zip: list,
-    # A ZoneInfo, a timezone, a SimpleNamespace or a complex has no obvious JSON form.
-    # DjangoJSONEncoder also refuses them, so they stay unsupported.
 }
 
 
@@ -112,8 +108,7 @@ def default_serializer(value: Any) -> Any:
     this hook, since msgspec.Struct is natively supported by msgspec.
     """
     # Walk MRO to support polymorphic types
-    # Walk the full MRO: a slice copies the tuple on each call, and 'object' has no encoder.
-    for base in value.__class__.__mro__:
+    for base in value.__class__.__mro__[:-1]:  # Skip 'object'
         encoder = DEFAULT_TYPE_ENCODERS.get(base)
         if encoder is not None:
             return encoder(value)

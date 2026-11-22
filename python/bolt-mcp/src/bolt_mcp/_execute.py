@@ -38,9 +38,6 @@ def _text_content(text: str) -> dict[str, Any]:
 # legacy peers.
 RESULT_TYPE_COMPLETE = "complete"
 
-# No enc_hook: an encode fails for a value that needs the hook of django_bolt._json.
-_NATIVE_ENCODER = msgspec.json.Encoder()
-
 
 def error_result(message: str) -> dict[str, Any]:
     """An in-band CallToolResult error (the MCP way to surface tool failures)."""
@@ -82,21 +79,7 @@ def to_call_tool_result(result: Any) -> dict[str, Any]:
         return _from_tool_result(result)
     if isinstance(result, str):
         return {"content": [_text_content(result)], "isError": False, "resultType": RESULT_TYPE_COMPLETE}
-    if isinstance(result, dict):
-        # A dict of native JSON types encodes with no hook, so it can be the structured content.
-        try:
-            text = _NATIVE_ENCODER.encode(result).decode()
-        except TypeError:
-            pass
-        else:
-            return {
-                "content": [_text_content(text)],
-                "structuredContent": result,
-                "isError": False,
-                "resultType": RESULT_TYPE_COMPLETE,
-            }
-    # Convert once and use the result for both outputs. An encode of the raw value
-    # uses up a map, zip or generator in it, and structuredContent would then hold it empty.
+    # Convert once for both outputs. A second pass gets a used-up map, zip or generator.
     payload = msgspec.to_builtins(result, enc_hook=default_serializer)
     structured = payload if isinstance(payload, dict) else {"result": payload}
     text = json_encode(payload).decode()
