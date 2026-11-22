@@ -127,7 +127,7 @@ def action(
         detail: True for instance-level (requires pk), False for collection-level
         path: Optional custom path segment (defaults to function name)
         name: Optional URL-reverse suffix override. Combined with the viewset's
-            base name as ``{base}-{name}``; defaults to the path/function name.
+            base name as ``{base}-{name}``; defaults to the function name, not ``path``.
         auth: Optional authentication backends (overrides class-level auth)
         guards: Optional permission guards (overrides class-level guards)
         response_model: Optional response model for serialization
