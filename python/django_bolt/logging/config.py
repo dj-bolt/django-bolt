@@ -13,6 +13,7 @@ import atexit
 import contextlib
 import importlib
 import logging
+import os
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -341,6 +342,33 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
         _QUEUE_LISTENER = listener
 
     return queue_handler
+
+
+def _hold_listener_handlers() -> None:
+    """Take the lock of each listener handler before a fork.
+
+    A fork does not reset the lock of a stream. If the fork occurs during a
+    write of the listener, the child gets the lock of the stream in the held
+    state. Then the listener of the child waits for the lock with no end.
+    The handler lock is held during each write, so the fork waits for the write.
+    """
+    if _QUEUE_LISTENER is not None:
+        for handler in _QUEUE_LISTENER.handlers:
+            handler.acquire()
+
+
+def _release_listener_handlers() -> None:
+    """Release the handler locks in the parent after a fork.
+
+    The ``logging`` module makes new handler locks in the child.
+    """
+    if _QUEUE_LISTENER is not None:
+        for handler in reversed(_QUEUE_LISTENER.handlers):
+            handler.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_hold_listener_handlers, after_in_parent=_release_listener_handlers)
 
 
 def restart_queue_listener_after_fork() -> None:

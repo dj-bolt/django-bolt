@@ -9,9 +9,13 @@ These tests validate the behavior documented in docs/LOGGING.md:
 - Integration with Django's logging system
 """
 
+import _thread
 import io
 import logging
+import os
 import re
+import signal
+import threading
 import time
 from contextlib import redirect_stderr
 from logging.handlers import QueueHandler
@@ -31,7 +35,9 @@ from django_bolt.logging.config import (
     _DropOnFullQueueHandler,
     _ensure_queue_logging,
     get_default_logging_config,
+    restart_queue_listener_after_fork,
     setup_django_logging,
+    stop_queue_listener,
 )
 
 
@@ -832,6 +838,66 @@ class TestQueueBasedLogging:
             logger.handlers[:] = handlers
             logger.setLevel(level)
             logger.propagate = propagate
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+    # The listener thread runs, so Python warns about the fork. The test checks that fork.
+    @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+    def test_a_fork_waits_for_the_write_of_the_listener(self):
+        """A fork during a write of the listener must not copy the lock of the stream in the held state.
+
+        A fork does not reset the lock of a stream. If the child gets the lock in
+        the held state, the listener of the child waits for it with no end. The
+        lock of ``_LockedStream`` behaves like the buffer lock of ``sys.stderr``.
+        """
+        in_write = threading.Event()
+        finish = threading.Event()
+
+        class _LockedStream:
+            def __init__(self):
+                self.lock = _thread.allocate_lock()
+
+            def write(self, text):
+                with self.lock:
+                    if "SLOW" in text:
+                        in_write.set()
+                        finish.wait(5)
+
+            def flush(self):
+                pass
+
+        queue = Queue()
+        listener = _BoundedQueueListener(queue, logging.StreamHandler(_LockedStream()))
+        config_module._QUEUE = queue
+        config_module._QUEUE_LISTENER = listener
+        listener.start()
+        queue.put(logging.makeLogRecord({"msg": "SLOW"}))
+        assert in_write.wait(5)
+        # The write ends a short time after the fork starts.
+        timer = threading.Timer(0.2, finish.set)
+        timer.start()
+
+        pid = os.fork()
+        if pid == 0:
+            try:
+                restart_queue_listener_after_fork()
+                config_module._QUEUE.put(logging.makeLogRecord({"msg": "from the child"}))
+                stop_queue_listener()
+            finally:
+                os._exit(0)
+
+        deadline = time.monotonic() + 5
+        status = None
+        while status is None and time.monotonic() < deadline:
+            done, raw = os.waitpid(pid, os.WNOHANG)
+            status = raw if done else None
+            time.sleep(0.05)
+        if status is None:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        timer.join()
+        listener.stop()
+        assert status is not None, "the listener of the child waited for the lock of the stream"
+        assert os.waitstatus_to_exitcode(status) == 0
 
     def test_ensure_queue_logging_returns_queue_handler(self):
         """_ensure_queue_logging should return a QueueHandler."""
