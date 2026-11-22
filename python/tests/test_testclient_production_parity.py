@@ -14,7 +14,10 @@ import pytest
 from django.test import override_settings
 
 from django_bolt import BoltAPI, Request, WebSocket
+from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
 from django_bolt.middleware import rate_limit
+from django_bolt.openapi import OpenAPIConfig
+from django_bolt.responses import Redirect
 from django_bolt.testing import AsyncTestClient, TestClient, WebSocketTestClient
 from tests.integration.apps.testclient_parity import api
 from tests.integration.parity_cases import CASES, PREFLIGHT, ParityCase
@@ -160,3 +163,122 @@ def test_each_client_starts_with_empty_rate_limit_buckets():
 
     with TestClient(_limited_api()) as client:
         assert client.get("/limited").status_code == 200
+
+
+def _redirect_api() -> BoltAPI:
+    local_api = BoltAPI()
+
+    @local_api.get("/old")
+    async def old():
+        return Redirect("/new")
+
+    @local_api.get("/new")
+    async def new():
+        return {"page": "new"}
+
+    return local_api
+
+
+def test_follow_redirects_false_gives_the_redirect():
+    """The ``follow_redirects`` of the caller replaces the default of the client (#915)."""
+    local_api = _redirect_api()
+    with TestClient(local_api, follow_redirects=False) as client:
+        response = client.get("/old")
+    assert response.status_code == 307
+    assert response.headers["location"] == "/new"
+
+
+def test_the_client_follows_redirects_by_default():
+    with TestClient(_redirect_api()) as client:
+        response = client.get("/old")
+    assert response.status_code == 200
+    assert response.json() == {"page": "new"}
+
+
+def test_async_client_follow_redirects_false_gives_the_redirect():
+    async def run():
+        async with AsyncTestClient(_redirect_api(), follow_redirects=False) as client:
+            return await client.get("/old")
+
+    response = asyncio.run(run())
+    assert response.status_code == 307
+    assert response.headers["location"] == "/new"
+
+
+def _docs_api(**kwargs) -> BoltAPI:
+    local_api = BoltAPI(**kwargs)
+
+    @local_api.get("/items")
+    async def items():
+        return []
+
+    return local_api
+
+
+def test_the_client_serves_the_docs_routes_as_runbolt_does():
+    """runbolt registers the docs routes of the API. The client does too (#932)."""
+    with TestClient(_docs_api()) as client:
+        schema = client.get("/docs/openapi.json")
+        ui = client.get("/docs")
+    assert schema.status_code == 200
+    assert "/items" in schema.json()["paths"]
+    assert ui.status_code == 200
+    assert ui.headers["content-type"].startswith("text/html")
+
+
+def test_the_async_client_serves_the_docs_routes():
+    async def run():
+        async with AsyncTestClient(_docs_api()) as client:
+            return await client.get("/docs/openapi.json")
+
+    response = asyncio.run(run())
+    assert response.status_code == 200
+    assert "/items" in response.json()["paths"]
+
+
+def test_disabled_docs_are_not_served():
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", enabled=False))
+    with TestClient(local_api) as client:
+        assert client.get("/docs/openapi.json").status_code == 404
+
+
+def test_the_docs_routes_use_the_auth_of_the_openapi_config():
+    config = OpenAPIConfig(
+        title="T",
+        version="1",
+        auth=[APIKeyAuthentication(api_keys={"secret"})],
+        guards=[IsAuthenticated()],
+    )
+    with TestClient(_docs_api(openapi_config=config)) as client:
+        assert client.get("/docs/openapi.json").status_code == 401
+        assert client.get("/docs/openapi.json", headers={"x-api-key": "secret"}).status_code == 200
+
+
+def test_many_clients_of_one_api_serve_the_docs():
+    local_api = _docs_api()
+    for _ in range(3):
+        with TestClient(local_api) as client:
+            assert client.get("/docs/openapi.json").status_code == 200
+
+
+def test_a_route_at_a_docs_path_is_refused_as_runbolt_refuses_it():
+    """runbolt stops with "GET /docs is already registered" for this API. The client raises the same error."""
+    local_api = _docs_api()
+
+    @local_api.get("/docs")
+    async def own_docs():
+        return {"own": True}
+
+    with pytest.raises(ValueError):
+        TestClient(local_api)
+
+
+def test_a_route_at_a_docs_path_is_served_when_the_docs_are_disabled():
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", enabled=False))
+
+    @local_api.get("/docs")
+    async def own_docs():
+        return {"own": True}
+
+    with TestClient(local_api) as client:
+        assert client.get("/docs").json() == {"own": True}

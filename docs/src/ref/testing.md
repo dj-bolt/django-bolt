@@ -38,7 +38,7 @@ TestClient(
 
 A synchronous HTTP client for one `BoltAPI`. It is a subclass of `httpx.Client`. Each request runs on a Bolt test worker thread, through the request pipeline of `runbolt`. The calling thread waits for the response.
 
-The constructor registers the HTTP routes, WebSocket routes, ASGI mounts, MCP mounts and middleware of `api`. It does not register the OpenAPI docs routes. `runbolt` adds those when it starts.
+The constructor registers the HTTP routes, WebSocket routes, ASGI mounts, MCP mounts and middleware of `api`. It also registers the OpenAPI docs routes, with the code of `runbolt`. The `auth`, `guards` and `enabled` values of the `OpenAPIConfig` of `api` apply. A route of `api` with the path of a docs route raises `ValueError`, as `runbolt` refuses to start with it. The docs routes stay on `api`, so a second client of `api` does not add them again.
 
 ### Parameters
 
@@ -52,7 +52,8 @@ The constructor registers the HTTP routes, WebSocket routes, ASGI mounts, MCP mo
 | `use_http_layer` | `bool` | `True` | Ignored. Each request goes through the HTTP layer. |
 | `static_files_config` | `dict \| None` | `None` | Replaces the static files settings. The keys are `url_prefix` (default `"/static"`), `directories` (a list of paths), `csp_header` and `cache_control`. |
 | `share_db_connection` | `bool` | `True` | If `True`, the handler threads use the database connection of the test while the client is open, when that connection is in a transaction. See [Test routes that use the database](../topics/testing.md#test-routes-that-use-the-database). |
-| `**kwargs` | | | Passed to `httpx.Client`. Do not pass `follow_redirects`: `TestClient` sets it to `True`, and a second value raises `TypeError`. |
+| `follow_redirects` | `bool` | `True` | If `True`, follow redirects. If `False`, give the redirect response. A request can also set it. |
+| `**kwargs` | | | Passed to `httpx.Client`. |
 
 Bolt reads the other settings when you create the client, with the code of `runbolt`. Examples are `BOLT_MAX_UPLOAD_SIZE`, `BOLT_TRUSTED_PROXIES` and `BOLT_COMPRESSION`.
 
@@ -81,7 +82,7 @@ The lifespan runs on an event loop of the client. That loop runs only during sta
 
 `request()`, `send()` and `stream()` are the methods of `httpx.Client`.
 
-Each method returns an `httpx.Response`. The client follows redirects. Pass `follow_redirects=False` to a request to get the redirect response.
+Each method returns an `httpx.Response`. By default, the client follows redirects. Pass `follow_redirects=False` to the client or to a request to get the redirect response.
 
 ### Streaming responses
 

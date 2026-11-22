@@ -83,7 +83,7 @@ curl -s localhost:8000/docs/openapi.json | jq '.paths["/articles/{article_id}"].
 }
 ```
 
-`runbolt` adds the docs routes when it starts. `TestClient` does not serve them. The docs paths do not get the `prefix` of the `BoltAPI`.
+`runbolt` adds the docs routes when it starts. `TestClient` adds them when you create it. The docs paths do not get the `prefix` of the `BoltAPI`.
 
 When `runbolt` finds more than one `BoltAPI`, one schema covers the routes of all of them. It uses the `OpenAPIConfig` of the first API that it finds. That is the API of the `BOLT_API` setting, or else the API of the project package, or else the first app in `INSTALLED_APPS`.
 
