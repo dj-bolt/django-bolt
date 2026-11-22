@@ -278,7 +278,7 @@ def test_viewset_class_settings_apply_to_its_routes(api):
         status_code = 202
         validate_response = False
 
-        async def list(self, request) -> list[_Pair]:
+        async def list(self, request) -> builtins.list[_Pair]:
             return [{"id": "not a number"}]
 
         async def create(self, request) -> dict:
