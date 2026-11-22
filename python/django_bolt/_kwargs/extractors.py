@@ -1383,7 +1383,7 @@ def compile_struct_row_readers(
         # A forward reference can resolve after the route registers. The
         # nested reader resolves the fields on the first QuerySet.
         return _compile_nested_row_loader(item_type), project
-    if any(is_msgspec_struct(unwrap_optional(field.type)) for field in fields):
+    if any(is_msgspec_struct(_field_value_type(field.type)) for field in fields):
         return _compile_nested_row_loader(item_type), project
 
     if names == wire_names:
@@ -1400,6 +1400,14 @@ def compile_struct_row_readers(
 
 
 _RowPlan = tuple[tuple[str, ...], Callable[[dict[str, Any]], dict[str, Any]]]
+
+
+def _field_value_type(annotation: Any) -> Any:
+    """Return the type of a Struct field without ``| None`` and ``Annotated`` metadata."""
+    annotation = unwrap_optional(annotation)
+    if get_origin(annotation) is Annotated:
+        annotation = unwrap_optional(get_args(annotation)[0])
+    return annotation
 
 
 def _compile_nested_row_loader(item_type: type) -> Callable[[QuerySet], list[dict[str, Any]]]:
@@ -1447,7 +1455,7 @@ def _row_plan(model: type, struct_type: type, prefix: str, outer: tuple[type, ..
     for field in msgspec.structs.fields(struct_type):
         path = prefix + field.name
         paths.append(path)
-        nested_type = unwrap_optional(field.type)
+        nested_type = _field_value_type(field.type)
         relation = _single_relation(model, field.name) if is_msgspec_struct(nested_type) else None
         if relation is None:
             readers.append((field.encode_name, path, None))

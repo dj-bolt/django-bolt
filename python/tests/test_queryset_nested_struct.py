@@ -7,6 +7,8 @@ reads the fields of the nested Struct across the relation, in the same query.
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import msgspec
 import pytest
 from django.db.backends import utils as db_utils
@@ -27,6 +29,21 @@ class PostOut(msgspec.Struct):
     id: int
     title: str
     author: AuthorOut
+
+
+class AnnotatedPost(msgspec.Struct):
+    title: str
+    author: Annotated[AuthorOut, msgspec.Meta(description="The author")]
+
+
+class AnnotatedOptionalPost(msgspec.Struct):
+    title: str
+    author: Annotated[AuthorOut | None, msgspec.Meta(description="The author")] = None
+
+
+class OptionalAnnotatedPost(msgspec.Struct):
+    title: str
+    author: Annotated[AuthorOut, msgspec.Meta(description="The author")] | None = None
 
 
 class RenamedAuthor(msgspec.Struct):
@@ -159,6 +176,31 @@ def test_nested_struct_uses_the_wire_names():
         {"postTitle": "First", "postAuthor": {"authorName": "Ada"}},
         {"postTitle": "Second", "postAuthor": {"authorName": "Bob"}},
     ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_nested_struct_with_annotated_metadata():
+    """``Annotated[Nested, msgspec.Meta(...)]`` is a nested Struct of a relation too."""
+    _make_posts()
+    api = BoltAPI()
+
+    @api.get("/annotated")
+    async def annotated() -> list[AnnotatedPost]:
+        return BlogPost.objects.order_by("id")
+
+    @api.get("/annotated-optional")
+    async def annotated_optional() -> list[AnnotatedOptionalPost]:
+        return BlogPost.objects.order_by("id")
+
+    @api.get("/optional-annotated")
+    async def optional_annotated() -> list[OptionalAnnotatedPost]:
+        return BlogPost.objects.order_by("id")
+
+    with TestClient(api) as client:
+        for path in ("/annotated", "/annotated-optional", "/optional-annotated"):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert [row["author"]["name"] for row in response.json()] == ["Ada", "Bob"], path
 
 
 @pytest.mark.django_db(transaction=True)
