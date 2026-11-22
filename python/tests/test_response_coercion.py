@@ -490,6 +490,7 @@ _SHORT_TEXT = Annotated[str, msgspec.Meta(max_length=5)]
         (bytes | None, b"abc", "application/octet-stream"),
         (bytes | Item, bytearray(b"abc"), "application/octet-stream"),
     ],
+    ids=["str", "str-or-none", "str-or-struct", "any", "annotated-str", "bytes", "bytes-or-none", "bytes-or-struct"],
 )
 def test_str_or_bytes_for_a_type_that_allows_it_keeps_its_content_type(return_type, value, content_type, is_async):
     api = BoltAPI()
