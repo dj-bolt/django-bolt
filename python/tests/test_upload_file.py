@@ -1762,7 +1762,7 @@ class TestAutoCleanup:
             assert not avatar._file.closed, "File should be open during handler"
             raise ValueError("Intentional error in handler")
 
-        client = TestClient(api)
+        client = TestClient(api, raise_server_exceptions=False)
         response = client.post(
             "/upload",
             files={"avatar": ("test.jpg", b"image data", "image/jpeg")},

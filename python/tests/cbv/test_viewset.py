@@ -292,7 +292,7 @@ def test_viewset_class_settings_apply_to_its_routes(api):
         async def checked(self, request) -> _Pair:
             return {"id": "not a number"}
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         # With validation on, these bodies give 500, because they are not a _Pair.
         response = client.get("/things")
         assert (response.status_code, response.json()) == (202, [{"id": "not a number"}])

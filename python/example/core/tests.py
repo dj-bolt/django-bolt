@@ -50,7 +50,7 @@ class SharingCanBeSwitchedOff(TestCase):
 
         with warnings.catch_warnings(record=True) as recorded:
             warnings.simplefilter("always")
-            with TestClient(api, share_db_connection=False) as client:
+            with TestClient(api, share_db_connection=False, raise_server_exceptions=False) as client:
                 response = client.get("/blogs/")
 
         advisories = [w for w in recorded if issubclass(w.category, BoltTestClientWarning)]

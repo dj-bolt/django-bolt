@@ -23,7 +23,6 @@ import httpx
 from httpx import Response
 
 from django_bolt import BoltAPI, _core
-from django_bolt._bridge import make_bound_dispatch
 from django_bolt.api import (
     _routes_and_native_routes,
     _validate_asgi_mount_conflicts,
@@ -32,6 +31,7 @@ from django_bolt.api import (
 )
 from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.testing.dbshare import SharedConnections
+from django_bolt.testing.server_exceptions import ServerExceptions, bound_dispatches
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +70,8 @@ def _warn_if_inside_atomic_block() -> None:
     in a transaction (Django's ``TestCase``, or pytest-django's plain
     ``django_db``) does not commit. Thus the handler cannot read those rows.
     On SQLite the write lock of the test also stops the query of the handler,
-    which gives ``database table is locked``. In the two conditions the symptom
-    is an unclear 500 that does not show the cause.
+    which gives ``database table is locked``. The cause is not clear from the
+    symptom: a 500, or with ``raise_server_exceptions`` the lock error.
 
     The warning is advisory. A test whose handlers do not use the database is
     correct in a transaction, thus this function must not stop the run.
@@ -99,7 +99,7 @@ def _warn_if_inside_atomic_block() -> None:
         f"TestClient started in an open database transaction on: {', '.join(open_aliases)}. "
         "Handlers run on framework threads that have their own database connections. "
         "Thus they cannot read the rows that this test made, and on SQLite the lock of "
-        "the test shows as an unclear 500. Remove share_db_connection=False, or use "
+        "the test stops their queries. Remove share_db_connection=False, or use "
         "TransactionTestCase (or pytest-django's django_db(transaction=True)) for tests "
         "whose handlers use the database. "
         "See https://bolt.farhana.li/topics/testing/#using-djangos-test-runner",
@@ -116,13 +116,14 @@ class BoltTestTransport(httpx.BaseTransport):
 
     Args:
         app_id: Test app instance ID
-        raise_server_exceptions: If True, raise an error of the test backend, for example an
-            unsupported HTTP method. A handler exception still gives a 500 response.
-            If False, the backend error gives a 500 response too
+        exceptions: The exceptions of the handlers, or None for raise_server_exceptions=False
+        raise_server_exceptions: If True, raise the exception of a handler that gives a
+            server error, and an error of the test backend. If False, give a 500 response
     """
 
-    def __init__(self, app_id: int, raise_server_exceptions: bool = True):
+    def __init__(self, app_id: int, exceptions: ServerExceptions | None = None, raise_server_exceptions: bool = True):
         self.app_id = app_id
+        self.exceptions = exceptions
         self.raise_server_exceptions = raise_server_exceptions
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
@@ -157,15 +158,6 @@ class BoltTestTransport(httpx.BaseTransport):
                 body=body_bytes,
                 query_string=query_string,
             )
-
-            # Build httpx Response
-            return Response(
-                status_code=status_code,
-                headers=resp_headers,
-                content=resp_body,
-                request=request,
-            )
-
         except Exception as e:
             if self.raise_server_exceptions:
                 raise
@@ -177,6 +169,15 @@ class BoltTestTransport(httpx.BaseTransport):
                 request=request,
             )
 
+        if self.exceptions is not None and (error := self.exceptions.take(resp_headers)) is not None:
+            raise error
+        return Response(
+            status_code=status_code,
+            headers=resp_headers,
+            content=resp_body,
+            request=request,
+        )
+
 
 class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
     """Async HTTP transport that routes requests through django-bolt's test handler.
@@ -186,13 +187,14 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
 
     Args:
         app_id: Test app instance ID
-        raise_server_exceptions: If True, raise an error of the test backend, for example an
-            unsupported HTTP method. A handler exception still gives a 500 response.
-            If False, the backend error gives a 500 response too
+        exceptions: The exceptions of the handlers, or None for raise_server_exceptions=False
+        raise_server_exceptions: If True, raise the exception of a handler that gives a
+            server error, and an error of the test backend. If False, give a 500 response
     """
 
-    def __init__(self, app_id: int, raise_server_exceptions: bool = True):
+    def __init__(self, app_id: int, exceptions: ServerExceptions | None = None, raise_server_exceptions: bool = True):
         self.app_id = app_id
+        self.exceptions = exceptions
         self.raise_server_exceptions = raise_server_exceptions
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -232,15 +234,6 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
                     query_string=query_string,
                 ),
             )
-
-            # Build httpx Response
-            return Response(
-                status_code=status_code,
-                headers=resp_headers,
-                content=resp_body,
-                request=request,
-            )
-
         except Exception as e:
             if self.raise_server_exceptions:
                 raise
@@ -251,6 +244,15 @@ class AsyncBoltTestTransport(httpx.AsyncBaseTransport):
                 content=f"Test client error: {e}".encode(),
                 request=request,
             )
+
+        if self.exceptions is not None and (error := self.exceptions.take(resp_headers)) is not None:
+            raise error
+        return Response(
+            status_code=status_code,
+            headers=resp_headers,
+            content=resp_body,
+            request=request,
+        )
 
 
 def _close_server_connections() -> None:
@@ -332,9 +334,10 @@ class TestClient(httpx.Client):
         Args:
             api: BoltAPI instance to test
             base_url: Base URL for requests
-            raise_server_exceptions: If True, raise an error of the test backend, for example an
-                unsupported HTTP method. A handler exception still gives a 500 response.
-                If False, the backend error gives a 500 response too
+            raise_server_exceptions: If True (the default), raise the exception of a handler
+                that gives a server error, as Starlette's TestClient does. An exception that
+                the API answers with a 4xx, or an HTTPException, gives its response. Also
+                raise an error of the test backend. If False, give the 500 response of the server
             cors_allowed_origins: Global CORS allowed origins for this test. They
                                   replace the CORS settings. A "*" entry allows every origin.
             read_django_settings: If True (the default), read the CORS, static and media
@@ -376,15 +379,10 @@ class TestClient(httpx.Client):
         self._release_app = weakref.finalize(self, _core.destroy_test_app, self.app_id)
 
         # Register routes
+        # With raise_server_exceptions, a test-only dispatch brings the exception of a handler back.
+        exceptions = ServerExceptions() if raise_server_exceptions else None
         rust_routes = [
-            (
-                method,
-                path,
-                handler_id,
-                handler,
-                make_bound_dispatch(api._dispatch, handler, handler_id),
-                make_bound_dispatch(api._dispatch_sync, handler, handler_id),
-            )
+            (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
             for method, path, handler_id, handler in api._routes
         ]
         _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes), api._rust_no_route())
@@ -417,7 +415,7 @@ class TestClient(httpx.Client):
 
         super().__init__(
             base_url=base_url,
-            transport=BoltTestTransport(self.app_id, raise_server_exceptions),
+            transport=BoltTestTransport(self.app_id, exceptions, raise_server_exceptions),
             follow_redirects=True,
             **kwargs,
         )
@@ -675,9 +673,10 @@ class AsyncTestClient(httpx.AsyncClient):
         Args:
             api: BoltAPI instance to test
             base_url: Base URL for requests
-            raise_server_exceptions: If True, raise an error of the test backend, for example an
-                unsupported HTTP method. A handler exception still gives a 500 response.
-                If False, the backend error gives a 500 response too
+            raise_server_exceptions: If True (the default), raise the exception of a handler
+                that gives a server error, as Starlette's TestClient does. An exception that
+                the API answers with a 4xx, or an HTTPException, gives its response. Also
+                raise an error of the test backend. If False, give the 500 response of the server
             cors_allowed_origins: Global CORS allowed origins for this test. They
                                   replace the CORS settings. A "*" entry allows every origin.
             read_django_settings: If True (the default), read the CORS, static and media
@@ -709,15 +708,10 @@ class AsyncTestClient(httpx.AsyncClient):
         self._release_app = weakref.finalize(self, _core.destroy_test_app, self.app_id)
 
         # Register routes
+        # With raise_server_exceptions, a test-only dispatch brings the exception of a handler back.
+        exceptions = ServerExceptions() if raise_server_exceptions else None
         rust_routes = [
-            (
-                method,
-                path,
-                handler_id,
-                handler,
-                make_bound_dispatch(api._dispatch, handler, handler_id),
-                make_bound_dispatch(api._dispatch_sync, handler, handler_id),
-            )
+            (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
             for method, path, handler_id, handler in api._routes
         ]
         _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes), api._rust_no_route())
@@ -748,7 +742,7 @@ class AsyncTestClient(httpx.AsyncClient):
 
         super().__init__(
             base_url=base_url,
-            transport=AsyncBoltTestTransport(self.app_id, raise_server_exceptions),
+            transport=AsyncBoltTestTransport(self.app_id, exceptions, raise_server_exceptions),
             follow_redirects=True,
             **kwargs,
         )
