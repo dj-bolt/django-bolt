@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import copy
 import logging
 import threading
 import warnings
@@ -45,6 +46,9 @@ except ImportError:
     connections = None  # type: ignore
 
 
+_docs_routes_lock = threading.Lock()
+
+
 def _docs_routes(api: BoltAPI) -> list[tuple[Any, ...]]:
     """Return the docs routes of a test client of ``api``.
 
@@ -53,21 +57,25 @@ def _docs_routes(api: BoltAPI) -> list[tuple[Any, ...]]:
     ``api._routes``. Thus a client keeps its docs routes out of ``api._routes``.
     The registration occurs one time for each ``OpenAPIConfig`` of ``api``.
     """
-    if api._openapi_routes_registered:
-        # runbolt, or the test, added the docs routes to api._routes.
-        return []
-    cached = api._client_docs_routes
-    if cached is None or cached[0] is not api._openapi_config:
-        start = len(api._routes)
-        # The code of runbolt. A disabled config adds no route.
-        api._register_openapi_routes()
-        routes = api._routes[start:]
-        del api._routes[start:]
-        api._openapi_routes_registered = False
-        cached = api._client_docs_routes = (api._openapi_config, routes)
-    # Each client serves the schema of the routes at its creation, as runbolt does at startup.
-    api._openapi_schema = None
-    return cached[1]
+    # Clients of one API can start in parallel threads. The registration
+    # changes api._routes for a short time, so one thread at a time does it.
+    with _docs_routes_lock:
+        if api._openapi_routes_registered:
+            # runbolt, or the test, added the docs routes to api._routes.
+            return []
+        cached = api._client_docs_routes
+        # A copy of the config is the key, so a changed field registers again.
+        if cached is None or cached[0] != api._openapi_config:
+            start = len(api._routes)
+            # The code of runbolt. A disabled config adds no route.
+            api._register_openapi_routes()
+            routes = api._routes[start:]
+            del api._routes[start:]
+            api._openapi_routes_registered = False
+            cached = api._client_docs_routes = (copy.copy(api._openapi_config), routes)
+        # A new client generates the schema again, so it has the routes added before it.
+        api._openapi_schema = None
+        return cached[1]
 
 
 class BoltTestClientWarning(RuntimeWarning):

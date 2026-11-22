@@ -9,6 +9,7 @@ from a real `runbolt` server.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 from django.test import override_settings
@@ -321,3 +322,39 @@ def test_an_asgi_mount_at_the_docs_path_is_refused_as_runbolt_refuses_it():
     local_api.mount_asgi("/docs", asgi_app)
     with pytest.raises(ValueError):
         TestClient(local_api)
+
+
+@pytest.mark.parametrize("enabled_first", [True, False])
+def test_a_change_of_the_docs_config_applies_to_the_next_client(enabled_first):
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", enabled=enabled_first))
+    expected = {True: 200, False: 404}
+    with TestClient(local_api) as client:
+        assert client.get("/docs/openapi.json").status_code == expected[enabled_first]
+
+    local_api._openapi_config.enabled = not enabled_first
+
+    with TestClient(local_api) as client:
+        assert client.get("/docs/openapi.json").status_code == expected[not enabled_first]
+
+
+def _get_docs_after(barrier: threading.Barrier, local_api: BoltAPI, results: list[object]) -> None:
+    barrier.wait()
+    try:
+        with TestClient(local_api) as client:
+            results.append(client.get("/docs/openapi.json").status_code)
+    except Exception as error:  # noqa: BLE001 - the test reports the error below
+        results.append(error)
+
+
+def test_clients_created_at_the_same_time_all_serve_the_docs():
+    """Threads that create clients of one API at the same time must each get the docs routes."""
+    for _ in range(20):
+        local_api = _docs_api()
+        barrier = threading.Barrier(8)
+        results: list[object] = []
+        threads = [threading.Thread(target=_get_docs_after, args=(barrier, local_api, results)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert results == [200] * 8

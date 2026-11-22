@@ -38,7 +38,7 @@ TestClient(
 
 A synchronous HTTP client for one `BoltAPI`. It is a subclass of `httpx.Client`. Each request runs on a Bolt test worker thread, through the request pipeline of `runbolt`. The calling thread waits for the response.
 
-The constructor registers the HTTP routes, WebSocket routes, ASGI mounts, MCP mounts and middleware of `api`. It also registers the OpenAPI docs routes, with the code of `runbolt`. The `auth`, `guards` and `enabled` values of the `OpenAPIConfig` of `api` apply. A route of `api` with the path of a docs route raises `ValueError`, as `runbolt` refuses to start with it. The client does not add the docs routes to `api`, so a later `mount()` of `api` does not copy them. The schema has the routes of `api` at the creation of the client.
+The constructor registers the HTTP routes, WebSocket routes, ASGI mounts, MCP mounts and middleware of `api`. It also registers the OpenAPI docs routes, with the code of `runbolt`. The `auth`, `guards` and `enabled` values of the `OpenAPIConfig` of `api` apply. A route of `api` with the path of a docs route raises `ValueError`, as `runbolt` refuses to start with it. The client does not add the docs routes to `api`, so a later `mount()` of `api` does not copy them. A new client generates the schema again, so the schema has each route of `api` that was added before the client.
 
 ### Parameters
 
