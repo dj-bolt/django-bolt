@@ -74,7 +74,7 @@ curl localhost:8000/mcp \
 ```
 
 ```text
-data: 
+data:
 id: 0
 retry: 3000
 
