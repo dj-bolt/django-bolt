@@ -18,7 +18,7 @@ repository = "https://github.com/dj-bolt/django-bolt"
 pyo3 = { version = "0.30.1", features = ["abi3-py312", "chrono"] }
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
 actix-web = { version = "4.18.2", features = ["compress-gzip", "compress-brotli", "compress-zstd", "cookies"] }
-actix-http = "3.20.3"
+actix-http = "3.21.3"
 actix-web-actors = "4"  # WebSocket support
 actix = "0.13"  # Actor framework for WebSocket
 actix-files = "0.7.4"
