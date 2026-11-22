@@ -163,3 +163,15 @@ class Release(models.Model):
 
     class Meta:
         app_label = "django_bolt"
+
+
+class ShortJtiRevokedToken(models.Model):
+    """A revocation model of a project, with a ``jti`` column shorter than the column of Bolt."""
+
+    jti = models.CharField(max_length=40, unique=True)
+    revoked_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    version = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        app_label = "django_bolt"

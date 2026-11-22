@@ -165,7 +165,9 @@ Bolt applies these rules to each static request:
 
 - A path with `..` gets `400` with the body `Invalid path`.
 - A path with a part that starts with a dot, such as `.env` or `.git/config`, gets `404`.
-- A symbolic link that points out of the directory gives `404`. With `DEBUG = True`, the Django finders can still find the file of such a link. Do not expose a server with `DEBUG = True`.
+- A symbolic link that points out of the directory gives `404`.
+- With `DEBUG = True`, a file from a staticfiles finder must stay in the directory of its finder location. A symbolic link out of that directory gives `404`. A `STATICFILES_DIRS` entry can be a symbolic link to a directory.
+- A finder with no filesystem storage has no known directory. Bolt does not serve its files and prints a warning at startup.
 - Each response, also a `404`, has `X-Content-Type-Options: nosniff`.
 
 Bolt sends a static file with its own content type, also an `.html` or `.svg` file. Put only files that you trust in `STATIC_ROOT`. For files that users upload, see [Media files](media-files.md).

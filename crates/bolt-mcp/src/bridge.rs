@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::{McpAuthExt, McpMount};
+use crate::{McpAuthExt, McpMount, McpRouteRequest, McpRouteRequestExt};
 use bolt_core::middleware::auth::AuthContext;
 use bolt_core::request_pipeline::extract_headers;
 use bolt_core::responses;
@@ -176,6 +176,16 @@ pub async fn handle_mcp_request(
     request
         .extensions_mut()
         .insert(McpAuthExt(auth_ctx.map(std::sync::Arc::new)));
+    if mount.route_gates {
+        let scheme = req.connection_info().scheme().to_owned();
+        request
+            .extensions_mut()
+            .insert(McpRouteRequestExt(std::sync::Arc::new(McpRouteRequest {
+                headers,
+                method,
+                scheme,
+            })));
+    }
 
     // ---- Serve via rmcp ----
     let response = mount.service.handle(request).await;

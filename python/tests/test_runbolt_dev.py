@@ -320,6 +320,8 @@ async def pong():
 
 
 @pytest.mark.django_db
+# runbolt calls setup_django_logging(), which starts a queue listener on the stderr of this test.
+@pytest.mark.usefixtures("bolt_logging_state")
 @pytest.mark.parametrize(
     ("argv", "backlog", "mounts", "warnings"),
     [

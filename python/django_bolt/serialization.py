@@ -31,7 +31,7 @@ from collections.abc import (
     Iterator as IteratorABC,
 )
 from functools import cache
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, Union, get_args, get_origin
 
 import msgspec
 from django.core.exceptions import FieldError
@@ -60,6 +60,7 @@ from .responses import (
     format_sse_event,
 )
 from .responses import Response as ResponseClass
+from .typing import resolve_type_alias
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -432,34 +433,76 @@ def _response_class_wire_meta(
     return (_infer_wire_response_type(media_type), custom_ct, headers_list, cookies_data)
 
 
+def split_response_annotation(annotation: Any) -> tuple[Any, tuple[type, ...]]:
+    """Split a return annotation into its body type and the response classes that it names.
+
+    A response class, such as ``JSON`` in ``-> Item | JSON``, names the class of
+    the result and not the type of its body. The body type is the union of the
+    other members, or None when they are only None. ``Annotated`` and a ``type``
+    alias do not change this: the metadata of ``Annotated`` stays on the body
+    type. An annotation that names no response class is its own body type. The
+    validation of the body and the OpenAPI schema both use this function, so
+    that they agree.
+    """
+    body, classes = _split_response_annotation(annotation)
+    if body is type(None) and classes:
+        return None, classes
+    return body, classes
+
+
+def _split_response_annotation(annotation: Any) -> tuple[Any, tuple[type, ...]]:
+    # A None member stays as NoneType here. Thus the null of a nested member,
+    # as in ``Item | Annotated[JSON | None, ...]``, stays in the outer union.
+    resolved = resolve_type_alias(annotation)
+    origin = get_origin(resolved)
+    if origin is Annotated:
+        body, classes = _split_response_annotation(resolved.__origin__)
+        if not classes:
+            return annotation, ()
+        if body is None or body is type(None):
+            return body, classes
+        return Annotated[body, *resolved.__metadata__], classes
+    if origin in (Union, types.UnionType):
+        bodies: list[Any] = []
+        classes: tuple[type, ...] = ()
+        for arg in get_args(resolved):
+            body, arg_classes = _split_response_annotation(arg)
+            classes += arg_classes
+            if body is not None:
+                bodies.append(body)
+        if not classes:
+            return annotation, ()
+        if not bodies:
+            return None, classes
+        return Union[tuple(bodies)], classes  # noqa: UP007 - the members are only known at run time
+    if isinstance(resolved, type) and is_response_class(resolved):
+        return None, (resolved,)
+    return annotation, ()
+
+
 def _validated_body_type(annotation: Any) -> Any:
     """Return the type that validates the body of a result, or None for no validation.
 
-    A response class, such as ``JSON`` in ``-> Item | JSON``, names the class of
-    the result and not the type of its body. Thus a union validates the body
-    against its other members: ``-> Item | JSON`` validates against ``Item``.
+    ``-> Item | JSON`` validates against ``Item`` (see split_response_annotation).
     ``-> JSON`` and ``-> JSON | Redirect`` send the body as it is.
     """
     if annotation is None or annotation in _VALIDATION_NOOP_TYPES:
         return None
-    if isinstance(annotation, type) and is_response_class(annotation):
-        return None
-    if get_origin(annotation) not in (Union, types.UnionType):
-        return annotation
-    members = get_args(annotation)
-    bodies = tuple(arg for arg in members if not (isinstance(arg, type) and is_response_class(arg)))
-    if len(bodies) == len(members):
-        return annotation
-    if all(arg is type(None) for arg in bodies):
-        return None
-    return Union[bodies]  # noqa: UP007 - the members are only known at run time
+    return split_response_annotation(annotation)[0]
 
 
 def _allows_none(annotation: Any) -> bool:
-    """Return True when the response type is None or a union with None."""
+    """Return True when the response type is None or a union with None.
+
+    ``Annotated`` and a ``type`` alias do not change this, as for msgspec.
+    """
+    annotation = resolve_type_alias(annotation)
     if annotation is type(None):
         return True
-    return get_origin(annotation) in (Union, types.UnionType) and type(None) in get_args(annotation)
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        return _allows_none(annotation.__origin__)
+    return origin in (Union, types.UnionType) and any(_allows_none(arg) for arg in get_args(annotation))
 
 
 def _names_one_of(annotation: Any, kinds: tuple[type, ...]) -> bool:

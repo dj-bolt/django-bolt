@@ -240,3 +240,32 @@ def test_static_url_with_scope_param_chars_is_ignored(make_server_project):
             f"{label} request must 404 when STATIC_URL is malformed, got {response.status_code}"
         )
         assert b"color: red" not in response.content
+
+
+def test_debug_finders_refuse_a_symlink_out_of_their_root(make_server_project):
+    """With DEBUG, a finder file that resolves out of its root gives 404 (#933)."""
+    project = make_server_project(
+        installed_apps=["django.contrib.staticfiles"],
+        settings_extra="""
+        DEBUG = True
+        STATIC_URL = "/static/"
+        STATICFILES_DIRS = [("vendor", str(BASE_DIR / "vendorassets"))]
+        """,
+        extra_files={
+            "vendorassets/app.css": "body { color: teal; }\n",
+            "secret.txt": "SECRET_CONTENT\n",
+        },
+    )
+    try:
+        project.path("vendorassets/leak.txt").symlink_to(project.path("secret.txt"))
+    except OSError:
+        pytest.skip("Symlink creation not supported on this system")
+
+    with project.start() as server:
+        served = server.get("/static/vendor/app.css")
+        leak = server.get("/static/vendor/leak.txt")
+
+    assert served.status_code == 200
+    assert "color: teal" in served.text
+    assert leak.status_code == 404
+    assert "SECRET_CONTENT" not in leak.text
