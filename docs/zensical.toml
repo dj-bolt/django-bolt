@@ -1,371 +1,205 @@
-# ============================================================================
-#
-# The configuration produced by default is meant to highlight the features
-# that Zensical provides and to serve as a starting point for your own
-# projects.
-#
-# ============================================================================
+# Django-Bolt documentation site. Build: `just docs-build`. Serve: `just docs`.
+# Read docs/STYLE.md before you add or change a page.
 
 [project]
-
-# The site_name is shown in the page header and the browser window title
-#
-# Read more: https://zensical.org/docs/setup/basics/#site_name
 site_name = "Django-Bolt"
-
-# The site_description is included in the HTML head and should contain a
-# meaningful description of the site content for use by search engines.
-#
-# Read more: https://zensical.org/docs/setup/basics/#site_description
-site_description = "Django-Bolt: the fastest Python web framework, built on Django. Rust (Actix Web) HTTP server, async typed handlers, msgspec validation — with the full Django ORM, Admin, middleware and auth. 300k+ req/s, no gunicorn or uvicorn."
-
-# The site_author attribute. This is used in the HTML head element.
-#
-# Read more: https://zensical.org/docs/setup/basics/#site_author
-site_author = "Farhan"
-
-# Source directory for markdown files
+site_description = "Django-Bolt serves typed Django APIs from a Rust HTTP server. Keep your models, admin and auth. Run one command in production."
+site_author = "Farhan Ali Raza"
 docs_dir = "src"
-
-# Repository URL for edit links and header icon
-repo_url = "https://github.com/FarhanAliRaza/django-bolt"
-repo_name = "FarhanAliRaza/django-bolt"
-
-# The site_url is the canonical URL for your site. When building online
-# documentation you should set this.
-# Read more: https://zensical.org/docs/setup/basics/#site_url
+repo_url = "https://github.com/dj-bolt/django-bolt"
+repo_name = "dj-bolt/django-bolt"
+edit_uri = "edit/master/docs/src/"
 site_url = "https://bolt.farhana.li/"
+copyright = "Copyright &copy; 2025–2026 Farhan Ali Raza. MIT License."
 
-# The copyright notice appears in the page footer and can contain an HTML
-# fragment.
-#
-# Read more: https://zensical.org/docs/setup/basics/#copyright
-copyright = """
-Copyright &copy; 2026 Farhan Ali Raza
-"""
-
-# Navigation structure following Django's progressive disclosure pattern:
-# - Start simple (Getting Started)
-# - Build understanding (Tutorials)
-# - Go deeper (Topic Guides)
-# - Reference for lookup (API Reference)
-#
-# Read more: https://zensical.org/docs/setup/navigation/
+# The navigation follows Diátaxis: learn (tutorial), do (guides),
+# look up (reference), understand (explanation).
 nav = [
-  { "Getting Started" = [
-    { "Overview" = "index.md" },
-    { "Quick Start" = "getting-started/quickstart.md" },
-    { "Deployment" = "getting-started/deployment.md" },
-    { "How It Works" = "architecture.md" },
+  { "Home" = "index.md" },
+  { "Get started" = [
+    { "Introduction" = "intro/index.md" },
+    { "Installation" = "intro/install.md" },
+    { "Tutorial" = [
+      { "1. Project and first route" = "tutorial/index.md" },
+      { "2. Models and validation" = "tutorial/part-2.md" },
+      { "3. Authentication" = "tutorial/part-3.md" },
+      { "4. Tests and production" = "tutorial/part-4.md" },
+    ]},
+    { "Migrate from Ninja, DRF or FastAPI" = "topics/migrating.md" },
+  ]},
+  { "Guides" = [
+    { "Basics" = [
+      { "Routing" = "topics/routing.md" },
+      { "Requests" = "topics/requests.md" },
+      { "Responses" = "topics/responses.md" },
+      { "Errors" = "topics/error-handling.md" },
+    ]},
+    { "Data" = [
+      { "Serializers" = "topics/serializers.md" },
+      { "Django ORM" = "topics/async-orm.md" },
+      { "Pagination" = "topics/pagination.md" },
+    ]},
+    { "Structure" = [
+      { "Class-based views" = "topics/class-based-views.md" },
+      { "Dependencies" = "topics/dependencies.md" },
+      { "Middleware" = "topics/middleware.md" },
+      { "Lifespan" = "topics/lifespan.md" },
+      { "Signals" = "topics/signals.md" },
+    ]},
+    { "Security" = [
+      { "Authentication" = "topics/authentication.md" },
+      { "Permissions" = "topics/permissions.md" },
+      { "CORS" = "topics/cors.md" },
+      { "Rate limiting" = "topics/rate-limiting.md" },
+    ]},
+    { "Real time" = [
+      { "Server-sent events" = "topics/sse.md" },
+      { "WebSocket" = "topics/websocket.md" },
+    ]},
+    { "API docs" = [
+      { "OpenAPI" = "topics/openapi.md" },
+    ]},
+    { "Files" = [
+      { "Static files" = "topics/static-files.md" },
+      { "Media files" = "topics/media-files.md" },
+    ]},
+    { "Production" = [
+      { "Deployment" = "topics/deployment.md" },
+      { "Testing" = "topics/testing.md" },
+      { "Logging" = "topics/logging.md" },
+      { "Health checks" = "topics/health-checks.md" },
+      { "Compression" = "topics/compression.md" },
+    ]},
+    { "Integrations" = [
+      { "MCP servers" = "topics/mcp.md" },
+      { "ASGI mounts" = "topics/asgi-mounts.md" },
+      { "Debug toolbar" = "topics/debug-toolbar.md" },
+      { "nanodjango" = "topics/nanodjango.md" },
+      { "Native routes" = "topics/native-routes.md" },
+    ]},
+  ]},
+  { "Reference" = [
+    { "BoltAPI and Router" = "ref/api.md" },
+    { "Request" = "ref/request.md" },
+    { "Parameters" = "ref/params.md" },
+    { "Responses" = "ref/responses.md" },
+    { "Exceptions" = "ref/exceptions.md" },
+    { "Serializers" = "ref/serializers.md" },
+    { "Views" = "ref/views.md" },
+    { "Authentication" = "ref/auth.md" },
+    { "Middleware" = "ref/middleware.md" },
+    { "Testing" = "ref/testing.md" },
+    { "Settings" = "ref/settings.md" },
+    { "runbolt" = "ref/runbolt.md" },
+  ]},
+  { "Explanation" = [
+    { "How it works" = "architecture.md" },
     { "Benchmarks" = "benchmarks.md" },
     { "Comparison" = "comparison.md" },
     { "FAQ" = "faq.md" },
   ]},
-  { "Topic Guides" = [
-    { "Routing" = "topics/routing.md" },
-    { "Request Handling" = "topics/requests.md" },
-    { "Responses" = "topics/responses.md" },
-    { "Serializers" = "topics/serializers.md" },
-    { "Async Django ORM" = "topics/async-orm.md" },
-    { "Authentication" = "topics/authentication.md" },
-    { "Permissions" = "topics/permissions.md" },
-    { "Class-Based Views" = "topics/class-based-views.md" },
-    { "Pagination" = "topics/pagination.md" },
-    { "Dependencies" = "topics/dependencies.md" },
-    { "Middleware" = "topics/middleware.md" },
-    { "Compression" = "topics/compression.md" },
-    { "Static Files" = "topics/static-files.md" },
-    { "Media Files" = "topics/media-files.md" },
-    { "Lifespan" = "topics/lifespan.md" },
-    { "Django Signals" = "topics/signals.md" },
-    { "Error Handling" = "topics/error-handling.md" },
-    { "Logging" = "topics/logging.md" },
-    { "Health Checks" = "topics/health-checks.md" },
-    { "Testing" = "topics/testing.md" },
-    { "Server-Sent Events" = "topics/sse.md" },
-    { "WebSocket" = "topics/websocket.md" },
-    { "MCP Server (bolt-mcp)" = "topics/mcp.md" },
-    { "OpenAPI" = "topics/openapi.md" },
-    { "ASGI Mounts" = "topics/asgi-mounts.md" },
-    { "Native Routes" = "topics/native-routes.md" },
-    { "Django Debug Toolbar" = "topics/debug-toolbar.md" },
-
-  ]},
-  { "Reference" = [
-    { "BoltAPI" = "ref/api.md" },
-    { "Responses" = "ref/responses.md" },
-    { "Exceptions" = "ref/exceptions.md" },
-    { "Authentication" = "ref/auth.md" },
-    { "Settings" = "ref/settings.md" },
-  ]},
 ]
 
-# With the "extra_css" option you can add your own CSS styling to customize
-# your Zensical project according to your needs. You can add any number of
-# CSS files.
-#
-# The path provided should be relative to the "docs_dir".
-#
-# Read more: https://zensical.org/docs/customization/#additional-css
 extra_css = ["stylesheets/bolt.css"]
+extra_javascript = ["javascripts/bolt.js"]
 
-# With the `extra_javascript` option you can add your own JavaScript to your
-# project to customize the behavior according to your needs.
-#
-# The path provided should be relative to the "docs_dir".
-#
-# Read more: https://zensical.org/docs/customization/#additional-javascript
-#extra_javascript = ["javascripts/extra.js"]
-
-# ----------------------------------------------------------------------------
-# Section for configuring theme options
-# ----------------------------------------------------------------------------
 [project.theme]
-
+custom_dir = "overrides"
 logo = "images/bolt-logo.png"
-
-# change this to "classic" to use the traditional Material for MkDocs look.
-#variant = "classic"
-
-# Zensical allows you to override specific blocks, partials, or whole
-# templates as well as to define your own templates. To do this, uncomment
-# the custom_dir setting below and set it to a directory in which you
-# keep your template overrides.
-#
-# Read more:
-# - https://zensical.org/docs/customization/#extending-the-theme
-#
-#custom_dir = "overrides"
-
-# With the "favicon" option you can set your own image to use as the icon
-# browsers will use in the browser title bar or tab bar. The path provided
-# must be relative to the "docs_dir".
-#
-# Read more:
-# - https://zensical.org/docs/setup/logo-and-icons/#favicon
-# - https://developer.mozilla.org/en-US/docs/Glossary/Favicon
-#
 favicon = "images/bolt-logo.png"
-
-# Zensical supports more than 60 different languages. This means that the
-# labels and tooltips that Zensical's templates produce are translated.
-# The "language" option allows you to set the language used. This language
-# is also indicated in the HTML head element to help with accessibility
-# and guide search engines and translation tools.
-#
-# The default language is "en" (English). It is possible to create
-# sites with multiple languages and configure a language selector. See
-# the documentation for details.
-#
-# Read more:
-# - https://zensical.org/docs/setup/language/
-#
 language = "en"
-
-# Zensical provides a number of feature toggles that change the behavior
-# of the documentation site.
 features = [
-    # Zensical includes an announcement bar. This feature allows users to
-    # dismiss it then they have read the announcement.
-    # https://zensical.org/docs/setup/header/#announcement-bar
-    "announce.dismiss",
-
-    # If you have a repository configured and turn feature this on, Zensical
-    # will generate an edit button for the page. This works for common
-    # repository hosting services.
-    # https://zensical.org/docs/setup/repository/#code-actions
-    #"content.action.edit",
-
-    # If you have a repository configured and turn feature this on, Zensical
-    # will generate a button that allows the user to view the Markdown
-    # code for the current page.
-    # https://zensical.org/docs/setup/repository/#code-actions
-    #"content.action.view",
-
-    # Code annotations allow you to add an icon with a tooltip to your
-    # code blocks to provide explanations at crucial points.
-    # https://zensical.org/docs/authoring/code-blocks/#code-annotations
-    "content.code.annotate",
-
-    # This feature turns on a button in code blocks that allow users to
-    # copy the content to their clipboard without first selecting it.
-    # https://zensical.org/docs/authoring/code-blocks/#code-copy-button
-    "content.code.copy",
-
-    # Code blocks can include a button to allow for the selection of line
-    # ranges by the user.
-    # https://zensical.org/docs/authoring/code-blocks/#code-selection-button
-    "content.code.select",
-
-    # Zensical can render footnotes as inline tooltips, so the user can read
-    # the footnote without leaving the context of the document.
-    # https://zensical.org/docs/authoring/footnotes/#footnote-tooltips
-    "content.footnote.tooltips",
-
-    # If you have many content tabs that have the same titles (e.g., "Python",
-    # "JavaScript", "Cobol"), this feature causes all of them to switch to
-    # at the same time when the user chooses their language in one.
-    # https://zensical.org/docs/authoring/content-tabs/#linked-content-tabs
-    "content.tabs.link",
-
-    # TODO: not sure I understand this one? Is there a demo of this in the docs?
-    # https://zensical.org/docs/authoring/tooltips/#improved-tooltips
-    "content.tooltips",
-
-    # With this feature enabled, Zensical will automatically hide parts
-    # of the header when the user scrolls past a certain point.
-    # https://zensical.org/docs/setup/header/#automatic-hiding
-    # "header.autohide",
-
-    # Turn on this feature to expand all collapsible sections in the
-    # navigation sidebar by default.
-    # https://zensical.org/docs/setup/navigation/#navigation-expansion
-    # "navigation.expand",
-
-    # This feature turns on navigation elements in the footer that allow the
-    # user to navigate to a next or previous page.
-    # https://zensical.org/docs/setup/footer/#navigation
-    "navigation.footer",
-
-    # When section index pages are enabled, documents can be directly attached
-    # to sections, which is particularly useful for providing overview pages.
-    # https://zensical.org/docs/setup/navigation/#section-index-pages
-    "navigation.indexes",
-
-    # When instant navigation is enabled, clicks on all internal links will be
-    # intercepted and dispatched via XHR without fully reloading the page.
-    # https://zensical.org/docs/setup/navigation/#instant-navigation
-    "navigation.instant",
-
-    # With instant prefetching, your site will start to fetch a page once the
-    # user hovers over a link. This will reduce the perceived loading time
-    # for the user.
-    # https://zensical.org/docs/setup/navigation/#instant-prefetching
-    "navigation.instant.prefetch",
-
-    # In order to provide a better user experience on slow connections when
-    # using instant navigation, a progress indicator can be enabled.
-    # https://zensical.org/docs/setup/navigation/#progress-indicator
-    #"navigation.instant.progress",
-
-    # When navigation paths are activated, a breadcrumb navigation is rendered
-    # above the title of each page
-    # https://zensical.org/docs/setup/navigation/#navigation-path
-    "navigation.path",
-
-    # When pruning is enabled, only the visible navigation items are included
-    # in the rendered HTML, reducing the size of the built site by 33% or more.
-    # https://zensical.org/docs/setup/navigation/#navigation-pruning
-    #"navigation.prune",
-
-    # When sections are enabled, top-level sections are rendered as groups in
-    # the sidebar for viewports above 1220px, but remain as-is on mobile.
-    # https://zensical.org/docs/setup/navigation/#navigation-sections
-    "navigation.sections",
-
-    # When tabs are enabled, top-level sections are rendered in a menu layer
-    # below the header for viewports above 1220px, but remain as-is on mobile.
-    # https://zensical.org/docs/setup/navigation/#navigation-tabs
-    #"navigation.tabs",
-
-    # When sticky tabs are enabled, navigation tabs will lock below the header
-    # and always remain visible when scrolling down.
-    # https://zensical.org/docs/setup/navigation/#sticky-navigation-tabs
-    #"navigation.tabs.sticky",
-
-    # A back-to-top button can be shown when the user, after scrolling down,
-    # starts to scroll up again.
-    # https://zensical.org/docs/setup/navigation/#back-to-top-button
-    "navigation.top",
-
-    # When tabs are enabled, top-level sections are rendered in a menu layer
-    # below the header for viewports above 1220px, but remain as-is on mobile.
-    # https://zensical.org/docs/setup/navigation/#navigation-tabs
-    "navigation.tabs",
-
-    # When sticky tabs are enabled, navigation tabs will lock below the header
-    # and always remain visible when scrolling down.
-    # https://zensical.org/docs/setup/navigation/#sticky-navigation-tabs
-    "navigation.tabs.sticky",
-
-    # When anchor tracking is enabled, the URL in the address bar is
-    # automatically updated with the active anchor as highlighted in the table
-    # of contents.
-    # https://zensical.org/docs/setup/navigation/#anchor-tracking
-    "navigation.tracking",
-
-    # When search highlighting is enabled and a user clicks on a search result,
-    # Zensical will highlight all occurrences after following the link.
-    # https://zensical.org/docs/setup/search/#search-highlighting
-    "search.highlight",
-
-    # When anchor following for the table of contents is enabled, the sidebar
-    # is automatically scrolled so that the active anchor is always visible.
-    # https://zensical.org/docs/setup/navigation/#anchor-following
-    # "toc.follow",
-
-    # When navigation integration for the table of contents is enabled, it is
-    # always rendered as part of the navigation sidebar on the left.
-    # https://zensical.org/docs/setup/navigation/#navigation-integration
-    #"toc.integrate",
+  "content.action.edit",
+  "content.code.annotate",
+  "content.code.copy",
+  "content.code.select",
+  "content.footnote.tooltips",
+  "content.tabs.link",
+  "content.tooltips",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.tabs",
+  "navigation.tabs.sticky",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+  "toc.follow",
 ]
 
-# ----------------------------------------------------------------------------
-# In the "palette" subsection you can configure options for the color scheme.
-# You can configure different color # schemes, e.g., to turn on dark mode,
-# that the user can switch between. Each color scheme can be further
-# customized.
-#
-# Read more:
-# - https://zensical.org/docs/setup/colors/
-# ----------------------------------------------------------------------------
-# Light mode - Icy Day
 [[project.theme.palette]]
-scheme = "default"
-toggle.icon = "lucide/moon"
-toggle.name = "Switch to dark mode"
-
-# Dark mode - Arctic Night
-[[project.theme.palette]]
-scheme = "slate"
-toggle.icon = "lucide/sun"
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
 toggle.name = "Switch to light mode"
 
-# ----------------------------------------------------------------------------
-# In the "font" subsection you can configure the fonts used. By default, fonts
-# are loaded from Google Fonts, giving you a wide range of choices from a set
-# of suitably licensed fonts. There are options for a normal text font and for
-# a monospaced font used in code blocks.
-# ----------------------------------------------------------------------------
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "custom"
+accent = "custom"
+toggle.icon = "lucide/moon"
+toggle.name = "Use the system theme"
+
 [project.theme.font]
-text = "Outfit"
+text = "Inter"
 code = "JetBrains Mono"
 
-# ----------------------------------------------------------------------------
-# You can configure your own logo to be shown in the header using the "logo"
-# option in the "icons" subsection. The logo can be a path to a file in your
-# "docs_dir" or it can be a path to an icon.
-#
-# Likewise, you can customize the logo used for the repository section of the
-# header. Zensical derives the default logo for this from the repository URL.
-# See below...
-#
-# There are other icons you can customize. See the documentation for details.
-#
-# Read more:
-# - https://zensical.org/docs/setup/logo-and-icons
-# - https://zensical.org/docs/authoring/icons-emojis/#search
-# ----------------------------------------------------------------------------
 [project.theme.icon]
 repo = "fontawesome/brands/github"
+edit = "lucide/pencil"
 
-# ----------------------------------------------------------------------------
-# The "extra" section contains miscellaneous settings.
-# ----------------------------------------------------------------------------
 [[project.extra.social]]
 icon = "fontawesome/brands/github"
-link = "https://github.com/FarhanAliRaza/django-bolt"
+link = "https://github.com/dj-bolt/django-bolt"
+name = "Django-Bolt on GitHub"
 
 [[project.extra.social]]
 icon = "fontawesome/brands/python"
 link = "https://pypi.org/project/django-bolt/"
+name = "Django-Bolt on PyPI"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/discord"
+link = "https://discord.gg/4xErptXK82"
+name = "Django-Bolt on Discord"
+
+# Markdown extensions. These are the Zensical defaults, written out so that
+# a reader of this file sees what the pages can use.
+[project.markdown_extensions.abbr]
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.def_list]
+[project.markdown_extensions.footnotes]
+[project.markdown_extensions.md_in_html]
+[project.markdown_extensions.tables]
+[project.markdown_extensions.toc]
+permalink = true
+[project.markdown_extensions.pymdownx.details]
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+[project.markdown_extensions.pymdownx.inlinehilite]
+[project.markdown_extensions.pymdownx.snippets]
+[project.markdown_extensions.pymdownx.superfences]
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+combine_header_slug = true
+[project.markdown_extensions.pymdownx.emoji]
+emoji_index = "zensical.extensions.emoji.twemoji"
+emoji_generator = "zensical.extensions.emoji.to_svg"
+[project.markdown_extensions.pymdownx.keys]
+[project.markdown_extensions.pymdownx.mark]
+[project.markdown_extensions.pymdownx.tasklist]
+custom_checkbox = true

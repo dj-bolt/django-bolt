@@ -1,0 +1,298 @@
+{#-
+  The landing page. docs/src/index.md selects it with `template: home.html`.
+  Each number on this page comes from docs/src/benchmarks.md. Change both together.
+  Each code sample runs as shown; check it with TestClient before you change it.
+-#}
+{% extends "main.html" %}
+
+{% block tabs %}{{ super() }}{% endblock %}
+
+{% block hero %}
+<div class="bl-home">
+
+  <section class="bl-hero">
+    <div class="bl-wrap bl-hero__grid">
+      <div class="bl-hero__copy">
+        <p class="bl-eyebrow"><span class="bl-dot"></span> Open source · MIT · Python 3.12+</p>
+        <h1 class="bl-hero__title">Django APIs on a&nbsp;Rust&nbsp;server.</h1>
+        <p class="bl-hero__lede">
+          Write typed handlers in Python. Django-Bolt serves them from Actix Web and runs
+          routing, authentication, CORS and rate limits in Rust before your code starts.
+          Your models, admin and migrations do not change.
+        </p>
+        <div class="bl-actions">
+          <a class="bl-btn bl-btn--primary" href="{{ 'tutorial/' | url }}">Start the tutorial</a>
+          <a class="bl-btn" href="{{ 'intro/' | url }}">Read the introduction</a>
+        </div>
+        <div class="bl-install">
+          <span class="bl-install__prompt">$</span>
+          <code id="bl-install-cmd">pip install django-bolt</code>
+          <button class="bl-install__copy" type="button" data-copy="pip install django-bolt" aria-label="Copy the install command">Copy</button>
+        </div>
+      </div>
+
+      <div class="bl-window" aria-label="Example: a typed route and its response">
+        <div class="bl-window__bar">
+          <span></span><span></span><span></span>
+          <p>articles/api.py</p>
+        </div>
+<pre class="bl-code"><code><span class="k">import</span> msgspec
+<span class="k">from</span> django_bolt <span class="k">import</span> BoltAPI
+<span class="k">from</span> .models <span class="k">import</span> Article
+
+api = BoltAPI()
+
+<span class="k">class</span> <span class="t">ArticleOut</span>(msgspec.Struct):
+    id: <span class="t">int</span>
+    title: <span class="t">str</span>
+
+<span class="d">@api.get</span>(<span class="s">"/articles"</span>)
+<span class="k">async def</span> <span class="f">list_articles</span>(limit: <span class="t">int</span> = <span class="n">20</span>) -> <span class="t">list</span>[<span class="t">ArticleOut</span>]:
+    <span class="k">return</span> Article.objects.order_by(<span class="s">"-id"</span>)[:limit]</code></pre>
+        <div class="bl-window__term">
+<pre><code><span class="p">$</span> python manage.py runbolt --dev
+<span class="p">$</span> curl localhost:8000/articles?limit=2
+<span class="o">[{"id":42,"title":"Hello, Bolt"},{"id":41,"title":"Typed routes"}]</span></code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="bl-proof">
+    <div class="bl-wrap bl-proof__grid">
+      <div class="bl-stat">
+        <p class="bl-stat__value">324,493</p>
+        <p class="bl-stat__label">requests per second for a JSON route. 8 processes, 100 connections, one desktop CPU.</p>
+      </div>
+      <div class="bl-stat">
+        <p class="bl-stat__value">2.8×</p>
+        <p class="bl-stat__label">the throughput of Litestar and 5.8× FastAPI on a 1 KB JSON response, one process each.</p>
+      </div>
+      <div class="bl-stat">
+        <p class="bl-stat__value">1 command</p>
+        <p class="bl-stat__label"><code>manage.py runbolt</code> is the production server. No gunicorn, no uvicorn.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="bl-section">
+    <div class="bl-wrap">
+      <header class="bl-section__head">
+        <p class="bl-kicker">Benchmarks</p>
+        <h2>Measured against Litestar and FastAPI</h2>
+        <p>
+          Same machine, same PostgreSQL data, one process per framework, 100 connections.
+          Higher is better. Each framework uses its usual stack: Django ORM for Bolt,
+          SQLAlchemy with asyncpg for the others.
+        </p>
+      </header>
+
+      <div class="bl-bench" role="table" aria-label="Requests per second by endpoint and framework">
+        {#- (name, [(framework, requests per second, bar width in % of the panel maximum)]) -#}
+        {% set bench = [
+          ("1 KB JSON response", [("Django-Bolt", "43,541", 100), ("Litestar", "15,477", 35.5), ("FastAPI", "7,517", 17.3)]),
+          ("10 KB JSON response", [("Django-Bolt", "27,610", 100), ("Litestar", "12,925", 46.8), ("FastAPI", "1,805", 6.5)]),
+          ("JWT auth, then load the user", [("Django-Bolt", "4,478", 100), ("Litestar", "1,155", 25.8), ("FastAPI", "941", 21.0)]),
+          ("10 rows from PostgreSQL", [("Django-Bolt", "2,881", 100), ("Litestar", "1,321", 45.9), ("FastAPI", "1,237", 42.9)]),
+        ] %}
+        {% for name, rows in bench %}
+        <div class="bl-bench__panel" role="rowgroup">
+          <p class="bl-bench__name" role="rowheader">{{ name }}</p>
+          {% for label, value, width in rows %}
+          <div class="bl-bar" role="row" title="{{ label }}: {{ value }} requests per second">
+            <span class="bl-bar__label" role="cell">{{ label }}</span>
+            <span class="bl-bar__track"><span class="bl-bar__fill bl-bar__fill--{{ 'bolt' if loop.first else 'other' }}" style="width: {{ width }}%"></span></span>
+            <span class="bl-bar__value" role="cell">{{ value }}</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+      <p class="bl-footnote">
+        Requests per second, median of two runs, 2026-08-30, Python 3.14, bombardier.
+        <a href="{{ 'benchmarks/' | url }}">Conditions, more endpoints and how to reproduce</a>.
+      </p>
+    </div>
+  </section>
+
+  <section class="bl-section bl-section--alt">
+    <div class="bl-wrap">
+      <header class="bl-section__head">
+        <p class="bl-kicker">How it works</p>
+        <h2>Rust does the work around your handler</h2>
+        <p>
+          Bolt rejects a bad token, a blocked origin or a request over the rate limit
+          in Rust. Python runs only for a request that reaches your handler.
+        </p>
+      </header>
+      <ol class="bl-flow">
+        <li class="bl-flow__step"><span class="bl-flow__lang">Rust</span><strong>HTTP</strong><span>Actix Web parses the request</span></li>
+        <li class="bl-flow__step"><span class="bl-flow__lang">Rust</span><strong>Routing</strong><span>A radix tree finds the route</span></li>
+        <li class="bl-flow__step"><span class="bl-flow__lang">Rust</span><strong>CORS and rate limits</strong><span>Preflights and limits end here</span></li>
+        <li class="bl-flow__step"><span class="bl-flow__lang">Rust</span><strong>Auth and guards</strong><span>JWT and API keys are checked</span></li>
+        <li class="bl-flow__step bl-flow__step--py"><span class="bl-flow__lang">Python</span><strong>Your handler</strong><span>Typed arguments, Django ORM</span></li>
+        <li class="bl-flow__step"><span class="bl-flow__lang">Rust</span><strong>Response</strong><span>msgspec bytes, compression</span></li>
+      </ol>
+      <p class="bl-footnote"><a href="{{ 'architecture/' | url }}">Read how a request moves through Bolt</a>.</p>
+    </div>
+  </section>
+
+  <section class="bl-section">
+    <div class="bl-wrap bl-split">
+      <div>
+        <p class="bl-kicker">Still Django</p>
+        <h2>Keep the project you have</h2>
+        <p>
+          Bolt is a Django app. Add it to <code>INSTALLED_APPS</code>, write routes in
+          <code>api.py</code>, and start the server with <code>manage.py</code>.
+          Move one endpoint at a time from Django REST Framework or Django Ninja.
+        </p>
+        <a class="bl-link" href="{{ 'topics/migrating/' | url }}">Migrate from Ninja, DRF or FastAPI →</a>
+      </div>
+      <div class="bl-compare">
+        <div class="bl-compare__col">
+          <h3>You keep</h3>
+          <ul>
+            <li>Models, migrations and the ORM</li>
+            <li>The admin</li>
+            <li><code>settings.py</code> and your apps</li>
+            <li>Users, groups and permissions</li>
+            <li>Signals and Django middleware</li>
+            <li>Templates and the test runner</li>
+          </ul>
+        </div>
+        <div class="bl-compare__col bl-compare__col--add">
+          <h3>Bolt adds</h3>
+          <ul>
+            <li>A Rust HTTP server, many processes</li>
+            <li>Typed parameters, checked by msgspec</li>
+            <li>JWT and API-key auth in Rust</li>
+            <li>OpenAPI docs at <code>/docs</code></li>
+            <li>WebSocket and server-sent events</li>
+            <li>MCP servers for LLM clients</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="bl-section bl-section--alt">
+    <div class="bl-wrap">
+      <header class="bl-section__head">
+        <p class="bl-kicker">Examples</p>
+        <h2>The code you write</h2>
+      </header>
+      <div class="bl-tabs">
+        <input type="radio" name="bl-tab" id="bl-tab-1" checked>
+        <label for="bl-tab-1">Validation</label>
+        <input type="radio" name="bl-tab" id="bl-tab-2">
+        <label for="bl-tab-2">Django ORM</label>
+        <input type="radio" name="bl-tab" id="bl-tab-3">
+        <label for="bl-tab-3">Authentication</label>
+        <input type="radio" name="bl-tab" id="bl-tab-4">
+        <label for="bl-tab-4">WebSocket</label>
+
+        <div class="bl-tabs__panel">
+<pre class="bl-code"><code><span class="k">class</span> <span class="t">ArticleIn</span>(msgspec.Struct):
+    title: <span class="t">str</span>
+    body: <span class="t">str</span>
+    tags: <span class="t">list</span>[<span class="t">str</span>] = []
+
+<span class="d">@api.post</span>(<span class="s">"/articles"</span>, status_code=<span class="n">201</span>)
+<span class="k">async def</span> <span class="f">create_article</span>(article: <span class="t">ArticleIn</span>):
+    <span class="k">return</span> {<span class="s">"title"</span>: article.title, <span class="s">"tags"</span>: article.tags}</code></pre>
+<pre class="bl-code bl-code--out"><code><span class="c"># POST /articles  {"title": 1}</span>
+<span class="o">422 {"detail": [{"loc": ["body", "title"],
+      "msg": "Expected `str`, got `int`", "type": "validation_error"}]}</span></code></pre>
+          <p>Bolt reads each argument from its type hint. A bad body never reaches the handler. <a href="{{ 'topics/requests/' | url }}">Requests guide</a></p>
+        </div>
+
+        <div class="bl-tabs__panel">
+<pre class="bl-code"><code><span class="k">from</span> django_bolt.exceptions <span class="k">import</span> NotFound
+
+<span class="d">@api.get</span>(<span class="s">"/users/{user_id}"</span>)
+<span class="k">async def</span> <span class="f">get_user</span>(user_id: <span class="t">int</span>) -> <span class="t">UserOut</span>:
+    user = <span class="k">await</span> User.objects.filter(id=user_id).afirst()
+    <span class="k">if</span> user <span class="k">is</span> <span class="k">None</span>:
+        <span class="k">raise</span> NotFound(detail=<span class="s">"User not found"</span>)
+    <span class="k">return</span> user</code></pre>
+          <p>Use the async ORM, or return a QuerySet. Bolt runs the query on a bounded thread pool and encodes each row to the return type. <a href="{{ 'topics/async-orm/' | url }}">Django ORM guide</a></p>
+        </div>
+
+        <div class="bl-tabs__panel">
+<pre class="bl-code"><code><span class="k">from</span> django_bolt.auth <span class="k">import</span> IsAuthenticated, JWTAuthentication
+
+<span class="d">@api.get</span>(<span class="s">"/me"</span>, auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+<span class="k">async def</span> <span class="f">me</span>(request):
+    user = <span class="k">await</span> request.auser()
+    <span class="k">return</span> {<span class="s">"username"</span>: user.username}</code></pre>
+<pre class="bl-code bl-code--out"><code><span class="c"># GET /me  (no token)</span>
+<span class="o">401 {"detail": "Authentication required"}</span></code></pre>
+          <p>Rust checks the token signature, the expiry and the guards. A request without a valid token does not start Python. <a href="{{ 'topics/authentication/' | url }}">Authentication guide</a></p>
+        </div>
+
+        <div class="bl-tabs__panel">
+<pre class="bl-code"><code><span class="k">from</span> django_bolt.websocket <span class="k">import</span> WebSocket
+
+<span class="d">@api.websocket</span>(<span class="s">"/ws/echo"</span>)
+<span class="k">async def</span> <span class="f">echo</span>(websocket: <span class="t">WebSocket</span>):
+    <span class="k">await</span> websocket.accept()
+    <span class="k">async for</span> message <span class="k">in</span> websocket.iter_text():
+        <span class="k">await</span> websocket.send_text(message.upper())</code></pre>
+          <p>WebSocket routes use the same auth, guards and CORS rules as HTTP routes. <a href="{{ 'topics/websocket/' | url }}">WebSocket guide</a></p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="bl-section">
+    <div class="bl-wrap">
+      <header class="bl-section__head">
+        <p class="bl-kicker">Documentation</p>
+        <h2>Find what you need</h2>
+      </header>
+      <div class="bl-cards">
+        <a class="bl-card" href="{{ 'tutorial/' | url }}">
+          <h3>Tutorial</h3>
+          <p>Build an articles API in four parts: routes, models, authentication, tests.</p>
+        </a>
+        <a class="bl-card" href="{{ 'topics/routing/' | url }}">
+          <h3>Guides</h3>
+          <p>Do one task: validate a body, paginate a list, add CORS, stream events.</p>
+        </a>
+        <a class="bl-card" href="{{ 'ref/api/' | url }}">
+          <h3>Reference</h3>
+          <p>Every class, argument, default and setting, taken from the source.</p>
+        </a>
+        <a class="bl-card" href="{{ 'topics/deployment/' | url }}">
+          <h3>Deployment</h3>
+          <p>Run many processes, recycle workers, and put Bolt behind nginx.</p>
+        </a>
+        <a class="bl-card" href="{{ 'comparison/' | url }}">
+          <h3>Comparison</h3>
+          <p>Bolt next to Django Ninja, DRF, FastAPI and Litestar, with its weak points.</p>
+        </a>
+        <a class="bl-card" href="{{ 'faq/' | url }}">
+          <h3>FAQ</h3>
+          <p>Production use, supported versions, WSGI and ASGI, and how to get help.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section class="bl-cta">
+    <div class="bl-wrap">
+      <h2>Add Bolt to your Django project</h2>
+      <p>Install the package, add one app, and run one command.</p>
+      <div class="bl-actions bl-actions--center">
+        <a class="bl-btn bl-btn--primary" href="{{ 'intro/install/' | url }}">Install Django-Bolt</a>
+        <a class="bl-btn" href="{{ config.repo_url }}">View on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+</div>
+{% endblock %}
+
+{% block site_nav %}{% endblock %}
+{% block container %}{% endblock %}

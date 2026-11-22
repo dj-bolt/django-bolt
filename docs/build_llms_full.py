@@ -1,40 +1,43 @@
-"""Generate src/llms-full.txt by concatenating llms.txt and every docs page.
+"""Write src/llms-full.txt: llms.txt, then each page in the order of the navigation.
 
-Run before `zensical build`; the output is copied verbatim into the site root.
+The navigation in zensical.toml sets the order, so a new page is in the file
+when it is in the navigation. Run this script before `zensical build`. The
+build copies the file to the root of the site.
 """
 
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
-SRC = Path(__file__).parent / "src"
+ROOT = Path(__file__).parent
+SRC = ROOT / "src"
 BASE_URL = "https://bolt.farhana.li/"
-
-ORDER = [
-    "index.md",
-    "faq.md",
-    "architecture.md",
-    "benchmarks.md",
-    "comparison.md",
-    "getting-started/quickstart.md",
-    "getting-started/deployment.md",
-]
-
 FRONTMATTER = re.compile(r"\A---\n.*?\n---\n", re.S)
 
 
+def nav_pages(items: list) -> list[str]:
+    """Give the path of each page in the navigation, in order."""
+    pages = []
+    for item in items:
+        for value in item.values() if isinstance(item, dict) else [item]:
+            if isinstance(value, list):
+                pages += nav_pages(value)
+            else:
+                pages.append(value)
+    return pages
+
+
 def page_url(rel: str) -> str:
-    if rel == "index.md":
-        return BASE_URL
-    return BASE_URL + rel[:-3] + "/"
+    path = rel.removesuffix(".md").removesuffix("index")
+    return BASE_URL + (path + "/" if path and not path.endswith("/") else path)
 
 
 def main() -> None:
-    pages = list(ORDER)
-    for group in ("topics", "ref"):
-        pages += sorted(p.relative_to(SRC).as_posix() for p in (SRC / group).glob("*.md"))
-
+    config = tomllib.loads((ROOT / "zensical.toml").read_text())
+    # The landing page is a template. Its Markdown has no content to read.
+    pages = [page for page in nav_pages(config["project"]["nav"]) if page != "index.md"]
     parts = [(SRC / "llms.txt").read_text(), "\n\n---\n\n# Full documentation\n"]
     for rel in pages:
         text = FRONTMATTER.sub("", (SRC / rel).read_text())

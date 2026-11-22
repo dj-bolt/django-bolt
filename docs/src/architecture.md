@@ -1,81 +1,113 @@
 ---
-icon: lucide/layers
-description: How Django-Bolt works — a Rust (Actix Web + Tokio) HTTP server calls Python handlers through PyO3, with routing, auth, guards, CORS, rate limiting and compression running in Rust without the GIL. No WSGI, no ASGI server.
+description: How a request moves through Django-Bolt, which parts run in Rust and which in Python, and where Django fits.
 ---
 
-# How Django-Bolt works
+# How it works
 
-Django-Bolt is **not** a WSGI or ASGI application and does not run behind gunicorn or uvicorn. It is a Rust HTTP server that embeds the Python interpreter and calls your Django handlers directly. This page explains the request path and why it is fast.
+Django-Bolt is a Django app and a Rust extension module.
+`python manage.py runbolt` starts an HTTP server written in Rust.
+The server calls your Python handlers directly. There is no WSGI or ASGI layer between them.
 
-## The request path
+This page is for readers who want to know why Bolt behaves as it does.
+You do not need it to build an API.
 
+## The path of a request
+
+```text
+ client
+   │
+   ▼
+ Actix Web (Rust) ─ parses HTTP/1.1, keeps connections alive
+   │
+   ▼
+ Router (Rust) ─ finds the route for the method and path
+   │
+   ▼
+ Rust middleware ─ CORS, rate limits
+   │
+   ▼
+ Authentication and guards (Rust) ─ JWT, API keys, IsAuthenticated, Requires(...)
+   │
+   ▼
+ Your handler (Python) ─ typed arguments, Django ORM, your code
+   │
+   ▼
+ Response (Rust) ─ msgspec bytes, headers, cookies, compression
+   │
+   ▼
+ client
 ```
-HTTP request
-   │
-   ▼
-Actix Web (Rust, Tokio runtime)
-   │  HTTP/1.1 parsing, keep-alive, TLS termination upstream
-   ▼
-Router (matchit — zero-copy path matching)
-   │
-   ▼
-Rust middleware pipeline — no Python, no GIL
-   │  CORS · rate limiting (token bucket) · compression (gzip/brotli/zstd)
-   ▼
-Authentication (Rust)
-   │  JWT signature + expiry · API-key lookup
-   ▼
-Guards (Rust)
-   │  IsAuthenticated · Requires(claim, ...) · AllowAny
-   ▼
-Dispatch decision
-   ├─ sync fast path: handler needs no event loop → one GIL block, response built in Rust
-   └─ async path: handler awaits → scheduled on the worker thread's persistent asyncio loop
-   │
-   ▼
-Your Python handler
-   │  typed params (path/query/header/cookie/form/body) · Depends(...) · Django ORM
-   ▼
-msgspec serialization → zero-copy bytes → Actix response
-```
 
-Only the last two boxes touch Python. Everything above them runs in Rust, so a request that fails auth or a guard, hits a rate limit, or is a CORS preflight never acquires the GIL at all.
+Only the handler step runs Python.
+Bolt answers a CORS preflight, a request over the rate limit, or a request with a bad token in Rust.
+Such a request does not take the Python global interpreter lock (GIL).
 
-## Components
+## What runs where
 
-| Layer | Technology | Role |
+| Step | Language | What it does |
 | --- | --- | --- |
-| HTTP server | [Actix Web](https://actix.rs/) on [Tokio](https://tokio.rs/) | Connection handling, HTTP parsing, response writing |
-| Routing | [matchit](https://github.com/ibraheemdev/matchit) | Radix-tree router, no allocation per match |
-| Python bridge | [PyO3](https://pyo3.rs/) | Calls handlers, converts arguments, receives the response tuple |
-| Serialization | [msgspec](https://jcristharif.com/msgspec/) | Request validation and response encoding, 5–10× faster than `json` |
-| Process model | `SO_REUSEPORT` | N independent processes, kernel load-balanced on Linux; each has its own interpreter and Django |
-| Supervisor | `runbolt` | Spawns processes, recycles by RSS/lifetime, respawns on crash, drains WebSockets on shutdown |
+| HTTP server | Rust ([Actix Web](https://actix.rs/), [Tokio](https://tokio.rs/)) | Accepts connections, parses requests, writes responses. |
+| Routing | Rust ([matchit](https://github.com/ibraheemdev/matchit)) | Matches the path with a radix tree. |
+| CORS, rate limits | Rust | Reads the configuration that Bolt compiles from your settings and decorators at startup. |
+| Authentication, guards | Rust | Checks JWT signatures and expiry, API keys, and the guards of the route. |
+| Parameter parsing | Rust and Python | Rust parses the query string, headers, cookies and forms. msgspec decodes and validates the JSON body. |
+| Handler | Python | Your code. |
+| Serialization | Python ([msgspec](https://jcristharif.com/msgspec/)) | Encodes the return value to JSON bytes. |
+| Response | Rust | Builds headers and cookies, compresses the body, writes it. |
+| Static and media files | Rust | Serves `STATIC_URL` and `MEDIA_URL` without Python. |
+
+## Processes and threads
+
+`runbolt --processes N` starts N processes.
+Each process loads Django once and has its own Python interpreter.
+On Linux, all processes listen on the same port with `SO_REUSEPORT`, and the kernel spreads the connections.
+
+Each process has one or more Actix worker threads (`--workers`).
+Each worker thread owns an asyncio event loop. An `async def` handler runs on the loop of the thread that received the request.
+
+On a normal (GIL) build of Python, add processes to use more CPU cores. Do not add worker threads.
+See [Deployment](topics/deployment.md) for sizing.
+
+## Sync and async handlers
+
+Bolt chooses how to call a handler when you register the route. It does not choose per request.
+
+- A `def` handler runs in one call, with the GIL held for the whole call. Bolt builds the response in the same step.
+- An `async def` handler that never awaits also runs in one call. Bolt finds this from the bytecode of the function.
+- An `async def` handler that awaits runs as a task on the event loop of the worker thread.
+
+The Django ORM is sync code. A `def` handler can call it directly.
+An `async def` handler can use the async ORM methods (`aget`, `afirst`, `acreate`), or return a `QuerySet`.
+Bolt runs a returned `QuerySet` on a bounded thread pool. See [Django ORM](topics/async-orm.md).
 
 ## Where Django fits
 
-Your Django project is loaded once per process at startup (`django.setup()`), the same way `manage.py` does it. From then on:
+Bolt calls `django.setup()` once in each process, as `manage.py` does. Then:
 
-- **ORM** — handlers call the ORM directly. Async handlers use `aget`/`afilter`/… or return a `QuerySet`, which Bolt evaluates on a bounded, vendor-aware thread pool. Sync handlers run on a thread pool with the ORM inline.
-- **Admin** — mounted automatically as an ASGI sub-application at your admin prefix; Django's own middleware stack runs for it.
-- **Django middleware** — opt in with `BoltAPI(django_middleware=True)` to run `settings.MIDDLEWARE` on API routes (sessions, CSRF, auth, messages…). Built-in Django middleware is executed directly; third-party middleware is wrapped safely.
-- **Signals, settings, apps, static/media** — unchanged. Static and media files are served from Rust.
+- **Models and the ORM** work as in any Django project.
+- **The admin** is served by `runbolt` at the prefix in your URLconf. Bolt mounts Django's ASGI handler for it. Use `runbolt --no-admin` to turn this off.
+- **Django middleware** does not run on Bolt routes by default. Turn it on with `BoltAPI(django_middleware=True)`. A route with Django middleware runs on its own thread for each request, so thread-local state stays with the request. See [Middleware](topics/middleware.md).
+- **Other Django views** can run next to Bolt routes. Mount Django's ASGI handler with `api.mount_django(...)`. See [ASGI mounts](topics/asgi-mounts.md).
+- **Settings, apps, signals and templates** do not change.
 
 ## Why it is fast
 
-1. **Rust owns the hot path.** HTTP, routing, auth, guards, CORS, rate limiting, and compression never take the GIL.
-2. **Registration-time precomputation.** Parameter extractors, dependency graphs, response metadata, and middleware are compiled once when routes register, not per request.
-3. **Sync dispatch bypass.** Handlers that don't actually suspend (detected at registration by bytecode analysis) skip the async machinery entirely — one GIL acquisition, response built in the same block.
-4. **Persistent worker loop.** Truly async handlers run on a process-lived loop owned by their Actix worker thread and serviced by Tokio on that thread; there is no per-request task/thread creation, and worker threads never share a loop.
-5. **Zero-copy responses.** Serialized bodies cross to Rust without a memcpy; common response shapes use static metadata with zero allocation.
-6. **msgspec.** Validation and encoding are C-accelerated and schema-compiled.
+1. **Rust does the work around the handler.** Parsing, routing, auth, guards, CORS, rate limits and compression run without Python.
+2. **Work happens once, at startup.** Bolt inspects each handler signature when you register the route. It builds the parameter extractors, the dependency graph and the response metadata then. A request reuses them.
+3. **Simple handlers skip the event loop.** A handler that does not await runs in one call, with no task and no thread switch.
+4. **The event loop lives as long as the process.** Bolt does not create a loop, a task group or a thread for each request.
+5. **The response body is not copied.** The bytes from msgspec go to Rust as they are.
 
-Measured effect: [Benchmarks](benchmarks.md).
+[Benchmarks](benchmarks.md) gives the measured effect.
 
-## What this is not
+## What Bolt is not
 
-- **Not a WSGI/ASGI adapter.** There is no protocol translation layer; Rust calls Python functions.
-- **Not a Django fork.** `django` is a normal dependency; Bolt is a Django app plus a Rust extension.
-- **Not a subset.** No Django feature is removed — see the [FAQ](faq.md#is-django-bolt-a-stripped-down-version-of-django).
+- **Not a WSGI or ASGI application.** You cannot run Bolt routes under gunicorn or uvicorn. `runbolt` is the server.
+- **Not a fork of Django.** Django is a normal dependency. Bolt removes no Django feature.
+- **Not Pydantic.** Validation uses msgspec. See [Serializers](topics/serializers.md).
 
-For the deep dive (dispatch outcomes, wire format, worker loop), read [`CLAUDE.md`](https://github.com/dj-bolt/django-bolt/blob/master/CLAUDE.md) and [`docs/PROFILING.md`](https://github.com/dj-bolt/django-bolt/blob/master/docs/PROFILING.md) in the repository.
+## See also
+
+- [Deployment](topics/deployment.md): processes, workers and database connections.
+- [Benchmarks](benchmarks.md): numbers, conditions and how to reproduce them.
+- [`CLAUDE.md`](https://github.com/dj-bolt/django-bolt/blob/master/CLAUDE.md) and [`docs/PROFILING.md`](https://github.com/dj-bolt/django-bolt/blob/master/docs/PROFILING.md) in the repository: design notes for contributors.

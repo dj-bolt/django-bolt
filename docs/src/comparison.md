@@ -1,95 +1,99 @@
 ---
-icon: lucide/git-compare
-description: Django-Bolt vs Django Ninja vs Django REST Framework vs FastAPI vs Litestar — architecture, server, validation, Django integration, auth, OpenAPI, WebSockets, and measured performance, compared feature by feature.
+description: Django-Bolt next to Django Ninja, Django REST Framework, FastAPI and Litestar. Server, validation, Django integration, features, speed and weak points.
 ---
 
-# Django-Bolt vs Django Ninja vs DRF vs FastAPI vs Litestar
+# Comparison
 
-**Short answer:** Django-Bolt is the only option in this list that gives you FastAPI-style typed handlers *and* the full Django stack (ORM, admin, middleware, auth) *and* a Rust HTTP server that replaces gunicorn/uvicorn. Django Ninja and DRF are Python view layers inside Django; FastAPI and Litestar are standalone ASGI frameworks where you assemble ORM, admin, and auth yourself.
+This page compares Django-Bolt with four Python API frameworks.
+It also lists where Bolt is weaker, so that you can choose with all the facts.
 
-*Last updated: August 2026. Corrections welcome — open an issue.*
+Last checked: November 2026. If a fact here is wrong, [open an issue](https://github.com/dj-bolt/django-bolt/issues).
 
-## At a glance
+## In one paragraph
 
-| | **Django-Bolt** | Django Ninja | Django REST Framework | FastAPI | Litestar |
+Django Ninja and Django REST Framework (DRF) are API layers inside Django. They need a separate server, such as gunicorn or uvicorn.
+FastAPI and Litestar are standalone ASGI frameworks. You choose and connect your own ORM, migrations, admin and auth.
+Django-Bolt runs inside Django, like Ninja and DRF, and has typed handlers, like FastAPI.
+It also brings its own HTTP server, written in Rust, and runs auth, CORS and rate limits there.
+
+## Features
+
+| | Django-Bolt | Django Ninja | DRF | FastAPI | Litestar |
 | --- | --- | --- | --- | --- | --- |
-| Runs inside a Django project | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Django ORM, Admin, middleware, signals | ✅ all | ✅ all | ✅ all | ❌ bring your own | ❌ bring your own |
-| HTTP server | **Built-in Rust (Actix Web)** — no gunicorn/uvicorn | ASGI/WSGI → uvicorn/gunicorn | WSGI/ASGI → gunicorn/uvicorn | ASGI → uvicorn | ASGI → uvicorn/granian |
-| Handler style | Typed functions (`async def` / `def`) + `ViewSet`/`ModelViewSet` | Typed functions | `@api_view` functions or class-based views; untyped | Typed functions | Typed functions + controllers |
-| Validation | msgspec (`Struct`) + Bolt `Serializer` | Pydantic | DRF serializers | Pydantic | msgspec / Pydantic / attrs |
-| Where auth & permissions run | **Rust, before the GIL** (JWT, API key, guards) | Python | Python | Python | Python |
-| CORS / rate limiting / compression | **Rust middleware** | Django middleware / third-party | Django middleware / third-party | Starlette middleware / third-party | Built-in Python middleware |
-| OpenAPI docs | Swagger, ReDoc, Scalar, RapiDoc, Stoplight | Swagger, ReDoc | Via drf-spectacular | Swagger, ReDoc | Swagger, ReDoc, Scalar, RapiDoc, Stoplight |
-| WebSockets | ✅ built-in | ❌ (use Channels) | ❌ (use Channels) | ✅ | ✅ |
-| Server-Sent Events / streaming | ✅ built-in | Partial | Partial | ✅ | ✅ |
-| Dependency injection | `Depends(...)` | ❌ | ❌ | `Depends(...)` | `Provide(...)` |
-| Class-based CRUD (`ModelViewSet`) | ✅ | ❌ (community) | ✅ | ❌ | ❌ |
-| Static & media serving | **Rust, built-in** | WhiteNoise / web server | WhiteNoise / web server | Starlette `StaticFiles` | Built-in |
-| MCP server support | ✅ [`bolt-mcp`](topics/mcp.md) | ❌ | ❌ | Third-party | ❌ |
-| Multi-process serving | Built-in (`--processes N`, `SO_REUSEPORT`, worker recycling) | Via gunicorn/uvicorn | Via gunicorn/uvicorn | Via uvicorn/gunicorn | Via uvicorn/granian |
-| Test client | In-process, full Rust pipeline | `ninja.testing.TestClient` | DRF `APIClient` | Starlette `TestClient` | Litestar `TestClient` |
-| Language of the hot path | Rust | Python | Python | Python (Starlette) | Python (msgspec in C) |
-| Maturity (first release, version) | 2025, 0.x | 2020, 1.x | 2011, 3.x | 2018, 0.x | 2021, 2.x |
-| Ecosystem and community | Small, no third-party packages yet | Medium | Large, hundreds of packages | Large, hundreds of packages | Medium |
-| Install | Rust extension (prebuilt wheels) | Pure Python | Pure Python | Pure Python | Pure Python |
-| Measured JSON hello-world, 8 processes¹ | **~311k req/s** | — | — | — | — |
+| Runs inside a Django project | Yes | Yes | Yes | No | No |
+| Django ORM, admin, migrations | Yes | Yes | Yes | No. Choose your own. | No. Choose your own. |
+| HTTP server | Built in (Rust, Actix Web) | gunicorn or uvicorn | gunicorn or uvicorn | uvicorn or another ASGI server | uvicorn or another ASGI server |
+| Handler style | Typed functions, class-based views | Typed functions | Untyped functions and classes | Typed functions | Typed functions, controllers |
+| Validation | msgspec | Pydantic | DRF serializers | Pydantic | msgspec, Pydantic or attrs |
+| Where auth and guards run | Rust | Python | Python | Python | Python |
+| CORS, rate limits, compression | Built in, Rust | Django middleware or packages | Django middleware or packages | Starlette middleware or packages | Built in, Python |
+| Dependency injection | `Depends()` | No | No | `Depends()` | `Provide()` |
+| Model viewsets (CRUD classes) | `ModelViewSet` | No | `ModelViewSet` | No | No |
+| Pagination | Built in | Built in | Built in | Packages | Built in |
+| OpenAPI UIs | Swagger UI, ReDoc, Scalar, RapiDoc, Stoplight Elements | Swagger UI, ReDoc | Packages (drf-spectacular) | Swagger UI, ReDoc | Swagger UI, ReDoc, Scalar, RapiDoc, Stoplight Elements |
+| WebSocket | Built in | No. Use Django Channels. | No. Use Django Channels. | Built in | Built in |
+| Server-sent events | Built in | Django `StreamingHttpResponse` | Django `StreamingHttpResponse` | Built in | Built in |
+| Static and media files | Built in, Rust | WhiteNoise or a web server | WhiteNoise or a web server | Starlette `StaticFiles` | Built in |
+| MCP servers | Built in ([`bolt-mcp`](topics/mcp.md)) | Packages | Packages | Packages | Packages |
+| Many processes | `runbolt --processes N` | Through the server | Through the server | Through the server | Through the server |
+| First release, version | 2025, 0.x | 2020, 1.x | 2011, 3.x | 2018, 0.x | 2021, 2.x |
+| Third-party packages | Few | Some | Many | Many | Some |
+| Install | Wheels with a Rust extension | Pure Python | Pure Python | Pure Python | Pure Python |
 
-¹ Ryzen 5 5600G, `C=100`, loopback bombardier; see [Benchmarks](benchmarks.md). Cross-framework, one process each, Python 3.14 (2026-08-30): Django-Bolt 43.5k req/s on 1 KB JSON vs Litestar 15.5k and FastAPI 7.5k; on a 10-row PostgreSQL query 2.9k vs 1.3k and 1.2k. Full table in [Benchmarks](benchmarks.md#against-python-frameworks).
+## Speed
 
-## Django-Bolt vs Django Ninja
+The [benchmark harness](benchmarks.md#against-litestar-and-fastapi) runs the same routes on Bolt, Litestar and FastAPI, with one process for each.
 
-Both live inside Django and use type-hinted handlers with automatic OpenAPI.
+| Route | Django-Bolt | Litestar | FastAPI |
+| --- | ---: | ---: | ---: |
+| 1 KB JSON response | 43,541 | 15,477 | 7,517 |
+| 10 rows from PostgreSQL | 2,881 | 1,321 | 1,237 |
+| JWT auth, then load the user | 4,478 | 1,155 | 941 |
 
-- **Server.** Ninja is a view layer behind uvicorn/gunicorn. Bolt *is* the server, with multi-process, worker recycling, and static serving built in.
-- **Validation.** Ninja uses Pydantic. Bolt uses msgspec ([benchmarks](https://jcristharif.com/msgspec/benchmarks.html)) plus a `Serializer` with field sets, computed fields, and model integration.
-- **Auth.** Ninja checks auth in Python. Bolt validates JWT/API keys and guards in Rust before Python runs.
-- **Extras.** `ViewSet`/`ModelViewSet`, WebSockets, SSE, MCP servers, Rust CORS/rate-limit/compression.
-- **Migration.** Change the decorator, swap Pydantic models for `msgspec.Struct`. Ninja routes keep serving through the [ASGI mount](topics/asgi-mounts.md) while you move.
-- **Pick Ninja** if you want Pydantic, a pure-Python install, or a 1.x API.
+Requests per second, 100 connections, Python 3.14, 2026-08-30. [Benchmarks](benchmarks.md) has the conditions.
+We have not measured Django Ninja and DRF with the same harness.
 
-## Django-Bolt vs Django REST Framework
+## Django-Bolt and Django Ninja
 
-- **Style.** DRF has `@api_view` functions and class views, but neither reads type hints; validation lives in serializers. Bolt validates from the handler signature and also offers `APIView`/`ViewSet`/`ModelViewSet` with `@action`.
-- **Serializers.** DRF serializers are flexible but slow. Bolt's `Serializer` is a `msgspec.Struct` with `field_sets`: one class, many projections.
-- **Performance.** DRF runs entirely in Python behind gunicorn. Bolt moves the server, auth, guards, and middleware to Rust.
-- **Ecosystem.** DRF has more than a decade of packages (django-filter, dj-rest-auth, drf-spectacular, simplejwt). Bolt has none yet; it reuses Django's ecosystem, not DRF's.
-- **Migration.** DRF views keep working through the [ASGI mount](topics/asgi-mounts.md). Move one endpoint at a time.
-- **Pick DRF** if you depend on its packages or need a stable, long-lived API.
+The two have the most in common. Both run in Django, and both read parameters from type hints.
 
-## Django-Bolt vs FastAPI
+- **Server.** Ninja is a view layer behind gunicorn or uvicorn. Bolt is the server. It also runs many processes, recycles workers and serves static files.
+- **Validation.** Ninja uses Pydantic. Bolt uses msgspec, and a `Serializer` class for model data.
+- **Auth.** Ninja checks auth in Python. Bolt checks JWT, API keys and guards in Rust.
+- **Extra features.** Bolt has class-based views and viewsets, `Depends()`, WebSocket, server-sent events and MCP.
+- **Choose Ninja** if you need Pydantic, a pure-Python install, or a 1.x release.
 
-- **Same handler ergonomics**: typed parameters, `Depends`, automatic docs. Bolt is faster because HTTP, routing, and middleware are Rust, not Starlette/uvicorn.
-- **Batteries.** FastAPI is an API layer; ORM, migrations, admin, auth, and static files are separate choices. Bolt ships Django's.
-- **Deployment.** FastAPI needs uvicorn/gunicorn. Bolt runs with `runbolt`.
-- **Pick FastAPI** if you do not want Django, or depend on Pydantic tooling or FastAPI's package ecosystem.
+## Django-Bolt and Django REST Framework
 
-## Django-Bolt vs Litestar
+- **Style.** DRF validates in serializers, not in the handler signature. Bolt reads types from the signature. It also has `APIView`, `ViewSet`, `ModelViewSet` and `@action`, with names close to DRF.
+- **Speed.** DRF runs in Python behind a Python server. Bolt moves the server, auth and guards to Rust.
+- **Packages.** DRF has more than ten years of packages: django-filter, drf-spectacular, Simple JWT and many more. Bolt cannot use them.
+- **Choose DRF** if you depend on its packages, or need a long-stable API.
 
-- Closest in design: msgspec, guards, controllers, several OpenAPI UIs. Bolt's OpenAPI plugin system is adapted from Litestar.
-- Litestar is a standalone ASGI framework; Bolt runs inside Django on a Rust server.
-- **Pick Litestar** if you want a framework-agnostic ASGI stack, a choice of ORM and validation library, or a stable 2.x API.
+## Django-Bolt and FastAPI
+
+- **Handlers.** Both use typed parameters, `Depends()` and generated docs.
+- **Scope.** FastAPI is an API layer. You choose the ORM, migrations, admin, auth and static files. Bolt uses Django for these.
+- **Server.** FastAPI needs uvicorn or another ASGI server. Bolt has its own server.
+- **Choose FastAPI** if you do not want Django, or you depend on Pydantic or FastAPI packages.
+
+## Django-Bolt and Litestar
+
+- **Design.** Both use msgspec, guards and several OpenAPI UIs. The OpenAPI plugins of Bolt are adapted from Litestar.
+- **Scope.** Litestar is a standalone ASGI framework. Bolt runs inside Django.
+- **Choose Litestar** if you want an ASGI stack without Django, or a choice of ORM and validation library.
 
 ## Where Django-Bolt is weaker
 
-- **Young.** First release 2025, version 0.x. Minor releases can change APIs; read the [changelog](https://github.com/dj-bolt/django-bolt/blob/master/CHANGELOG.md) before you upgrade.
-- **No package ecosystem.** Filters, social auth, or API versioning packages do not exist yet. You write or adapt them.
-- **Small community.** Fewer tutorials and answered questions. Skills transfer: anyone who knows Django plus FastAPI or Ninja is productive in a day.
-- **Rust extension.** Prebuilt wheels cover common platforms; others need a Rust toolchain. Rust crashes are harder to debug than Python ones.
-- **Not ASGI.** Bolt cannot run under uvicorn, gunicorn, or serverless ASGI adapters. Bolt is the server.
-- **Not Pydantic.** Bolt's `Serializer` (validators, computed fields, nested, `from_model`) sits on msgspec. Pydantic-specific packages and `BaseModel` classes need a port.
-- **Django middleware is opt-in.** `BoltAPI(django_middleware=True)` enables it and costs throughput. The published benchmarks run without it.
+- **It is young.** The first release was in 2025. The version is 0.x, so a minor release can change an API. Read the [changelog](https://github.com/dj-bolt/django-bolt/blob/master/CHANGELOG.md) before you upgrade.
+- **It has few packages.** Packages for filters, social login or API versions do not exist yet. Django packages that do not depend on DRF or Ninja still work.
+- **The community is small.** There are fewer tutorials and fewer answered questions.
+- **It has a Rust extension.** Wheels cover the common platforms. Other platforms need a Rust toolchain to install. A crash in Rust is harder to debug than a Python error.
+- **It is not ASGI.** You cannot run Bolt routes under uvicorn, gunicorn or a serverless ASGI adapter.
+- **It is not Pydantic.** Pydantic models and packages that need them must change to msgspec.
+- **Django middleware costs throughput.** It is off by default on Bolt routes. When you turn it on, each request runs the full stack in Python.
 
-## Common misconceptions
+## Move to Django-Bolt
 
-- **"Django-Bolt strips out Django features."** False. Nothing is removed; see the [FAQ](faq.md#is-django-bolt-a-stripped-down-version-of-django).
-- **"It's a WSGI wrapper / synchronous."** False. It is an Actix Web (Tokio) server that calls `async def` and `def` handlers through PyO3, and can mount ASGI apps. See [How Django-Bolt works](architecture.md).
-- **"It's only fast on hello-world."** The suite covers JSON bodies, forms, uploads, auth, ORM, static files, class-based views, and SSE with 10k connections. See [Benchmarks](benchmarks.md).
-
-## Try it
-
-```bash
-pip install django-bolt
-```
-
-Then follow the [Quick Start](getting-started/quickstart.md). Migrate from DRF or Ninja one endpoint at a time; the old routes keep serving next to the new ones.
+You can move one endpoint at a time. Your old views keep working next to the new routes.
+[Migrate from Ninja, DRF or FastAPI](topics/migrating.md) shows each step.

@@ -111,7 +111,7 @@ python manage.py runbolt --processes 4      # production: multi-process, no guni
 
 Your API is live at `http://localhost:8000/users/1` and interactive docs at `http://localhost:8000/docs`.
 
-📖 **Next:** the [Quick Start guide](https://bolt.farhana.li/getting-started/quickstart/) → [Deployment](https://bolt.farhana.li/getting-started/deployment/) → [Topic guides](https://bolt.farhana.li/topics/routing/).
+📖 **Next:** the [tutorial](https://bolt.farhana.li/tutorial/) → [Deployment](https://bolt.farhana.li/topics/deployment/) → [Guides](https://bolt.farhana.li/topics/routing/).
 
 ## 🧭 A tour of the API
 
@@ -298,7 +298,7 @@ python manage.py runbolt --host 0.0.0.0 --port 8000 --processes 4
 python manage.py runbolt --processes 4 --max-rss 512   # recycle workers above 512 MB
 ```
 
-Multi-process scaling uses `SO_REUSEPORT` for kernel-level load balancing. Worker recycling, crash respawn, graceful shutdown, and WebSocket drain are built in. See the [Deployment guide](https://bolt.farhana.li/getting-started/deployment/) for systemd, supervisor, and reverse-proxy setups.
+Multi-process scaling uses `SO_REUSEPORT` for kernel-level load balancing. Worker recycling, crash respawn, graceful shutdown, and WebSocket drain are built in. See the [Deployment guide](https://bolt.farhana.li/topics/deployment/) for systemd, supervisor, and reverse-proxy setups.
 
 ## 🤝 Contributing
 

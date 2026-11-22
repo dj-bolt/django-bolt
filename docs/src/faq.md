@@ -1,204 +1,105 @@
 ---
-icon: lucide/circle-help
-description: Direct answers to the most common questions about Django-Bolt — production readiness, Django Admin and ORM support, WSGI vs async, gunicorn, and how it compares to Django Ninja, DRF and FastAPI.
+description: Answers to common questions about Django-Bolt. Production use, Django features, WSGI and ASGI, servers, versions, and how to get help.
 ---
 
-# Frequently asked questions
+# FAQ
 
-Short, direct answers. Each answer links to the page with the full detail.
+## Does Django-Bolt remove Django features?
 
-## Is Django-Bolt a stripped-down version of Django?
+No. Bolt replaces two parts of a Django project: the HTTP server and the API layer.
+Everything else is the Django you know.
 
-**No.** Django-Bolt removes nothing from Django. It *replaces the HTTP server and the API layer* — the part that WSGI/ASGI servers, DRF, or Django Ninja would otherwise handle — with a Rust server (Actix Web) and a typed, msgspec-based routing layer. Everything else is the same Django you already run:
+| Django feature | With Bolt |
+| --- | --- |
+| ORM, sync and async | Works. Return a `QuerySet` from an async handler, or use `aget()` and `afirst()`. See [Django ORM](topics/async-orm.md). |
+| Admin | Works. `runbolt` serves it at the prefix in your URLconf. |
+| Middleware | Off on Bolt routes by default. Turn it on with `BoltAPI(django_middleware=True)`. See [Middleware](topics/middleware.md). |
+| Users, sessions, permissions | Works. Bolt adds JWT and API-key auth. See [Authentication](topics/authentication.md). |
+| Signals | Works. See [Signals](topics/signals.md). |
+| Settings and apps | No change. |
+| Static and media files | Served by Bolt in Rust. See [Static files](topics/static-files.md). |
+| Other Django views | Mount Django with `api.mount_django()`. See [ASGI mounts](topics/asgi-mounts.md). |
 
-| Django feature | In Django-Bolt | Notes |
-| --- | --- | --- |
-| Django ORM | ✅ Full | Sync and async (`aget`, `afilter`, …); return a `QuerySet` from an async handler and Bolt evaluates it on a bounded thread pool. [Async ORM](topics/async-orm.md) |
-| Django Admin | ✅ Full | Auto-mounted from `INSTALLED_APPS`; served by `runbolt`, no second server. |
-| Django middleware | ✅ Full | `BoltAPI(django_middleware=True)` runs your `settings.MIDDLEWARE` stack (sessions, CSRF, auth, messages, CSP…) on API routes. [Middleware](topics/middleware.md#django-middleware-integration) |
-| Django auth / sessions | ✅ Full | JWT and API-key backends are built in (validated in Rust); with `django_middleware=True`, Django's `SessionMiddleware` + `AuthenticationMiddleware` populate `request.user` / `request.session` exactly as in Django. [Authentication](topics/authentication.md) |
-| Django signals | ✅ Full | `request_started`, `request_finished`, and model signals fire. [Signals](topics/signals.md) |
-| Django settings / apps | ✅ Full | Same `settings.py`, `INSTALLED_APPS`, `manage.py`. |
-| Static & media files | ✅ Full | Served natively from Rust — no WhiteNoise. [Static files](topics/static-files.md) |
-| Third-party Django apps | ✅ Full | Anything that plugs into Django's ORM, admin, or middleware works. |
-| Templates / server-rendered views | ✅ | Existing Django URLconf views run through the ASGI mount alongside API routes. [ASGI mounts](topics/asgi-mounts.md) |
+## Does Bolt use WSGI or ASGI?
 
-The performance comes from *where* work runs (routing, auth, guards, CORS, rate limiting, compression in Rust without the GIL) — not from removing features. Django middleware is opt-in per API (`BoltAPI(django_middleware=True)`); the [example project](https://github.com/dj-bolt/django-bolt/tree/master/python/example) used for the published benchmarks runs the admin and sessions but not `settings.MIDDLEWARE` on Bolt routes.
+No. `runbolt` starts an HTTP server written in Rust. The server calls your handlers through PyO3, with no WSGI or ASGI layer.
+Handlers can be `async def` or `def`. See [How it works](architecture.md).
 
-## Does Django-Bolt use WSGI? Is it synchronous?
-
-**No WSGI, no ASGI server, not sync-only.** Django-Bolt ships its own HTTP server: [Actix Web](https://actix.rs/) on the Tokio runtime, called from `python manage.py runbolt`. Handlers are `async def` (sync `def` is also supported). Requests flow HTTP → Rust → your Python handler via PyO3, with no WSGI or ASGI protocol layer in between. See [How Django-Bolt works](architecture.md).
+Bolt can mount an ASGI application, for example the Django admin. See [ASGI mounts](topics/asgi-mounts.md).
 
 ## Do I need gunicorn or uvicorn?
 
-**No.** `runbolt` *is* the production server. It runs multiple processes with `SO_REUSEPORT` kernel load balancing on Linux, recycles workers by RSS or lifetime, respawns on crash, and drains WebSockets on shutdown. See [Deployment](getting-started/deployment.md).
+No. `runbolt` is the production server. It runs many processes. With options, it also recycles workers and restarts a worker that stops.
 
 ```bash
 python manage.py runbolt --host 0.0.0.0 --port 8000 --processes 4
 ```
 
-## Is Django-Bolt production ready?
+See [Deployment](topics/deployment.md).
 
-Django-Bolt is used in production, publishes a benchmark suite and regression gate for every release, and has a full test suite covering routing, auth, middleware, ORM, streaming, WebSockets, and multi-process behavior. It is pre-1.0, so minor releases can still change APIs; the [changelog](https://github.com/dj-bolt/django-bolt/blob/master/CHANGELOG.md) lists every breaking change.
+## Can I use Bolt in production?
 
-## How fast is Django-Bolt?
+Projects use Bolt in production. The test suite covers routing, auth, middleware, the ORM, streaming, WebSocket and many processes.
+Bolt is at version 0.x. A minor release can change an API.
+Read the [changelog](https://github.com/dj-bolt/django-bolt/blob/master/CHANGELOG.md) before each upgrade, and pin the version in your requirements.
 
-On a 12-core desktop (Ryzen 5 5600G, 8 processes, `C=100`, loopback) Django-Bolt serves **~311,000 requests/second** on a JSON hello-world, ~187,000 req/s for a 10 KB JSON response, and ~21,000–27,000 req/s for a 10-row Django ORM query on SQLite. It is faster than FastAPI, Robyn, and — on 10 KB payloads — faster than Bun-based Elysia and Hono. Numbers, conditions, and reproduction commands are on the [Benchmarks](benchmarks.md) page.
+## How fast is Bolt?
 
-## How does Django-Bolt compare to Django Ninja and Django REST Framework?
+On a 6-core desktop CPU with 8 processes and 100 connections, Bolt serves 324,493 requests per second for a small JSON route.
+With one process each, it serves 2.8× the requests of Litestar and 5.8× the requests of FastAPI for a 1 KB JSON response.
+See [Benchmarks](benchmarks.md) for all results and their conditions.
 
-All three run inside a Django project. DRF and Django Ninja are Python view layers that still need gunicorn/uvicorn; Django-Bolt replaces the server with Rust and moves auth, guards, and middleware out of Python. Bolt's syntax is closest to Django Ninja/FastAPI (type-hinted function handlers) and it also provides DRF-style `ViewSet`/`ModelViewSet` classes. Full grid: [Comparison](comparison.md).
+## Which Python and Django versions does Bolt support?
 
-## How does Django-Bolt compare to FastAPI and Litestar?
+See [Installation](intro/install.md#requirements).
 
-FastAPI and Litestar are standalone ASGI frameworks — you bring your own ORM, admin, auth, and migrations. Django-Bolt gives you the same type-hinted handler style plus the whole Django stack, and serves requests faster because the HTTP layer is Rust. See [Comparison](comparison.md).
+## Can I move from DRF or Django Ninja one endpoint at a time?
 
-## Can I migrate from DRF or Django Ninja incrementally?
+Yes. Keep your old views, and add Bolt routes next to them. See [Migrate from Ninja, DRF or FastAPI](topics/migrating.md).
 
-**Yes.** Add `django_bolt` to `INSTALLED_APPS`, create an `api.py`, and move one endpoint at a time. Existing Django URLconf views (including DRF/Ninja routes) keep working through the ASGI mount while you migrate.
+## Does Bolt support WebSocket and server-sent events?
 
-## Does Django-Bolt support WebSockets, SSE, and streaming?
+Yes. See [WebSocket](topics/websocket.md) and [Server-sent events](topics/sse.md).
 
-Yes — [WebSockets](topics/websocket.md), [Server-Sent Events](topics/sse.md), and [streaming responses](topics/responses.md) are built in and served by the Rust layer.
+## Does Bolt make OpenAPI docs?
 
-## Does Django-Bolt generate OpenAPI docs?
+Yes. Bolt serves the schema and Swagger UI, ReDoc, Scalar, RapiDoc and Stoplight Elements at `/docs`. See [OpenAPI](topics/openapi.md).
 
-Yes. Swagger UI, ReDoc, Scalar, RapiDoc, and Stoplight Elements are served at `/docs` by default. See [OpenAPI](topics/openapi.md).
+## Can I use Pydantic models?
 
-## Which Python and Django versions are supported?
+No. Bolt validates with [msgspec](https://jcristharif.com/msgspec/). Use `msgspec.Struct` or the Bolt `Serializer`. See [Serializers](topics/serializers.md).
 
-Python 3.12, 3.13, 3.14 (CPython and PyPy), and the free-threaded build of CPython 3.14 (`3.14t`). Django 5.2 (LTS), 6.0, 6.1. See [Free-threaded Python](getting-started/deployment.md#free-threaded-python).
+## Why does runbolt stop on macOS when it connects to PostgreSQL?
 
-## Why does `runbolt` hang on macOS when it connects to PostgreSQL?
+This problem occurs on macOS with libpq (psycopg), when `runbolt` starts worker processes with `fork()`.
+It occurs with `--processes 2` or more, and with `--max-rss`, `--workers-lifetime` or `--respawn-failed-workers`.
+A worker stops, or ends with a segmentation fault, when it opens a PostgreSQL connection.
 
-This affects local development on macOS with libpq (psycopg). A forked `runbolt` worker can hang, or stop with a segmentation fault, when it opens a PostgreSQL connection. This occurs with and without Django's connection pool. Workers fork with `--processes 2` or more, and with a worker recycling option (`--max-rss`, `--workers-lifetime`, `--respawn-failed-workers`). When libpq is built with GSSAPI support, the libpq option `gssencmode` is `prefer` by default. With `prefer`, libpq calls the macOS Kerberos (GSS) framework on each TCP connection. That framework is not safe to use after `fork()`. A libpq build without GSSAPI support does not call the framework, so this cause does not apply to it.
+The cause is GSSAPI encryption. When libpq has GSSAPI support, it calls the macOS Kerberos framework for each connection.
+That framework is not safe to use after `fork()`.
 
-To prevent this, disable GSSAPI encryption. Set the environment variable before you start the server:
+Turn off GSSAPI encryption with an environment variable:
 
 ```bash
 PGGSSENCMODE=disable python manage.py runbolt --processes 2
 ```
 
-Alternatively, set the connection option in `DATABASES`:
+Or set the option in `DATABASES`:
 
-```python
-# settings.py
+```python title="settings.py"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.postgresql",
-        # ...
+        "NAME": "app",
         "OPTIONS": {"gssencmode": "disable"},
     }
 }
 ```
 
-This setting turns off GSSAPI encryption only. If the connection must be encrypted, use TLS with `sslmode` (for example `verify-full`). A server that accepts only GSSAPI-encrypted connections refuses the connection with this setting. Linux does not need this setting.
+This setting turns off GSSAPI encryption only. To encrypt the connection, use TLS with `sslmode`, for example `verify-full`.
+Linux does not need this setting.
 
 ## Where can I get help?
 
-[Discord](https://discord.gg/4xErptXK82) · [GitHub Issues](https://github.com/dj-bolt/django-bolt/issues) · [DeepWiki](https://deepwiki.com/FarhanAliRaza/django-bolt)
-
-<script type="application/ld+json">
-{
- "@context": "https://schema.org",
- "@type": "FAQPage",
- "mainEntity": [
-  {
-   "@type": "Question",
-   "name": "Is Django-Bolt a stripped-down version of Django?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "No. Django-Bolt removes nothing from Django. It replaces the HTTP server and the API layer — the part that WSGI/ASGI servers, DRF, or Django Ninja would otherwise handle — with a Rust server (Actix Web) and a typed, msgspec-based routing layer. Everything else is the same Django you already run:"
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "Does Django-Bolt use WSGI? Is it synchronous?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "No WSGI, no ASGI server, not sync-only. Django-Bolt ships its own HTTP server: Actix Web on the Tokio runtime, called from python manage.py runbolt. Handlers are async def (sync def is also supported). Requests flow HTTP → Rust → your Python handler via PyO3, with no WSGI or ASGI protocol layer in between. See How Django-Bolt works."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "Do I need gunicorn or uvicorn?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "No. runbolt is the production server. It runs multiple processes with SO_REUSEPORT kernel load balancing on Linux, recycles workers by RSS or lifetime, respawns on crash, and drains WebSockets on shutdown. See Deployment."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "Is Django-Bolt production ready?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "Django-Bolt is used in production, publishes a benchmark suite and regression gate for every release, and has a full test suite covering routing, auth, middleware, ORM, streaming, WebSockets, and multi-process behavior. It is pre-1.0, so minor releases can still change APIs; the changelog lists every breaking change."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "How fast is Django-Bolt?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "On a 12-core desktop (Ryzen 5 5600G, 8 processes, C=100, loopback) Django-Bolt serves ~311,000 requests/second on a JSON hello-world, ~187,000 req/s for a 10 KB JSON response, and ~21,000–27,000 req/s for a 10-row Django ORM query on SQLite. It is faster than FastAPI, Robyn, and — on 10 KB payloads — faster than Bun-based Elysia and Hono. Numbers, conditions, and reproduction commands are on the Benchmarks page."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "How does Django-Bolt compare to Django Ninja and Django REST Framework?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "All three run inside a Django project. DRF and Django Ninja are Python view layers that still need gunicorn/uvicorn; Django-Bolt replaces the server with Rust and moves auth, guards, and middleware out of Python. Bolt's syntax is closest to Django Ninja/FastAPI (type-hinted function handlers) and it also provides DRF-style ViewSet/ModelViewSet classes. Full grid: Comparison."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "How does Django-Bolt compare to FastAPI and Litestar?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "FastAPI and Litestar are standalone ASGI frameworks — you bring your own ORM, admin, auth, and migrations. Django-Bolt gives you the same type-hinted handler style plus the whole Django stack, and serves requests faster because the HTTP layer is Rust. See Comparison."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "Can I migrate from DRF or Django Ninja incrementally?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "Yes. Add django_bolt to INSTALLED_APPS, create an api.py, and move one endpoint at a time. Existing Django URLconf views (including DRF/Ninja routes) keep working through the ASGI mount while you migrate."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "Does Django-Bolt support WebSockets, SSE, and streaming?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "Yes — WebSockets, Server-Sent Events, and streaming responses are built in and served by the Rust layer."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "Does Django-Bolt generate OpenAPI docs?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "Yes. Swagger UI, ReDoc, Scalar, RapiDoc, and Stoplight Elements are served at /docs by default. See OpenAPI."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "Which Python and Django versions are supported?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "Python 3.12, 3.13, 3.14 (CPython and PyPy), and the free-threaded build of CPython 3.14 (3.14t). Django 5.2 (LTS), 6.0, 6.1."
-   }
-  },
-  {
-   "@type": "Question",
-   "name": "Why does runbolt hang on macOS when it connects to PostgreSQL?",
-   "acceptedAnswer": {
-    "@type": "Answer",
-    "text": "This affects local development on macOS with libpq (psycopg). A forked runbolt worker can hang, or stop with a segmentation fault, when it opens a PostgreSQL connection. This occurs with and without Django's connection pool. Workers fork with --processes 2 or more, and with a worker recycling option. When libpq is built with GSSAPI support, gssencmode is prefer by default. Then libpq calls the macOS Kerberos (GSS) framework, which is not safe to use after fork(). Set PGGSSENCMODE=disable, or set \"gssencmode\": \"disable\" in DATABASES[\"default\"][\"OPTIONS\"]. This turns off GSSAPI encryption only; use TLS with sslmode if the connection must be encrypted. Linux does not need this setting."
-   }
-  }
- ]
-}
-</script>
+- Ask a question on [Discord](https://discord.gg/4xErptXK82).
+- Report a bug on [GitHub Issues](https://github.com/dj-bolt/django-bolt/issues). Give the versions of Bolt, Django and Python, and a short example.
