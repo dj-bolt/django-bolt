@@ -171,10 +171,10 @@ def computed_field(
 
             @computed_field(alias="displayName")
             def display_name(self) -> str:
-                return self.full_name.upper()
+                return self.full_name().upper()
 
         # When dumped:
-        # {"first_name": "John", "last_name": "Doe", "full_name": "John Doe", "display_name": "JOHN DOE"}
+        # {"first_name": "John", "last_name": "Doe", "full_name": "John Doe", "displayName": "JOHN DOE"}
 
     Note:
         - Computed fields are OUTPUT ONLY - they don't exist during parsing/loading

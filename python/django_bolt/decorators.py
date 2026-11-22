@@ -168,7 +168,7 @@ def action(
 
     Notes:
         - Actions inherit class-level auth and guards unless explicitly overridden
-        - The function must be async
+        - The function can be async or sync
         - Path parameters are automatically extracted from the route
         - For detail=True actions, the lookup field parameter (e.g., 'id', 'pk') is required
     """
