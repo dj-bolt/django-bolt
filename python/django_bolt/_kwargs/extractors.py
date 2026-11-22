@@ -16,6 +16,7 @@ from typing import Annotated, Any, Literal, get_args, get_origin
 import msgspec
 from django.db.models import QuerySet
 
+from .._field_marker import _FieldMarker
 from .._serializer_before import RAW_VALIDATED, before_plan, run_before_validators
 from .._serializer_input import ignore_read_only_input, read_only_input_extractor
 from ..concurrency import run_in_orm_executor
@@ -81,32 +82,23 @@ def _refuse_many_item_default(loc: str, key: str, annotation: Any, default: Any)
     a source holds one item, and the OpenAPI schema says ``maxItems: 1``. A
     default of two items is not valid for that schema, so the route fails here.
     """
-    if type(default) in _SEQUENCE_ORIGINS and len(default) > 1 and _is_sequence_field(_strip_annotated(annotation)):
+    if isinstance(default, _SEQUENCE_ORIGINS) and len(default) > 1 and _is_sequence_field(annotation):
         raise TypeError(
             f"The {loc} parameter {key!r} gets at most one item, but its default {default!r} "
             f"has {len(default)} items. Use a default of at most one item, or use Query() for a list of values."
         )
 
 
-def _strip_annotated(annotation: Any) -> Any:
-    """Remove ``Annotated`` metadata, also inside ``Optional``. A ``msgspec.Meta`` constraint keeps it on the type."""
-    if get_origin(annotation) is Annotated:
-        annotation = get_args(annotation)[0]
-    inner = unwrap_optional(annotation)
-    return get_args(inner)[0] if get_origin(inner) is Annotated else inner
+def _schema_default(field: msgspec.structs.FieldInfo) -> Any:
+    """Return the default of a model field that the OpenAPI schema shows.
 
-
-def _field_default(field: msgspec.structs.FieldInfo) -> Any:
-    """Return the default that a model field gets at run time, also from a ``default_factory``."""
-    if field.default is msgspec.NODEFAULT and field.default_factory is not msgspec.NODEFAULT:
-        return field.default_factory()
-    return field.default
-
-
-def _refuse_many_item_field_defaults(struct_type: type, loc: str) -> None:
-    """Apply ``_refuse_many_item_default`` to each field of a header or cookie model."""
-    for field in msgspec.structs.fields(struct_type):
-        _refuse_many_item_default(loc, field.encode_name, field.type, _field_default(field))
+    The schema calls the ``default_factory`` of a serializer ``field()``. It
+    calls no other factory that can give two items.
+    """
+    default = field.default
+    if isinstance(default, _FieldMarker):
+        return default.config.get_default() if default.config.has_default() else msgspec.NODEFAULT
+    return default
 
 
 def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = False) -> Callable | None:
@@ -600,7 +592,7 @@ def _is_sequence_field(field_type: Any) -> bool:
     """
     Determine whether a type annotation represents a sequence container (list, set, frozenset, or tuple).
 
-    Unwraps Optional[...] before checking the underlying origin. A bare ``set`` has no origin, so the class itself counts.
+    Unwraps Optional[...] and Annotated[...] before checking the underlying origin. A bare ``set`` has no origin, so the class itself counts.
 
     Parameters:
         field_type (Any): The type annotation to inspect.
@@ -609,6 +601,8 @@ def _is_sequence_field(field_type: Any) -> bool:
         bool: `True` if the (unwrapped) annotation's origin is one of list, set, frozenset, or tuple; `False` otherwise.
     """
     inner = unwrap_optional(field_type)
+    if get_origin(inner) is Annotated:
+        inner = unwrap_optional(get_args(inner)[0])
     return (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
 
 
@@ -708,8 +702,6 @@ def _create_param_struct_extractor(
     """
     # An unknown source fails here, when the route registers.
     source = _STRUCT_ERROR_SOURCES[param_type]
-    if source == "cookie":
-        _refuse_many_item_field_defaults(struct_type, source)
     # Check at registration time if any fields need file handling
     has_upload_file_fields = any(is_upload_file_type(f.type) for f in msgspec.structs.fields(struct_type))
     # Pre-compute sequence field names — empty tuple means zero runtime overhead.
@@ -897,7 +889,6 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     Returns:
         Extractor function that takes headers_map and returns struct instance
     """
-    _refuse_many_item_field_defaults(struct_type, "header")
     # Pre-compute header name mapping at registration time
     # Maps kebab-case header name → encoded field name (for msgspec alias support)
     header_to_encoded: list[tuple[str, str, bool]] = []
@@ -1251,26 +1242,33 @@ def create_extractor_for_field(field: FieldDefinition, other_keys: frozenset[str
         Extractor function, or None for 'request' and 'dependency' sources
         (which are handled specially by the injector)
     """
-    # Import here to avoid circular imports
-
     source = field.source
     name = field.name
     annotation = field.annotation
     # An Optional type without default has the default None.
     default = None if field.default is inspect.Parameter.empty and is_optional(annotation) else field.default
     alias = field.alias
-    if source in _SINGLE_VALUE_SOURCES:
-        _refuse_many_item_default(source, alias or name, annotation, default)
 
     # Return appropriate extractor based on source
-    if source == "path":
-        return create_path_extractor(name, annotation, alias)
+    if source in _SINGLE_VALUE_SOURCES:
+        if source == "path":
+            extractor = create_path_extractor(name, annotation, alias)
+        elif source == "header":
+            extractor = create_header_extractor(name, annotation, default, alias)
+        else:
+            extractor = create_cookie_extractor(name, annotation, default, alias, other_keys)
+        # After the extractor: a type that cannot hold one item gives its own error first.
+        model = unwrap_optional(annotation)
+        if is_msgspec_struct(model):
+            for model_field in msgspec.structs.fields(model):
+                _refuse_many_item_default(
+                    source, model_field.encode_name, model_field.type, _schema_default(model_field)
+                )
+        else:
+            _refuse_many_item_default(source, alias or name, annotation, default)
+        return extractor
     elif source == "query":
         return create_query_extractor(name, annotation, default, alias, other_keys)
-    elif source == "header":
-        return create_header_extractor(name, annotation, default, alias)
-    elif source == "cookie":
-        return create_cookie_extractor(name, annotation, default, alias, other_keys)
     elif source == "form":
         return create_form_extractor(name, annotation, default, alias, other_keys)
     elif source == "file":

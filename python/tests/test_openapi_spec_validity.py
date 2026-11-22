@@ -27,6 +27,7 @@ from openapi_spec_validator import validate
 from django_bolt import BoltAPI
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.param_functions import Cookie, Header, Path, Query
+from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
 from django_bolt.websocket.types import WebSocket
 
@@ -169,11 +170,12 @@ def test_query_operation_declares_openapi_3_2_and_validates() -> None:
 
 
 @pytest.mark.parametrize(("marker", "param_in"), [(Header, "header"), (Cookie, "cookie"), (Query, "query")])
-def test_list_parameter_with_an_empty_default_validates(marker, param_in) -> None:
-    """An empty list default must be a valid value of the parameter schema."""
+@pytest.mark.parametrize("empty", [[], (), frozenset()], ids=["list", "tuple", "frozenset"])
+def test_list_parameter_with_an_empty_default_validates(marker, param_in, empty) -> None:
+    """An empty sequence default must be a valid value of the parameter schema."""
     api = BoltAPI(openapi_config=OpenAPIConfig(title="List API", version="1.0.0"))
 
-    async def tagged(tags=[]):  # noqa: B006
+    async def tagged(tags=empty):
         pass
 
     async def named(names=["a"]):  # noqa: B006
@@ -199,31 +201,56 @@ def test_list_parameter_with_an_empty_default_validates(marker, param_in) -> Non
     assert names["schema"].get("minItems") == (None if param_in == "query" else 1)
 
 
+class EmptyTagsModel(msgspec.Struct):
+    tags: tuple[str, ...] = ()
+    flags: frozenset[str] = frozenset()
+
+
 @pytest.mark.parametrize("marker", [Header, Cookie])
-def test_header_or_cookie_list_gets_one_item_as_its_schema_says(marker) -> None:
-    """A header or cookie list gets one item from a request, so ``maxItems: 1`` is true (#871)."""
+def test_model_sequence_field_with_an_empty_default_validates(marker) -> None:
+    """An empty tuple or frozenset default of a model field must be a valid value of the field schema."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="List API", version="1.0.0"))
+
+    async def tagged(model):
+        pass
+
+    tagged.__annotations__ = {"model": Annotated[EmptyTagsModel, marker()], "return": dict}
+    api.get("/tagged")(tagged)
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+
+    validate(spec)
+    for parameter in spec["paths"]["/tagged"]["get"]["parameters"]:
+        assert parameter["schema"]["default"] == []
+        assert "minItems" not in parameter["schema"]
+
+
+@pytest.mark.parametrize(
+    ("marker", "headers", "expected"),
+    [
+        (Header, [("tags", "a"), ("tags", "b")], ["b"]),
+        (Header, {"tags": "a,b"}, ["a,b"]),
+        (Cookie, {"cookie": "tags=a; tags=b"}, ["b"]),
+        (Cookie, {"cookie": "tags=a,b"}, ["a,b"]),
+    ],
+    ids=["header-repeated", "header-comma", "cookie-repeated", "cookie-comma"],
+)
+def test_header_or_cookie_list_gets_one_item_as_its_schema_says(marker, headers, expected) -> None:
+    """Bolt keeps the last value of a repeated name and does not split a comma list, so ``maxItems: 1`` is true (#871)."""
     api = BoltAPI(openapi_config=OpenAPIConfig(title="List API", version="1.0.0"))
 
     async def tagged(tags=["default"]):  # noqa: B006
         return tags
 
-    # The module has postponed annotations, so the test sets the evaluated types.
     tagged.__annotations__ = {"tags": Annotated[list[str], marker()]}
     api.get("/tagged")(tagged)
 
     api._register_openapi_routes()
     with TestClient(api) as client:
         spec = client.get("/docs/openapi.json").json()
-        if marker is Header:
-            # Bolt keeps the last line of a repeated header and does not split a comma list.
-            repeated = client.get("/tagged", headers=[("tags", "a"), ("tags", "b")]).json()
-            comma = client.get("/tagged", headers={"tags": "a,b"}).json()
-            assert repeated == ["b"]
-            assert comma == ["a,b"]
-        else:
-            # Bolt reads one value for each cookie name.
-            assert client.get("/tagged", headers={"cookie": "tags=a; tags=b"}).json() in (["a"], ["b"])
-            assert client.get("/tagged", headers={"cookie": "tags=a,b"}).json() == ["a,b"]
+        assert client.get("/tagged", headers=headers).json() == expected
         assert client.get("/tagged").json() == ["default"]
 
     validate(spec)
@@ -232,8 +259,16 @@ def test_header_or_cookie_list_gets_one_item_as_its_schema_says(marker) -> None:
     assert tags["schema"]["default"] == ["default"]
 
 
+class _TagList(list):
+    pass
+
+
 @pytest.mark.parametrize("marker", [Path, Header, Cookie])
-@pytest.mark.parametrize("default", [["a", "b"], ("a", "b"), {"a", "b"}])
+@pytest.mark.parametrize(
+    "default",
+    [["a", "b"], ("a", "b"), {"a", "b"}, _TagList(["a", "b"])],
+    ids=["list", "tuple", "set", "list-subclass"],
+)
 def test_one_value_list_parameter_refuses_a_default_of_two_items(marker, default) -> None:
     """A path, header or cookie list gets at most one item, so a default of two items fails at registration (#871)."""
     api = BoltAPI()
@@ -247,43 +282,18 @@ def test_one_value_list_parameter_refuses_a_default_of_two_items(marker, default
         api.get(route)(tagged)
 
 
-def test_query_list_parameter_accepts_a_default_of_two_items() -> None:
-    """A query key can repeat, so a query list can have a default of two items (#871)."""
-    api = BoltAPI(openapi_config=OpenAPIConfig(title="List API", version="1.0.0"))
-
-    async def tagged(tags=["a", "b"]):  # noqa: B006
-        return tags
-
-    tagged.__annotations__ = {"tags": Annotated[list[str], Query()]}
-    api.get("/tagged")(tagged)
-
-    api._register_openapi_routes()
-    with TestClient(api) as client:
-        spec = client.get("/docs/openapi.json").json()
-        assert client.get("/tagged").json() == ["a", "b"]
-        assert client.get("/tagged?tags=x&tags=y").json() == ["x", "y"]
-
-    validate(spec)
-    (tags,) = spec["paths"]["/tagged"]["get"]["parameters"]
-    assert "maxItems" not in tags["schema"]
-    assert tags["schema"]["default"] == ["a", "b"]
-
-
-class TaggedModel(msgspec.Struct):
-    tags: list[str] = ("a", "b")  # type: ignore[assignment]
-
-
-@pytest.mark.parametrize("marker", [Header, Cookie])
-def test_header_or_cookie_model_refuses_a_list_field_default_of_two_items(marker) -> None:
-    """A list field of a header or cookie model gets at most one item, as a plain parameter does (#871)."""
+@pytest.mark.parametrize("marker", [Path, Header, Cookie])
+def test_one_value_pair_parameter_names_its_type_before_its_default(marker) -> None:
+    """A type that cannot hold one item gives that error, not the error of its default."""
     api = BoltAPI()
 
-    async def tagged(model):
-        return model.tags
+    async def paired(pair=("a", "b")):
+        return pair
 
-    tagged.__annotations__ = {"model": Annotated[TaggedModel, marker()]}
-    with pytest.raises(TypeError, match=r"'tags'.*default .* has 2 items"):
-        api.get("/tagged")(tagged)
+    paired.__annotations__ = {"pair": Annotated[tuple[str, str], marker()]}
+    route = "/paired/{pair}" if marker is Path else "/paired"
+    with pytest.raises(TypeError, match="cannot hold one item"):
+        api.get(route)(paired)
 
 
 @pytest.mark.parametrize("marker", [Header, Cookie])
@@ -307,16 +317,58 @@ def test_constrained_one_value_list_refuses_a_default_of_two_items(marker, annot
         api.get("/tagged")(tagged)
 
 
-@pytest.mark.parametrize("marker", [Header, Cookie])
-def test_constrained_one_value_list_accepts_a_default_of_one_item(marker) -> None:
-    """A default of one item is valid for maxItems: 1."""
+@pytest.mark.parametrize(
+    ("marker", "annotation"),
+    [
+        (Header, list[str]),
+        (Cookie, list[str]),
+        (Header, Annotated[list[str], msgspec.Meta(min_length=0)]),
+        (Cookie, Annotated[list[str], msgspec.Meta(min_length=0)]),
+    ],
+    ids=["header", "cookie", "header-constrained", "cookie-constrained"],
+)
+def test_one_value_list_parameter_accepts_a_default_of_one_item(marker, annotation) -> None:
+    """A default of one item is valid for ``maxItems: 1``."""
     api = BoltAPI()
 
     async def tagged(tags=["a"]):  # noqa: B006
         return tags
 
-    tagged.__annotations__ = {"tags": Annotated[list[str], msgspec.Meta(min_length=0), marker()]}
+    tagged.__annotations__ = {"tags": Annotated[annotation, marker()]}
     api.get("/tagged")(tagged)
+
+    with TestClient(api) as client:
+        assert client.get("/tagged").json() == ["a"]
+
+
+class TaggedModel(msgspec.Struct):
+    tags: tuple[str, ...] = ("a", "b")
+
+
+class TaggedSerializer(Serializer):
+    tags: list[str] = field(default=["a", "b"])
+
+
+class TaggedFactorySerializer(Serializer):
+    tags: list[str] = field(default_factory=lambda: ["a", "b"])
+
+
+@pytest.mark.parametrize("marker", [Header, Cookie])
+@pytest.mark.parametrize(
+    "model",
+    [TaggedModel, TaggedSerializer, TaggedFactorySerializer],
+    ids=["struct", "serializer-default", "serializer-default-factory"],
+)
+def test_header_or_cookie_model_refuses_a_list_field_default_of_two_items(marker, model) -> None:
+    """A list field of a header or cookie model gets at most one item, as a plain parameter does (#871)."""
+    api = BoltAPI()
+
+    async def tagged(model):
+        return model.tags
+
+    tagged.__annotations__ = {"model": Annotated[model, marker()]}
+    with pytest.raises(TypeError, match=r"'tags'.*default .* has 2 items"):
+        api.get("/tagged")(tagged)
 
 
 class TaggedFactoryModel(msgspec.Struct):
@@ -324,16 +376,23 @@ class TaggedFactoryModel(msgspec.Struct):
 
 
 @pytest.mark.parametrize("marker", [Header, Cookie])
-def test_header_or_cookie_model_refuses_a_default_factory_of_two_items(marker) -> None:
-    """A default_factory gives the default at run time. The check uses that value."""
-    api = BoltAPI()
+def test_header_or_cookie_model_with_a_default_factory_registers(marker) -> None:
+    """The schema of a field with a ``default_factory`` has no default, so it stays valid."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="List API", version="1.0.0"))
 
     async def tagged(model):
         return model.tags
 
     tagged.__annotations__ = {"model": Annotated[TaggedFactoryModel, marker()]}
-    with pytest.raises(TypeError, match=r"'tags'.*default .* has 2 items"):
-        api.get("/tagged")(tagged)
+    api.get("/tagged")(tagged)
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        spec = client.get("/docs/openapi.json").json()
+
+    validate(spec)
+    (tags,) = spec["paths"]["/tagged"]["get"]["parameters"]
+    assert "default" not in tags["schema"]
 
 
 def test_query_free_spec_keeps_openapi_3_1(full_spec: dict) -> None:
