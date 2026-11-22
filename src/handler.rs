@@ -1096,36 +1096,9 @@ async fn route_request(
                 return without_error_info(response, &state);
             }
 
-            // HTTP ASGI mount fallback:
-            // - only after Bolt route miss
-            // - only after trailing-slash/API-method near-miss checks above
-            if let Some(asgi_mount) = find_asgi_mount(state.get_ref(), path) {
-                let response = asgi_http::handle_asgi_mount_request(
-                    req,
-                    payload,
-                    asgi_mount,
-                    state.debug,
-                    state.max_payload_size,
-                    state.asgi_mount_timeout,
-                    &state.trusted_proxies,
-                )
-                .await;
-                return without_error_info(response, &state);
-            }
-
-            // Handle OPTIONS preflight for non-existent routes
-            // IMPORTANT: Preflight MUST return 2xx status for browser to proceed with actual request
-            // Browsers reject preflight responses with non-2xx status codes (like 404)
-            if method == "OPTIONS" {
-                // Check if global CORS is configured
-                if state.global_cors_config.is_some() {
-                    // CORS headers will be added by CorsMiddleware
-                    return HttpResponse::NoContent().finish();
-                }
-            }
-
             // The path has routes, but none for this method: 405 with `Allow`
-            // (RFC 9110 section 15.5.6). This lookup runs on a miss only.
+            // (RFC 9110 section 15.5.6). This lookup runs on a miss only, and before
+            // the ASGI mounts, so a mount at "/" does not take a path of a route.
             // The other slash form of the path gets the same check. That form
             // redirects for a method of its routes, so the path is a route path.
             let mut allowed_path = route_path;
@@ -1149,6 +1122,34 @@ async fn route_request(
                 }
                 responses::error_405(&allowed_methods)
             } else {
+                // HTTP ASGI mount fallback:
+                // - only after Bolt route miss
+                // - only after trailing-slash/API-method near-miss checks above
+                if let Some(asgi_mount) = find_asgi_mount(state.get_ref(), path) {
+                    let response = asgi_http::handle_asgi_mount_request(
+                        req,
+                        payload,
+                        asgi_mount,
+                        state.debug,
+                        state.max_payload_size,
+                        state.asgi_mount_timeout,
+                        &state.trusted_proxies,
+                    )
+                    .await;
+                    return without_error_info(response, &state);
+                }
+
+                // Handle OPTIONS preflight for non-existent routes
+                // IMPORTANT: Preflight MUST return 2xx status for browser to proceed with actual request
+                // Browsers reject preflight responses with non-2xx status codes (like 404)
+                if method == "OPTIONS" {
+                    // Check if global CORS is configured
+                    if state.global_cors_config.is_some() {
+                        // CORS headers will be added by CorsMiddleware
+                        return HttpResponse::NoContent().finish();
+                    }
+                }
+
                 // Route not found - return 404
                 // CORS headers will be added by CorsMiddleware if configured
                 responses::error_404()

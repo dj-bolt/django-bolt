@@ -43,8 +43,9 @@ except ImportError:
     initialize_file_response_settings = None
 
 try:
-    from django_bolt.admin.admin_detection import detect_admin_url_prefix
+    from django_bolt.admin.admin_detection import admin_url_needs_path_parameter, detect_admin_url_prefix
 except ImportError:
+    admin_url_needs_path_parameter = None
     detect_admin_url_prefix = None
 
 
@@ -871,7 +872,8 @@ class Command(BaseCommand):
         admin_enabled = not options.get("no_admin", False)
         if admin_enabled and detect_admin_url_prefix is not None:
             merged_api._register_admin_routes(options["host"], options["port"])
-            if merged_api._admin_routes_registered:
+            # The root mount for an admin site behind a path parameter has no admin URL to print.
+            if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():
                 admin_prefix = detect_admin_url_prefix()
                 admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
                 features.append(("Admin", f"{banner_base_url}{admin_path}"))
@@ -977,7 +979,8 @@ class Command(BaseCommand):
             # Register admin routes
             merged_api._register_admin_routes(options["host"], options["port"])
 
-            if merged_api._admin_routes_registered:
+            # The root mount for an admin site behind a path parameter has no admin URL to print.
+            if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():
                 admin_prefix = detect_admin_url_prefix()
                 admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
                 features.append(("Admin", f"{banner_base_url}{admin_path}"))
@@ -1462,6 +1465,7 @@ class Command(BaseCommand):
 
                 route_map[asgi_key] = api_path
                 merged._asgi_mounts.append((asgi_prefix, asgi_app))
+                merged._asgi_mount_prefixes.add(asgi_prefix)
 
             # Same key as a Python route, so a clash fails here, before
             # runbolt starts its worker processes.
