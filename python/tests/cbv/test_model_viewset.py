@@ -10,7 +10,7 @@ import pytest
 from django_bolt import BoltAPI, ModelViewSet, ReadOnlyModelViewSet, action
 from django_bolt.serializers import Serializer, field
 from django_bolt.testing import TestClient
-from tests.test_models import Article
+from tests.test_models import Article, Author, BlogPost
 
 
 @pytest.fixture
@@ -413,6 +413,44 @@ def test_partial_update_with_a_renamed_serializer(api):
         # A value of the wrong type is still a validation error.
         response = client.patch(f"/required/{article.id}", json={"isPublished": "text"})
         assert response.status_code == 422
+
+
+@pytest.mark.django_db(transaction=True)
+def test_write_actions_take_the_primary_key_of_a_foreign_key_field(api):
+    """A foreign key field given as an int sets the column, as ``Serializer.to_model()`` does (#914)."""
+
+    class PostIn(Serializer):
+        title: str
+        content: str
+        author: int
+
+    @api.viewset("/posts")
+    class PostViewSet(ModelViewSet):
+        queryset = BlogPost.objects.all()
+        serializer_class = PostIn
+
+    first = Author.objects.create(name="first", email="first@example.com")
+    second = Author.objects.create(name="second", email="second@example.com")
+    third = Author.objects.create(name="third", email="third@example.com")
+
+    with TestClient(api) as client:
+        response = client.post("/posts", json={"title": "t", "content": "c", "author": first.id})
+        assert response.status_code == 201, response.text
+        assert response.json() == {"title": "t", "content": "c", "author": first.id}
+        post = BlogPost.objects.get()
+        assert post.author_id == first.id
+
+        response = client.put(f"/posts/{post.id}", json={"title": "t2", "content": "c2", "author": second.id})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"title": "t2", "content": "c2", "author": second.id}
+        post.refresh_from_db()
+        assert (post.title, post.author_id) == ("t2", second.id)
+
+        response = client.patch(f"/posts/{post.id}", json={"author": third.id})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"title": "t2", "content": "c2", "author": third.id}
+        post.refresh_from_db()
+        assert post.author_id == third.id
 
 
 @pytest.mark.django_db(transaction=True)
