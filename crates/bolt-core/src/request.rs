@@ -1,10 +1,14 @@
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyString};
 
 use ahash::AHashMap;
 use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::OnceLock;
+
+/// `django_bolt.auth.anonymous.new_anonymous_user`, imported on the first read of an unset `request.user`.
+static NEW_ANONYMOUS_USER: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// Parse host:port from Actix's connection_info().host()
 /// Returns (hostname, port_string) - port defaults to "443" for HTTPS, else "80"
@@ -63,8 +67,12 @@ pub struct PyRequest {
     /// replaced its string in `cookies`. `raw_cookies` is built from them.
     pub raw_cookies: Option<AHashMap<String, String>>,
     pub context: Option<Py<PyDict>>, // Middleware context data
-    // None if no auth context or user not found
+    /// The user that Bolt auth, a middleware or the app set. None when no one set it.
     pub user: Option<Py<PyAny>>,
+    /// The anonymous user that `request.user` gives when `user` is None.
+    /// Made on the first read only, so a request that does not read the user
+    /// pays nothing. One object for each request, as in Django.
+    pub anonymous_user: PyOnceLock<Py<PyAny>>,
     /// Lazy state dict for middleware AND dynamic attributes (e.g. _messages, _bolt_prebound_args).
     /// Only allocated on first access, so fast-path handlers with no prebound args pay zero cost.
     pub state: OnceLock<Py<PyDict>>,
@@ -140,20 +148,42 @@ impl PyRequest {
         }
     }
 
-    /// Get the user object (LazyUser proxy set by Python's _dispatch).
-    ///
-    /// Returns a LazyUser proxy that loads the user from the database
-    /// on first access (no await needed in handler code).
+    /// Get the user of the request.
     ///
     /// Returns:
-    /// - LazyUser proxy if authentication succeeded
-    /// - None if no auth context or authentication failed
+    /// - The user that was set: a LazyUser proxy from Bolt auth, which loads
+    ///   the user on the first attribute read, or the user that Django's
+    ///   AuthenticationMiddleware or the app set.
+    /// - Otherwise, Django's AnonymousUser, as Django's AuthenticationMiddleware
+    ///   gives. `await request.auser()` gives the same object. Without
+    ///   `django.contrib.auth` in INSTALLED_APPS, there is no user model, and
+    ///   the value is None.
     #[getter]
-    fn user<'py>(&self, py: Python<'py>) -> Py<PyAny> {
+    fn user<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         match &self.user {
-            Some(user) => user.clone_ref(py),
-            None => py.None(),
+            Some(user) => Ok(user.clone_ref(py)),
+            None => self
+                .anonymous_user
+                .get_or_try_init(py, || {
+                    NEW_ANONYMOUS_USER
+                        .get_or_try_init(py, || {
+                            Ok::<_, PyErr>(
+                                py.import("django_bolt.auth.anonymous")?
+                                    .getattr("new_anonymous_user")?
+                                    .unbind(),
+                            )
+                        })?
+                        .call0(py)
+                })
+                .map(|user| user.clone_ref(py)),
         }
+    }
+
+    /// True when Bolt auth, a middleware or the app set `request.user`.
+    /// Bolt's Django adapter reads it. It does not make the anonymous user.
+    #[getter]
+    fn _has_user(&self) -> bool {
+        self.user.is_some()
     }
 
     /// Set the user object (called by Django middleware via DjangoMiddlewareStack).
@@ -405,8 +435,8 @@ impl PyRequest {
     ///
     /// Returns:
     ///     Async callable that returns the user when awaited.
-    ///     Otherwise, returns a callable for the Bolt user, or AnonymousUser
-    ///     if no user is set.
+    ///     Otherwise, returns a callable that gives the user of `request.user`.
+    ///     It loads a lazy Bolt user without blocking the event loop.
     #[getter]
     fn auser<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         // Get "auser" from state dict (set by Django middleware adapter)
@@ -415,11 +445,11 @@ impl PyRequest {
         match state_dict.get_item("auser") {
             Ok(Some(auser)) => Ok(auser.unbind()),
             _ => {
-                // Share the Bolt user when no middleware provides an async getter.
-                let django_bolt_module = py.import("django_bolt.auth.anonymous")?;
-                let auser_fallback = django_bolt_module.getattr("auser_fallback")?;
+                // Share the user of `request.user` when no middleware provides an async getter.
+                let user_loader = py.import("django_bolt.auth.user_loader")?;
+                let aload_bolt_user = user_loader.getattr("aload_bolt_user")?;
                 let partial = py.import("functools")?.getattr("partial")?;
-                Ok(partial.call1((auser_fallback, self.user(py)))?.unbind())
+                Ok(partial.call1((aload_bolt_user, self.user(py)?))?.unbind())
             }
         }
     }

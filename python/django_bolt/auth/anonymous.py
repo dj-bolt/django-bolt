@@ -1,27 +1,21 @@
 """
-Async user fallback for requests without Django authentication middleware.
+The user of a request that has no user.
+
+Rust imports this module on the first read of a ``request.user`` that no one
+set. The Django app registry is then ready.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from django.apps import apps
 
-from django.contrib.auth.models import AnonymousUser
+if apps.is_installed("django.contrib.auth"):
+    from django.contrib.auth.models import AnonymousUser as new_anonymous_user
+else:
 
-from .user_loader import aload_bolt_user
-
-
-async def auser_fallback(user: Any = None) -> Any:
-    """
-    Return the Bolt user, or an anonymous user if no user is set.
-
-    A user that Bolt authenticated loads with its async loader, on the lane
-    of the request or on the ORM pool, and does not block the event loop.
-    ``request.user`` then shares the loaded result.
-    """
-    if user is None:
-        return AnonymousUser()
-    return await aload_bolt_user(user)
+    def new_anonymous_user() -> None:
+        """Without ``django.contrib.auth``, there is no user model and no anonymous user."""
+        return None
 
 
-__all__ = ["auser_fallback"]
+__all__ = ["new_anonymous_user"]

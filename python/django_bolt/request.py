@@ -71,7 +71,7 @@ class Request(Protocol):
 
     @property
     def user(self) -> Any:
-        """Authenticated user (set by middleware)"""
+        """The user of the request, or Django's AnonymousUser when there is none."""
         ...
 
     @user.setter

@@ -444,7 +444,7 @@ These are the most used attributes. The [Request reference](../ref/request.md) l
 | `headers`, `cookies`, `query` | `dict` of the headers, cookies and query values |
 | `params` | `dict` of the path parameters, converted to their types |
 | `state` | A `dict` for your own data during the request, for example from middleware |
-| `user` | The user that an authentication backend found, or `None` |
+| `user` | The user that an authentication backend found, or Django's `AnonymousUser` |
 | `context` | The authentication data, for example the JWT claims, or `None` |
 
 ### Get the current user

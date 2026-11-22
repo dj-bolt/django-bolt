@@ -1732,6 +1732,7 @@ async fn route_request(
             },
             context,
             user: None,
+            anonymous_user: pyo3::sync::PyOnceLock::new(),
             state: state_lock,
             form_map: form_map_opt,
             files_map: files_map_opt,
