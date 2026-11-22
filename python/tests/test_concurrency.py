@@ -21,7 +21,7 @@ from django.core.exceptions import ImproperlyConfigured
 
 from django_bolt import BoltAPI
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
-from django_bolt.concurrency import check_pool_environment, run_in_orm_executor, sync_to_thread
+from django_bolt.concurrency import check_pool_environment, run_in_orm_executor, run_orm_blocking, sync_to_thread
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack
 from django_bolt.testing import TestClient
 
@@ -125,6 +125,54 @@ def test_a_sync_read_of_request_user_keeps_the_running_loop(middleware):
 
     assert response.status_code == 200, response.text
     assert response.json() == {"user": "user of apikey:secret", "same_loop": True}
+
+
+def test_a_sync_read_on_a_loop_can_run_a_loop_of_its_own():
+    """A sync read can run a second event loop on the thread, and the outer task stays the current task.
+
+    Python 3.14 keeps the current task for each thread. While the read hides
+    the running loop, it must also hide the current task. Else the inner loop
+    cannot start its task, and it waits with no end.
+    """
+    results: list[object] = []
+
+    def blocking(fn):
+        async def call():
+            outer_task = asyncio.current_task()
+            value = run_orm_blocking(fn)
+            return value, asyncio.current_task() is outer_task
+
+        return asyncio.run(call())
+
+    def run() -> None:
+        results.append(blocking(lambda: blocking(lambda: 1)))
+
+    # A thread with a time limit, so that a hang fails the test and does not stop the suite.
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive(), "the nested event loop did not finish"
+    assert results == [((1, True), True)]
+
+
+def test_a_sync_read_in_a_loop_callback_runs():
+    """A loop callback has no current task. Python 3.12 refuses to swap out a task that is not there."""
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        def callback() -> None:
+            try:
+                done.set_result(run_orm_blocking(lambda: 1))
+            except BaseException as error:  # noqa: BLE001 - await done raises the error of the read
+                done.set_exception(error)
+
+        loop.call_soon(callback)
+        return await done
+
+    assert asyncio.run(main()) == 1
 
 
 def _slow_thread_name() -> str:
