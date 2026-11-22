@@ -909,13 +909,106 @@ fn without_error_info(mut response: HttpResponse, state: &AppState) -> HttpRespo
     response
 }
 
+/// The content type and the other headers of an answer of Rust, as text for
+/// the middleware. The middleware chain sends a header again from its text.
+/// A value that is not visible ASCII cannot go back into a response, so this
+/// logs it and leaves it out, as the response builder does.
+fn answer_headers(map: &actix_web::http::header::HeaderMap) -> (String, Vec<(String, String)>) {
+    let mut content_type = String::new();
+    let mut headers = Vec::with_capacity(map.len());
+    for (name, value) in map {
+        if *name == actix_web::http::header::CONTENT_LENGTH || *name == SKIP_CORS_HEADER_NAME {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            log::warn!(
+                "The response header '{name}' is not ASCII text. The middleware does not get it, and Bolt does not send it."
+            );
+            continue;
+        };
+        if *name == actix_web::http::header::CONTENT_TYPE {
+            content_type = value.to_owned();
+        } else {
+            headers.push((name.as_str().to_owned(), value.to_owned()));
+        }
+    }
+    (content_type, headers)
+}
+
+/// A response that Rust gave before the handler, read for the Python middleware.
+struct RustAnswer {
+    status: u16,
+    content_type: String,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+}
+
+impl RustAnswer {
+    /// Read the parts of `answer`. With an error formatter, the middleware gets
+    /// the formatted response, as the client would without middleware.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error is the response to send; the path is cold"
+    )]
+    fn read(
+        answer: HttpResponse,
+        req: &HttpRequest,
+        state: &Arc<AppState>,
+    ) -> Result<Self, HttpResponse> {
+        let answer = if state.error_renderer.is_some() {
+            crate::error_formatter::format_error_response(answer, req, state)
+        } else {
+            answer
+        };
+        let status = answer.status().as_u16();
+        let (content_type, headers) = answer_headers(answer.headers());
+        // The body of a response that Rust builds is in memory.
+        let body = match actix_web::body::MessageBody::try_into_bytes(answer.into_body()) {
+            Ok(body) => body,
+            Err(_) => {
+                return Err(error::with_error_info(
+                    HttpResponse::InternalServerError().finish(),
+                    || error::ErrorInfo::core("internal_error", "The response has no bytes body"),
+                ));
+            }
+        };
+        Ok(Self {
+            status,
+            content_type,
+            headers,
+            body,
+        })
+    }
+
+    /// The ResponseWireV1 of the answer: `(status, meta, 0, body)`. An empty
+    /// content type means none.
+    fn into_wire(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let headers = if self.headers.is_empty() {
+            py.None()
+        } else {
+            self.headers.into_pyobject(py)?.into_any().unbind()
+        };
+        let meta = (
+            pyo3::intern!(py, "octetstream"),
+            self.content_type,
+            headers,
+            py.None(),
+        );
+        Ok((self.status, meta, 0u8, PyBytes::new(py, &self.body))
+            .into_pyobject(py)?
+            .into_any()
+            .unbind())
+    }
+}
+
 /// Route one request. `access_log_route` becomes the handler id of the route
 /// when the response is for a Bolt route: each response after the route match,
 /// the redirect to the other slash form of a route path, the automatic OPTIONS
 /// answer, and the 405 for a method that the route path does not have.
+/// A 404 of a path with no route gets the no-route route of the app.
 /// `handle_request` writes the access-log line for these, if
-/// the filter of that route keeps it. A native route, a mount and a path with
-/// no route leave it `None`.
+/// the filter of that route keeps it. A native route, a mount and the
+/// preflight answer of global CORS leave it `None`.
 async fn route_request(
     req: HttpRequest,
     mut payload: web::Payload,
@@ -937,11 +1030,16 @@ async fn route_request(
     // The route reference borrows the 'static global router, so the handler
     // clone_ref is deferred into the main dispatch GIL block — no extra
     // Python::attach per request just to clone the callable.
-    let (route, path_params, handler_id) = {
+    //
+    // `rust_answer` holds a response that Rust gives before the handler: a
+    // 404 or a 405 for a request with no route, and a 401 or a 403 of the
+    // route. When the route runs Python middleware, the response goes through
+    // that middleware as the response of the handler (see `RustAnswer`).
+    let (route, path_params, handler_id, mut rust_answer) = {
         if let Some(route_match) = router.find(method, route_path) {
             let handler_id = route_match.handler_id();
             let (route, path_params) = route_match.into_parts();
-            (route, path_params, handler_id)
+            (route, path_params, handler_id, None)
         } else {
             // No route found - check for trailing slash redirect FIRST
             // This only runs when route doesn't match (minimal overhead)
@@ -1010,7 +1108,7 @@ async fn route_request(
                 allowed_path = alternate_path;
                 allowed_methods = router.find_all_methods(alternate_path);
             }
-            if !allowed_methods.is_empty() {
+            let answer = if !allowed_methods.is_empty() {
                 // The line of this answer has the filter of the first route of the path.
                 *access_log_route = router
                     .find(&allowed_methods[0], allowed_path)
@@ -1022,40 +1120,59 @@ async fn route_request(
                         .insert_header(("Content-Type", "application/json"))
                         .finish();
                 }
-                return responses::error_405(&allowed_methods);
-            }
-
-            // HTTP ASGI mount fallback:
-            // - only after Bolt route miss
-            // - only after trailing-slash/API-method near-miss checks above
-            if let Some(asgi_mount) = find_asgi_mount(state.get_ref(), path) {
-                let response = asgi_http::handle_asgi_mount_request(
-                    req,
-                    payload,
-                    asgi_mount,
-                    state.debug,
-                    state.max_payload_size,
-                    state.asgi_mount_timeout,
-                    &state.trusted_proxies,
-                )
-                .await;
-                return without_error_info(response, &state);
-            }
-
-            // Handle OPTIONS preflight for non-existent routes
-            // IMPORTANT: Preflight MUST return 2xx status for browser to proceed with actual request
-            // Browsers reject preflight responses with non-2xx status codes (like 404)
-            if method == "OPTIONS" {
-                // Check if global CORS is configured
-                if state.global_cors_config.is_some() {
-                    // CORS headers will be added by CorsMiddleware
-                    return HttpResponse::NoContent().finish();
+                responses::error_405(&allowed_methods)
+            } else {
+                // HTTP ASGI mount fallback:
+                // - only after Bolt route miss
+                // - only after trailing-slash/API-method near-miss checks above
+                if let Some(asgi_mount) = find_asgi_mount(state.get_ref(), path) {
+                    let response = asgi_http::handle_asgi_mount_request(
+                        req,
+                        payload,
+                        asgi_mount,
+                        state.debug,
+                        state.max_payload_size,
+                        state.asgi_mount_timeout,
+                        &state.trusted_proxies,
+                    )
+                    .await;
+                    return without_error_info(response, &state);
                 }
-            }
 
-            // Route not found - return 404
-            // CORS headers will be added by CorsMiddleware if configured
-            return responses::error_404();
+                // Handle OPTIONS preflight for non-existent routes
+                // IMPORTANT: Preflight MUST return 2xx status for browser to proceed with actual request
+                // Browsers reject preflight responses with non-2xx status codes (like 404)
+                if method == "OPTIONS" {
+                    // Check if global CORS is configured
+                    if state.global_cors_config.is_some() {
+                        // CORS headers will be added by CorsMiddleware
+                        return HttpResponse::NoContent().finish();
+                    }
+                }
+
+                // Route not found - return 404
+                // CORS headers will be added by CorsMiddleware if configured
+                responses::error_404()
+            };
+
+            // The no-route route of the app has the access-log filter of the
+            // API. When the API has Python middleware, the answer goes through it.
+            // A 405 keeps the filter of the route of its path. With merged APIs,
+            // that route can be of another API than the no-route route.
+            let Some(no_route) = router.no_route() else {
+                return answer;
+            };
+            if access_log_route.is_none() {
+                *access_log_route = Some(no_route.handler_id);
+            }
+            let runs_middleware = state
+                .route_metadata
+                .get(no_route.handler_id)
+                .is_some_and(|meta| meta.plan.runs_python_middleware());
+            if !runs_middleware {
+                return answer;
+            }
+            (no_route, None, no_route.handler_id, Some(answer))
         }
     };
 
@@ -1082,7 +1199,10 @@ async fn route_request(
     // Get parsed route metadata (Rust-native) by reference.
     // NOTE: Fetch metadata EARLY so we can use optimization flags to skip unnecessary parsing.
     let route_metadata = state.route_metadata.get(handler_id);
-    *access_log_route = Some(handler_id);
+    // A 405 keeps the filter of the route of its path.
+    if access_log_route.is_none() {
+        *access_log_route = Some(handler_id);
+    }
 
     // OPTIMIZATION: Extract the execution plan bitfield once (Copy u16).
     // All subsequent flag reads are direct bit-tests, avoiding repeated Option::map closures.
@@ -1100,9 +1220,13 @@ async fn route_request(
     // Max parameter length resolved once at startup; read the plain field here.
     let max_param_length = state.max_param_length;
 
+    // A no-route answer has no handler, so no query value is checked for it.
+    // Thus a 422 cannot take the place of the 404 or the 405.
+    let check_query = rust_answer.is_none();
+
     // A sequence query parameter takes each value of its repeated key.
     let query_sequences = match route_metadata {
-        Some(route_meta) if needs_query => match query_sequences(
+        Some(route_meta) if needs_query && check_query => match query_sequences(
             req.uri().query(),
             &route_meta.query_seq_fields,
             max_param_length,
@@ -1114,20 +1238,21 @@ async fn route_request(
     };
 
     // Type validation for path and query parameters (Rust-native, no GIL)
-    let (path_coerced, query_coerced) = if let Some(route_meta) = route_metadata {
-        match validate_and_cache_typed_params(
-            path_params.as_ref(),
-            query_params.as_ref(),
-            &route_meta.path_types,
-            &route_meta.query_types,
-            max_param_length,
-        ) {
-            Ok(cached) => cached,
-            Err(response) => return response,
-        }
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let (path_coerced, query_coerced) =
+        if let Some(route_meta) = route_metadata.filter(|_| check_query) {
+            match validate_and_cache_typed_params(
+                path_params.as_ref(),
+                query_params.as_ref(),
+                &route_meta.path_types,
+                &route_meta.query_types,
+                max_param_length,
+            ) {
+                Ok(cached) => cached,
+                Err(response) => return response,
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     let needs_headers = plan.is_none_or(|p| p.needs_headers());
     let needs_cookies = plan.is_none_or(|p| p.needs_cookies());
@@ -1141,6 +1266,7 @@ async fn route_request(
     let can_sync_dispatch = plan.is_some_and(|p| p.can_sync_dispatch());
     let can_lane_dispatch = plan.is_some_and(|p| p.can_lane_dispatch());
     let is_async_handler = plan.is_some_and(|p| p.is_async());
+    let runs_python_middleware = plan.is_some_and(|p| p.runs_python_middleware());
 
     // Extract and validate headers
     let mut headers = if must_extract_headers {
@@ -1180,7 +1306,8 @@ async fn route_request(
                 method,
                 path,
             ) {
-                // CORS headers will be added by CorsMiddleware
+                // A 429 stays in Rust: the limit sheds load before Python
+                // runs. CORS headers will be added by CorsMiddleware.
                 return response;
             }
         } else {
@@ -1188,52 +1315,59 @@ async fn route_request(
         }
     }
 
-    // Execute authentication and guards using shared validation logic
-    let auth_ctx = if has_route_auth_or_guards {
-        if let Some(route_meta) = route_metadata {
-            let empty_headers = AHashMap::new();
-            let headers_map = headers.as_ref().unwrap_or(&empty_headers);
-            let ctx = match validate_auth_and_guards(
-                headers_map,
-                &route_meta.auth_backends,
-                &route_meta.guards,
-            ) {
-                AuthGuardResult::Allow(ctx) => ctx,
-                // The Python dispatch checks the guards against the Django user.
-                AuthGuardResult::Deferred(ctx) => Some(ctx),
-                AuthGuardResult::Unauthorized => {
-                    // CORS headers will be added by CorsMiddleware
-                    return responses::error_401_challenge(route_meta.www_authenticate.as_ref());
-                }
-                AuthGuardResult::Forbidden(denial) => {
-                    // CORS headers will be added by CorsMiddleware
-                    return responses::error_403_denial(denial.as_deref());
-                }
-            };
-            // A safe method passes the check, so it needs no connection info.
-            let requires_csrf = ctx.as_ref().is_some_and(|auth| auth.cookie_csrf)
-                && !bolt_core::validation::is_safe_method(method);
-            if requires_csrf {
-                // Any peer may set the scheme here. See `passes_cookie_csrf`.
-                let info = req.connection_info();
-                if bolt_core::validation::cookie_csrf_blocks(
-                    method,
-                    headers_map,
-                    true,
-                    info.scheme(),
-                ) {
-                    return responses::error_403();
-                }
+    // Execute authentication and guards using shared validation logic.
+    let mut auth_ctx = None;
+    if has_route_auth_or_guards && let Some(route_meta) = route_metadata {
+        let empty_headers = AHashMap::new();
+        let headers_map = headers.as_ref().unwrap_or(&empty_headers);
+        let mut rejection = match validate_auth_and_guards(
+            headers_map,
+            &route_meta.auth_backends,
+            &route_meta.guards,
+        ) {
+            AuthGuardResult::Allow(ctx) => {
+                auth_ctx = ctx;
+                None
             }
-            ctx
-        } else {
-            None
+            // The Python dispatch checks the guards against the Django user.
+            AuthGuardResult::Deferred(ctx) => {
+                auth_ctx = Some(ctx);
+                None
+            }
+            AuthGuardResult::Unauthorized => Some(responses::error_401_challenge(
+                route_meta.www_authenticate.as_ref(),
+            )),
+            AuthGuardResult::Forbidden(denial) => {
+                Some(responses::error_403_denial(denial.as_deref()))
+            }
+        };
+        // A safe method passes the check, so it needs no connection info.
+        let requires_csrf = auth_ctx.as_ref().is_some_and(|auth| auth.cookie_csrf)
+            && !bolt_core::validation::is_safe_method(method);
+        // Any peer may set the scheme here. See `passes_cookie_csrf`.
+        if requires_csrf
+            && bolt_core::validation::cookie_csrf_blocks(
+                method,
+                headers_map,
+                true,
+                req.connection_info().scheme(),
+            )
+        {
+            rejection = Some(responses::error_403());
         }
-    } else {
-        None
-    };
+        if let Some(response) = rejection {
+            // CORS headers will be added by CorsMiddleware.
+            if !runs_python_middleware {
+                return response;
+            }
+            rust_answer = Some(response);
+            auth_ctx = None;
+        }
+    }
 
-    if let Some(config) = rate_config
+    // A rejected request does not count against an identity limit.
+    if rust_answer.is_none()
+        && let Some(config) = rate_config
         && let Some(headers_map) = headers.as_ref()
         && let Some(response) = middleware::rate_limit::check_after_auth(
             &state.rate_limiters,
@@ -1289,8 +1423,11 @@ async fn route_request(
     let empty_types: &TypeHints = &EMPTY_TYPES;
     let header_types = route_metadata.map_or(empty_types, |m| &m.header_types);
     let cookie_types = route_metadata.map_or(empty_types, |m| &m.cookie_types);
+    // A request that Rust answers does not reach the handler, so it has no
+    // values to check. Thus a 422 cannot take the place of the answer.
+    let answered = rust_answer.is_some();
     let headers_coerced = match headers.as_ref() {
-        Some(headers_map) if needs_headers => {
+        Some(headers_map) if needs_headers && !answered => {
             match validate_and_cache_source(headers_map, header_types, max_param_length, "Header") {
                 Ok(cached) => cached,
                 Err(response) => return response,
@@ -1299,13 +1436,13 @@ async fn route_request(
         _ => Vec::new(),
     };
     let cookies_coerced = match cookies.as_ref() {
-        Some(cookies_map) => {
+        Some(cookies_map) if !answered => {
             match validate_and_cache_source(cookies_map, cookie_types, max_param_length, "Cookie") {
                 Ok(cached) => cached,
                 Err(response) => return response,
             }
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     };
 
     // Derive connection info from already-extracted headers (avoids a second header-parse pass).
@@ -1347,7 +1484,9 @@ async fn route_request(
     // payload-size limit is enforced consistently regardless of content type.
     // Only computed for routes that read a body — no-body routes (e.g. the hot
     // GET path) skip the header lookup entirely.
-    let reads_body = needs_body || needs_form_parsing;
+    // Bolt does not read the body of a request that Rust answers: a flood of
+    // rejected requests reads no body, and a 413 cannot replace the answer.
+    let reads_body = (needs_body || needs_form_parsing) && !answered;
     let content_length = if reads_body {
         parse_content_length(&req)
     } else {
@@ -1359,9 +1498,7 @@ async fn route_request(
 
     // Read body from payload only when needed.
     // For multipart, we need the payload stream directly.
-    let (body, form_result): (Vec<u8>, Option<FormParseResult>) = if !needs_body
-        && !needs_form_parsing
-    {
+    let (body, form_result): (Vec<u8>, Option<FormParseResult>) = if !reads_body {
         (Vec::new(), None)
     } else if needs_form_parsing && is_multipart {
         // Multipart form parsing - uses the payload stream directly
@@ -1445,6 +1582,15 @@ async fn route_request(
     // Check if this is a HEAD request (needed for body stripping after Python handler)
     let is_head_request = method == "HEAD";
 
+    // The middleware gets the answer in the form that the client would get.
+    let rust_answer = match rust_answer {
+        Some(answer) => match RustAnswer::read(answer, &req, &state) {
+            Ok(answer) => Some(answer),
+            Err(response) => return response,
+        },
+        None => None,
+    };
+
     // Unified GIL block: build request + dispatch (sync or async).
     // OPTIMIZATION: The ONLY GIL acquisition on the happy path. Dispatch goes
     // through the per-route bound callables (partial(handler, handler_id))
@@ -1465,7 +1611,15 @@ async fn route_request(
         // then needs no Python source dicts.
         let state_lock = std::sync::OnceLock::new();
         let mut skip_dicts = false;
-        if let Some(bindings) = route_metadata.and_then(|m| m.rust_arg_bindings.as_deref()) {
+        // The innermost layer of the middleware chain returns the wire of an
+        // answer. A route that runs Python middleware has no sync dispatch,
+        // so the wire goes to that chain.
+        debug_assert!(rust_answer.is_none() || !can_sync_dispatch);
+        let rust_answer = rust_answer.map(|answer| answer.into_wire(py)).transpose()?;
+        // The handler does not run for an answer, so it gets no arguments.
+        if rust_answer.is_none()
+            && let Some(bindings) = route_metadata.and_then(|m| m.rust_arg_bindings.as_deref())
+        {
             let prebound = build_prebound_from_values(
                 py,
                 bindings,
@@ -1582,6 +1736,7 @@ async fn route_request(
             conn_host,
             conn_scheme,
             conn_remote_addr,
+            rust_answer,
         };
         let request_obj = Py::new(py, request)?;
 
@@ -1750,7 +1905,32 @@ async fn route_request(
 
 #[cfg(test)]
 mod tests {
-    use super::access_log_level;
+    use super::{SKIP_CORS_HEADER_NAME, access_log_level, answer_headers};
+    use actix_web::http::header::{
+        CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
+    };
+
+    #[test]
+    fn the_middleware_gets_each_text_header_of_an_answer() {
+        let mut map = HeaderMap::new();
+        map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        map.insert(CONTENT_LENGTH, HeaderValue::from_static("2"));
+        map.insert(SKIP_CORS_HEADER_NAME, HeaderValue::from_static("1"));
+        map.insert(
+            HeaderName::from_static("allow"),
+            HeaderValue::from_static("GET, POST"),
+        );
+        // A value with a byte that is not ASCII cannot go back into a response.
+        map.insert(
+            HeaderName::from_static("x-name"),
+            HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
+
+        let (content_type, headers) = answer_headers(&map);
+
+        assert_eq!(content_type, "application/json");
+        assert_eq!(headers, [("allow".to_owned(), "GET, POST".to_owned())]);
+    }
 
     #[test]
     fn the_access_log_level_follows_the_status_class() {

@@ -304,6 +304,10 @@ pub struct Router {
     head: MethodRouter,
     options: MethodRouter,
     query: MethodRouter,
+    /// The route of a request that matches no route. Its metadata holds the
+    /// access-log filter of the API. When its plan runs Python middleware,
+    /// the 404 or the 405 goes through the middleware of the API.
+    no_route: Option<Route>,
 }
 
 impl Default for Router {
@@ -323,7 +327,32 @@ impl Router {
             head: MethodRouter::new(),
             options: MethodRouter::new(),
             query: MethodRouter::new(),
+            no_route: None,
         }
+    }
+
+    /// Set the route of a request that matches no route. The router does not
+    /// match it for a method or a path.
+    pub fn set_no_route(
+        &mut self,
+        handler_id: usize,
+        handler: Py<PyAny>,
+        dispatch: Py<PyAny>,
+        dispatch_sync: Py<PyAny>,
+    ) {
+        self.no_route = Some(Route {
+            handler,
+            dispatch,
+            dispatch_sync,
+            handler_id,
+            native: None,
+        });
+    }
+
+    /// The route of a request that matches no route, if the app has one.
+    #[inline]
+    pub fn no_route(&self) -> Option<&Route> {
+        self.no_route.as_ref()
     }
 
     pub fn register(
