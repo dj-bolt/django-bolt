@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, ClassVar
+from typing import Annotated, ClassVar, Generic, TypeVar
 
 import msgspec
 import pytest
@@ -20,6 +20,9 @@ from django_bolt.serializers import (
     model_validator,
 )
 from django_bolt.testing import TestClient
+
+from .read_only_bases import Author, AuthoredChild, TaggedBase
+from .read_only_bases_pep649 import LazyBareChild, LazyChild
 
 
 class ReadOnlyAddress(Serializer):
@@ -51,6 +54,46 @@ class StrictFieldReadOnly(Serializer, forbid_unknown_fields=True):
     name: str
     id: int = field(read_only=True, default=0)
     tags: list[str] = field(read_only=True, default_factory=list)
+
+
+class SameModuleBase(Serializer):
+    id: int = 0
+    name: str
+
+
+class StrictBaseIdChild(SameModuleBase, forbid_unknown_fields=True):
+    class Config:
+        read_only = {"id"}
+
+
+class StrictOtherModuleChild(TaggedBase, forbid_unknown_fields=True):
+    class Config:
+        read_only = {"id", "tag", "tags", "user_id"}
+
+
+# Python 3.12.3 get_type_hints() does not see a PEP 695 type parameter.
+ItemT = TypeVar("ItemT")
+
+
+class StrictMsgspecFieldBody(Serializer, forbid_unknown_fields=True):
+    id: int = msgspec.field(default=0, name="ID")
+    tags: list[str] = msgspec.field(default_factory=list)
+    name: str
+
+    class Config:
+        read_only = {"id", "tags"}
+
+
+def _echo_api(body_type: type) -> BoltAPI:
+    """An API whose POST /strict answers with the dump of its body."""
+    api = BoltAPI()
+
+    async def create(body):
+        return body.dump()
+
+    create.__annotations__ = {"body": body_type, "return": dict}
+    api.post("/strict")(create)
+    return api
 
 
 class NoDefaultBody(Serializer):
@@ -174,6 +217,141 @@ class TestFieldFunction:
         assert subset.model_validate({"name": "a"}).id == 0
         with pytest.raises(msgspec.ValidationError, match="unknown field `id`"):
             subset.model_validate({"name": "a", "id": sent_id})
+
+    @pytest.mark.parametrize(
+        ("Strict", "expected"),
+        [
+            (StrictBaseIdChild, {"id": 0, "name": "a"}),
+            (StrictOtherModuleChild, {"id": 0, "tag": None, "tags": [], "userId": 0, "name": "a"}),
+            (LazyChild, {"id": 0, "label": None, "name": "a", "note": ""}),
+            (LazyBareChild, {"id": 0, "label": None, "name": "a"}),
+            (StrictMsgspecFieldBody, {"ID": 0, "tags": [], "name": "a"}),
+        ],
+    )
+    def test_a_strict_body_with_no_read_only_input_gets_the_defaults(self, Strict, expected):  # noqa: N803
+        with TestClient(_echo_api(Strict)) as client:
+            response = client.post("/strict", json={"name": "a"})
+        assert response.status_code == 200
+        assert response.json() == expected
+
+    @pytest.mark.parametrize(
+        ("Strict", "input_name", "sent_value"),
+        [
+            (StrictBaseIdChild, "id", 0),
+            (StrictBaseIdChild, "id", 5),
+            (StrictOtherModuleChild, "id", 0),
+            (StrictOtherModuleChild, "id", 5),
+            (StrictOtherModuleChild, "tag", None),
+            (StrictOtherModuleChild, "tag", {"label": "x"}),
+            (StrictOtherModuleChild, "tags", []),
+            (StrictOtherModuleChild, "tags", ["x"]),
+            (StrictOtherModuleChild, "userId", 0),
+            (StrictOtherModuleChild, "userId", 5),
+            (LazyChild, "id", 0),
+            (LazyChild, "label", None),
+            (LazyChild, "label", {"text": "x"}),
+            (LazyBareChild, "id", 0),
+            (LazyBareChild, "label", None),
+            (StrictMsgspecFieldBody, "ID", 0),
+            (StrictMsgspecFieldBody, "ID", 5),
+            (StrictMsgspecFieldBody, "tags", []),
+        ],
+    )
+    def test_a_strict_body_refuses_each_value_of_a_config_read_only_field(  # noqa: N803
+        self, Strict, input_name, sent_value
+    ):
+        """A field of a base class, or with a msgspec.field() default, follows the rule of field(read_only=True).
+
+        An input value that is equal to the default is an unknown field, as is
+        each other value.
+        """
+        with TestClient(_echo_api(Strict)) as client:
+            response = client.post("/strict", json={"name": "a", input_name: sent_value})
+        assert response.status_code == 422
+        assert f"unknown field `{input_name}`" in response.text
+
+    def test_config_read_only_keeps_the_field_order_of_a_base_class(self):
+        """The field order sets the array of array_like and the positional arguments."""
+
+        class Base(Serializer, kw_only=False, array_like=True):
+            id: int = 0
+            other: int = 1
+
+        class Child(Base):
+            class Config:
+                read_only = {"id"}
+
+        class StrictChild(Base, kw_only=False, forbid_unknown_fields=True):
+            class Config:
+                read_only = {"id"}
+
+        for cls in (Child, StrictChild):
+            assert cls.__struct_fields__ == ("id", "other")
+            assert msgspec.json.encode(cls(other=2)) == b"[0,2]"
+            assert cls(5).id == 5
+
+        # A keyword-only declaration of `id` would move it after `other`.
+        with pytest.raises(ImproperlyConfigured, match=r"KwOnlyChild\.Config\.read_only.*`id`.*positional"):
+
+            class KwOnlyChild(Base, forbid_unknown_fields=True):
+                class Config:
+                    read_only = {"id"}
+
+    def test_config_read_only_names_a_base_field_with_a_forward_reference(self):
+        """Without forbid_unknown_fields, the annotation resolves later, as for each other field."""
+        assert AuthoredChild.model_validate({"author": {"name": "x"}}).author is None
+        assert AuthoredChild(author=Author(name="x")).dump() == {"author": {"name": "x"}}
+
+    def test_config_read_only_names_a_base_field_with_an_unknown_annotation(self):
+        """A forward reference that does not resolve is an error at class creation."""
+
+        class Base(Serializer):
+            other: Missing | None = None  # noqa: F821
+            name: str
+
+        with pytest.raises(ImproperlyConfigured, match=r"Child\.Config\.read_only.*`other`.*Missing"):
+
+            class Child(Base, forbid_unknown_fields=True):
+                class Config:
+                    read_only = {"other"}
+
+    def test_config_read_only_names_a_field_of_a_bound_generic_base(self):
+        """The type argument of the base class gives the type of the field."""
+
+        class Base(Serializer, Generic[ItemT]):
+            item: ItemT | None = None
+            name: str = ""
+
+        class Middle(Base[int]):
+            pass
+
+        class Child(Base[int], forbid_unknown_fields=True):
+            class Config:
+                read_only = {"item"}
+
+        class GrandChild(Middle, forbid_unknown_fields=True):
+            class Config:
+                read_only = {"item"}
+
+        for cls in (Child, GrandChild):
+            assert cls.model_validate({"name": "a"}).item is None
+            assert cls(item=3).item == 3
+            for sent_value in (None, 3):
+                with pytest.raises(msgspec.ValidationError, match="unknown field `item`"):
+                    cls.model_validate({"item": sent_value})
+
+    def test_config_read_only_names_a_base_field_with_a_type_parameter(self):
+        """The class has no value for the type parameter. This is an error at class creation."""
+
+        class Base[T](Serializer):
+            item: T | None = None
+            name: str
+
+        with pytest.raises(ImproperlyConfigured, match=r"Child\.Config\.read_only.*`item`.*type parameter"):
+
+            class Child(Base, forbid_unknown_fields=True):
+                class Config:
+                    read_only = {"item"}
 
     def test_read_only_field_with_no_default_cannot_validate_input(self):
         """Input has no value for the field, and there is no default to use."""
