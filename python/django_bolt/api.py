@@ -29,6 +29,7 @@ from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
 
 from . import _core, _json
+from ._bridge import make_bound_dispatch
 from ._kwargs import (
     compile_argument_injector,
     compile_binder,
@@ -78,7 +79,12 @@ from .middleware.compiler import (
 )
 from .middleware.compression import check_compression, compression_setting
 from .middleware.django_loader import load_django_middleware
-from .middleware.middleware import FunctionMiddlewareSpec, mark_route_handler, normalize_middleware_specs
+from .middleware.middleware import (
+    FunctionMiddlewareSpec,
+    mark_route_handler,
+    normalize_middleware_specs,
+    skip_middleware,
+)
 from .middleware_response import MiddlewareResponse
 from .openapi import (
     OpenAPIConfig,
@@ -405,6 +411,9 @@ def _validate_asgi_mount_conflicts(
             )
 
 
+# A TestClient puts this key in ``request.state``. The error path then keeps a server error in it.
+SERVER_EXCEPTION_STATE_KEY = "_bolt_server_exception"
+
 # RFC 9110 section 15: a final response status is from 200 to 599.
 _MIN_RESPONSE_STATUS = 200
 _MAX_RESPONSE_STATUS = 599
@@ -598,6 +607,22 @@ def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: s
     new_message = dict(message)
     new_message["headers"] = rewritten
     return new_message
+
+
+# The path of the route for a request that matches no route. The router does
+# not get this route, so no request matches the path.
+_NO_ROUTE_PATH = "/__bolt_no_route__"
+
+
+# A rate limit of the API counts the requests of its routes only.
+@skip_middleware("rate_limit")
+def _no_route(request) -> None:
+    """The handler of the route for a request that matches no route.
+
+    Rust sends such a request with its answer, and the middleware chain
+    returns the answer before the handler.
+    """
+    raise RuntimeError("Bolt calls no handler for a request that matches no route")
 
 
 class _ErrorResponseFailure(Exception):
@@ -846,6 +871,9 @@ class BoltAPI:
         # handler can have different skip lists.
         self._route_global_chain_cache: dict[int, Callable] = {}
         self._route_executor_lock = threading.Lock()
+        # (handler_id, handler) of the route for a request that matches no route.
+        # ``_no_route_handler`` makes it at the first call.
+        self._no_route: tuple[int, Callable] | None = None
 
         # Handler-to-API mapping for merged APIs (initialized here to avoid hasattr in hot path)
         self._handler_api_map: dict[int, BoltAPI] = {}
@@ -1522,8 +1550,8 @@ class BoltAPI:
             name: Optional base URL-reverse name. Standard actions are named
                 ``{name}-{action}`` (e.g. "user-list", "user-retrieve"); custom
                 @action routes are named ``{name}-{action_name}``. When omitted,
-                the base defaults to the slugified ViewSet class name, so
-                ``UserViewSet`` yields "user-view-set-list", "user-view-set-retrieve",
+                the base is the ViewSet class name as written, so
+                ``UserViewSet`` yields "UserViewSet-list", "UserViewSet-retrieve",
                 etc. -- reverse() works without an explicit name (a derived base is
                 non-explicit, so it loses collisions to explicitly named routes).
             guards: Optional guards to apply to all routes. An @action that sets
@@ -1921,6 +1949,7 @@ class BoltAPI:
         _name_explicit: bool = True,
         _skip_prefix: bool = False,
         _router_middleware: list[Any] | None = None,
+        _routable: bool = True,
     ):
         # RFC 9110 section 15: a final status is from 200 to 599. A 1xx status is interim.
         if status_code is not None and not _MIN_RESPONSE_STATUS <= int(status_code) <= _MAX_RESPONSE_STATUS:
@@ -1957,7 +1986,9 @@ class BoltAPI:
             full_path = _normalize_path(full_path, self.trailing_slash)
             _refuse_repeated_path_params(full_path)
 
-            self._routes.append((method, full_path, handler_id, fn))
+            # The router does not get a route that is not routable.
+            if _routable:
+                self._routes.append((method, full_path, handler_id, fn))
             self._handlers[handler_id] = fn
             # A config decorator that runs after this one is above it, and has no effect.
             mark_route_handler(fn)
@@ -1977,7 +2008,8 @@ class BoltAPI:
 
             # Django middleware gets the handler as the view in process_view. It reads
             # the flags that view decorators set, such as @csrf_exempt and @login_not_required.
-            meta["view_func"] = fn
+            # A route that is not routable has no view, as Django finds none for a 404.
+            meta["view_func"] = fn if _routable else None
 
             request_param_names = {
                 field.name for field in meta.get("fields", []) if getattr(field, "source", None) == "request"
@@ -2310,6 +2342,13 @@ class BoltAPI:
             )
             meta["can_lane_dispatch"] = can_lane_dispatch
             middleware_meta["can_lane_dispatch"] = can_lane_dispatch
+            # A response that Rust gives before the handler then goes through
+            # the Python middleware of the route: a 401 or a 403 of auth or a
+            # guard, or the 404 or 405 of the route that is not routable.
+            middleware_meta["runs_python_middleware"] = meta["_middleware_api"] is not None
+            meta["_takes_rust_answer"] = meta["_middleware_api"] is not None and (
+                not _routable or bool(effective_auth_backends) or bool(middleware_meta.get("guards"))
+            )
             # Rust installs WorkerLoop as the running loop while executing the
             # trivially-async sync fast path. This keeps create_task() and
             # get_running_loop() valid even when the coroutine never awaits.
@@ -3349,6 +3388,10 @@ class BoltAPI:
         """
         if self._logging_middleware and is_server_exception(e):
             self._logging_middleware.log_exception(request, e)
+        state = request.state
+        if SERVER_EXCEPTION_STATE_KEY in state and is_server_exception(e):
+            # Only a TestClient sets the key. The client raises the exception in the test.
+            state[SERVER_EXCEPTION_STATE_KEY] = e
         try:
             # Without a formatter, the handler reads the Django DEBUG setting.
             if self._error_formatter is None:
@@ -3572,6 +3615,18 @@ class BoltAPI:
                     return rejection
                 return await self._execute_handler_as_middleware_response(handler, req, meta)
 
+        if meta["_takes_rust_answer"]:
+            # Rust gives the answer of a request that it rejected or that matches
+            # no route as the response of the handler. The handler does not run.
+            # The answer is in a read-only field, so middleware cannot remove it.
+            execute_route = execute_handler
+
+            async def execute_handler(req):
+                rust_answer = req._rust_answer
+                if rust_answer is not None:
+                    return MiddlewareResponse.from_tuple(rust_answer)
+                return await execute_route(req)
+
         chain = execute_handler
         for middleware_spec in reversed(route_specs):
             if not self._is_python_middleware_spec(middleware_spec):
@@ -3609,6 +3664,32 @@ class BoltAPI:
                 self._route_executor_cache[key] = cached_executor
 
         return cached_executor
+
+    def _no_route_handler(self) -> tuple[int, Callable]:
+        """Return ``(handler_id, handler)`` of the route for a request that matches no route.
+
+        Rust answers such a request with a 404 or a 405. The metadata of this
+        route has the access-log filter of the API. When the API has Python
+        middleware, Rust sends the answer through the middleware of the API, as
+        Django runs each middleware for a 404.
+        """
+        if self._no_route is None:
+            handler_id = self._next_handler_id
+            self._route_decorator(
+                "GET", _NO_ROUTE_PATH, auth=[], guards=[], include_in_schema=False, _skip_prefix=True, _routable=False
+            )(_no_route)
+            self._no_route = (handler_id, _no_route)
+        return self._no_route
+
+    def _rust_no_route(self) -> tuple[int, Callable, Callable, Callable]:
+        """Return the route for a request that matches no route, in the form of ``_core.register_routes``."""
+        handler_id, handler = self._no_route_handler()
+        return (
+            handler_id,
+            handler,
+            make_bound_dispatch(self._dispatch, handler, handler_id),
+            make_bound_dispatch(self._dispatch_sync, handler, handler_id),
+        )
 
     async def _dispatch_with_middleware(
         self,

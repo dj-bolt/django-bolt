@@ -946,7 +946,7 @@ def test_cursor_pagination_refuses_a_foreign_key_to_a_model_with_a_default_order
     async def list_comments(request):
         return Comment.objects.all()
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/comments")
 
     assert response.status_code == 500
@@ -1015,7 +1015,7 @@ def test_cursor_pagination_values_queryset_without_primary_key_is_an_error(sampl
     async def list_articles(request):
         return Article.objects.values("title", "author")
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/articles")
 
     assert response.status_code == 500
@@ -1033,7 +1033,7 @@ def test_cursor_pagination_of_a_list_is_an_error_that_names_the_queryset(setting
     async def list_articles(request):
         return [{"id": 1, "title": "Article 1"}]
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/articles")
 
     assert response.status_code == 500
@@ -2273,7 +2273,7 @@ def test_cursor_pagination_after_a_null_ordering_value_is_an_error(settings):
     async def list_profiles(request):
         return UserProfile.objects.all()
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/profiles")
 
     assert response.status_code == 500
@@ -2295,7 +2295,7 @@ def test_cursor_pagination_values_queryset_without_the_ordering_field_is_an_erro
     async def list_articles(request):
         return Article.objects.values("title")
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/articles")
 
     assert response.status_code == 500

@@ -346,6 +346,22 @@ async def options_items():
     )
 ```
 
+Each response copies its `headers` dict.
+A change through `response.headers` does not change the dict that you gave.
+Thus many responses can use one module-level dict.
+
+```python
+from django_bolt import JSON
+
+COMMON_HEADERS = {"X-Service": "api"}
+
+@api.get("/items")
+async def list_items():
+    response = JSON({"items": []}, headers=COMMON_HEADERS)
+    response.headers["X-Count"] = "0"  # COMMON_HEADERS does not change
+    return response
+```
+
 ## Setting cookies
 
 Use the `.set_cookie()` method on any response type:
