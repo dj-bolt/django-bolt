@@ -590,6 +590,7 @@ pub(crate) fn configure_file_scopes(cfg: &mut web::ServiceConfig, state: &AppSta
 }
 
 #[pyfunction]
+#[pyo3(signature = (routes, native_routes, no_route=None))]
 #[expect(
     clippy::type_complexity,
     reason = "PyO3 wire format: Python passes each route as one tuple"
@@ -598,8 +599,9 @@ pub fn register_routes(
     py: Python<'_>,
     routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
     native_routes: Vec<crate::native::NativeRouteSpec>,
+    no_route: Option<crate::native::NoRouteSpec>,
 ) -> PyResult<()> {
-    let router = crate::native::build_router(py, routes, native_routes)?;
+    let router = crate::native::build_router(py, routes, native_routes, no_route)?;
     GLOBAL_ROUTER
         .set(Arc::new(router))
         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Router already initialized"))?;

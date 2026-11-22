@@ -5,24 +5,7 @@ from __future__ import annotations
 import pytest
 
 from .apps import app_module
-
-_LOGGING = """
-LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {"plain": {"format": "%(levelname)s %(message)s"}},
-    "handlers": {
-        "file": {
-            "class": "logging.FileHandler",
-            "filename": str(BASE_DIR / "access.log"),
-            "formatter": "plain",
-        }
-    },
-    "loggers": {
-        "django.server": {"handlers": ["file"], "level": "INFO", "propagate": False}
-    },
-}
-"""
+from .helpers import access_log_settings
 
 _PATHS = ("/fast", "/fast", "/slow", "/gone", "/sampled/ok", "/sampled/ok", "/sampled/gone", "/sampled/down")
 
@@ -30,7 +13,7 @@ _PATHS = ("/fast", "/fast", "/slow", "/gone", "/sampled/ok", "/sampled/ok", "/sa
 def _run(make_server_project, settings: str) -> list[str]:
     project = make_server_project(
         api_module=app_module("access_log_filters"),
-        settings_extra=_LOGGING + settings,
+        settings_extra=access_log_settings() + settings,
     )
     with project.start(startup_path="/health") as server:
         for path in _PATHS:
@@ -58,7 +41,7 @@ def test_access_log_applies_the_sample_rate_of_a_logging_config(make_server_proj
 def test_access_log_filters_the_redirect_and_the_options_answer_of_a_route(make_server_project):
     project = make_server_project(
         api_module=app_module("access_log_filters"),
-        settings_extra=_LOGGING,
+        settings_extra=access_log_settings(),
     )
     with project.start(startup_path="/health") as server:
         # Rust gives these answers before the handler runs.
