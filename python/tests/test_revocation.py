@@ -5,6 +5,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import jwt
 import pytest
 from django.core.cache import caches
 from django.core.cache.backends.locmem import LocMemCache
@@ -13,12 +14,14 @@ from django.core.management import call_command
 from django.db import IntegrityError
 
 from django_bolt import BoltAPI
-from django_bolt.auth import JWTAuthentication, JWTAuthViews
+from django_bolt.auth import JWTAuthentication, JWTAuthViews, TokenRotationError, rotate_refresh_token
+from django_bolt.auth import revocation as revocation_module
 from django_bolt.auth.revocation import (
     _DEFAULT_TTL_SECONDS,
     DjangoCacheRevocation,
     DjangoORMRevocation,
     InMemoryRevocation,
+    ReservedJtiError,
     RevocationStore,
     _ttl_for,
 )
@@ -67,9 +70,9 @@ def test_in_memory_consume_is_single_use():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("leeway", "expected"), [(0, 3600), (60, 3660)], ids=["no-leeway", "leeway-60"])
+@pytest.mark.parametrize(("leeway", "expected"), [(0, 3601), (60, 3661)], ids=["no-leeway", "leeway-60"])
 def test_ttl_for_derives_from_future_exp(leeway, expected):
-    """exp in the future → seconds until ``exp + leeway``."""
+    """exp in the future → seconds until the end of the second ``exp + leeway``."""
     exp = int(time.time()) + 3600
     resolved = _ttl_for(exp, leeway=leeway)
     # Allow ±2s drift between the time.time() inside _ttl_for and the
@@ -88,7 +91,7 @@ def test_ttl_for_clamps_past_exp_to_zero(leeway):
 def test_ttl_for_keeps_an_entry_for_a_token_inside_the_leeway():
     """The backend still accepts a token 10 seconds after ``exp``. Its entry must live."""
     just_expired = int(time.time()) - 10
-    assert 48 <= _ttl_for(just_expired, leeway=60) <= 50
+    assert 49 <= _ttl_for(just_expired, leeway=60) <= 51
     assert _ttl_for(just_expired, leeway=0) == 0
 
 
@@ -122,14 +125,14 @@ def test_cache_revocation_no_exp_uses_default():
 
 
 def test_cache_revocation_exp_drives_timeout():
-    """revoke(jti, exp=future) → cache timeout ≈ exp + leeway - now."""
+    """revoke(jti, exp=future) → cache timeout ≈ exp + leeway + 1 - now."""
     store, mock_cache = _make_cache_revocation()
     exp = int(time.time()) + 3600
     asyncio.run(store.revoke("jti-2", exp=exp))
 
     _, call_kwargs = mock_cache.set.call_args
     timeout = call_kwargs["timeout"]
-    assert 3658 <= timeout <= 3660
+    assert 3659 <= timeout <= 3661
 
 
 def test_cache_revocation_past_exp_clamps_to_zero():
@@ -161,7 +164,7 @@ def test_cache_revocation_per_call_exp_beats_per_instance_default():
 
     _, call_kwargs = mock_cache.set.call_args
     timeout = call_kwargs["timeout"]
-    assert 3658 <= timeout <= 3660
+    assert 3659 <= timeout <= 3661
 
 
 @pytest.mark.parametrize("store_class", [DjangoCacheRevocation, DjangoORMRevocation])
@@ -446,6 +449,15 @@ PAST = -3600
 # 10 seconds after ``exp``: the default leeway of 60 seconds still accepts the token.
 IN_LEEWAY = -10
 
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    """Stop ``time.time`` at the start of a second, so that ``exp == now`` stays true in the test."""
+    now = float(int(time.time()))
+    monkeypatch.setattr(time, "time", lambda: now)
+    return int(now)
+
+
 _CACHE_MARKER_CASES = pytest.mark.parametrize(
     ("kwargs", "exp_offset", "marker_lives"),
     [
@@ -453,6 +465,7 @@ _CACHE_MARKER_CASES = pytest.mark.parametrize(
         ({}, PAST, False),
         ({}, IN_LEEWAY, True),
         ({"leeway": 0}, IN_LEEWAY, False),
+        ({"leeway": 0}, 0, True),
         ({"default_ttl": 0}, None, False),
         ({"default_ttl": 900}, None, True),
     ],
@@ -461,6 +474,7 @@ _CACHE_MARKER_CASES = pytest.mark.parametrize(
         "exp-in-past",
         "exp-inside-leeway",
         "exp-in-past-no-leeway",
+        "exp-now-no-leeway",
         "default-ttl-zero",
         "default-ttl-900",
     ],
@@ -468,19 +482,20 @@ _CACHE_MARKER_CASES = pytest.mark.parametrize(
 
 
 @_CACHE_MARKER_CASES
-def test_cache_consume_marker_lifetime(cache_store, kwargs, exp_offset, marker_lives):
+def test_cache_consume_marker_lifetime(cache_store, frozen_now, kwargs, exp_offset, marker_lives):
     """The marker lives until ``exp + leeway``. With no ``exp`` it lives for ``default_ttl`` seconds."""
     store = cache_store(**kwargs)
-    exp = None if exp_offset is None else int(time.time()) + exp_offset
+    exp = None if exp_offset is None else frozen_now + exp_offset
 
-    assert asyncio.run(store.consume("a", exp=exp)) is True
-    assert asyncio.run(store.consume("a", exp=exp)) is (not marker_lives)
+    # A consume that cannot keep its marker refuses the token, on each call.
+    assert asyncio.run(store.consume("a", exp=exp)) is marker_lives
+    assert asyncio.run(store.consume("a", exp=exp)) is False
 
 
 @_CACHE_MARKER_CASES
-def test_cache_family_marker_lifetime(cache_store, kwargs, exp_offset, marker_lives):
+def test_cache_family_marker_lifetime(cache_store, frozen_now, kwargs, exp_offset, marker_lives):
     store = cache_store(**kwargs)
-    exp = None if exp_offset is None else int(time.time()) + exp_offset
+    exp = None if exp_offset is None else frozen_now + exp_offset
 
     asyncio.run(store.revoke_family("f", exp=exp))
 
@@ -593,7 +608,7 @@ def test_orm_consume_is_single_use_for_each_jti(orm_store):
     [
         ({}, FUTURE, FUTURE + 60),
         ({"leeway": 0}, FUTURE, FUTURE),
-        ({}, PAST, 0),
+        ({"leeway": 0}, 0, 1),
         ({}, IN_LEEWAY, 50),
         ({}, None, _DEFAULT_TTL_SECONDS),
         ({"default_ttl": 900}, None, 900),
@@ -601,20 +616,31 @@ def test_orm_consume_is_single_use_for_each_jti(orm_store):
     ids=[
         "exp-in-future",
         "exp-in-future-no-leeway",
-        "exp-in-past",
+        "exp-now-no-leeway",
         "exp-inside-leeway",
         "module-default",
         "default-ttl-900",
     ],
 )
-def test_orm_consume_row_expires_with_the_token(orm_store, kwargs, exp_offset, expected):
+def test_orm_consume_row_expires_with_the_token(orm_store, frozen_now, kwargs, exp_offset, expected):
     """The row expires at ``exp + leeway``, the time when the backend stops accepting the token."""
     store = orm_store(**kwargs)
-    exp = None if exp_offset is None else int(time.time()) + exp_offset
+    exp = None if exp_offset is None else frozen_now + exp_offset
 
     assert asyncio.run(store.consume("a", exp=exp)) is True
 
     assert _expires_in("a") == pytest.approx(expected, abs=3)
+
+
+@pytest.mark.parametrize(("kwargs", "exp_offset"), [({}, PAST), ({"leeway": 0}, IN_LEEWAY)])
+def test_orm_consume_refuses_a_token_that_the_backend_no_longer_accepts(orm_store, kwargs, exp_offset):
+    """The cleanup task deletes an expired row, so the row cannot make a later consume fail."""
+    store = orm_store(**kwargs)
+    exp = int(time.time()) + exp_offset
+
+    assert asyncio.run(store.consume("a", exp=exp)) is False
+    assert asyncio.run(store.consume("a", exp=exp)) is False
+    assert not RevokedToken.objects.filter(jti="a").exists()
 
 
 def test_orm_family_revocation_is_per_family(orm_store):
@@ -627,7 +653,6 @@ def test_orm_family_revocation_is_per_family(orm_store):
     assert asyncio.run(store.is_family_revoked("g")) is False
     # A family and a token with the same name are not the same thing.
     assert asyncio.run(store.is_revoked("f")) is False
-    assert asyncio.run(store.is_revoked("family:f")) is True
     assert _expires_in("family:f") == pytest.approx(FUTURE + 60, abs=3)
 
 
@@ -687,3 +712,214 @@ def test_jwt_auth_views_work_on_the_orm_store(orm_store):
 
         assert client.post("/auth/login", json=login).status_code == 200
         assert client.post("/auth/refresh", headers=no_csrf_origin).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# A jti must not use the key of a family or of a user version (#887)
+# ---------------------------------------------------------------------------
+
+_TOKEN_CALLS = pytest.mark.parametrize(
+    "call",
+    [
+        lambda store, jti: store.revoke(jti, exp=int(time.time()) + FUTURE),
+        lambda store, jti: store.consume(jti, exp=int(time.time()) + FUTURE),
+        lambda store, jti: store.is_revoked(jti),
+    ],
+    ids=["revoke", "consume", "is_revoked"],
+)
+
+
+@_TOKEN_CALLS
+@pytest.mark.parametrize(("jti", "key"), [("fam:f", "revoked:fam:f"), ("ver:u", "revoked:ver:u")])
+def test_cache_refuses_a_jti_that_uses_the_key_of_another_entry(cache_store, call, jti, key):
+    store = cache_store()
+
+    with pytest.raises(ReservedJtiError, match=f"^jti {jti!r} starts with a reserved prefix"):
+        asyncio.run(call(store, jti))
+
+    assert caches["revocation"].get(key) is None
+
+
+@_TOKEN_CALLS
+@pytest.mark.parametrize("jti", ["family:f", "version:u"])
+def test_orm_refuses_a_jti_that_uses_the_key_of_another_entry(orm_store, call, jti):
+    store = orm_store()
+
+    with pytest.raises(ReservedJtiError, match=f"^jti {jti!r} starts with a reserved prefix"):
+        asyncio.run(call(store, jti))
+
+    assert RevokedToken.objects.filter(jti=jti).exists() is False
+
+
+@pytest.mark.parametrize("jti", ["fam", "family:f"])
+def test_cache_accepts_a_jti_that_does_not_start_with_a_reserved_prefix(cache_store, jti):
+    store = cache_store()
+
+    asyncio.run(store.revoke(jti))
+
+    assert asyncio.run(store.is_revoked(jti)) is True
+
+
+@pytest.mark.parametrize("jti", ["family", "fam:f"])
+def test_orm_accepts_a_jti_that_does_not_start_with_a_reserved_prefix(orm_store, jti):
+    store = orm_store()
+
+    asyncio.run(store.revoke(jti))
+
+    assert asyncio.run(store.is_revoked(jti)) is True
+
+
+_SECRET = "a-secure-test-secret-that-is-long-enough"
+
+
+def _signed(typ: str, jti: str) -> str:
+    """Sign a token of type ``typ`` whose ``jti`` is not a UUID."""
+    now = int(time.time())
+    claims = {"sub": "u", "iat": now, "exp": now + FUTURE, "typ": typ, "jti": jti, "fam": "f", "ver": 0}
+    return jwt.encode(claims, _SECRET, algorithm="HS256")
+
+
+_RESERVED_JTI_STORES = pytest.mark.parametrize(
+    ("store_fixture", "jti"),
+    [("cache_store", "ver:u"), ("cache_store", "fam:f"), ("orm_store", "version:u"), ("orm_store", "family:f")],
+)
+
+
+@_RESERVED_JTI_STORES
+def test_a_token_whose_jti_has_a_reserved_prefix_gets_a_401_at_authentication(request, caplog, store_fixture, jti):
+    """The store refuses the jti, so the backend refuses the token. A refused token is not a server error."""
+    store = request.getfixturevalue(store_fixture)()
+    api = BoltAPI()
+
+    @api.get("/protected", auth=[JWTAuthentication(secret=_SECRET, revocation_store=store)])
+    async def protected():
+        return {"ok": True}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/protected", headers={"Authorization": f"Bearer {_signed('access', jti)}"})
+
+    assert response.status_code == 401
+    assert "reserved prefix" not in caplog.text
+
+
+class _BrokenStore(InMemoryRevocation):
+    """A custom store with a bug: ``is_revoked`` raises a ``ValueError`` that is not ``ReservedJtiError``."""
+
+    async def is_revoked(self, jti: str) -> bool:
+        raise ValueError("bug in the store")
+
+
+def test_a_value_error_of_a_broken_store_is_not_a_revoked_token(caplog):
+    """Only ``ReservedJtiError`` means a revoked token. Another error of the store stays a server error."""
+    api = BoltAPI()
+
+    @api.get("/protected", auth=[JWTAuthentication(secret=_SECRET, revocation_store=_BrokenStore())])
+    async def protected():
+        return {"ok": True}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/protected", headers={"Authorization": f"Bearer {_signed('access', 'jti-1')}"})
+
+    assert response.status_code == 500
+    assert "bug in the store" in caplog.text
+
+
+def test_logout_with_a_broken_store_is_a_server_error(caplog):
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return _ViewsUser()
+
+    JWTAuthViews(store=_BrokenStore(), secret=_SECRET, secure_cookies=False, credential_validator=validate).register(
+        api
+    )
+    headers = {"Cookie": f"refresh_token={_signed('refresh', 'jti-1')}", "Sec-Fetch-Site": "none"}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.post("/auth/logout", headers=headers)
+
+    assert response.status_code == 500
+    assert "bug in the store" in caplog.text
+
+
+@pytest.mark.parametrize("path", ["/auth/logout", "/auth/logout-all"])
+@_RESERVED_JTI_STORES
+def test_logout_with_a_token_whose_jti_has_a_reserved_prefix_gives_the_uniform_401(
+    request, caplog, store_fixture, jti, path
+):
+    store = request.getfixturevalue(store_fixture)()
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return _ViewsUser()
+
+    JWTAuthViews(store=store, secret=_SECRET, secure_cookies=False, credential_validator=validate).register(api)
+    headers = {"Cookie": f"refresh_token={_signed('refresh', jti)}", "Sec-Fetch-Site": "none"}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.post(path, headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid token"
+    assert "reserved prefix" not in caplog.text
+    # The user version stays, so the live tokens of the user stay valid.
+    assert asyncio.run(store.get_user_version("u")) == 0
+    assert asyncio.run(store.is_family_revoked("f")) is False
+
+
+def test_refresh_of_a_token_whose_jti_has_a_reserved_prefix_gives_the_uniform_401(cache_store):
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return _ViewsUser()
+
+    JWTAuthViews(store=cache_store(), secret=_SECRET, secure_cookies=False, credential_validator=validate).register(api)
+    headers = {"Cookie": f"refresh_token={_signed('refresh', 'ver:u')}", "Sec-Fetch-Site": "none"}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.post("/auth/refresh", headers=headers)
+
+    assert response.status_code == 401
+
+
+def test_reusable_refresh_of_a_token_whose_jti_has_a_reserved_prefix_raises_token_rotation_error(cache_store):
+    claims = jwt.decode(_signed("refresh", "ver:u"), _SECRET, algorithms=["HS256"])
+
+    with pytest.raises(TokenRotationError):
+        asyncio.run(rotate_refresh_token(claims, store=cache_store(), secret=_SECRET, rotate=False))
+
+
+class _SteppingClock:
+    """A clock that moves a little at each read, so a read order is visible.
+
+    The first read is just before the second 101 and the next reads are in it.
+    """
+
+    def __init__(self) -> None:
+        self.reads = iter([100.999, 101.0, 101.0, 101.0])
+
+    def time(self) -> float:
+        return next(self.reads)
+
+    def now(self, tz=None) -> datetime:
+        return datetime.fromtimestamp(self.time(), tz)
+
+
+@pytest.mark.parametrize("method", ["revoke", "revoke_family", "consume"])
+def test_orm_entry_lives_to_the_end_of_exp_plus_leeway_at_a_second_boundary(orm_store, monkeypatch, method):
+    """The TTL and the base time come from two reads of the clock.
+
+    When the second changes between the reads, ``expires_at`` must still not
+    be before the end of the second ``exp + leeway``. The backend accepts the token
+    until then, so the cleanup task must keep the row until then.
+    """
+    clock = _SteppingClock()
+    monkeypatch.setattr(revocation_module, "time", clock)
+    monkeypatch.setattr(revocation_module, "datetime", clock)
+    store = orm_store()
+    exp = 200
+
+    asyncio.run(getattr(store, method)("jti-1", exp=exp))
+
+    row = RevokedToken.objects.get(jti="family:jti-1" if method == "revoke_family" else "jti-1")
+    assert row.expires_at.timestamp() >= exp + store.leeway + 1
