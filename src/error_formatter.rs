@@ -176,6 +176,7 @@ fn error_request(py: Python<'_>, req: &HttpRequest, state: &AppState) -> PyResul
         raw_cookies: None,
         context: None,
         user: None,
+        anonymous_user: pyo3::sync::PyOnceLock::new(),
         state: std::sync::OnceLock::new(),
         form_map: None,
         files_map: None,

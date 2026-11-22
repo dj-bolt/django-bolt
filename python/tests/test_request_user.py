@@ -8,6 +8,10 @@ for different authentication backends via actual HTTP requests.
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
+import sys
+import textwrap
 import time
 from types import SimpleNamespace
 
@@ -20,8 +24,10 @@ from django_bolt.auth import (
     APIKeyAuthentication,
     IsAuthenticated,
     JWTAuthentication,
+    SessionAuthentication,
 )
 from django_bolt.exceptions import HTTPException
+from django_bolt.middleware import DjangoMiddlewareStack
 from django_bolt.testing import TestClient
 
 
@@ -56,9 +62,9 @@ def jwt_api():
 
     @api.get("/profile")
     async def get_profile(request):
-        """Public endpoint - request.user should not be loaded."""
+        """Public endpoint - request.user is the anonymous user."""
         user = request.user
-        return {"is_authenticated": bool(user)}
+        return {"is_authenticated": user.is_authenticated}
 
     return api
 
@@ -79,7 +85,7 @@ def api_key_api():
         # APIKeyAuthentication doesn't provide user mapping by default
         return {
             "data": "sensitive",
-            "user_loaded": bool(user),
+            "user_loaded": user.is_authenticated,
         }
 
     return api
@@ -319,6 +325,160 @@ class TestJWTUserLoading:
 
         assert response.status_code == 200, response.text
         assert response.json() == {"is_anonymous": True, "is_authenticated": False}
+
+    @pytest.mark.parametrize("handler_is_async", [True, False], ids=["async", "sync"])
+    @pytest.mark.parametrize(
+        ("auth", "headers"),
+        [
+            (None, {}),
+            ([JWTAuthentication(secret="test-secret")], {}),
+            ([APIKeyAuthentication(api_keys={"valid-key-123"})], {}),
+            ([APIKeyAuthentication(api_keys={"valid-key-123"})], {"X-API-Key": "valid-key-123"}),
+        ],
+        ids=["no-auth", "jwt-no-token", "api-key-no-key", "api-key-valid"],
+    )
+    def test_both_forms_give_the_anonymous_user_when_there_is_no_user(self, auth, headers, handler_is_async):
+        """Issue #916: request.user and await request.auser() agree, as with Django's AuthenticationMiddleware."""
+        api = BoltAPI()
+
+        def describe(user) -> dict:
+            return {"type": type(user).__name__, "is_authenticated": user.is_authenticated}
+
+        if handler_is_async:
+
+            @api.get("/who", auth=auth)
+            async def who(request):
+                auser = await request.auser()
+                return {"user": describe(request.user), "auser": describe(auser), "same": auser is request.user}
+
+        else:
+
+            @api.get("/who", auth=auth)
+            def who(request):
+                return {"user": describe(request.user), "auser": None, "same": request.user is request.user}
+
+        with TestClient(api) as client:
+            response = client.get("/who", headers=headers)
+
+        assert response.status_code == 200, response.text
+        anonymous = {"type": "AnonymousUser", "is_authenticated": False}
+        assert response.json() == {
+            "user": anonymous,
+            "auser": anonymous if handler_is_async else None,
+            "same": True,
+        }
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize("handler_is_async", [True, False], ids=["async", "sync"])
+    @pytest.mark.parametrize(
+        ("route_kind", "headers"),
+        [
+            ("no-auth", {}),
+            ("jwt", {}),
+            ("api-key", {"X-API-Key": "valid-key-123"}),
+            ("session", {}),
+            ("lane", {}),
+        ],
+        ids=["no-auth", "jwt-no-token", "api-key-valid", "session-no-login", "lane-no-auth"],
+    )
+    def test_an_is_authenticated_check_denies_an_anonymous_request(self, route_kind, headers, handler_is_async):
+        """The migration of #916: ``if not request.user.is_authenticated`` denies a request with no user.
+
+        A valid token for an existing user passes the same check, so the check does not deny everything.
+        """
+        user = User.objects.create_user(username="checked")
+        stack = [
+            DjangoMiddlewareStack(
+                [
+                    "django.contrib.sessions.middleware.SessionMiddleware",
+                    "django.contrib.auth.middleware.AuthenticationMiddleware",
+                ]
+            )
+        ]
+        api = BoltAPI(middleware=stack) if route_kind == "lane" else BoltAPI()
+        auth = {
+            "no-auth": None,
+            "jwt": [JWTAuthentication(secret="test-secret")],
+            "api-key": [APIKeyAuthentication(api_keys={"valid-key-123"})],
+            "session": [SessionAuthentication()],
+            "lane": None,
+        }[route_kind]
+
+        if handler_is_async:
+
+            @api.get("/check", auth=auth)
+            async def check(request):
+                if not request.user.is_authenticated:
+                    raise HTTPException(status_code=401, detail="Sign in")
+                if not (await request.auser()).is_authenticated:
+                    raise HTTPException(status_code=401, detail="Sign in")
+                return {"ok": True}
+
+        else:
+
+            @api.get("/check", auth=auth)
+            def check(request):
+                if not request.user.is_authenticated:
+                    raise HTTPException(status_code=401, detail="Sign in")
+                return {"ok": True}
+
+        @api.get("/control", auth=[JWTAuthentication(secret="test-secret")])
+        def control(request):
+            if not request.user.is_authenticated:
+                raise HTTPException(status_code=401, detail="Sign in")
+            return {"ok": True}
+
+        with TestClient(api) as client:
+            anonymous = client.get("/check", headers=headers)
+            signed_in = client.get(
+                "/control", headers={"Authorization": f"Bearer {create_jwt_token(user_id=str(user.id))}"}
+            )
+
+        assert anonymous.status_code == 401, anonymous.text
+        assert signed_in.status_code == 200, signed_in.text
+
+    def test_without_the_auth_app_both_forms_give_none(self):
+        """Without django.contrib.auth there is no user model: both forms give None, and neither raises.
+
+        INSTALLED_APPS is fixed for the process, so the project runs in a subprocess.
+        """
+        script = textwrap.dedent(
+            """
+            import json
+            import django
+            from django.conf import settings
+
+            settings.configure(
+                INSTALLED_APPS=["django.contrib.contenttypes", "django_bolt"],
+                DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+                SECRET_KEY="x" * 50,
+            )
+            django.setup()
+            from django_bolt import BoltAPI
+            from django_bolt.testing import TestClient
+
+            api = BoltAPI()
+
+            @api.get("/sync")
+            def read_sync(request) -> dict:
+                return {"user": repr(request.user)}
+
+            @api.get("/async")
+            async def read_async(request) -> dict:
+                return {"user": repr(request.user), "auser": repr(await request.auser())}
+
+            with TestClient(api) as client:
+                responses = [client.get("/sync"), client.get("/async")]
+                print(json.dumps([[response.status_code, response.json()] for response in responses]))
+            """
+        )
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60, check=False)
+
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout.strip().splitlines()[-1]) == [
+            [200, {"user": "None"}],
+            [200, {"user": "None", "auser": "None"}],
+        ]
 
     @pytest.mark.django_db(transaction=True)  # Use real database transaction
     def test_authenticated_request_has_user(self, jwt_api):

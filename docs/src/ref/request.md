@@ -60,7 +60,7 @@ All attributes are read-only, except `user` and `auser`.
 | `META` | `dict[str, str]` | A Django `HttpRequest.META` dict. It has `REQUEST_METHOD`, `PATH_INFO`, `QUERY_STRING`, `SERVER_NAME`, `SERVER_PORT`, `SERVER_PROTOCOL`, `REMOTE_ADDR`, `REMOTE_HOST`, `SCRIPT_NAME`, `CONTENT_TYPE`, `CONTENT_LENGTH`, and `HTTP_*` for each header. Bolt builds it on the first read. |
 | `state` | `dict[str, Any]` | A dict for data of your own during the request. Middleware can put data in it. |
 | `context` | `dict \| None` | The data of the authentication backend, for example `user_id` and the JWT claims. `None` on a route with no authentication. |
-| `user` | `Any` | The user that the authentication backend found, or `None`. In an async handler, the first read runs a blocking database query. Django's `AuthenticationMiddleware` can set it. |
+| `user` | `Any` | The user that the authentication backend found. With no user, it is Django's `AnonymousUser`, the same object that `auser()` returns. Without `django.contrib.auth` in `INSTALLED_APPS`, it is `None`. In an async handler, the first read runs a blocking database query. Django's `AuthenticationMiddleware` can set it. |
 | `auser` | `Callable` | An async function that returns the user. It returns `AnonymousUser` when no user is authenticated. Django's `alogin()` and `alogout()` can set it. |
 | `scheme` | `str` | `"http"` or `"https"`. It is `"https"` only when a trusted proxy says so. `SECURE_PROXY_SSL_HEADER` applies, as in Django. |
 | `session` | `SessionBase` | The Django session. It exists only when Django's `SessionMiddleware` runs on the route. Without it, a read raises `AttributeError`. |

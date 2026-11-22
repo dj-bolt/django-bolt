@@ -27,8 +27,11 @@ def _alive(pid: int) -> bool:
 
 @pytest.mark.server_integration
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Multiprocess runs only on Linux.")
-@pytest.mark.parametrize("signum", [signal.SIGHUP, signal.SIGQUIT], ids=["SIGHUP", "SIGQUIT"])
-def test_supervisor_stops_its_workers_on_signal(make_server_project, signum):
+# Signal names, not signal.SIGHUP: Windows has no SIGHUP or SIGQUIT, and the
+# parameters are made when pytest collects the module, before skipif applies.
+@pytest.mark.parametrize("signal_name", ["SIGHUP", "SIGQUIT"])
+def test_supervisor_stops_its_workers_on_signal(make_server_project, signal_name):
+    signum = getattr(signal, signal_name)
     project = make_server_project(api_module=app_module("multiprocess_pid"))
     with project.start(processes=2) as server:
         workers = child_pids(server.process.pid)

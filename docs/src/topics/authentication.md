@@ -96,7 +96,7 @@ Each failure gets the same 401. The body does not tell the client why the token 
 
 !!! warning "`auth` alone does not reject a request"
     `auth=[...]` only tries to read a credential. A request with no token, or with a bad token, still reaches the handler.
-    Then `request.context` and `request.user` are `None`. Add a guard such as `IsAuthenticated()` to reject such a request.
+    Then `request.context` is `None`, and `request.user` is Django's `AnonymousUser`. Add a guard such as `IsAuthenticated()` to reject such a request.
 
 ## Issue a token
 
@@ -203,7 +203,8 @@ A token can be valid for a user that cannot log in. Bolt treats these cases as "
 Then `CurrentUser` answers 401, a read such as `request.user.id` answers 401, and `await request.auser()` gives `None`.
 A route that does not load the user still accepts the token. To reject the token on each route, [revoke it](#revoke-tokens).
 
-With no credential, `request.user` is `None` and `await request.auser()` gives Django's `AnonymousUser`.
+With no credential, `request.user` and `await request.auser()` give the same Django `AnonymousUser`, as Django's `AuthenticationMiddleware` does.
+Read `user.is_authenticated` to find out if a user signed in. `AnonymousUser` is true in a boolean test, so `if request.user:` does not work for this.
 
 ## Load the user with your own query
 
@@ -549,7 +550,7 @@ async def import_articles(request: Request) -> dict:
 
 The header value is the key, `Bearer <key>` or `ApiKey <key>`. Bolt compares keys in constant time.
 The context has `"user_id": "apikey:<key>"`, so do not log the context.
-A key has no Django user: `request.user` is `None`, and `await request.auser()` gives `AnonymousUser`.
+A key has no Django user: `request.user` and `await request.auser()` give `AnonymousUser`.
 
 `api_keys` must be a set, list or tuple of strings. A plain string, an empty key, or a key that starts with `Bearer ` or `ApiKey ` raises `ImproperlyConfigured`.
 Thus a missing environment variable stops startup.
