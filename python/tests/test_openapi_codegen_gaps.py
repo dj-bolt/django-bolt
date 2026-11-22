@@ -22,10 +22,10 @@ from typing import Generic, TypeVar
 import msgspec
 import pytest
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, ModelViewSet
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import OpenAPIStrictError, SchemaGenerator
-from django_bolt.pagination import PageNumberPagination, paginate
+from django_bolt.pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
 from django_bolt.responses import (
     HTML,
     EventSourceResponse,
@@ -254,6 +254,107 @@ def test_custom_pagination_envelope_in_schema():
     }
     # No trace of the default envelope.
     assert "PaginatedResponse_ArticleListSchema_" not in schema["components"]["schemas"]
+
+
+# ---------------------------------------------------------------------------
+# #917 — the query parameters of a paginated route
+# ---------------------------------------------------------------------------
+
+
+class SmallPages(PageNumberPagination):
+    page_size = 10
+    max_page_size = 50
+    page_size_query_param = "size"
+
+
+class FixedPageSize(CursorPagination):
+    page_size_query_param = None
+
+
+def _integer(**keywords) -> dict:
+    return {"type": "integer", **keywords}
+
+
+@pytest.mark.parametrize(
+    ("pagination_class", "expected"),
+    [
+        (
+            PageNumberPagination,
+            {
+                "page": _integer(minimum=1, default=1),
+                "page_size": _integer(minimum=1, maximum=1000, default=100),
+            },
+        ),
+        (
+            SmallPages,
+            {
+                "page": _integer(minimum=1, default=1),
+                "size": _integer(minimum=1, maximum=50, default=10),
+            },
+        ),
+        (
+            LimitOffsetPagination,
+            {
+                "limit": _integer(minimum=1, maximum=1000, default=100),
+                "offset": _integer(minimum=0, default=0),
+            },
+        ),
+        (
+            CursorPagination,
+            {
+                "cursor": {"type": "string"},
+                "page_size": _integer(minimum=1, maximum=1000, default=100),
+            },
+        ),
+        (FixedPageSize, {"cursor": {"type": "string"}}),
+    ],
+)
+def test_paginated_route_documents_its_query_parameters(pagination_class, expected):
+    """The operation lists each query parameter that the pagination class reads."""
+    api = BoltAPI(openapi_config=_config())
+
+    @api.get("/articles")
+    @paginate(pagination_class)
+    async def list_articles(request, title: str | None = None) -> list[ArticleListSchema]:
+        return Article.objects.order_by("id")
+
+    parameters = _get_schema(api)["paths"]["/articles"]["get"]["parameters"]
+    assert [p["name"] for p in parameters] == ["title", *expected]
+    schema_parameters = {p["name"]: p for p in parameters[1:]}
+    for name, schema in expected.items():
+        assert schema_parameters[name]["in"] == "query"
+        assert schema_parameters[name]["required"] is False
+        assert schema_parameters[name]["schema"] == schema
+        assert schema_parameters[name]["description"]
+
+
+def test_paginated_route_keeps_a_query_parameter_of_the_handler():
+    """A handler parameter with the name of a pagination parameter is documented one time."""
+    api = BoltAPI(openapi_config=_config())
+
+    @api.get("/articles")
+    @paginate(PageNumberPagination)
+    async def list_articles(request, page: int = 1) -> list[ArticleListSchema]:
+        return Article.objects.order_by("id")
+
+    parameters = _get_schema(api)["paths"]["/articles"]["get"]["parameters"]
+    assert [p["name"] for p in parameters] == ["page", "page_size"]
+
+
+def test_paginated_viewset_list_documents_its_query_parameters():
+    """The list action of a viewset with ``pagination_class`` lists the pagination parameters."""
+    api = BoltAPI(openapi_config=_config())
+
+    @api.viewset("/articles")
+    class ArticleViewSet(ModelViewSet):
+        queryset = Article.objects.all()
+        serializer_class = ArticleListSchema
+        pagination_class = LimitOffsetPagination
+
+    schema = _get_schema(api)
+    assert [p["name"] for p in schema["paths"]["/articles"]["get"]["parameters"]] == ["limit", "offset"]
+    # The detail route reads no pagination parameter.
+    assert [p["name"] for p in schema["paths"]["/articles/{pk}"]["get"]["parameters"]] == ["pk"]
 
 
 # ---------------------------------------------------------------------------
