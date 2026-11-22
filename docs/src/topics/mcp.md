@@ -59,6 +59,7 @@ api.mount_mcp(mcp)
 ```
 
 `api.mount_mcp(mcp)` serves the MCP endpoint at `/mcp`.
+Register each tool, resource, prompt and middleware before `mount_mcp()`. Bolt reads the lists one time, at the mount.
 Start the server, and send an `initialize` request to check it:
 
 ```bash
@@ -130,7 +131,7 @@ async def list_articles(published: bool = True) -> list[dict]:
 The client sees this entry in `tools/list`:
 
 ```json
-{"name": "list_articles", "description": "List the articles. Set published to false for the drafts.", "inputSchema": {"properties": {"published": {"type": "boolean", "default": true}}, "type": "object"}, "annotations": {"readOnlyHint": true}}
+{"name": "list_articles", "description": "List the articles. Set published to false for the drafts.", "inputSchema": {"properties": {"published": {"default": true, "type": "boolean"}}, "required": [], "type": "object"}, "annotations": {"readOnlyHint": true}}
 ```
 
 The type hints of the arguments give the JSON Schema of the input.
@@ -170,7 +171,7 @@ Bolt maps the return value to the MCP result:
 For `get_article(article_id=1)`, the result is:
 
 ```json
-{"content": [{"type": "text", "text": "{\"id\":1,\"title\":\"Hello Bolt\",\"published\":true}"}], "structuredContent": {"id": 1, "published": true, "title": "Hello Bolt"}, "isError": false}
+{"resultType": "complete", "content": [{"type": "text", "text": "{\"id\":1,\"title\":\"Hello Bolt\",\"published\":true}"}], "structuredContent": {"id": 1, "published": true, "title": "Hello Bolt"}, "isError": false}
 ```
 
 Return a `ToolResult` to give the model a short text and the client the full data:
@@ -181,7 +182,7 @@ from bolt_mcp import ToolResult
 
 @mcp.tool
 async def article_stats(article_id: int) -> ToolResult:
-    """Count the words of an article."""
+    """Count the words in the title of an article."""
     words = len(ARTICLES[article_id]["title"].split())
     return ToolResult(
         content=f"The article has {words} words.",
@@ -190,7 +191,7 @@ async def article_stats(article_id: int) -> ToolResult:
 ```
 
 ```json
-{"content": [{"type": "text", "text": "The article has 2 words."}], "structuredContent": {"article_id": 1, "words": 2}, "isError": false}
+{"resultType": "complete", "content": [{"type": "text", "text": "The article has 2 words."}], "structuredContent": {"article_id": 1, "words": 2}, "isError": false}
 ```
 
 `content` is a string or a list of MCP content blocks. `meta` becomes the `_meta` of the result.
@@ -216,7 +217,7 @@ async def find_article(article_id: int) -> dict:
 ```
 
 ```json
-{"content": [{"type": "text", "text": "No article with id 5."}], "isError": true}
+{"resultType": "complete", "content": [{"type": "text", "text": "No article with id 5."}], "isError": true}
 ```
 
 Bolt hides the text of each other exception, because it can contain passwords, hosts or file paths.
@@ -244,7 +245,7 @@ async def whoami(request: Request) -> dict:
     return principal(request)
 ```
 
-For a caller with a JWT of the user `ada`, the structured result is:
+On a mount with `auth=[JWTAuthentication()]`, a caller with a JWT of the user `ada` gets this structured result:
 
 ```json
 {"user_id": "1", "is_staff": false, "is_superuser": false, "auth_backend": "jwt", "auth_backend_index": 0, "auth_claims": {"sub": "1", "exp": 1795316703, "iat": 1795313103, "is_staff": false, "is_superuser": false, "username": "ada"}}
@@ -286,14 +287,17 @@ The client finds the template with `resources/templates/list`.
 A read of `articles://1` converts `1` to `int` and gives:
 
 ```json
-{"contents": [{"uri": "articles://1", "mimeType": "application/json", "text": "{\"id\":1,\"title\":\"Hello Bolt\",\"published\":true}"}]}
+{"resultType": "complete", "ttlMs": 0, "cacheScope": "private", "contents": [{"uri": "articles://1", "mimeType": "application/json", "text": "{\"id\":1,\"title\":\"Hello Bolt\",\"published\":true}"}]}
 ```
 
 Each part matches one path segment. Different names in the URI and the function raise `ValueError`.
 
 A resource error is a JSON-RPC error, not a result.
 Bolt hides the text of an exception and logs it on the `bolt_mcp._dispatch` logger.
-The client gets `Resource 'articles://9' failed.`
+The client gets a message such as `Resource 'articles://1' failed.`
+
+A `KeyError` or another `LookupError` from the function gives the error `Unknown resource: 'articles://9'`, and Bolt does not log it.
+To report a missing item on purpose, raise `JsonRpcError`. See [Add middleware](#add-middleware).
 
 ## Write a prompt
 
@@ -310,9 +314,8 @@ A string becomes one user message.
 A function can also return a list of MCP message dicts, for example `[{"role": "user", "content": {"type": "text", "text": "..."}}]`.
 The arguments come from the signature. An argument with no default is required.
 
-!!! note
-    An MCP client sends each prompt argument as a string.
-    Declare each argument as `str`. An `int` argument refuses the string `"1"` with an invalid-params error.
+An MCP client sends each prompt argument as a string.
+Declare each argument as `str`. An `int` argument refuses the string `"1"` with an invalid-params error.
 
 ## Report progress and log messages
 
@@ -345,7 +348,7 @@ data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"Ba
 
 data: {"jsonrpc":"2.0","method":"notifications/message","params":{"data":"Index rebuilt","level":"info"}}
 
-data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"indexed\":2}"}],"structuredContent":{"indexed":2},"isError":false}}
+data: {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","content":[{"type":"text","text":"{\"indexed\":2}"}],"structuredContent":{"indexed":2},"isError":false}}
 ```
 
 - `ctx.report_progress(progress, total=None, message=None)` sends a progress notification. Bolt drops it when the client sent no `progressToken`.
@@ -593,15 +596,16 @@ curl -i -X POST localhost:8000/mcp
 
 ```text
 HTTP/1.1 401 Unauthorized
+content-length: 25
 www-authenticate: Bearer resource_metadata="https://blog.example.com/.well-known/oauth-protected-resource/mcp"
+content-type: application/json
 
 {"detail":"Unauthorized"}
 ```
 
-!!! warning
-    `issuer` must be the exact public origin of the server, for example `https://blog.example.com`.
-    Clients compare it byte by byte, and each token holds it.
-    Without `issuer`, the default is `http://localhost:8000`, and Python shows a warning.
+Set `issuer` to the exact public origin of the server, for example `https://blog.example.com`.
+Clients compare it byte by byte, and each token holds it.
+Without `issuer`, the default is `http://localhost:8000`, and Python shows a warning.
 
 The server adds these routes:
 

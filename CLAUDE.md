@@ -64,7 +64,7 @@ Do it once at registration, reuse forever at runtime. In `_dispatch`, `_dispatch
 - Never silently ignore errors. Imports at module top. `from __future__ import annotations`.
 - Library code (`python/django_bolt/`) must pass ruff. Some S110 in test WebSocket handlers is acceptable.
 - Never add Co-Authored-By / AI trailers to commits or PRs.
-- **Writing style**: docs (`docs/`, README), code comments and docstrings, and `CHANGELOG.md` entries use ASD-STE100 Simplified Technical English: short sentences (max 20 words per instruction, 25 per description), one instruction per sentence, active voice, simple tenses, one meaning per word, no noun clusters over three nouns, start instructions with a verb. Code identifiers stay as they are.
+- **Writing style** (pages in `docs/src` also follow `docs/STYLE.md`): docs (`docs/`, README), code comments and docstrings, and `CHANGELOG.md` entries use ASD-STE100 Simplified Technical English: short sentences (max 20 words per instruction, 25 per description), one instruction per sentence, active voice, simple tenses, one meaning per word, no noun clusters over three nouns, start instructions with a verb. Code identifiers stay as they are.
 
 ## Testing
 
