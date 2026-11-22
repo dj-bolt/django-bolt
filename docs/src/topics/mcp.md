@@ -136,7 +136,7 @@ The client sees this entry in `tools/list`:
 The type hints of the arguments give the JSON Schema of the input.
 The docstring is the description. The model reads it, so write what the tool does and when to use it.
 Bolt converts and checks the arguments with msgspec.
-A bad argument gives an error result, for example `Invalid arguments: Expected int, got str - at $.article_id`.
+A bad argument gives an error result. Its text starts with `Invalid arguments:` and names the field.
 
 A `def` tool runs on a worker thread. An `async def` tool runs on the event loop.
 
@@ -393,6 +393,9 @@ MCP calls do not go through Bolt or Django HTTP middleware.
 Use MCP middleware for logging, metrics and tracing of each call:
 
 ```python
+import logging
+import time
+
 from bolt_mcp import ToolCall
 
 logger = logging.getLogger("blog.mcp")
@@ -406,8 +409,6 @@ async def log_tool_calls(call: ToolCall, call_next) -> dict:
     logger.info("tools/call %s error=%s %.1f ms", call.name, result["isError"], elapsed_ms)
     return result
 ```
-
-Add `import logging` and `import time` at the top of the module.
 
 A `ToolCall` has these attributes:
 
@@ -471,7 +472,7 @@ The path, query, header and cookie parameters, and the body, become the tool arg
     A client of the MCP endpoint can call it with the auth of the mount only.
     Do not expose a route that needs a guard. Write an `@mcp.tool` with `guards=` for it.
 
-Bolt never exposes a route that you do not name.
+`mount_mcp()` exposes only the routes that you name.
 A handler that is not a route of the API, a handler with `File` or `Form` parameters, or a duplicate tool name raises `ValueError`.
 
 To change the name or the description, use `@expose_as_tool`:
