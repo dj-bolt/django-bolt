@@ -282,3 +282,42 @@ def test_a_route_at_a_docs_path_is_served_when_the_docs_are_disabled():
 
     with TestClient(local_api) as client:
         assert client.get("/docs").json() == {"own": True}
+
+
+@pytest.mark.parametrize("mount_path", ["/sub", "/"])
+def test_a_mount_does_not_copy_the_docs_routes_of_a_client(mount_path):
+    """runbolt adds the docs routes after each mount. A client before a mount must not change the mount."""
+    child = _docs_api()
+    with TestClient(child) as client:
+        assert client.get("/docs/openapi.json").status_code == 200
+
+    parent = BoltAPI()
+    parent.mount(mount_path, child)
+
+    with TestClient(parent) as client:
+        assert client.get("/docs/openapi.json").status_code == 200
+        if mount_path != "/":
+            assert client.get(f"{mount_path}/docs/openapi.json").status_code == 404
+
+
+def test_a_client_serves_the_schema_of_the_routes_at_its_creation():
+    local_api = _docs_api()
+    with TestClient(local_api) as client:
+        assert "/later" not in client.get("/docs/openapi.json").json()["paths"]
+
+    @local_api.get("/later")
+    async def later():
+        return []
+
+    with TestClient(local_api) as client:
+        assert "/later" in client.get("/docs/openapi.json").json()["paths"]
+
+
+def test_an_asgi_mount_at_the_docs_path_is_refused_as_runbolt_refuses_it():
+    async def asgi_app(scope, receive, send):
+        raise AssertionError("not called")
+
+    local_api = _docs_api()
+    local_api.mount_asgi("/docs", asgi_app)
+    with pytest.raises(ValueError):
+        TestClient(local_api)
