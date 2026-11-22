@@ -351,20 +351,24 @@ def _hold_listener_handlers() -> None:
     write of the listener, the child gets the lock of the stream in the held
     state. Then the listener of the child waits for the lock with no end.
     The handler lock is held during each write, so the fork waits for the write.
+    Take the module lock of ``logging`` first. ``dictConfig()`` takes the locks
+    in this order, so the two threads cannot wait for each other.
     """
     if _QUEUE_LISTENER is not None:
+        logging._lock.acquire()
         for handler in _QUEUE_LISTENER.handlers:
             handler.acquire()
 
 
 def _release_listener_handlers() -> None:
-    """Release the handler locks in the parent after a fork.
+    """Release the handler locks and the module lock in the parent after a fork.
 
-    The ``logging`` module makes new handler locks in the child.
+    The ``logging`` module makes new locks in the child.
     """
     if _QUEUE_LISTENER is not None:
         for handler in reversed(_QUEUE_LISTENER.handlers):
             handler.release()
+        logging._lock.release()
 
 
 if hasattr(os, "register_at_fork"):

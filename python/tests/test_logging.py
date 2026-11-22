@@ -15,6 +15,9 @@ import logging
 import os
 import re
 import signal
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from contextlib import redirect_stderr
@@ -838,6 +841,58 @@ class TestQueueBasedLogging:
             logger.handlers[:] = handlers
             logger.setLevel(level)
             logger.propagate = propagate
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+    def test_a_fork_takes_the_logging_lock_before_the_handler_locks(self):
+        """The fork hook takes the locks in the order of ``dictConfig()``: module lock, then handler lock.
+
+        A thread in ``dictConfig()`` holds the module lock and then waits for
+        each handler lock. If the fork hook takes a handler lock first, the
+        two threads wait for each other with no end. The scenario runs in a
+        subprocess, so a deadlock ends at the timeout and not in pytest.
+        """
+        script = textwrap.dedent(
+            """
+            import logging, os, sys, threading, time
+            from queue import Queue
+            import django_bolt.logging.config as config
+
+            handler = logging.StreamHandler(sys.stderr)
+            config._QUEUE = Queue()
+            config._QUEUE_LISTENER = config._BoundedQueueListener(config._QUEUE, handler)
+            held = threading.Event()
+
+            def configure():
+                # dictConfig() holds the module lock, then takes each handler lock.
+                with logging._lock:
+                    held.set()
+                    time.sleep(0.3)
+                    handler.acquire()
+                    handler.release()
+
+            thread = threading.Thread(target=configure)
+            thread.start()
+            held.wait()
+            pid = os.fork()
+            if pid == 0:
+                os._exit(0)
+            os.waitpid(pid, 0)
+            thread.join()
+            print("forked")
+            """
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-W", "ignore::DeprecationWarning", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail("the fork hook and dictConfig() waited for each other")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "forked"
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
     # The listener thread runs, so Python warns about the fork. The test checks that fork.
