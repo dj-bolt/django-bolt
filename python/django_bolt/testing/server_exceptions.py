@@ -3,8 +3,9 @@
 A handler runs on a test worker thread, and the test gets only the response.
 Thus the dispatch of each route of the test client goes through a wrapper:
 
-- The error path of ``BoltAPI`` keeps the exception of a server error in
-  ``request.state``. The wrapper then gives a response with a token header.
+- The wrapper puts a key in ``request.state``. With the key, the error path of
+  ``BoltAPI`` keeps the exception of a server error there. The wrapper removes
+  the key and gives a response with a token header when the status is 5xx.
 - The wrapper also records an exception that leaves the dispatch.
 - For a streaming response, the wrapper records an exception of the body.
 
@@ -26,6 +27,8 @@ from django_bolt.serialization import _BODY_STREAM
 # The transport removes this header. The test never sees it.
 TOKEN_HEADER = "x-django-bolt-test-exception"
 
+_MIN_SERVER_ERROR_STATUS = 500
+
 
 class ServerExceptions:
     """The exceptions of the requests of one test client, by token."""
@@ -33,37 +36,31 @@ class ServerExceptions:
     __slots__ = ("_held", "_tokens")
 
     def __init__(self) -> None:
-        self._held: dict[str, list[BaseException]] = {}
+        # Only a failed request has an entry. The transport removes it.
+        self._held: dict[str, BaseException] = {}
         self._tokens = itertools.count(1)
-
-    def _hold(self) -> tuple[str, list[BaseException]]:
-        token = str(next(self._tokens))
-        held: list[BaseException] = []
-        self._held[token] = held
-        return token, held
 
     def take(self, headers: list[tuple[str, bytes]]) -> BaseException | None:
         """Remove the token header from ``headers``, and return the exception of its request."""
         for index, (name, value) in enumerate(headers):
             if name == TOKEN_HEADER:
                 del headers[index]
-                held = self._held.pop(value.decode("ascii"))
-                return held[0] if held else None
+                return self._held.pop(value.decode("ascii"), None)
         return None
 
     def error_wire(self, error: BaseException) -> tuple:
         """Return a response that tells the transport to raise ``error``."""
-        token, held = self._hold()
-        held.append(error)
+        token = str(next(self._tokens))
+        self._held[token] = error
         return 500, ("plaintext", "text/plain", [(TOKEN_HEADER, token)], None), 0, b""
 
-    def check(self, request: Any, wire: Any) -> Any:
-        """Return the wire of a dispatch, or a response that raises the exception of the request."""
+    def check(self, wire: Any, error: BaseException | None) -> Any:
+        """Return the wire of a dispatch, or a response that raises ``error`` for a 5xx."""
         if isinstance(wire, bytes):
             # The fast path of a sync handler. Its handler did not raise.
             return wire
-        error = request.state.pop(SERVER_EXCEPTION_STATE_KEY, None)
-        if error is not None:
+        # An error_formatter can answer the exception with a 4xx. Then the test gets the response.
+        if error is not None and wire[0] >= _MIN_SERVER_ERROR_STATUS:
             return self.error_wire(error)
         if wire[2] == _BODY_STREAM and isinstance(wire[1], tuple):
             return self._watch_stream(wire)
@@ -72,25 +69,25 @@ class ServerExceptions:
     def _watch_stream(self, wire: tuple) -> tuple:
         status, (response_type, content_type, headers, cookies), body_kind, stream = wire
         content = stream.content
-        token, held = self._hold()
+        token = str(next(self._tokens))
         if stream.is_async_generator:
-            stream.content = _record_async(content, held)
+            stream.content = _record_async(content, self._held, token)
         elif hasattr(content, "__iter__"):
-            stream.content = _record_sync(content, held)
+            stream.content = _record_sync(content, self._held, token)
         headers = [*(headers or ()), (TOKEN_HEADER, token)]
         return status, (response_type, content_type, headers, cookies), body_kind, stream
 
 
-def _record_sync(content: Any, held: list[BaseException]) -> Iterator[Any]:
+def _record_sync(content: Any, held: dict[str, BaseException], token: str) -> Iterator[Any]:
     """Yield the chunks of ``content``, and record the exception that ends it."""
     try:
         yield from content
     except Exception as error:
-        held.append(error)
+        held[token] = error
         raise
 
 
-async def _record_async(content: Any, held: list[BaseException]) -> AsyncIterator[Any]:
+async def _record_async(content: Any, held: dict[str, BaseException], token: str) -> AsyncIterator[Any]:
     """Yield the chunks of ``content``, and record the exception that ends it."""
     iterator = content.__aiter__() if hasattr(content, "__aiter__") else content
     try:
@@ -101,7 +98,7 @@ async def _record_async(content: Any, held: list[BaseException]) -> AsyncIterato
                 return
             yield item
     except Exception as error:
-        held.append(error)
+        held[token] = error
         raise
     finally:
         aclose = getattr(iterator, "aclose", None)
@@ -122,16 +119,24 @@ def bound_dispatches(
         return dispatch, dispatch_sync
 
     async def checked_dispatch(request: Any) -> Any:
+        state = request.state
+        state[SERVER_EXCEPTION_STATE_KEY] = None
         try:
             wire = await dispatch(request)
         except Exception as error:
             return exceptions.error_wire(error)
-        return exceptions.check(request, wire)
+        finally:
+            # The exception holds the request in its traceback. The state must not hold it.
+            kept = state.pop(SERVER_EXCEPTION_STATE_KEY)
+        return exceptions.check(wire, kept)
 
     def checked_dispatch_sync(request: Any) -> Any:
+        state = request.state
+        state[SERVER_EXCEPTION_STATE_KEY] = None
         try:
             result = dispatch_sync(request)
         except Exception as error:
+            state.pop(SERVER_EXCEPTION_STATE_KEY)
             return exceptions.error_wire(error)
         if callable(result):
             # Rust awaits the call on the worker loop, for example to load a QuerySet.
@@ -140,9 +145,11 @@ def bound_dispatches(
                     wire = await result(request)
                 except Exception as error:
                     return exceptions.error_wire(error)
-                return exceptions.check(request, wire)
+                finally:
+                    kept = state.pop(SERVER_EXCEPTION_STATE_KEY)
+                return exceptions.check(wire, kept)
 
             return checked_result
-        return exceptions.check(request, result)
+        return exceptions.check(result, state.pop(SERVER_EXCEPTION_STATE_KEY))
 
     return checked_dispatch, checked_dispatch_sync

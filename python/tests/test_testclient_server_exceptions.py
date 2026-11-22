@@ -8,17 +8,24 @@ test gets the 500 response that a real server sends.
 from __future__ import annotations
 
 import asyncio
+import gc
+import logging
+import weakref
 
+import msgspec
 import pytest
 from django.core.exceptions import PermissionDenied
+from django.db.models import QuerySet
 from django.http import HttpResponse
 
 from django_bolt import BoltAPI
 from django_bolt.error_handlers import problem_details
-from django_bolt.exceptions import HTTPException
+from django_bolt.exceptions import HTTPException, ResponseValidationError
 from django_bolt.middleware import DjangoMiddlewareStack
-from django_bolt.responses import StreamingResponse
+from django_bolt.responses import JSON, StreamingResponse
 from django_bolt.testing import AsyncTestClient, TestClient
+
+from .test_models import Article
 
 
 class Boom(Exception):
@@ -66,25 +73,22 @@ def make_api(**kwargs) -> BoltAPI:
 
 
 ROUTES = [("/sync", "sync"), ("/trivial-async", "trivial async"), ("/async", "async")]
+PATHS = [path for path, _ in ROUTES]
 
 
+# The option is on by default.
+@pytest.mark.parametrize("client_kwargs", [{}, {"raise_server_exceptions": True}])
 @pytest.mark.parametrize(("path", "message"), ROUTES)
-def test_the_client_raises_the_exception_of_the_handler(path, message):
-    with TestClient(make_api(), raise_server_exceptions=True) as client:
+def test_the_client_raises_the_exception_of_the_handler(path, message, client_kwargs):
+    with TestClient(make_api(), **client_kwargs) as client:
         with pytest.raises(Boom, match=f"^{message}$"):
             client.get(path)
         # The client still works after the exception.
         assert client.get("/ok").json() == {"ok": True}
 
 
-@pytest.mark.parametrize(("path", "message"), ROUTES)
-def test_the_option_is_on_by_default(path, message):
-    with TestClient(make_api()) as client, pytest.raises(Boom, match=f"^{message}$"):
-        client.get(path)
-
-
-@pytest.mark.parametrize(("path", "message"), ROUTES)
-def test_without_the_option_the_client_gets_the_500(path, message):
+@pytest.mark.parametrize("path", PATHS)
+def test_without_the_option_the_client_gets_the_500(path):
     with TestClient(make_api(), raise_server_exceptions=False) as client:
         response = client.get(path)
     assert response.status_code == 500
@@ -100,16 +104,16 @@ def test_a_route_with_django_middleware_raises_the_exception(path, message):
         assert client.get("/ok").json() == {"ok": True}
 
 
-@pytest.mark.parametrize(("path", "message"), ROUTES)
-def test_a_route_with_django_middleware_gives_the_500_without_the_option(path, message):
+@pytest.mark.parametrize("path", PATHS)
+def test_a_route_with_django_middleware_gives_the_500_without_the_option(path):
     api = make_api(middleware=[DjangoMiddlewareStack([PassThroughMiddleware])])
     with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get(path)
     assert response.status_code == 500
 
 
-@pytest.mark.parametrize(("path", "message"), ROUTES)
-def test_an_exception_that_process_exception_handles_is_not_raised(path, message):
+@pytest.mark.parametrize("path", PATHS)
+def test_an_exception_that_process_exception_handles_is_not_raised(path):
     api = make_api(middleware=[DjangoMiddlewareStack([HandlingMiddleware])])
     with TestClient(api) as client:
         response = client.get(path)
@@ -185,7 +189,7 @@ def test_an_error_response_of_the_api_is_not_raised():
 
 
 def test_an_error_formatter_does_not_stop_the_raise():
-    """As in Starlette, a handler for server errors formats the 500, and the test still gets the exception."""
+    """An error_formatter that answers with a 5xx formats the 500, and the test still gets the exception."""
     api = make_api(error_formatter=problem_details)
     with TestClient(api) as client, pytest.raises(Boom, match="^sync$"):
         client.get("/sync")
@@ -193,6 +197,94 @@ def test_an_error_formatter_does_not_stop_the_raise():
         response = client.get("/sync")
     assert response.status_code == 500
     assert response.headers["content-type"] == "application/problem+json"
+
+
+class Conflict(Exception):
+    """An exception that ``conflict_formatter`` answers with a 409."""
+
+
+def conflict_formatter(error, request):
+    if isinstance(error.exception, Conflict):
+        return JSON({"code": "conflict"}, status_code=409)
+    return JSON({"code": error.kind}, status_code=error.status)
+
+
+def test_an_exception_that_the_error_formatter_answers_with_a_4xx_is_not_raised():
+    api = BoltAPI(error_formatter=conflict_formatter)
+
+    @api.get("/sync")
+    def sync_conflict():
+        raise Conflict("sync")
+
+    @api.get("/async")
+    async def async_conflict():
+        await asyncio.sleep(0)
+        raise Conflict("async")
+
+    with TestClient(api) as client:
+        for path in ("/sync", "/async"):
+            response = client.get(path)
+            assert response.status_code == 409, path
+            assert response.json() == {"code": "conflict"}, path
+
+
+class Item(msgspec.Struct):
+    name: str
+
+
+def test_a_response_validation_error_is_raised():
+    api = BoltAPI()
+
+    @api.get("/item")
+    async def bad_item() -> Item:
+        return {"title": "no name"}
+
+    with TestClient(api) as client, pytest.raises(ResponseValidationError):
+        client.get("/item")
+
+
+class BrokenArticles(QuerySet):
+    def _fetch_all(self):
+        raise Boom("rows")
+
+
+def broken_articles() -> QuerySet:
+    return BrokenArticles(model=Article)
+
+
+def test_the_exception_of_a_queryset_that_loads_after_a_sync_dispatch_is_raised():
+    """The sync dispatch defers the QuerySet of a helper, and Rust loads it on the ORM pool."""
+    api = BoltAPI()
+
+    @api.get("/articles")
+    def articles(request):
+        return broken_articles()
+
+    with TestClient(api) as client, pytest.raises(Boom, match="^rows$"):
+        client.get("/articles")
+
+
+def test_a_client_without_the_option_keeps_no_exception(caplog):
+    """A client with the option does not make a later client keep the exception in the request."""
+    # A log record holds the exception. This test looks only at the request.
+    for logger in ("django.server", "django_bolt"):
+        caplog.set_level(logging.CRITICAL, logger=logger)
+    raised = []
+    api = BoltAPI()
+
+    @api.get("/boom")
+    def boom():
+        error = Boom("boom")
+        raised.append(weakref.ref(error))
+        raise error
+
+    with TestClient(api) as client, pytest.raises(Boom):
+        client.get("/boom")
+    with TestClient(api, raise_server_exceptions=False) as client:
+        assert client.get("/boom").status_code == 500
+    gc.collect()
+    # The exception holds the request in its traceback. Thus the request must not hold it.
+    assert [ref() for ref in raised] == [None, None]
 
 
 def sync_chunks():

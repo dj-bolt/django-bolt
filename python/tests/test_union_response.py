@@ -10,6 +10,7 @@ import pytest
 from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
+from django_bolt.exceptions import ResponseValidationError
 from django_bolt.middleware import Middleware
 from django_bolt.openapi.config import OpenAPIConfig
 from django_bolt.openapi.schema_generator import SchemaGenerator
@@ -222,15 +223,10 @@ def test_inline_path_with_queryset_like_object_delegates_to_slow_path():
     async def qs_endpoint() -> list[Tagged]:
         return FakeQuerySet()
 
-    with TestClient(api, raise_server_exceptions=False) as client:
-        resp = client.get("/qs")
-        # Either 200 (slow-path values() → []) or 500 is acceptable here, but the
-        # response must NOT be a validation error citing the wrong wire shape —
-        # that would mean the inline path swallowed the input and bypassed
-        # slow-path QuerySet detection.
-        assert resp.status_code in (200, 500)
-        if resp.status_code == 200:
-            assert resp.json() == []
+    # The slow path refuses the duck-type, because it is not a QuerySet. The
+    # error of the inline path would name the wire shape, not the handler result.
+    with TestClient(api) as client, pytest.raises(ResponseValidationError, match="handler returned FakeQuerySet"):
+        client.get("/qs")
 
 
 def test_tagged_union_emits_per_arm_examples_in_openapi():

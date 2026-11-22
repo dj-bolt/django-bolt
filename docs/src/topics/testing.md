@@ -83,8 +83,9 @@ with TestClient(api) as client:
 The client raises an exception that the server answers with a 5xx. This
 includes an exception in the body of a streaming response, and a
 `ResponseValidationError`. The client raises it for each route: sync and
-async handlers, and routes with Django middleware. An `error_formatter` does
-not stop the raise.
+async handlers, and routes with Django middleware. An `error_formatter` that
+answers with a 5xx does not stop the raise. When it answers with a 4xx, you
+get the response.
 
 The client does not raise an exception that the API answers with a response.
 Thus you get the response for an `HTTPException` (also with status 500), and

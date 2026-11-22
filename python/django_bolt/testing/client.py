@@ -108,14 +108,6 @@ def _warn_if_inside_atomic_block() -> None:
     )
 
 
-def _server_exceptions(raise_server_exceptions: bool) -> ServerExceptions | None:
-    """Return the store of handler exceptions, and make the API keep them. None without the option."""
-    if not raise_server_exceptions:
-        return None
-    BoltAPI._keep_server_exceptions = True
-    return ServerExceptions()
-
-
 class BoltTestTransport(httpx.BaseTransport):
     """HTTP transport that routes requests through django-bolt's test handler.
 
@@ -388,7 +380,7 @@ class TestClient(httpx.Client):
 
         # Register routes
         # With raise_server_exceptions, a test-only dispatch brings the exception of a handler back.
-        exceptions = _server_exceptions(raise_server_exceptions)
+        exceptions = ServerExceptions() if raise_server_exceptions else None
         rust_routes = [
             (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
             for method, path, handler_id, handler in api._routes
@@ -717,7 +709,7 @@ class AsyncTestClient(httpx.AsyncClient):
 
         # Register routes
         # With raise_server_exceptions, a test-only dispatch brings the exception of a handler back.
-        exceptions = _server_exceptions(raise_server_exceptions)
+        exceptions = ServerExceptions() if raise_server_exceptions else None
         rust_routes = [
             (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
             for method, path, handler_id, handler in api._routes

@@ -412,6 +412,13 @@ def api():
 @pytest.fixture(scope="module")
 def client(api):
     """Create TestClient for the API"""
+    with TestClient(api) as client:
+        yield client
+
+
+@pytest.fixture(scope="module")
+def client_500(api):
+    """A TestClient that gives the 500 of a server error, not the exception."""
     with TestClient(api, raise_server_exceptions=False) as client:
         yield client
 
@@ -483,8 +490,8 @@ def test_response_model_validation_ok(client):
     assert data[0]["name"] == "a" and data[0]["price"] == 1.0
 
 
-def test_response_model_validation_error(client):
-    response = client.get("/bad-list")
+def test_response_model_validation_error(client_500):
+    response = client_500.get("/bad-list")
     # We currently surface server error (500) on validation problems
     assert response.status_code == 500
     assert b"Response validation error" in response.content
@@ -497,8 +504,8 @@ def test_return_annotation_validation_ok(client):
     assert isinstance(data, list) and data[0]["name"] == "c"
 
 
-def test_return_annotation_validation_error(client):
-    response = client.get("/anno-bad")
+def test_return_annotation_validation_error(client_500):
+    response = client_500.get("/anno-bad")
     assert response.status_code == 500
     assert b"Response validation error" in response.content
 
@@ -510,8 +517,8 @@ def test_response_coercion_from_objects(client):
     assert data == [{"id": 1, "username": "a"}, {"id": 2, "username": "b"}]
 
 
-def test_response_coercion_error_from_objects(client):
-    response = client.get("/coerce/mini-bad")
+def test_response_coercion_error_from_objects(client_500):
+    response = client_500.get("/coerce/mini-bad")
     assert response.status_code == 500
     assert b"Response validation error" in response.content
 
@@ -1056,9 +1063,9 @@ def test_204_no_content_with_none_return(client):
     assert response.content == b""
 
 
-def test_none_return_without_204_returns_500(client):
+def test_none_return_without_204_returns_500(client_500):
     """Test that returning None without 204 status code returns 500 error."""
-    response = client.get("/none-return")
+    response = client_500.get("/none-return")
     assert response.status_code == 500
 
 
