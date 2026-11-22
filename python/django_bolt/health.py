@@ -10,6 +10,8 @@ from typing import Any
 from asgiref.sync import sync_to_async
 from django.db import DEFAULT_DB_ALIAS, DatabaseError, connections
 
+from .responses import JSON
+
 
 class HealthCheck:
     """Health check configuration and helpers."""
@@ -31,6 +33,10 @@ class HealthCheck:
         Returns:
             Dictionary with health check results
         """
+        return (await self._run())[1]
+
+    async def _run(self) -> tuple[bool, dict[str, Any]]:
+        # Give the aggregate result as a bool too, so a caller does not compare strings.
         results_list = await asyncio.gather(
             *(check() for check in self._checks),
             return_exceptions=True,
@@ -55,14 +61,10 @@ class HealthCheck:
                 if not is_healthy:
                     all_healthy = False
 
-        return {
+        return all_healthy, {
             "status": "healthy" if all_healthy else "unhealthy",
             "checks": results,
         }
-
-
-# Global health check instance
-_health_check = HealthCheck()
 
 
 def _ensure_connection() -> None:
@@ -93,6 +95,12 @@ async def check_database() -> tuple[bool, str]:
         return False, f"Database error: {e!s}"
 
 
+# Global health check instance. The database check is in the list from the
+# start, so add_health_check() and the first request do not change it.
+_health_check = HealthCheck()
+_health_check.add_check(check_database)
+
+
 # Health endpoint handlers
 
 
@@ -108,15 +116,16 @@ async def health_handler() -> dict[str, str]:
 async def ready_handler() -> dict[str, Any]:
     """Readiness check with dependency checks.
 
-    Returns:
-        Dictionary with readiness status and checks
-    """
-    # Add database check by default
-    if not _health_check._checks:
-        _health_check.add_check(check_database)
+    A readiness probe reads only the status code. Thus a failed check gives
+    status 503 with the same body.
 
-    results = await _health_check.run_checks()
-    return results
+    Returns:
+        Dictionary with readiness status and checks, or a 503 response
+    """
+    healthy, results = await _health_check._run()
+    if healthy:
+        return results
+    return JSON(results, status_code=503)
 
 
 def register_health_checks(api) -> None:
