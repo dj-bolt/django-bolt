@@ -409,8 +409,12 @@ def test_none_result_of_an_annotated_or_aliased_optional_return_type_is_json_nul
     async def alias_item() -> OptionalItem:
         return None
 
+    @api.get("/nested-none")
+    def nested_none() -> Item | Annotated[JSON | None, "Optional."]:
+        return None
+
     with TestClient(api) as client:
-        for path in ("/annotated-json", "/alias-json", "/annotated-item", "/alias-item"):
+        for path in ("/annotated-json", "/alias-json", "/annotated-item", "/alias-item", "/nested-none"):
             response = client.get(path)
             assert response.status_code == 200, path
             assert response.json() is None, path

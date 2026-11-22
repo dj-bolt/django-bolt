@@ -478,6 +478,8 @@ def _register_with_return_type(api, path, return_type, declared_by):
         ),
         (Annotated[UserRead, "A user."] | JSON | None, UserRead | None),
         (UserOrJSON | None, UserRead | None),
+        (UserRead | Annotated[JSON | None, "Optional."], UserRead | None),
+        (Annotated[str, "A text body."], str),
     ],
     ids=[
         "annotated-text",
@@ -487,6 +489,8 @@ def _register_with_return_type(api, path, return_type, declared_by):
         "annotated-union",
         "annotated-member",
         "alias",
+        "nested-none",
+        "annotated-str",
     ],
 )
 def test_response_class_in_return_type_documents_the_body_type(return_type, equivalent, declared_by):
@@ -539,6 +543,20 @@ def test_response_class_with_no_body_type_documents_any_body(return_type, media_
     schema = _get_schema(api)
     validate(schema)
     assert _ok_response(schema, "/thing")["content"] == {media_type: {"schema": {}}}
+
+
+@pytest.mark.parametrize("return_type", [str | JSON, Annotated[str | JSON, "A text body."]], ids=["plain", "annotated"])
+def test_str_or_json_documents_the_text_and_the_json_body(return_type):
+    """A str result is text/plain, and ``JSON("ok")`` is an application/json string (#930)."""
+    api = BoltAPI(openapi_config=_config())
+    _register_with_return_type(api, "/thing", return_type, "annotation")
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _ok_response(schema, "/thing")["content"] == {
+        "text/plain": {"schema": {"type": "string"}},
+        "application/json": {"schema": {"type": "string"}},
+    }
 
 
 def test_response_class_in_response_model_dict_documents_the_body_type():

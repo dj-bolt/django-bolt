@@ -444,26 +444,35 @@ def split_response_annotation(annotation: Any) -> tuple[Any, tuple[type, ...]]:
     validation of the body and the OpenAPI schema both use this function, so
     that they agree.
     """
+    body, classes = _split_response_annotation(annotation)
+    if body is type(None) and classes:
+        return None, classes
+    return body, classes
+
+
+def _split_response_annotation(annotation: Any) -> tuple[Any, tuple[type, ...]]:
+    # A None member stays as NoneType here. Thus the null of a nested member,
+    # as in ``Item | Annotated[JSON | None, ...]``, stays in the outer union.
     resolved = resolve_type_alias(annotation)
     origin = get_origin(resolved)
     if origin is Annotated:
-        body, classes = split_response_annotation(resolved.__origin__)
+        body, classes = _split_response_annotation(resolved.__origin__)
         if not classes:
             return annotation, ()
-        if body is None:
-            return None, classes
+        if body is None or body is type(None):
+            return body, classes
         return Annotated[body, *resolved.__metadata__], classes
     if origin in (Union, types.UnionType):
         bodies: list[Any] = []
         classes: tuple[type, ...] = ()
         for arg in get_args(resolved):
-            body, arg_classes = split_response_annotation(arg)
+            body, arg_classes = _split_response_annotation(arg)
             classes += arg_classes
             if body is not None:
                 bodies.append(body)
         if not classes:
             return annotation, ()
-        if all(body is type(None) for body in bodies):
+        if not bodies:
             return None, classes
         return Union[tuple(bodies)], classes  # noqa: UP007 - the members are only known at run time
     if isinstance(resolved, type) and is_response_class(resolved):

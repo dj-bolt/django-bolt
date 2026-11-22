@@ -95,6 +95,14 @@ def _response_class_media(response_class: type | None) -> tuple[str, Schema] | N
     return None
 
 
+def _unwrap_annotated(annotation: Any) -> Any:
+    """The type behind a ``type`` alias and ``Annotated``, without the metadata."""
+    annotation = resolve_type_alias(annotation)
+    while get_origin(annotation) is Annotated:
+        annotation = resolve_type_alias(annotation.__origin__)
+    return annotation
+
+
 def _struct_origin(annotation: Any) -> type | None:
     """The msgspec.Struct class behind ``annotation`` — itself, or the origin of ``Struct[T]``."""
     if is_msgspec_struct(annotation):
@@ -1337,6 +1345,11 @@ class SchemaGenerator:
         if any_body_classes and body_type is None:
             media_type = "application/json" if all(issubclass(cls, JSON) for cls in any_body_classes) else "*/*"
             content.setdefault(media_type, OpenAPIMediaType(schema=Schema()))
+        elif any_body_classes and set(content) != {"application/json"}:
+            # ``JSON("ok")`` of ``-> str | JSON`` is JSON, not text. Its body has the full body type.
+            content["application/json"] = OpenAPIMediaType(
+                schema=self._type_to_schema(body_type, register_component=True)
+            )
         return content or None
 
     def _response_type_content(self, response_type: Any) -> dict[str, OpenAPIMediaType] | None:
@@ -1349,17 +1362,20 @@ class SchemaGenerator:
         body_type, classes = split_response_annotation(response_type)
         if classes:
             return self._response_class_content(classes, body_type)
-        arms = get_args(response_type) if get_origin(response_type) in (Union, UnionType) else (response_type,)
-        json_arms = [arm for arm in arms if arm not in (str, bytes, bytearray)]
+        # ``Annotated`` and a ``type`` alias do not change the media type of a result.
+        unwrapped = _unwrap_annotated(response_type)
+        arms = get_args(unwrapped) if get_origin(unwrapped) in (Union, UnionType) else (unwrapped,)
+        plain_arms = [_unwrap_annotated(arm) for arm in arms]
+        json_arms = [arm for arm, plain in zip(arms, plain_arms, strict=True) if plain not in (str, bytes, bytearray)]
         if len(json_arms) == len(arms):
             schema = self._type_to_schema(response_type, register_component=True)
             examples = _build_union_examples(response_type)
             return {"application/json": OpenAPIMediaType(schema=schema, examples=examples)}
 
         content: dict[str, OpenAPIMediaType] = {}
-        if str in arms:
+        if str in plain_arms:
             content[_STR_MEDIA[0]] = OpenAPIMediaType(schema=_STR_MEDIA[1])
-        if bytes in arms or bytearray in arms:
+        if bytes in plain_arms or bytearray in plain_arms:
             content[_BYTES_MEDIA[0]] = OpenAPIMediaType(schema=_BYTES_MEDIA[1])
         if not json_arms:
             return content
@@ -1434,7 +1450,7 @@ class SchemaGenerator:
                     response_class = Redirect
             has_type = bool(response_type) and response_type != inspect._empty
             media = _response_class_media(response_class)
-            if response_class is None and (response_type is str or response_type is bytes):
+            if response_class is None and not annotated_classes and (response_type is str or response_type is bytes):
                 # Bolt sends a str as text and bytes as they are. Neither is a JSON body.
                 media = _STR_MEDIA if response_type is str else _BYTES_MEDIA
                 has_type = False
