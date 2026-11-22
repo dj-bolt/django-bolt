@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import dataclasses
 import logging
 import threading
 import warnings
@@ -43,6 +44,73 @@ except ImportError:
     settings = None  # type: ignore
     ImproperlyConfigured = None  # type: ignore
     connections = None  # type: ignore
+
+
+_prepare_api_lock = threading.Lock()
+
+
+def _frozen(value: Any) -> Any:
+    """Return a copy of ``value`` that a later change of a list or a dict in it does not change."""
+    if isinstance(value, list | tuple):
+        return tuple(_frozen(item) for item in value)
+    if isinstance(value, dict):
+        return tuple((key, _frozen(item)) for key, item in value.items())
+    if isinstance(value, set | frozenset):
+        return frozenset(value)
+    return value
+
+
+def _config_key(config: Any) -> tuple[Any, ...] | None:
+    """Return the values of an ``OpenAPIConfig``, to compare with the values of an earlier client."""
+    if config is None:
+        return None
+    return tuple(_frozen(getattr(config, field.name)) for field in dataclasses.fields(config))
+
+
+def _prepare_api(api: BoltAPI) -> list[tuple[Any, ...]]:
+    """Add the routes that a test client makes on ``api``. Return the docs routes.
+
+    Clients of one API can start in parallel threads. A client adds routes to
+    the API, and another client reads the dicts of the API. Thus one client at
+    a time does the additions, before it reads the API. The first client of an
+    API adds the routes. A later client finds them, and changes nothing.
+    """
+    with _prepare_api_lock:
+        # Rust answers a request with no route through this route.
+        api._no_route_handler()
+        docs_routes = _docs_routes(api)
+        # A new client generates the schema again, so it has the routes added before it.
+        api._openapi_schema = None
+        return docs_routes
+
+
+def _docs_routes(api: BoltAPI) -> list[tuple[Any, ...]]:
+    """Return the docs routes of a test client of ``api``. Call it with ``_prepare_api_lock`` held.
+
+    runbolt adds the docs routes to ``api._routes`` at startup, after each
+    ``mount()``. A test client can come before a mount, and ``mount()`` copies
+    ``api._routes``. Thus a client keeps its docs routes out of ``api._routes``.
+    The registration occurs one time for each set of values of the ``OpenAPIConfig``.
+    """
+    if api._openapi_routes_registered:
+        # runbolt, or the test, added the docs routes to api._routes.
+        return []
+    # The values of the config are the key, so a changed value registers again.
+    key = _config_key(api._openapi_config)
+    cached = api._client_docs_routes
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    start = len(api._routes)
+    try:
+        # The code of runbolt. A disabled config adds no route.
+        api._register_openapi_routes()
+        routes = api._routes[start:]
+    finally:
+        # Also when the registration raises, api._routes stays as it was.
+        del api._routes[start:]
+        api._openapi_routes_registered = False
+    api._client_docs_routes = (key, routes)
+    return routes
 
 
 class BoltTestClientWarning(RuntimeWarning):
@@ -292,15 +360,17 @@ class TestClient(httpx.Client):
     __test__ = False  # Tell pytest this is not a test class
 
     @staticmethod
-    def _validate_asgi_mount_conflicts(api: BoltAPI) -> None:
+    def _validate_asgi_mount_conflicts(api: BoltAPI, docs_routes: list[tuple[Any, ...]]) -> None:
         """Validate exact-path conflicts for ASGI mounts (same rule as production startup)."""
-        _validate_asgi_mount_conflicts(_routes_and_native_routes(api), getattr(api, "_asgi_mounts", []))
+        _validate_asgi_mount_conflicts(
+            [*_routes_and_native_routes(api), *docs_routes], getattr(api, "_asgi_mounts", [])
+        )
 
     @staticmethod
-    def _validate_mcp_mount_conflicts(api: BoltAPI) -> None:
+    def _validate_mcp_mount_conflicts(api: BoltAPI, docs_routes: list[tuple[Any, ...]]) -> None:
         """Validate MCP paths against routes and ASGI mounts, like production."""
         _validate_mcp_mount_conflicts(
-            _routes_and_native_routes(api),
+            [*_routes_and_native_routes(api), *docs_routes],
             getattr(api, "_asgi_mounts", []),
             getattr(api, "_mcp_mounts", []),
         )
@@ -327,6 +397,7 @@ class TestClient(httpx.Client):
         use_http_layer: bool = True,  # Ignored - kept for backward compatibility
         static_files_config: dict | None = None,
         share_db_connection: bool = True,
+        follow_redirects: bool = True,
         **kwargs: Any,
     ):
         """Initialize test client.
@@ -352,17 +423,22 @@ class TestClient(httpx.Client):
                                  the test. Set False for a test that holds a cursor
                                  open across a request; then use ``TransactionTestCase``
                                  or ``django_db(transaction=True)``.
+            follow_redirects: If True (the default), follow redirects. If False, give the
+                             redirect response.
             **kwargs: Additional arguments passed to httpx.Client
         """
         # use_http_layer is ignored - we always use the HTTP layer now
         _ = use_http_layer
 
+        # runbolt registers the docs routes before it validates the routes. Do the same.
+        docs_routes = _prepare_api(api)
+
         # Validate before allocating native test-app state. A failed constructor
         # has no client instance available to release that state. Route
         # conflicts and invalid capsules raise later, in register_test_routes;
         # the finalizer then releases the state.
-        self._validate_asgi_mount_conflicts(api)
-        self._validate_mcp_mount_conflicts(api)
+        self._validate_asgi_mount_conflicts(api, docs_routes)
+        self._validate_mcp_mount_conflicts(api, docs_routes)
         refuse_unread_route_config(api._routes, api._websocket_routes)
 
         # Rust reads the Django settings with the function that runbolt uses.
@@ -383,7 +459,7 @@ class TestClient(httpx.Client):
         exceptions = ServerExceptions() if raise_server_exceptions else None
         rust_routes = [
             (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
-            for method, path, handler_id, handler in api._routes
+            for method, path, handler_id, handler in [*api._routes, *docs_routes]
         ]
         _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes), api._rust_no_route())
 
@@ -416,7 +492,7 @@ class TestClient(httpx.Client):
         super().__init__(
             base_url=base_url,
             transport=BoltTestTransport(self.app_id, exceptions, raise_server_exceptions),
-            follow_redirects=True,
+            follow_redirects=follow_redirects,
             **kwargs,
         )
         self.api = api
@@ -666,6 +742,7 @@ class AsyncTestClient(httpx.AsyncClient):
         cors_allowed_origins: list[str] | None = None,
         read_django_settings: bool = True,
         static_files_config: dict | None = None,
+        follow_redirects: bool = True,
         **kwargs: Any,
     ):
         """Initialize async test client.
@@ -684,14 +761,19 @@ class AsyncTestClient(httpx.AsyncClient):
             static_files_config: Static files configuration dict with keys:
                                  url_prefix, directories, csp_header, cache_control.
                                  It replaces the static settings.
+            follow_redirects: If True (the default), follow redirects. If False, give the
+                             redirect response.
             **kwargs: Additional arguments passed to httpx.AsyncClient
         """
+        # Register the docs routes as TestClient does.
+        docs_routes = _prepare_api(api)
+
         # Validate before allocating native test-app state. A failed constructor
         # has no client instance available to release that state. Route
         # conflicts and invalid capsules raise later, in register_test_routes;
         # the finalizer then releases the state.
-        TestClient._validate_asgi_mount_conflicts(api)
-        TestClient._validate_mcp_mount_conflicts(api)
+        TestClient._validate_asgi_mount_conflicts(api, docs_routes)
+        TestClient._validate_mcp_mount_conflicts(api, docs_routes)
         refuse_unread_route_config(api._routes, api._websocket_routes)
 
         # Rust reads the Django settings with the function that runbolt uses.
@@ -712,7 +794,7 @@ class AsyncTestClient(httpx.AsyncClient):
         exceptions = ServerExceptions() if raise_server_exceptions else None
         rust_routes = [
             (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
-            for method, path, handler_id, handler in api._routes
+            for method, path, handler_id, handler in [*api._routes, *docs_routes]
         ]
         _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes), api._rust_no_route())
 
@@ -743,7 +825,7 @@ class AsyncTestClient(httpx.AsyncClient):
         super().__init__(
             base_url=base_url,
             transport=AsyncBoltTestTransport(self.app_id, exceptions, raise_server_exceptions),
-            follow_redirects=True,
+            follow_redirects=follow_redirects,
             **kwargs,
         )
         self.api = api

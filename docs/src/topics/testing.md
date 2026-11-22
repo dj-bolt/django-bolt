@@ -175,7 +175,7 @@ client.query("/articles/search", json={"title": "Hello", "body": "..."})
 
 The response is an `httpx.Response`. Read `response.status_code`, `response.headers`, `response.json()`, `response.text` and `response.content`.
 
-`TestClient` follows redirects. To check the redirect itself, pass `follow_redirects=False` to the request:
+`TestClient` follows redirects. To check the redirect itself, pass `follow_redirects=False` to the request, or to `TestClient` for all requests:
 
 <!-- fragment -->
 ```python
@@ -516,7 +516,16 @@ async def test_get_article():
 
 ## Test the OpenAPI schema
 
-`TestClient` does not serve the `/docs` routes. `runbolt` adds them when it starts. To check the schema in a test, generate it. See [Check the schema in CI](openapi.md#check-the-schema-in-ci).
+`TestClient` serves the `/docs` routes, as `runbolt` does. The `auth` and `guards` of the `OpenAPIConfig` apply:
+
+<!-- fragment -->
+```python
+response = client.get("/docs/openapi.json")
+assert response.status_code == 200
+assert "/articles/{article_id}" in response.json()["paths"]
+```
+
+To check the schema in CI without a client, generate it. See [Check the schema in CI](openapi.md#check-the-schema-in-ci).
 
 ## Using Django's test runner
 

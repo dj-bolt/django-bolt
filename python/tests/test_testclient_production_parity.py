@@ -9,12 +9,16 @@ from a real `runbolt` server.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 from django.test import override_settings
 
 from django_bolt import BoltAPI, Request, WebSocket
+from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
 from django_bolt.middleware import rate_limit
+from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, SwaggerRenderPlugin
+from django_bolt.responses import Redirect
 from django_bolt.testing import AsyncTestClient, TestClient, WebSocketTestClient
 from tests.integration.apps.testclient_parity import api
 from tests.integration.parity_cases import CASES, PREFLIGHT, ParityCase
@@ -160,3 +164,223 @@ def test_each_client_starts_with_empty_rate_limit_buckets():
 
     with TestClient(_limited_api()) as client:
         assert client.get("/limited").status_code == 200
+
+
+def _redirect_api() -> BoltAPI:
+    local_api = BoltAPI()
+
+    @local_api.get("/old")
+    async def old():
+        return Redirect("/new")
+
+    @local_api.get("/new")
+    async def new():
+        return {"page": "new"}
+
+    return local_api
+
+
+def test_follow_redirects_false_gives_the_redirect():
+    """The ``follow_redirects`` of the caller replaces the default of the client (#915)."""
+    local_api = _redirect_api()
+    with TestClient(local_api, follow_redirects=False) as client:
+        response = client.get("/old")
+    assert response.status_code == 307
+    assert response.headers["location"] == "/new"
+
+
+def test_the_client_follows_redirects_by_default():
+    with TestClient(_redirect_api()) as client:
+        response = client.get("/old")
+    assert response.status_code == 200
+    assert response.json() == {"page": "new"}
+
+
+def test_async_client_follow_redirects_false_gives_the_redirect():
+    async def run():
+        async with AsyncTestClient(_redirect_api(), follow_redirects=False) as client:
+            return await client.get("/old")
+
+    response = asyncio.run(run())
+    assert response.status_code == 307
+    assert response.headers["location"] == "/new"
+
+
+def _docs_api(**kwargs) -> BoltAPI:
+    local_api = BoltAPI(**kwargs)
+
+    @local_api.get("/items")
+    async def items():
+        return []
+
+    return local_api
+
+
+def test_the_client_serves_the_docs_routes_as_runbolt_does():
+    """runbolt registers the docs routes of the API. The client does too (#932)."""
+    with TestClient(_docs_api()) as client:
+        schema = client.get("/docs/openapi.json")
+        ui = client.get("/docs")
+    assert schema.status_code == 200
+    assert "/items" in schema.json()["paths"]
+    assert ui.status_code == 200
+    assert ui.headers["content-type"].startswith("text/html")
+
+
+def test_the_async_client_serves_the_docs_routes():
+    async def run():
+        async with AsyncTestClient(_docs_api()) as client:
+            return await client.get("/docs/openapi.json")
+
+    response = asyncio.run(run())
+    assert response.status_code == 200
+    assert "/items" in response.json()["paths"]
+
+
+def test_disabled_docs_are_not_served():
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", enabled=False))
+    with TestClient(local_api) as client:
+        assert client.get("/docs/openapi.json").status_code == 404
+
+
+def test_the_docs_routes_use_the_auth_of_the_openapi_config():
+    config = OpenAPIConfig(
+        title="T",
+        version="1",
+        auth=[APIKeyAuthentication(api_keys={"secret"})],
+        guards=[IsAuthenticated()],
+    )
+    with TestClient(_docs_api(openapi_config=config)) as client:
+        assert client.get("/docs/openapi.json").status_code == 401
+        assert client.get("/docs/openapi.json", headers={"x-api-key": "secret"}).status_code == 200
+
+
+def test_many_clients_of_one_api_serve_the_docs():
+    local_api = _docs_api()
+    for _ in range(3):
+        with TestClient(local_api) as client:
+            assert client.get("/docs/openapi.json").status_code == 200
+
+
+def test_a_route_at_a_docs_path_is_refused_as_runbolt_refuses_it():
+    """runbolt stops with "GET /docs is already registered" for this API. The client raises the same error."""
+    local_api = _docs_api()
+
+    @local_api.get("/docs")
+    async def own_docs():
+        return {"own": True}
+
+    with pytest.raises(ValueError):
+        TestClient(local_api)
+
+
+def test_a_route_at_a_docs_path_is_served_when_the_docs_are_disabled():
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", enabled=False))
+
+    @local_api.get("/docs")
+    async def own_docs():
+        return {"own": True}
+
+    with TestClient(local_api) as client:
+        assert client.get("/docs").json() == {"own": True}
+
+
+@pytest.mark.parametrize("mount_path", ["/sub", "/"])
+def test_a_mount_does_not_copy_the_docs_routes_of_a_client(mount_path):
+    """runbolt adds the docs routes after each mount. A client before a mount must not change the mount."""
+    child = _docs_api()
+    with TestClient(child) as client:
+        assert client.get("/docs/openapi.json").status_code == 200
+
+    parent = BoltAPI()
+    parent.mount(mount_path, child)
+
+    with TestClient(parent) as client:
+        assert client.get("/docs/openapi.json").status_code == 200
+        if mount_path != "/":
+            assert client.get(f"{mount_path}/docs/openapi.json").status_code == 404
+
+
+def test_a_client_serves_the_schema_of_the_routes_at_its_creation():
+    local_api = _docs_api()
+    with TestClient(local_api) as client:
+        assert "/later" not in client.get("/docs/openapi.json").json()["paths"]
+
+    @local_api.get("/later")
+    async def later():
+        return []
+
+    with TestClient(local_api) as client:
+        assert "/later" in client.get("/docs/openapi.json").json()["paths"]
+
+
+def test_an_asgi_mount_at_the_docs_path_is_refused_as_runbolt_refuses_it():
+    async def asgi_app(scope, receive, send):
+        raise AssertionError("not called")
+
+    local_api = _docs_api()
+    local_api.mount_asgi("/docs", asgi_app)
+    with pytest.raises(ValueError):
+        TestClient(local_api)
+
+
+@pytest.mark.parametrize("enabled_first", [True, False])
+def test_a_change_of_the_docs_config_applies_to_the_next_client(enabled_first):
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", enabled=enabled_first))
+    expected = {True: 200, False: 404}
+    with TestClient(local_api) as client:
+        assert client.get("/docs/openapi.json").status_code == expected[enabled_first]
+
+    local_api._openapi_config.enabled = not enabled_first
+
+    with TestClient(local_api) as client:
+        assert client.get("/docs/openapi.json").status_code == expected[not enabled_first]
+
+
+def test_a_plugin_added_to_the_docs_config_applies_to_the_next_client():
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", render_plugins=[SwaggerRenderPlugin()]))
+    with TestClient(local_api) as client:
+        assert client.get("/docs/extra").status_code == 404
+
+    local_api._openapi_config.render_plugins.append(RedocRenderPlugin(path="/extra"))
+
+    with TestClient(local_api) as client:
+        assert client.get("/docs/extra").status_code == 200
+
+
+def test_a_docs_registration_that_raises_leaves_the_api_as_it_was():
+    bad_plugin = SwaggerRenderPlugin(path="/{x}/{x}")
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", render_plugins=[bad_plugin]))
+    with pytest.raises(ValueError):
+        TestClient(local_api)
+
+    local_api._openapi_config.render_plugins = [SwaggerRenderPlugin()]
+
+    with TestClient(local_api) as client:
+        assert client.get("/docs/openapi.json").status_code == 200
+
+
+def _get_docs_after(barrier: threading.Barrier, local_api: BoltAPI, results: list[object]) -> None:
+    barrier.wait()
+    try:
+        with TestClient(local_api) as client:
+            results.append((client.get("/items").status_code, client.get("/docs/openapi.json").status_code))
+    except Exception as error:  # noqa: BLE001 - the test reports the error below
+        results.append(error)
+
+
+def test_clients_created_at_the_same_time_all_serve_the_routes_and_the_docs():
+    """Threads that create clients of one API at the same time must each get its routes and the docs routes.
+
+    A client adds routes to the API at its creation. Another client must not read the API meanwhile.
+    """
+    for _ in range(50):
+        local_api = _docs_api()
+        barrier = threading.Barrier(8)
+        results: list[object] = []
+        threads = [threading.Thread(target=_get_docs_after, args=(barrier, local_api, results)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert results == [(200, 200)] * 8

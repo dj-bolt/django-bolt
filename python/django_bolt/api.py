@@ -865,6 +865,8 @@ class BoltAPI:
 
         self._openapi_schema: dict[str, Any] | None = None
         self._openapi_routes_registered = False
+        # The OpenAPIConfig values and the docs routes of the test clients. They are not in _routes.
+        self._client_docs_routes: tuple[Any, list[tuple[Any, ...]]] | None = None
 
         # Django admin configuration (controlled by --no-admin flag)
         self._admin_routes_registered = False
