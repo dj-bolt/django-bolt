@@ -399,7 +399,7 @@ def test_field_type_defined_after_the_route():
 
 
 def test_field_type_that_never_resolves_fails_closed():
-    with TestClient(late_api) as client:
+    with TestClient(late_api, raise_server_exceptions=False) as client:
         response = client.get("/never")
     assert response.status_code == 500, response.text
     assert SECRET not in response.text, response.text

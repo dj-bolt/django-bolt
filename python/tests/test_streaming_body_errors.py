@@ -108,7 +108,7 @@ def _stream_errors(caplog) -> list[logging.LogRecord]:
     ],
 )
 def test_body_error_ends_the_body_and_is_logged(api, caplog, path, message):
-    with caplog.at_level(logging.ERROR, logger=STREAM_LOGGER), TestClient(api) as client:
+    with caplog.at_level(logging.ERROR, logger=STREAM_LOGGER), TestClient(api, raise_server_exceptions=False) as client:
         response = client.get(path)
 
     assert response.status_code == 200
@@ -124,7 +124,7 @@ def test_body_error_ends_the_body_and_is_logged(api, caplog, path, message):
     [("/iter-fails", "boom in __iter__"), ("/aiter-fails", "boom in __aiter__")],
 )
 def test_an_error_before_the_first_chunk_gives_an_empty_body_and_is_logged(api, caplog, path, message):
-    with caplog.at_level(logging.ERROR, logger=STREAM_LOGGER), TestClient(api) as client:
+    with caplog.at_level(logging.ERROR, logger=STREAM_LOGGER), TestClient(api, raise_server_exceptions=False) as client:
         response = client.get(path)
 
     assert response.status_code == 200
