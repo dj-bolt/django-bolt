@@ -276,8 +276,10 @@ x-job-id: 42
 It sends `bytes` content with no change for each media type.
 
 !!! note
-    Do not annotate a handler with `-> JSON` or `-> Response`. Bolt then validates the data against the class, and the response is a 500.
-    Leave out the return annotation, or annotate the type of the data, as in [Validation of response objects](#validation-of-response-objects).
+    A response class in the return annotation names the class of the result, not the type of the body.
+    `-> JSON`, `-> Response` and `-> JSON | Redirect` send the body as it is. Bolt does not validate it.
+    `-> Item | JSON` validates the body against `Item`, as `-> Item` does.
+    To validate the body of a `-> JSON` handler, use `response_model=`, or annotate the type of the data, as in [Validation of response objects](#validation-of-response-objects).
 
 ### Redirect
 

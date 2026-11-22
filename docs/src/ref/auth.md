@@ -483,6 +483,20 @@ The base class. Subclass it for another storage.
 
 An optional method that a store does not have raises `NotImplementedError`.
 
+`DjangoCacheRevocation` and `DjangoORMRevocation` keep families and user versions in the same key space as tokens.
+Thus their `revoke`, `consume` and `is_revoked` raise `ReservedJtiError` for a `jti` with a reserved prefix.
+`ReservedJtiError` is a subclass of `ValueError`.
+For `DjangoCacheRevocation`, the reserved prefixes are `fam:` and `ver:`.
+For `DjangoORMRevocation`, they are `family:` and `version:`.
+A `jti` from `create_token_pair` is a UUID, so it does not have these prefixes.
+`JWTAuthentication(revocation_store=store)` and `JWTAuthViews` count a token as revoked when `is_revoked` raises `ReservedJtiError`.
+Thus such a token gets a 401.
+A custom store can raise `ReservedJtiError` for a `jti` that it cannot keep.
+Another exception from `is_revoked` gives a 500.
+`InMemoryRevocation` keeps tokens, families and user versions apart, so it accepts each `jti`.
+The two Django stores give `False` from `consume` for a token after `exp + leeway`.
+`InMemoryRevocation` does not read `exp`.
+
 ### InMemoryRevocation
 
 <!-- fragment -->
@@ -524,6 +538,7 @@ DjangoORMRevocation(
 Keeps entries in a database table. Add `"django_bolt.auth.revocation_db"` to `INSTALLED_APPS` and run `migrate`.
 `model` is an `"app_label.ModelName"` with the fields `jti` (unique), `revoked_at`, `expires_at` and `version`. Another form raises `ValueError` on first use.
 A family is a row with the `jti` `family:<fam>`. A user version is a row with the `jti` `version:<user_id>` that never expires.
+Thus a token `jti` cannot start with `family:` or `version:`.
 The store does not delete rows. Delete rows with an `expires_at` in the past from a periodic task:
 
 <!-- fragment -->

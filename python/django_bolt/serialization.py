@@ -432,10 +432,27 @@ def _response_class_wire_meta(
     return (_infer_wire_response_type(media_type), custom_ct, headers_list, cookies_data)
 
 
-def _response_validation_is_required(annotation: Any) -> bool:
-    if annotation is None:
-        return False
-    return annotation not in _VALIDATION_NOOP_TYPES
+def _validated_body_type(annotation: Any) -> Any:
+    """Return the type that validates the body of a result, or None for no validation.
+
+    A response class, such as ``JSON`` in ``-> Item | JSON``, names the class of
+    the result and not the type of its body. Thus a union validates the body
+    against its other members: ``-> Item | JSON`` validates against ``Item``.
+    ``-> JSON`` and ``-> JSON | Redirect`` send the body as it is.
+    """
+    if annotation is None or annotation in _VALIDATION_NOOP_TYPES:
+        return None
+    if isinstance(annotation, type) and is_response_class(annotation):
+        return None
+    if get_origin(annotation) not in (Union, types.UnionType):
+        return annotation
+    members = get_args(annotation)
+    bodies = tuple(arg for arg in members if not (isinstance(arg, type) and is_response_class(arg)))
+    if len(bodies) == len(members):
+        return annotation
+    if all(arg is type(None) for arg in bodies):
+        return None
+    return Union[bodies]  # noqa: UP007 - the members are only known at run time
 
 
 def _allows_none(annotation: Any) -> bool:
@@ -650,15 +667,15 @@ def _compile_serializer_response_handlers(serializer_cls: Any, many: bool, valid
 
 
 def _compile_response_validator(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any]:
-    response_type = meta.get("response_type")
-    if not _response_validation_is_required(response_type):
+    body_type = _validated_body_type(meta.get("response_type"))
+    if body_type is None:
         return None, None
 
-    serializer_cls, many = _response_serializer_info(response_type)
+    serializer_cls, many = _response_serializer_info(body_type)
     if serializer_cls is not None:
         return _compile_serializer_response_handlers(serializer_cls, many, validate_dicts=meta["validate_response"])
 
-    return _compile_type_validators(response_type, meta["validate_response"])
+    return _compile_type_validators(body_type, meta["validate_response"])
 
 
 def _compile_type_validators(annotation: Any, validate: bool) -> tuple[Any, Any]:
@@ -696,9 +713,10 @@ def _compile_stream_item_validators(meta: HandlerMetadata | dict[str, Any]) -> t
     # None. Only a typed stream of JSON items uses the validator, so a stream of
     # raw chunks never does.
     _, item_type = meta["_stream_info"]
-    if not _response_validation_is_required(item_type):
+    body_type = _validated_body_type(item_type)
+    if body_type is None:
         return None, None
-    return _compile_type_validators(item_type, meta["validate_response"])
+    return _compile_type_validators(body_type, meta["validate_response"])
 
 
 def _compile_row_readers(meta: HandlerMetadata | dict[str, Any]) -> tuple[Any, Any] | None:

@@ -13,6 +13,7 @@ import pytest
 
 from django_bolt import BoltAPI, WebSocket
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
+from django_bolt.auth.revocation import InMemoryRevocation, ReservedJtiError
 from django_bolt.testing import WebSocketTestClient
 
 SECRET = "websocket-revocation-secret-longer-than-32-characters"
@@ -123,6 +124,37 @@ async def test_two_jwt_backends_check_each_handshake_token_with_its_own_revocati
         ("a", "revoked-b"),
         ("b", "revoked-a"),
     ]
+
+
+class _RefusingStore(InMemoryRevocation):
+    """A store that refuses some jti values, as the two Django stores do for a reserved prefix."""
+
+    async def is_revoked(self, jti: str) -> bool:
+        if jti.startswith("ver:"):
+            raise ReservedJtiError(f"jti {jti!r} starts with a reserved prefix")
+        return await super().is_revoked(jti)
+
+
+@pytest.mark.asyncio
+async def test_a_token_whose_jti_the_store_refuses_fails_the_websocket_handshake():
+    api = BoltAPI()
+
+    @api.websocket(
+        "/ws", auth=[JWTAuthentication(secret=SECRET, revocation_store=_RefusingStore())], guards=[IsAuthenticated()]
+    )
+    async def endpoint(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    async def connect(jti: str) -> str:
+        async with WebSocketTestClient(
+            api, "/ws", headers=_bearer(jti, "sid"), cors_allowed_origins=["*"], read_django_settings=False
+        ) as websocket:
+            return await websocket.receive_text()
+
+    assert await connect("jti-1") == "connected"
+    with pytest.raises(PermissionError, match="revoked"):
+        await connect("ver:1")
 
 
 @pytest.mark.asyncio

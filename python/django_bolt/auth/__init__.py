@@ -41,6 +41,7 @@ from .revocation import (
     DjangoCacheRevocation,
     DjangoORMRevocation,
     InMemoryRevocation,
+    ReservedJtiError,
     RevocationStore,
     create_revocation_handler,
 )
@@ -100,6 +101,7 @@ __all__ = [
     "InMemoryRevocation",
     "DjangoCacheRevocation",
     "DjangoORMRevocation",
+    "ReservedJtiError",
     "create_revocation_handler",
     # User loading
     "register_auth_backend",

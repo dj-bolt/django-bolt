@@ -69,11 +69,12 @@ The return type tells Bolt how to read the rows:
 
 | Return type | How Bolt reads the QuerySet |
 | --- | --- |
-| `list[SomeStruct]` (a `msgspec.Struct`) | `.values()` of the Struct fields. A nested Struct does not work here. |
+| `list[SomeStruct]` (a `msgspec.Struct`) | `.values()` of the Struct fields. A nested Struct of a foreign key or a one-to-one relation reads the related row in the same query. |
 | `list[SomeSerializer]` (a Bolt `Serializer`) | Model instances, with `select_related()`, `prefetch_related()` and `annotate()` from the fields. See [Serializers](serializers.md#return-a-queryset). |
 | no return type | Return a `.values()` QuerySet. A QuerySet of model instances gives a `500` error, because JSON has no encoding for a model. |
 
-For nested relations, such as `author` as an object, use a Bolt `Serializer` as the item type.
+A nested Struct reads only a foreign key or a one-to-one relation. A `None` relation gives `null`, so type the field `AuthorOut | None` when the key can be empty.
+For a list of related rows, such as the tags of an article, use a Bolt `Serializer` as the item type.
 
 ## Read and write single rows
 
