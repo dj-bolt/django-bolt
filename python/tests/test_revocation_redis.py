@@ -103,9 +103,9 @@ async def test_each_redis_entry_lives_until_the_backend_stops_accepting_its_toke
     await store.revoke("no-exp-jti")
 
     keys = redis_keys()
-    # ``exp`` plus the default leeway of 60 seconds. One second can pass in the test.
+    # ``exp`` plus the default leeway of 60 seconds, to the end of that second. One second can pass in the test.
     for name in ("revoked:revoked-jti", "revoked:used-jti", "revoked:fam:family-id"):
-        assert 159 <= keys.pop(name) <= 160, name
+        assert 160 <= keys.pop(name) <= 161, name
     assert 604799 <= keys.pop("revoked:no-exp-jti") <= 604800
     assert keys == {}
     assert await store.is_revoked("revoked-jti")
@@ -208,7 +208,7 @@ async def test_a_jti_cannot_write_the_key_of_a_family_or_of_a_user_version_on_re
 @pytest.mark.redis
 @pytest.mark.asyncio
 async def test_a_consume_of_an_expired_token_is_refused_on_each_call_on_redis(redis_keys):
-    """Redis deletes a key with no time to live, so the store cannot keep the marker."""
+    """Django deletes a Redis key with a timeout of 0."""
     store = DjangoCacheRevocation()
     exp = int(time.time()) - 3600
 

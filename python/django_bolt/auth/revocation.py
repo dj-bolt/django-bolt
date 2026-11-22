@@ -27,27 +27,29 @@ _CACHE_RESERVED_PREFIXES = ("fam:", "ver:")
 _ORM_RESERVED_PREFIXES = ("family:", "version:")
 
 
-def _refuse_jti(jti: str, reserved: tuple[str, ...]) -> None:
-    """Raise ``ValueError`` for a ``jti`` that starts with a reserved prefix."""
-    raise ValueError(
-        f"jti {jti!r} starts with a reserved prefix ({', '.join(reserved)}). "
-        "The store uses these prefixes for families and user versions."
-    )
+def _check_jti(jti: str, reserved: tuple[str, ...]) -> None:
+    """Raise ``ValueError`` when ``jti`` starts with a reserved prefix."""
+    if jti.startswith(reserved):
+        raise ValueError(
+            f"jti {jti!r} starts with a reserved prefix ({', '.join(reserved)}). "
+            "The store uses these prefixes for families and user versions."
+        )
 
 
 def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS, *, leeway: int) -> int:
     """
     Return the seconds that a revocation entry must live.
 
-    With ``exp``, the entry lives until ``exp + leeway``. ``JWTAuthentication``
-    accepts a token until that time, so the entry must not expire before it.
-    A result below 0 becomes 0, because ``timedelta`` subtracts a negative
-    duration from now. Without ``exp``, the result is ``default``, usually the
+    With ``exp``, the entry lives until the end of the second ``exp + leeway``.
+    ``JWTAuthentication`` accepts a token until the end of that second, so the
+    entry must not expire before it. A token after that second gets 0, not a
+    negative value, because ``timedelta`` subtracts a negative duration from
+    now. Without ``exp``, the result is ``default``, usually the
     ``default_ttl`` of the store. ``leeway`` does not change ``default``.
     """
     if exp is None:
         return default
-    return max(0, int(exp) + leeway - int(time.time()))
+    return max(0, int(exp) + leeway - int(time.time()) + 1)
 
 
 def _checked_leeway(store_name: str, leeway: int) -> int:
@@ -317,10 +319,10 @@ class DjangoCacheRevocation(RevocationStore):
         return self._cache
 
     async def is_revoked(self, jti: str) -> bool:
-        if jti.startswith(_CACHE_RESERVED_PREFIXES):
-            _refuse_jti(jti, _CACHE_RESERVED_PREFIXES)
+        _check_jti(jti, _CACHE_RESERVED_PREFIXES)
+        key = f"{self.key_prefix}{jti}"
         # Django cache get is sync, but fast
-        return self.cache.get(f"{self.key_prefix}{jti}") is not None
+        return self.cache.get(key) is not None
 
     async def revoke(self, jti: str, *, exp: int | None = None) -> None:
         """
@@ -337,9 +339,9 @@ class DjangoCacheRevocation(RevocationStore):
 
         A ``jti`` that starts with ``fam:`` or ``ver:`` raises ``ValueError``.
         """
-        if jti.startswith(_CACHE_RESERVED_PREFIXES):
-            _refuse_jti(jti, _CACHE_RESERVED_PREFIXES)
-        self.cache.set(f"{self.key_prefix}{jti}", "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        _check_jti(jti, _CACHE_RESERVED_PREFIXES)
+        key = f"{self.key_prefix}{jti}"
+        self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
 
     def _require_atomic_cache(self) -> None:
         cache_type = type(self.cache)
@@ -358,14 +360,13 @@ class DjangoCacheRevocation(RevocationStore):
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
         self._require_atomic_cache()
-        if jti.startswith(_CACHE_RESERVED_PREFIXES):
-            _refuse_jti(jti, _CACHE_RESERVED_PREFIXES)
+        _check_jti(jti, _CACHE_RESERVED_PREFIXES)
+        key = f"{self.key_prefix}{jti}"
         ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
         if ttl == 0:
-            # The cache deletes an entry with no time to live, so a later consume
-            # would also succeed. The backend refuses this token, so refuse it here too.
+            # Django deletes an entry with a timeout of 0, so its marker cannot block a replay.
             return False
-        return bool(self.cache.add(f"{self.key_prefix}{jti}", "1", timeout=ttl))
+        return bool(self.cache.add(key, "1", timeout=ttl))
 
     async def get_user_version(self, user_id: str) -> int:
         return int(self.cache.get(f"{self.key_prefix}ver:{user_id}") or 0)
@@ -484,8 +485,7 @@ class DjangoORMRevocation(RevocationStore):
         return self._model
 
     async def is_revoked(self, jti: str) -> bool:
-        if jti.startswith(_ORM_RESERVED_PREFIXES):
-            _refuse_jti(jti, _ORM_RESERVED_PREFIXES)
+        _check_jti(jti, _ORM_RESERVED_PREFIXES)
         return await self.model.objects.filter(jti=jti).aexists()
 
     async def revoke(self, jti: str, *, exp: int | None = None) -> None:
@@ -503,8 +503,7 @@ class DjangoORMRevocation(RevocationStore):
 
         A ``jti`` that starts with ``family:`` or ``version:`` raises ``ValueError``.
         """
-        if jti.startswith(_ORM_RESERVED_PREFIXES):
-            _refuse_jti(jti, _ORM_RESERVED_PREFIXES)
+        _check_jti(jti, _ORM_RESERVED_PREFIXES)
         await self._upsert(jti, exp)
 
     async def _upsert(self, jti: str, exp: int | None) -> None:
@@ -512,8 +511,7 @@ class DjangoORMRevocation(RevocationStore):
         await self.model.objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
-        if jti.startswith(_ORM_RESERVED_PREFIXES):
-            _refuse_jti(jti, _ORM_RESERVED_PREFIXES)
+        _check_jti(jti, _ORM_RESERVED_PREFIXES)
         ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
         if ttl == 0:
             # The cleanup task deletes an expired row, and a later consume would then

@@ -239,7 +239,7 @@ async def rotate_refresh_token(
     # revocation state (jti here, family above). Mode A consumes atomically
     # below, immediately before minting, after all other validation has
     # succeeded.
-    if not rotate and await store.is_revoked(jti):
+    if not rotate and await _is_revoked(store, jti):
         raise TokenRotationError("Refresh token revoked")
 
     user_id = refresh_claims.get("sub")
@@ -418,6 +418,14 @@ async def _user_version(store: Any, user_id: str | None) -> int:
         return 0
 
 
+async def _is_revoked(store: Any, jti: str) -> bool:
+    try:
+        return await store.is_revoked(jti)
+    except ValueError as exc:
+        # A store raises ValueError for a jti with one of its reserved prefixes.
+        raise TokenRotationError("Refresh token has invalid jti") from exc
+
+
 async def _is_family_revoked(store: Any, fam: str) -> bool:
     try:
         return await store.is_family_revoked(fam)
@@ -433,6 +441,8 @@ async def _consume(store: Any, jti: str, *, exp: int | None) -> bool:
         return bool(await consume(jti, exp=exp))
     except NotImplementedError as exc:
         raise TokenRotationError("Revocation store does not support atomic refresh rotation") from exc
+    except ValueError as exc:
+        raise TokenRotationError("Refresh token has invalid jti") from exc
 
 
 async def _revoke_family(store: Any, fam: str, *, exp: int | None) -> None:
