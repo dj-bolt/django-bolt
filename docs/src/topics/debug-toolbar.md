@@ -1,120 +1,170 @@
 ---
-icon: lucide/bug
+description: Show django-debug-toolbar on Bolt routes and mounted Django views, and inspect the SQL queries of JSON API requests.
 ---
 
 # Django Debug Toolbar
 
-This guide shows how to use [Django Debug Toolbar](https://django-debug-toolbar.readthedocs.io/) with Django-Bolt.
+[Django Debug Toolbar](https://django-debug-toolbar.readthedocs.io/) shows the SQL queries, the templates and the timing of a request.
+It works on Bolt routes when you run its middleware on them.
+It also works on Django views that you mount with `api.mount_django()`.
 
-The toolbar works on two kinds of routes:
-
-- **Bolt routes** (`@api.get`, `@api.post`, ...) when you run the toolbar middleware on them with `BoltAPI(django_middleware=[...])`. HTML responses get the toolbar. JSON responses get the `djdt-request-id` and `Server-Timing` headers, and show up in the History panel.
-- **Mounted Django views** (`api.mount_django(...)`). These run the full Django middleware stack, so the toolbar works as it does under `runserver`.
-
-The SQL panel records queries from async Bolt handlers, including the async ORM.
-
-## Install
+## Install the toolbar
 
 ```bash
 pip install django-debug-toolbar
 ```
 
-## Configure
+Add the toolbar to the settings. Keep it behind `DEBUG`:
 
-Keep the toolbar behind `DEBUG`.
-
-```python
-# settings.py
+```python title="blogsite/settings.py"
 DEBUG = True
 
 INSTALLED_APPS = [
-    "django_bolt",
+    "django.contrib.contenttypes",
+    "django.contrib.auth",
     "django.contrib.staticfiles",
-    # ...
+    "django_bolt",
 ]
 if DEBUG:
     INSTALLED_APPS.append("debug_toolbar")
 
 MIDDLEWARE = [
     *(["debug_toolbar.middleware.DebugToolbarMiddleware"] if DEBUG else []),
-    "django.middleware.security.SecurityMiddleware",
-    # ...
+    "django.middleware.common.CommonMiddleware",
 ]
 
 INTERNAL_IPS = ["127.0.0.1"]
+STATIC_URL = "static/"
 ```
 
-The toolbar shows only when `request.META["REMOTE_ADDR"]` is in `INTERNAL_IPS`. Bolt sets `REMOTE_ADDR` on Bolt routes and on mounted Django views. Behind a reverse proxy, set `BOLT_TRUSTED_PROXIES` so `REMOTE_ADDR` is the real client address. In Docker, use `debug_toolbar.middleware.show_toolbar_with_docker` as `SHOW_TOOLBAR_CALLBACK`.
+Add the toolbar URLs to the URLconf:
 
-!!! note "Upgrading from Django-Bolt 0.10.3 or older"
-
-    Older versions did not set `REMOTE_ADDR` on Bolt routes. The `INTERNAL_IPS` check never matched. If you set `SHOW_TOOLBAR_CALLBACK` to work around that, remove the override. The default check works now.
-
-Add the toolbar URLs to your URLconf:
-
-```python
-# urls.py
+```python title="blogsite/urls.py"
 from django.conf import settings
 from django.urls import include, path
 
-urlpatterns = [
-    # ...
-]
+urlpatterns = []
 
 if "debug_toolbar" in settings.INSTALLED_APPS:
     urlpatterns.append(path("__debug__/", include("debug_toolbar.urls")))
 ```
 
-## Enable the toolbar on Bolt routes
+## Show the toolbar on Bolt routes
 
-Run the toolbar middleware on Bolt routes, and mount the toolbar views at the site root:
+Run the toolbar middleware on the Bolt routes with `django_middleware`.
+Then mount Django at `/__debug__`:
 
-```python
-# api.py
+```python title="blogsite/api.py"
 from django.conf import settings
-from django_bolt import BoltAPI
+from django.contrib.auth.models import User
 
-DEBUG_TOOLBAR_MIDDLEWARE = (
+from django_bolt import BoltAPI
+from django_bolt.responses import HTML
+
+TOOLBAR_MIDDLEWARE = (
     ["debug_toolbar.middleware.DebugToolbarMiddleware"] if "debug_toolbar" in settings.INSTALLED_APPS else None
 )
 
-api = BoltAPI(django_middleware=DEBUG_TOOLBAR_MIDDLEWARE)
+api = BoltAPI(django_middleware=TOOLBAR_MIDDLEWARE)
+
+
+@api.get("/authors/count")
+async def author_count() -> dict:
+    return {"count": await User.objects.acount()}
+
+
+@api.get("/dashboard")
+async def dashboard() -> HTML:
+    count = await User.objects.acount()
+    return HTML(f"<html><body><h1>{count} authors</h1></body></html>")
+
 
 if "debug_toolbar" in settings.INSTALLED_APPS:
     api.mount_django("/__debug__", clear_root_path=True)
 ```
 
-**Why the `/__debug__` mount:** the toolbar's JavaScript loads panel data from `__debug__/...` URLs next to the page. On a Bolt route the page is at the site root, so it calls `/__debug__/render_panel/`. Only Django can serve that URL, so mount Django there. `clear_root_path=True` passes the full `/__debug__/...` path to the URLconf.
-
-Pages inside `api.mount_django("/django")` do not need this. Their toolbar calls `/django/__debug__/...`, and that mount already serves it.
-
-**Why a list, not `True`:** `django_middleware=True` runs all of `settings.MIDDLEWARE` on Bolt routes. That includes `CsrfViewMiddleware`, which rejects API `POST` requests with `403`. The list runs only the toolbar. See [Middleware](middleware.md#django-middleware-integration) for the per-request cost.
-
-**`request.user` works in async handlers.** The toolbar is Django middleware, so each request gets a lane, and the user query runs there. `await request.auser()` loads the user without blocking the worker. See [Authentication](authentication.md#accessing-the-authenticated-user) and [Accessing Django request attributes](middleware.md#accessing-django-request-attributes).
-
-## API documentation
-
-The same middleware runs on the API documentation routes.
-When `runbolt` combines APIs, docs use the middleware from the API that supplies the OpenAPI configuration.
-With the setup above, Scalar (`/docs`) and Swagger (`/docs/swagger`) can show the toolbar.
-The JSON schema response cannot contain toolbar HTML.
-
-Custom HTML render plugins must include a closing `</body>` tag.
-The toolbar inserts its HTML before that tag.
-
-## Static files
-
-The toolbar ships its CSS and JS as app static files. In `DEBUG`, Bolt serves them through Django's staticfiles finders. No extra setup is needed. See [Static Files](static-files.md).
-
-## Run
+Run the server:
 
 ```bash
 python manage.py runbolt --dev
 ```
 
-`--dev` runs one process with auto-reload. The toolbar needs one process. The default `MemoryStore` keeps panel data in the worker that served the request. With more workers, a panel request can land on a different worker and return `404`. To run more workers without `--dev`, store panel data in the database:
+Open `http://127.0.0.1:8000/dashboard` in a browser. The toolbar shows on the right side of the page.
 
-```python
+The toolbar loads its panels from URLs that start with `/__debug__/`.
+Only Django can serve them, so the mount at `/__debug__` is necessary.
+`clear_root_path=True` gives Django the full path, which `urls.py` matches.
+
+Give `django_middleware` a list with only the toolbar.
+`django_middleware=True` runs each entry of `MIDDLEWARE` on the Bolt routes.
+`CsrfViewMiddleware` then refuses each API `POST` with `403`.
+See [Middleware](middleware.md).
+
+`request.user` and `await request.auser()` work in the handlers.
+The toolbar is Django middleware, so Bolt runs each request on its own thread, and the user query runs there.
+
+## See the queries of an API request
+
+A JSON response cannot hold the toolbar.
+The toolbar still records the request and adds two headers:
+
+```bash
+curl -i localhost:8000/authors/count
+```
+
+```text
+HTTP/1.1 200 OK
+content-length: 11
+server-timing: TimerPanel_utime;dur=21.524999999999906;desc="User CPU time", TimerPanel_stime;dur=23.663999999999998;desc="System CPU time", TimerPanel_total;dur=45.18899999999991;desc="Total CPU time", TimerPanel_total_time;dur=45.24872299998606;desc="Elapsed time", TimerPanel_toolbar_time;dur=45.387284000071304;desc="Including DebugToolbar time", SQLPanel_sql_time;dur=0.08111900001495087;desc="SQL 1 queries", CachePanel_total_time;dur=0;desc="Cache 0 Calls"
+djdt-request-id: 85c0b076b1ae45fcb6e12e251aac4025
+content-type: application/json
+
+{"count":0}
+```
+
+- `djdt-request-id` is the id of the record in the toolbar store.
+- `Server-Timing` has the CPU time, the elapsed time, the SQL time and the cache time. The network tab of the browser shows it.
+
+To see all the panels of an API request:
+
+1. Open a page that shows the toolbar, for example `/dashboard`.
+2. Send the API request, for example from your frontend or with `curl`.
+3. Open the **History** panel and click **Refresh**.
+4. Find the API request and click **Switch**.
+5. Open the **SQL** panel or another panel.
+
+The **Request Variables** column of the History panel shows only the GET and POST data.
+`No data` in that column does not mean that the request made no queries.
+
+## Show the toolbar on mounted Django views
+
+A view that you serve with `api.mount_django()` runs the full `MIDDLEWARE` of Django.
+The toolbar works there as under `runserver`.
+A view under `api.mount_django("/pages")` loads its panels from `/pages/__debug__/`, and the same mount serves them.
+
+## Show the toolbar on the API docs
+
+The `django_middleware` of the API also runs on the API documentation routes.
+Thus an HTML documentation page, for example Scalar at `/docs`, shows the toolbar.
+The JSON schema at `/docs/openapi.json` cannot hold the toolbar.
+
+A custom HTML render plugin must have a closing `</body>` tag. The toolbar puts its HTML before that tag.
+
+## Serve the toolbar files
+
+The toolbar has CSS and JavaScript files in its app static files.
+With `DEBUG = True`, Bolt serves them through the staticfiles finders of Django.
+See [Static files](static-files.md).
+
+## Run more than one process
+
+The default store of the toolbar, `MemoryStore`, keeps the panel data in the process that served the request.
+With `runbolt --processes 2` or more, a panel request can go to another process.
+The panel then shows `Data for this panel isn't available anymore`.
+
+`runbolt --dev` runs one process. To run more processes, keep the panel data in the database:
+
+```python title="blogsite/settings.py"
 DEBUG_TOOLBAR_CONFIG = {
     "TOOLBAR_STORE_CLASS": "debug_toolbar.store.DatabaseStore",
 }
@@ -122,39 +172,27 @@ DEBUG_TOOLBAR_CONFIG = {
 
 Then run `python manage.py migrate`.
 
-## See API requests
+## Show the toolbar behind a proxy or in Docker
 
-A JSON response cannot hold the toolbar HTML. The toolbar still records the request. To see it:
+The toolbar shows only when `REMOTE_ADDR` is in `INTERNAL_IPS`.
+Bolt sets `REMOTE_ADDR` to the client address.
+Behind a reverse proxy, set `BOLT_TRUSTED_PROXIES`, so `REMOTE_ADDR` is the address of the real client.
+In Docker, set `SHOW_TOOLBAR_CALLBACK` to `"debug_toolbar.middleware.show_toolbar_with_docker"` in `DEBUG_TOOLBAR_CONFIG`.
 
-1. Open a page that shows the toolbar, for example `/dashboard`.
-2. Call the API. Use the browser, `curl`, or your frontend.
-3. Open the **History** panel in the toolbar. Click **Refresh**.
-4. Find the API request in the list. Click **Switch**.
-5. Open the **SQL** panel, or any other panel.
+## Know when the toolbar does not show
 
-All panels now show that API request: SQL, Templates, Headers, Timer, and the others.
+| Response | Result |
+| --- | --- |
+| HTML from a Bolt route, for example `HTML(...)` or `render(...)` | The toolbar is in the page. |
+| JSON from a Bolt route | The `djdt-request-id` and `Server-Timing` headers. Use the History panel. |
+| HTML from a mounted Django view | The toolbar is in the page. |
+| A streaming response | No toolbar. The toolbar changes only a complete `text/html` body. |
 
-The **Request Variables** column in the History list holds only the GET and POST parameters of that request. `No data` there does not mean the request ran no queries. Use **Switch** and the SQL panel for the queries.
+The example project in `python/example` has this setup. Set `DEBUG = True` in `testproject/settings.py` to turn it on.
 
-Each API response also has two headers you can read in the browser's network tab or with `curl -i`:
+## See also
 
-- `djdt-request-id` - the id of the record in the toolbar store.
-- `Server-Timing` - CPU time, elapsed time, SQL time, and cache time.
-
-## What to expect
-
-| Request | Result |
-|---|---|
-| Bolt route that returns HTML (`render(...)`, `HTML(...)`) | Toolbar is in the page. |
-| Bolt route that returns JSON | `djdt-request-id` and `Server-Timing` headers. Open any page with the toolbar and use the History panel. |
-| Mounted Django HTML view | Toolbar is in the page. |
-| Streaming or compressed response | No toolbar. The toolbar only edits a complete, uncompressed `text/html` body. |
-
-## Example project
-
-`python/example` has this setup. Set `DEBUG = True` in `testproject/settings.py`.
-
-```bash
-cd python/example
-python manage.py runbolt --dev
-```
+- [Middleware](middleware.md)
+- [ASGI mounts](asgi-mounts.md)
+- [Static files](static-files.md)
+- [Settings reference](../ref/settings.md)

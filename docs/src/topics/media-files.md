@@ -1,111 +1,197 @@
 ---
-icon: lucide/upload
+description: Save user uploads to MEDIA_ROOT, serve them from Django-Bolt with safe headers, and serve private files through a handler.
 ---
 
-# Media Files
+# Media files
 
-Django-Bolt can serve user-uploaded media files (`MEDIA_ROOT`) directly from Rust, using the same high-performance handler as [static files](static-files.md). It's enabled automatically when both `MEDIA_URL` and `MEDIA_ROOT` are configured — no extra wiring.
+Django-Bolt serves the files of `MEDIA_ROOT` at `MEDIA_URL`, from Rust, with no call to Python.
+Use it for files that users upload, such as images and attachments.
 
-!!! warning "Offload media to a dedicated server in production"
-    Django-Bolt serves media *performantly*, but **we don't advise using it as your production media server.** Put a reverse proxy (Nginx), a CDN, or object storage (S3/GCS/R2) in front of `MEDIA_ROOT` and let it serve uploads directly. Built-in media serving is meant for development, internal tools, and small deployments — not as the primary delivery path for user content.
-
-    See [Production: offload media](#production-offload-media) for why and how.
-
-## Configuration
-
-Django-Bolt reads your existing Django media settings:
-
-```python
-# settings.py
-
-# URL prefix for media files
+```python title="blog/settings.py"
 MEDIA_URL = "/media/"
-
-# Directory where uploaded files are stored
 MEDIA_ROOT = BASE_DIR / "media"
 ```
 
-When both are set and `MEDIA_ROOT` exists on disk, Django-Bolt mounts a `/media/` scope served entirely in Rust. `GET` and `HEAD` are supported, with ETag/Last-Modified caching, conditional requests (`304 Not Modified`), and range requests — the same capabilities as static serving.
+This handler saves an upload with Django's storage and returns its URL:
 
-If `MEDIA_ROOT` doesn't exist, the scope isn't registered and a startup warning is printed.
+```python title="blog/api.py"
+from typing import Annotated
 
-## Security model
+from django.core.files.storage import default_storage
 
-User uploads are untrusted input, so media serving applies stricter defaults than static serving.
+from django_bolt import BoltAPI, UploadFile
+from django_bolt.params import File
 
-### Script-bearing uploads are force-downloaded
+api = BoltAPI()
 
-A file uploaded as `evil.html` or `avatar.svg` can contain JavaScript that runs **in your site's origin** if a browser renders it. `X-Content-Type-Options: nosniff` alone does not stop this — when the `Content-Type` is `text/html` or `image/svg+xml`, browsers *honor* that type and execute any embedded scripts.
 
-So for media, any upload whose extension can carry executable script is rewritten to `Content-Type: application/octet-stream` with `Content-Disposition: attachment`, forcing the browser to download rather than render it:
+@api.post("/attachments", status_code=201)
+def upload_attachment(file: Annotated[UploadFile, File(max_size=5 * 1024 * 1024)]) -> dict:
+    name = default_storage.save(f"attachments/{file.filename}", file.file)
+    return {"url": default_storage.url(name)}
+```
 
-| Family | Extensions |
-|--------|------------|
-| HTML | `html` `htm` `xhtml` `xhtm` `shtml` `shtm` `htc` `hta` |
-| SVG | `svg` `svgz` |
-| XML / XSLT | `xml` `xsl` `xslt` |
-| JavaScript | `js` `mjs` `cjs` |
+```bash
+curl -F "file=@cover.png" localhost:8000/attachments
+```
+
+```json
+{"url": "/media/attachments/cover.png"}
+```
+
+```bash
+curl -I localhost:8000/media/attachments/cover.png
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: image/png
+content-disposition: inline; filename="cover.png"
+x-content-type-options: nosniff
+accept-ranges: bytes
+etag: "d2093:9:6b02502b:4f9495d"
+last-modified: Sun, 22 Nov 2026 02:15:07 GMT
+```
+
+The handler is sync because `default_storage.save()` writes to the disk. A second file with the same name gets a new name, such as `cover_IIDMyr6.png`.
+For uploads, see [Requests](requests.md).
+
+## When Bolt serves media
+
+Bolt serves `MEDIA_URL` only when each of these is true:
+
+- `MEDIA_URL` starts with `/`, is not `/`, and has no `{` or `}`.
+- `MEDIA_ROOT` is an absolute path.
+- `MEDIA_ROOT` is a directory that exists when the server starts.
+
+Otherwise, Bolt prints a warning at startup and does not serve media. For example:
+
+```text
+[django-bolt] Warning: MEDIA_URL must start with '/' for in-process serving (got "media/"); ignoring.
+[django-bolt] Warning: MEDIA_ROOT must be an absolute path (got "media"); ignoring.
+```
+
+Django's defaults, `MEDIA_URL = ""` and `MEDIA_ROOT = ""`, serve no media.
+Bolt serves `GET` and `HEAD`. Media responses do not appear in the access log.
+
+## Files that can run script are downloads
+
+A user can upload an `.html` or `.svg` file with JavaScript in it. If a browser shows that file on your domain, the script runs with the cookies of your site.
+Thus Bolt sends each media file with one of these extensions as a download:
+
+| Kind | Extensions |
+| --- | --- |
+| HTML | `html`, `htm`, `xhtml`, `xhtm`, `shtml`, `shtm`, `htc`, `hta` |
+| SVG | `svg`, `svgz` |
+| XML and XSLT | `xml`, `xsl`, `xslt` |
+| JavaScript | `js`, `mjs`, `cjs` |
 | WebAssembly | `wasm` |
 
-Inert types — images (`png`, `jpg`, `gif`, `webp`), `pdf`, `txt`, `json`, `css` — keep their native content type and render inline as normal.
+```bash
+curl -I localhost:8000/media/attachments/page.html
+```
 
-!!! note "Static files are not disarmed"
-    This rewrite applies to **media only**. Static files are admin-curated (a `theme.html` you shipped is trusted), so they keep their native content types.
+```http
+HTTP/1.1 200 OK
+content-type: application/octet-stream
+content-disposition: attachment
+x-content-type-options: nosniff
+```
 
-### Other protections
+Other files, such as `.png`, `.pdf`, `.txt` and `.css`, keep their own content type and show in the browser.
 
-- **`nosniff` on every response** — including 404s, so a crafted `/media/...` miss can't be MIME-sniffed into executing.
-- **Dotfile deny** — any path with a leading-dot component (`.env`, `.git/config`, `.htaccess`, `.ssh/...`) returns `404`, matching the nginx/Apache default. Backslash-separated components are caught too.
-- **No directory traversal** — paths containing `..` are rejected with `400`; resolved symlink targets must stay inside `MEDIA_ROOT`.
-- **No Django finders fallback** — unlike static, media never falls through to Django's staticfiles finders (they only know `STATICFILES_DIRS`, never `MEDIA_ROOT`), so static assets can't leak under `/media/`.
+Bolt also applies the rules of static files to media:
 
-## Cache-Control
+- A path with `..` gets `400`.
+- A path with a part that starts with a dot, such as `.env`, gets `404`.
+- A symbolic link that points out of `MEDIA_ROOT` gives `404`.
+- Each response, also a `404`, has `X-Content-Type-Options: nosniff`.
+- `SECURE_CSP` adds a `Content-Security-Policy` header. See [Static files](static-files.md#add-a-content-security-policy-header).
 
-Set `BOLT_MEDIA_MAX_AGE` (seconds) to emit a `Cache-Control` header on successful media responses:
+Bolt never looks for a media file with the staticfiles finders.
 
-```python
-# settings.py
+## Cache media files
+
+Each response has an `ETag` and a `Last-Modified` header, so a browser can ask with `If-None-Match` and get `304`.
+Set `BOLT_MEDIA_MAX_AGE` in seconds to add a `Cache-Control` header:
+
+```python title="blog/settings.py"
 BOLT_MEDIA_MAX_AGE = 3600  # 1 hour
 ```
 
-This produces `Cache-Control: private, max-age=3600`. Media uses **`private`** (not `public`) on purpose: media is per-user content where the URL is often the only access gate, and `public` would let a shared cache or CDN hand one user's upload to another.
+```http
+cache-control: private, max-age=3600
+```
 
-- The header is only set on `2xx` responses — a `404` is never cached with a long `max-age`, so a file becomes visible the moment it's uploaded.
-- Missing, non-integer, boolean, or negative values are ignored with a startup warning (no header emitted).
+The header is `private`, so a shared cache or a CDN does not give one user's file to another user.
+Bolt adds it only to a `2xx` response. A value that is not an `int` of 0 or more stops startup with `ImproperlyConfigured`.
 
-See also [`SECURE_CSP`](static-files.md#content-security-policy-csp) — when configured, the CSP header is applied to media responses as well.
+## Serve private files
 
-## Production: offload media
+Each file in `MEDIA_ROOT` is public. A client that knows the URL gets the file, with no authentication.
+Keep private files out of `MEDIA_ROOT`, and serve them from a handler with a guard:
 
-For production, serve media from something other than your application server:
+```python title="blog/api.py"
+from django.conf import settings
 
-- **It's an attack surface kept off your app.** A CDN or object store serves untrusted user content from a separate origin, away from your API and its cookies.
-- **It frees app connections.** Streaming large or slow media downloads ties up connections that should be answering API requests.
-- **Local `MEDIA_ROOT` isn't shared.** Across multiple processes or hosts, a file uploaded on one machine isn't visible on another. Object storage solves this; a local directory doesn't.
-- **You get distribution and lifecycle for free.** CDNs and object stores give geographic edge caching, signed URLs, lifecycle/retention policies, and offsite durability.
+from django_bolt import BoltAPI
+from django_bolt.auth import IsAuthenticated
+from django_bolt.exceptions import NotFound
+from django_bolt.responses import FileResponse
 
-### Nginx
+api = BoltAPI()
 
-Serve `/media/` straight from disk so requests never reach Django-Bolt:
+PRIVATE_ROOT = settings.BASE_DIR / "private"
+
+
+@api.get("/invoices/{invoice_id}/pdf", guards=[IsAuthenticated()])
+async def invoice_pdf(invoice_id: int) -> FileResponse:
+    path = PRIVATE_ROOT / "invoices" / f"{invoice_id}.pdf"
+    if not path.is_file():
+        raise NotFound(detail="Invoice not found")
+    return FileResponse(str(path), filename=f"invoice-{invoice_id}.pdf")
+```
+
+With no token, the response is `401` with `{"detail":"Authentication required"}`.
+With a valid token, the response is the file:
+
+```http
+HTTP/1.1 200 OK
+content-type: application/pdf
+content-disposition: attachment; filename="invoice-7.pdf"
+```
+
+Set `BOLT_ALLOWED_FILE_PATHS = [BASE_DIR / "private"]` to stop a `FileResponse` outside that directory. See [Responses](responses.md).
+
+## Serve media in production
+
+Bolt can serve media in production. A reverse proxy, a CDN or an object store is often a better choice:
+
+- Two servers do not share a local `MEDIA_ROOT`. A file uploaded on one host is missing on the other. Object storage, for example S3 through [django-storages](https://django-storages.readthedocs.io/), solves this.
+- A large download keeps a connection of your API server open.
+- A separate domain for user files keeps the files away from the cookies of your site.
+
+When nginx serves `MEDIA_ROOT`, the download rule of Bolt does not apply. Add it yourself:
 
 ```nginx
 location /media/ {
-    alias /path/to/your/project/media/;
-    expires 1h;
-    add_header Cache-Control "private";
+    alias /srv/blog/media/;
+    add_header X-Content-Type-Options nosniff;
+}
+
+location ~* ^/media/(.+\.(?:html?|xhtml?|shtml?|htc|hta|svgz?|xml|xslt?|m?js|cjs|wasm))$ {
+    alias /srv/blog/media/$1;
+    types { }
+    default_type application/octet-stream;
+    add_header Content-Disposition attachment;
     add_header X-Content-Type-Options nosniff;
 }
 ```
 
-!!! warning "Replicate the download-forcing for untrusted uploads"
-    Django-Bolt's built-in handler force-downloads script-bearing uploads (see above). If you move media to Nginx or another server, **you lose that protection** unless you reconfigure it there — force `Content-Disposition: attachment` (or `application/octet-stream`) for user-uploaded HTML/SVG/JS, or serve untrusted media from a separate, cookieless domain.
-
-### Object storage (S3 / GCS / R2)
-
-For most production apps, store uploads in object storage via [`django-storages`](https://django-storages.readthedocs.io/) and serve them from the bucket/CDN. Set `Content-Disposition: attachment` on untrusted uploads at upload time, and use signed URLs for access control. With object storage, `MEDIA_URL` points at the bucket/CDN and Django-Bolt isn't in the media request path at all.
-
 ## See also
 
-- [Static Files](static-files.md) — serving `STATIC_ROOT` / `STATICFILES_DIRS` and admin assets
-- [Settings Reference](../ref/settings.md#static-and-media-file-serving) — `BOLT_MEDIA_MAX_AGE`, `BOLT_STATIC_MAX_AGE`
-- [Deployment](../getting-started/deployment.md) — running behind Nginx
+- [Static files](static-files.md)
+- [Requests](requests.md)
+- [Responses](responses.md)
+- [Deployment](deployment.md)
+- [Settings reference](../ref/settings.md#static-and-media-files)

@@ -1,215 +1,169 @@
+---
+description: Compress responses with brotli, gzip or zstd. Tune CompressionConfig, turn compression off for a route, and know the BREACH risk.
+---
+
 # Compression
 
-Django-Bolt compresses both buffered and streaming responses through a
-single configuration. The same `CompressionConfig` controls every codec
-choice, the same `@no_compress` decorator opts a route out, and the same
-client-side `Accept-Encoding` negotiation picks the encoding. Streaming
-responses (SSE, async generators) just add a per-chunk flush so events
-reach the client one at a time instead of waiting for the encoder's
-internal block to fill.
+Django-Bolt compresses response bodies in Rust. Compression makes large JSON bodies smaller on the network.
+It is on by default: brotli, with gzip for clients that do not accept brotli.
 
-## Quick start
+## Use the default
 
-Compression is on by default. Use the framework's defaults and you get
-brotli with gzip fallback for every eligible response:
+`BoltAPI()` compresses each response that has a body of 500 bytes or more, when the client accepts the encoding:
+
+```python title="blog/api.py"
+from django_bolt import BoltAPI
+
+api = BoltAPI()
+
+ARTICLES = [{"id": i, "title": f"Article {i}", "body": "Lorem ipsum " * 10} for i in range(50)]
+
+
+@api.get("/articles")
+async def list_articles() -> list:
+    return ARTICLES
+```
+
+```bash
+curl -i localhost:8000/articles -H "Accept-Encoding: br, gzip" --compressed
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+content-encoding: br
+vary: accept-encoding
+```
+
+The client chooses with its `Accept-Encoding` header. Bolt selects the encoding in this order:
+
+1. The `backend` of the config, when the client accepts it.
+2. `gzip`, when the client accepts it and `gzip_fallback` is `True`.
+3. No encoding.
+
+A `q` value of 0 rejects an encoding, for example `br;q=0`. Other `q` values do not change the order above.
+`*` accepts each encoding that the header does not name.
+Bolt does not use `deflate`, and it uses `zstd` only when `zstd` is the `backend`.
+
+| `Accept-Encoding` with the default config | `content-encoding` |
+| --- | --- |
+| `br, gzip` | `br` |
+| `gzip` | `gzip` |
+| `zstd` | none |
+| no header | none |
+
+## Configure compression
+
+Pass a `CompressionConfig` to the API:
 
 ```python
-from django_bolt import BoltAPI
-from django_bolt.responses import EventSourceResponse
-from django_bolt.middleware import CompressionConfig, no_compress
+from django_bolt import CompressionConfig
 
-api = BoltAPI()  # brotli, gzip fallback, on for buffered + streaming
+api = BoltAPI(compression=CompressionConfig(backend="gzip", minimum_size=1000))
+```
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `backend` | `"brotli"` | The first choice: `"brotli"`, `"gzip"` or `"zstd"` |
+| `minimum_size` | `500` | Bodies smaller than this number of bytes are not compressed. Has no effect on a stream. |
+| `gzip_fallback` | `True` | Use gzip when the client does not accept `backend` |
+| `brotli_level` | `5` | Brotli quality, 0 to 11. Streams only. |
+| `brotli_lgwin` | `14` | Brotli window, 2 to the power of this value in bytes, 10 to 24. Streams only. |
+| `gzip_level` | `6` | Gzip level, 0 to 9. Streams only. |
+| `zstd_level` | `3` | Zstd level, 1 to 22. Streams only. |
+
+A value out of range raises `ValueError` when you make the config.
+
+The level fields apply only to streaming responses, such as `StreamingResponse` and `EventSourceResponse`.
+A buffered response always uses the fixed levels of the HTTP server library: brotli 3, gzip 1 and zstd 3.
+
+`compression=False` turns compression off for the API. `compression=None` is the same as no argument: the default config.
+Another value, such as `True` or a dict, raises `TypeError`.
+
+### Use one config for the server
+
+One server has one compression config. Bolt selects it at startup:
+
+1. `BOLT_COMPRESSION` in `settings.py`, when you set it. `None` or `False` turns compression off.
+2. Otherwise the config of the first API that has compression on.
+
+```python title="settings.py"
+from django_bolt import CompressionConfig
+
+BOLT_COMPRESSION = CompressionConfig(backend="zstd", zstd_level=6)
+```
+
+When you serve more than one `BoltAPI`, set `BOLT_COMPRESSION`. Then the choice does not depend on the order of the APIs.
+A value that is not a `CompressionConfig`, `None` or `False` raises `ImproperlyConfigured`.
+
+## Turn compression off for a route
+
+`@no_compress` sends the body of one route with no encoding. Put it below the route decorator:
+
+```python
+from django_bolt import no_compress
 
 
-# Buffered JSON — compressed when body ≥ minimum_size and client accepts br/gzip
-@api.get("/users")
-async def users():
-    return [{"id": i, "name": f"user-{i}"} for i in range(1000)]
-
-
-# Streaming SSE — each event compressed and flushed individually
-@api.get("/sse/feed")
-async def feed():
-    async def gen():
-        for i in range(20):
-            yield {"i": i, "msg": "x" * 200}
-
-    return EventSourceResponse(gen())
-
-
-# Per-route opt-out — works the same for buffered and streaming
-@api.get("/raw")
+@api.get("/articles/export")
 @no_compress
-async def raw():
-    return {"plain": True}
+async def export_articles() -> list:
+    return ARTICLES
 ```
 
-Disable compression entirely by passing `compression=False`:
+`@no_compress` is the same as `@skip_middleware("compression")`. It works for buffered and streaming responses.
+
+## Compress a stream
+
+Bolt compresses `StreamingResponse` and `EventSourceResponse` too. It flushes the encoder after each chunk, so each event reaches the client at once:
 
 ```python
-api = BoltAPI(compression=False)
+from django_bolt.responses import EventSourceResponse
+
+
+@api.get("/articles/live")
+async def live_articles() -> EventSourceResponse:
+    async def events():
+        for article in ARTICLES[:3]:
+            yield {"id": article["id"], "title": article["title"]}
+
+    return EventSourceResponse(events())
 ```
 
-(`compression=None` and omitting the kwarg both mean "use the default
-`CompressionConfig()`".)
+A stream keeps one encoder for each connection. A brotli encoder holds a window of 2 to the power of `brotli_lgwin` bytes: 16 KiB with the default of 14.
+With many open streams, the window size sets most of the memory. Lower `brotli_lgwin` for a server with many connections.
 
-Each other value, for example `compression=True` or a dict, raises `TypeError` when the API is made.
+## Send a body that you compressed
 
-`StreamingResponse` / `EventSourceResponse` don't take a `compress=`
-kwarg — the decision is always made per-request from the global
-`CompressionConfig` plus the client's `Accept-Encoding`.
-
-## CompressionConfig
+A response with a `Content-Encoding` header passes through with no change. Use it for a body that you compressed and stored:
 
 ```python
-from django_bolt import BoltAPI
-from django_bolt.middleware import CompressionConfig
+import gzip
 
-api = BoltAPI(compression=CompressionConfig(
-    backend="brotli",        # "brotli" | "gzip" | "zstd"
-    minimum_size=500,        # buffered-only; ignored for streams
-    gzip_fallback=True,      # use gzip if client doesn't accept backend
-    brotli_level=5,          # 0..=11
-    brotli_lgwin=14,         # 10..=24 — 2^lgwin bytes window per stream
-    gzip_level=6,            # 0..=9
-    zstd_level=3,            # 1..=22
-))
+from django_bolt.responses import Response
+
+CACHED_EXPORT = gzip.compress(b'[{"id": 1, "title": "Hello"}]')
+
+
+@api.get("/articles/cached")
+async def cached_export() -> Response:
+    return Response(CACHED_EXPORT, media_type="application/json", headers={"Content-Encoding": "gzip"})
 ```
 
-| Field | Buffered | Streaming | Notes |
-|---|---|---|---|
-| `backend` | yes | yes | Preferred codec when client accepts it. |
-| `minimum_size` | yes | no effect | Streams don't have a known total size. |
-| `gzip_fallback` | yes | yes | Wrap with gzip when client doesn't accept `backend`. |
-| `brotli_level` / `gzip_level` / `zstd_level` | yes | yes | CPU/ratio tradeoff. |
-| `brotli_lgwin` | yes | yes | Per-stream memory knob — important for high-fanout SSE. |
+Bolt does not check that the body matches the header, and it does not check the `Accept-Encoding` of the client.
 
-## Negotiation
+## Avoid the BREACH attack
 
-For every response (buffered or streaming) the same algorithm runs:
+Compression can leak a secret. An attacker who can put text into a compressed response, and who can see its size, can guess a secret in the same response one byte at a time.
+This is the [BREACH](https://en.wikipedia.org/wiki/BREACH) attack. An event stream shows the size of each event, which makes the attack easier.
 
-1. `@no_compress` on the route → no compression.
-2. `BoltAPI(compression=False)` → no compression.
-3. Client accepts `cfg.backend` → wrap with that codec.
-4. Else `gzip_fallback=True` and client accepts `gzip` → wrap with gzip.
-5. Else → no compression.
+When a response holds a secret, such as a token or a CSRF value, and also text that a user controls:
 
-When no compression is applied, `Content-Encoding` is absent on the
-wire (the framework uses `identity` as an internal "skip" marker that
-the middleware strips before sending).
+- Turn compression off for the route with `@no_compress`.
+- Or send the secret in another response or a header.
 
-`Accept-Encoding: *` accepts any unmentioned coding; `*;q=0` rejects
-them. An explicit `br;q=0` rejects brotli even when `*` is generous.
+## See also
 
-## Streaming behavior
-
-Streaming responses go through a per-chunk *sync flush* so the wire
-sees a self-contained compressed block after every `yield`. Without
-this flush the encoder would buffer events into its internal block and
-the client wouldn't see anything until the block filled — fatal for
-SSE and async generators.
-
-| Codec  | Flush mechanism                             | Decodable per chunk |
-|--------|---------------------------------------------|---------------------|
-| brotli | `CompressorWriter::flush()` → `BROTLI_OPERATION_FLUSH` | yes |
-| gzip   | `GzEncoder::flush()` → `Z_SYNC_FLUSH`        | yes                 |
-| zstd   | `zstd::stream::write::Encoder::flush()`     | yes                 |
-
-One encoder runs per connection, so cross-chunk dictionary reuse still
-helps the ratio. Per-event flushing caps the achievable ratio compared
-to one-shot compression (each flush ends a self-contained block), so
-high quality levels buy less on streams than on buffered responses.
-
-## Per-connection memory (brotli `lgwin`)
-
-`brotli_lgwin` is the dominant memory knob for streaming compression.
-Window size = `2^lgwin` bytes **per active connection**. The default of
-`14` gives a 16 KiB window — enough for SSE event vocabulary reuse,
-cheap enough for high-fanout servers.
-
-| `lgwin`              | Window  |
-|----------------------|---------|
-| 10 (min)             | 1 KiB   |
-| 14 (**default**)     | 16 KiB  |
-| 16                   | 64 KiB  |
-| 18                   | 256 KiB |
-| 20                   | 1 MiB   |
-| 22 (brotli "normal") | 4 MiB   |
-| 24 (max)             | 16 MiB  |
-
-Memory cost scales with `2^lgwin` per active connection (plus encoder
-overhead), so the window choice dominates resident memory under high
-fanout. Drop `lgwin` for high-fanout SSE; raise it for large,
-repetitive buffered bodies where the per-request cost is amortized
-over a single response.
-
-## Compression levels
-
-Level fields trade CPU for ratio. Defaults are tuned for the streaming
-case (per-chunk flush caps achievable ratio, so spending CPU on level
-11 buys little).
-
-- **`brotli_level`** (0..=11) — `5` is balanced. The highest levels
-  trade significant CPU for a small ratio win and are typically only
-  worth it for static/precompressed assets.
-- **`gzip_level`** (0..=9) — `6` matches zlib's `Z_DEFAULT_COMPRESSION`.
-- **`zstd_level`** (1..=22) — `3` is balanced. Levels above 19 enable
-  "ultra" mode and are very memory- and CPU-heavy.
-
-## Interaction with the global compression middleware
-
-The buffered compression middleware reads `Content-Encoding` on the
-outgoing response: if any value is pre-set, it passes the body through
-unchanged. Streaming compression runs inside the handler and pre-sets
-`Content-Encoding`, so the global middleware never re-wraps a stream —
-no double-compression possible.
-
-A handler can also return a body that it compressed itself. Return the
-bytes in a `Response` and set the `Content-Encoding` header:
-
-```python
-@api.get("/cached")
-async def cached():
-    return Response(compressed_bytes, headers={"Content-Encoding": "zstd"})
-```
-
-Bytes-like content passes through verbatim, for every media type. The
-middleware keeps the pre-set encoding and does not compress again.
-
-## Security — CRIME / BREACH
-
-Compressing responses that mix attacker-influenced content with secrets
-(session tokens, cookies, CSRF values, user identifiers) is vulnerable
-to compression-ratio side-channel attacks. SSE is a particularly easy
-target: per-event sizes are directly observable, and an attacker who
-controls part of an event's content can probe for secret bytes one at
-a time.
-
-If your payloads can contain both attacker-controllable data **and**
-secrets, either:
-
-- Don't compress those responses (`@no_compress`), or
-- Move the secret elsewhere (header, separate channel) so the
-  compressed body never sees it.
-
-This is the same risk class as HTTPS-level compression
-([CRIME](https://en.wikipedia.org/wiki/CRIME) /
-[BREACH](https://en.wikipedia.org/wiki/BREACH)); the framework
-intentionally leaves the decision in your hands per-route rather than
-disabling compression globally.
-
-## Implementation pointers
-
-- `src/middleware/compression.rs` — buffered compression middleware;
-  bypasses any pre-set `Content-Encoding` so handler-owned encodings
-  (streaming or otherwise) aren't re-wrapped.
-- `src/streaming_compression.rs` — `StreamCodec` enum, `EncoderStream`
-  generic adapter, `select_stream_encoding`, zero-alloc Accept-Encoding
-  parser.
-- `src/streaming.rs::maybe_wrap_codec` — boxes the encoder around the
-  Python chunk stream (and the keep-alive wrapper for SSE).
-- `src/handler.rs::build_response_from_parsed` — reads
-  `AppState.global_compression_config`, runs negotiation, sets the
-  encoding headers, and wraps the stream.
-- `python/django_bolt/middleware/compression.py` — `CompressionConfig`
-  dataclass and per-codec level/range types.
+- [Middleware reference](../ref/middleware.md#compressionconfig): `CompressionConfig` and `@no_compress`.
+- [Server-sent events](sse.md): `EventSourceResponse`.
+- [Responses](responses.md): `StreamingResponse` and custom headers.
+- [Settings reference](../ref/settings.md): `BOLT_COMPRESSION`.

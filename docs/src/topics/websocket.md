@@ -1,552 +1,493 @@
 ---
-icon: lucide/cable
+description: Serve WebSocket connections with typed parameters, authentication, guards and close codes, and test them with WebSocketTestClient.
 ---
 
 # WebSocket
 
-Django-Bolt provides WebSocket support for real-time bidirectional communication.
+A WebSocket is a connection that stays open, so the server and the client can send messages at any time.
+Use it for chat, live comments or collaborative editing.
+For updates that go only from the server to the client, [Server-Sent Events](sse.md) are simpler.
 
-## Basic WebSocket endpoint
+Register a WebSocket route with `@api.websocket()`.
+The handler gets a `WebSocket` object:
 
-```python
-from django_bolt import BoltAPI, WebSocket
+```python title="blog/api.py"
+from django_bolt import BoltAPI
+from django_bolt.websocket import WebSocket
 
 api = BoltAPI()
 
-@api.websocket("/ws/echo")
-async def echo(websocket: WebSocket):
+
+@api.websocket("/ws/articles/{article_id}/comments")
+async def comment_room(websocket: WebSocket, article_id: int) -> None:
     await websocket.accept()
-    async for message in websocket.iter_text():
-        await websocket.send_text(f"Echo: {message}")
+    async for comment in websocket.iter_json():
+        await websocket.send_json({"article_id": article_id, "body": comment["body"]})
 ```
 
-## WebSocket lifecycle
+Connect from a browser:
 
-A WebSocket connection goes through these stages:
+```javascript
+const socket = new WebSocket("ws://localhost:8000/ws/articles/7/comments");
+socket.onmessage = (event) => console.log(JSON.parse(event.data));
+socket.onopen = () => socket.send(JSON.stringify({ body: "Nice article" }));
+```
 
-1. **Connection** - Client initiates WebSocket handshake
-2. **Accept** - The handler calls `accept()`. Bolt then sends the `101 Switching Protocols` response.
-3. **Communication** - Exchange messages
-4. **Close** - Either party closes the connection
+The browser logs `{article_id: 7, body: "Nice article"}`.
+
+A WebSocket handler must be an `async def` function.
+`@api.websocket()` raises `TypeError` for a `def` function.
+
+## Accept the connection
+
+A connection starts with an HTTP request: the handshake.
+Bolt runs the rate limit, the Origin check, the authentication and the guards before the handler starts.
+The handler then decides the handshake:
+
+- `await websocket.accept()` sends `101 Switching Protocols`, and the connection opens.
+- A `close()` or a `return` before `accept()` refuses the handshake with `403`.
+
+Call `accept()` before you send or receive messages.
+A second call to `accept()` does nothing.
+
+## Send and receive messages
+
+| Method | Does |
+| --- | --- |
+| `await websocket.send_text(data)` | Sends a text frame. |
+| `await websocket.send_bytes(data)` | Sends a binary frame. |
+| `await websocket.send_json(data, mode="text")` | Encodes `data` as JSON and sends it. `mode="binary"` sends a binary frame. |
+| `await websocket.receive_text()` | Waits for a text frame and returns a `str`. |
+| `await websocket.receive_bytes()` | Waits for a binary frame and returns `bytes`. |
+| `await websocket.receive_json(mode="text")` | Waits for a frame and decodes its JSON. |
+| `websocket.iter_text()`, `iter_bytes()`, `iter_json()` | Give each message until the client disconnects. |
+| `await websocket.receive()` | Returns the raw ASGI message, a `dict`. |
+
+`receive_text()` raises `WebSocketException` with code 1003 for a binary frame.
+`receive_bytes()` does the same for a text frame.
+The connection stays open, so you can handle the error and continue:
 
 ```python
-@api.websocket("/ws/chat")
-async def chat(websocket: WebSocket):
-    # 1. Accept the connection
+from django_bolt.websocket import WebSocketDisconnect, WebSocketException
+
+
+@api.websocket("/ws/drafts/{draft_id}")
+async def draft_editor(websocket: WebSocket, draft_id: int) -> None:
     await websocket.accept()
-
-    try:
-        # 2. Communication loop
-        while True:
-            message = await websocket.receive_text()
-            await websocket.send_text(f"You said: {message}")
-    except WebSocketDisconnect:
-        # 3. Client disconnected
-        pass
+    while True:
+        try:
+            text = await websocket.receive_text()
+        except WebSocketDisconnect:
+            return
+        except WebSocketException as exc:
+            await websocket.send_text(f"Error {exc.code}: {exc.reason}")
+            continue
+        await websocket.send_text(f"Saved {len(text)} characters")
 ```
 
-## Sending messages
+A binary frame gives the client the message `Error 1003: receive_text() got a binary frame`.
+`WebSocketDisconnect` is a subclass of `WebSocketException`, so catch it first.
 
-### Text messages
+## Read parameters
 
-```python
-await websocket.send_text("Hello, World!")
-```
-
-### Binary messages
-
-```python
-await websocket.send_bytes(b"\x00\x01\x02\x03")
-```
-
-### JSON messages
-
-```python
-await websocket.send_json({"type": "message", "data": "Hello"})
-```
-
-## Receiving messages
-
-### Text messages
-
-```python
-# Single message
-message = await websocket.receive_text()
-
-# Iterate over messages
-async for message in websocket.iter_text():
-    print(f"Received: {message}")
-```
-
-### Binary messages
-
-```python
-data = await websocket.receive_bytes()
-
-async for data in websocket.iter_bytes():
-    print(f"Received {len(data)} bytes")
-```
-
-### JSON messages
-
-```python
-data = await websocket.receive_json()
-
-async for data in websocket.iter_json():
-    print(f"Received: {data}")
-```
-
-### A frame of a different type
-
-`receive_text()` reads only a text frame, and `receive_bytes()` reads only a
-binary frame. A frame of the other type raises `WebSocketException` with code
-1003 (unsupported data). The reason names the frame, for example
-`receive_text() got a binary frame`. The connection stays open, and the next
-call reads the next frame. `receive_json()` and the iterators raise the same
-error. To read each frame type, use `receive()`:
-
-```python
-message = await websocket.receive()
-if "text" in message:
-    print(f"Text: {message['text']}")
-else:
-    print(f"Binary: {len(message['bytes'])} bytes")
-```
-
-## Path parameters
-
-WebSocket routes support path parameters:
-
-```python
-@api.websocket("/ws/room/{room_id}")
-async def room(websocket: WebSocket, room_id: str):
-    await websocket.accept()
-    async for message in websocket.iter_text():
-        await websocket.send_text(f"[{room_id}] {message}")
-```
-
-Bolt decodes path values as for HTTP routes. Thus `/ws/room/hello%20world`
-gives `hello world`.
-
-## Query parameters
-
-Access query parameters from the connection:
-
-```python
-@api.websocket("/ws/connect")
-async def connect(websocket: WebSocket, token: str | None = None):
-    if token != "secret":
-        await websocket.close(code=4001, reason="Invalid token")
-        return
-
-    await websocket.accept()
-    # ...
-```
-
-This `close()` runs before `accept()`, so it refuses the handshake with `403`.
-The client does not get the close code. To send a close code, call `accept()`
-first. See [Refuse the handshake](#refuse-the-handshake).
-
-When a query key repeats, the parameter gets the last value, as for HTTP
-routes.
-
-## Typed parameters
-
-Declare a path, query, header or cookie parameter with a type, for example
-`int`. Rust converts the value before the handler runs. A value that does not
-convert rejects the upgrade with a 400. The body names the parameter:
+A handler reads path, query, header and cookie parameters as an HTTP handler does.
+The `WebSocket` parameter can have any name. Bolt finds it by its type hint.
 
 ```python
 from typing import Annotated
 
-from django_bolt.param_functions import Query
+from django_bolt.params import Cookie, Header, Query
 
-@api.websocket("/ws/feed")
-async def feed(websocket: WebSocket, limit: Annotated[int, Query()] = 10):
+
+@api.websocket("/ws/articles/{article_id}/presence")
+async def presence(
+    websocket: WebSocket,
+    article_id: int,
+    nickname: Annotated[str, Query()] = "guest",
+    user_agent: Annotated[str, Header()] = "unknown",
+    theme: Annotated[str, Cookie()] = "light",
+) -> None:
     await websocket.accept()
-    await websocket.send_json({"limit": limit})
+    await websocket.send_json(
+        {"article_id": article_id, "nickname": nickname, "user_agent": user_agent, "theme": theme}
+    )
 ```
 
-`?limit=50` gives the integer `50`. `?limit=abc` gives a 400 with
-`Query parameter 'limit': Invalid integer 'abc'`. `WebSocketTestClient`
-raises `ValueError` with the same text.
+A request to `/ws/articles/7/presence?nickname=ada` with the cookie `theme=dark` gets:
 
-## Closing connections
+```json
+{"article_id": 7, "nickname": "ada", "user_agent": "Mozilla/5.0", "theme": "dark"}
+```
 
-### From the server
+A value that does not convert refuses the handshake with `400`.
+For example, `/ws/articles/abc/presence` gets `400`, and the handler does not run.
 
-When the handler returns after `accept()` with no `close()`, Bolt closes the
-connection with code 1000. When the handler raises, Bolt closes it with code
-1011 and the reason `Internal error`. To send a different code or a reason,
-call `close()`:
+A route matches the request path with and without a trailing slash.
+A WebSocket has no request body, so a body, form or file parameter is not available.
+
+The `WebSocket` object also has these attributes: `path`, `query_params`, `headers`, `cookies`, `path_params`, `subprotocols`, `client` and `state`.
+
+### Use dependencies
+
+`Depends()` works on a WebSocket route. A dependency can be `def` or `async def`:
 
 ```python
-await websocket.close()
+from django_bolt import Depends
 
-# With custom close code and reason
-await websocket.close(code=1000, reason="Normal closure")
+
+async def room_settings(room: str = "general") -> dict:
+    return {"room": room, "max_length": 500}
+
+
+@api.websocket("/ws/chat")
+async def chat(websocket: WebSocket, settings: dict = Depends(room_settings)) -> None:
+    await websocket.accept()
+    await websocket.send_json(settings)
 ```
 
-A close frame holds a code and a reason of at most 123 bytes of UTF-8 (RFC 6455).
-Use a code from 1000 to 1003, from 1007 to 1014 or from 3000 to 4999. RFC 6455
-reserves the other codes. `close()` raises
-`ValueError` for a code or a reason that makes an invalid close frame. The
-connection stays open, and `WebSocketTestClient` raises the same error.
+`/ws/chat?room=django` sends `{"room": "django", "max_length": 500}`.
+See [Dependencies](dependencies.md).
 
-To close from a helper or a dependency, raise `WebSocketException`. Bolt
-closes the connection with the code and the reason of the exception, and it
-does not log an error. `WebSocketClose` is the same exception with code 1000
-as its default:
+## Handle a disconnect
+
+`receive_text()`, `receive_bytes()`, `receive_json()` and `receive()` raise `WebSocketDisconnect` when the client leaves.
+Its `code` attribute has the close code of the client.
+The `iter_*()` methods catch it and stop:
 
 ```python
-from django_bolt import WebSocketException
+from django_bolt.websocket import WebSocketDisconnect
 
-@api.websocket("/ws/rooms/{room}")
-async def room(websocket: WebSocket, room: str):
+
+@api.websocket("/ws/articles/{article_id}/readers")
+async def readers(websocket: WebSocket, article_id: int) -> None:
     await websocket.accept()
-    if room not in OPEN_ROOMS:
-        raise WebSocketException(code=4004, reason="No such room")
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect as exc:
+        print(f"Reader of article {article_id} left with code {exc.code}")
 ```
 
-`WebSocketException` and `WebSocketClose` do the same check when the handler
-makes the exception. `WebSocketException(code=1005)` raises `ValueError`, and
-the handler then ends with that error: the connection closes with 1011.
-`WebSocketDisconnect` reports the close of the client, so it has no check.
+A send to a client that left also raises `WebSocketDisconnect`, with code 1006.
+The handler continues to run after the client leaves, so code after the receive loop runs.
 
-### Refuse the handshake
+## Close the connection
 
-Bolt sends the `101` response only when the handler calls `accept()`.
-Before that, the handler can refuse the connection with an HTTP status:
+Call `close()` with a code and a reason:
 
-| Handler action before `accept()` | Response |
-|----------------------------------|----------|
+```python
+@api.websocket("/ws/articles/{article_id}/edit")
+async def edit_article(websocket: WebSocket, article_id: int) -> None:
+    await websocket.accept()
+    await websocket.close(code=4001, reason="Read-only article")
+```
+
+The rules for a close frame come from RFC 6455:
+
+- The code is 1000 to 1003, 1007 to 1014, or 3000 to 4999. Use 4000 to 4999 for codes of your application.
+- The reason is at most 123 bytes of UTF-8.
+
+`close()` raises `ValueError` for a code or a reason that breaks these rules.
+The connection stays open.
+A second `close()` does nothing.
+
+You can also raise an exception to close the connection:
+
+```python
+from django_bolt.websocket import WebSocketClose
+
+
+@api.websocket("/ws/articles/{article_id}/votes")
+async def votes(websocket: WebSocket, article_id: int) -> None:
+    await websocket.accept()
+    raise WebSocketClose(code=4003, reason="Voting is closed")
+```
+
+`WebSocketClose` has the default code 1000.
+`WebSocketException` has the default code 1011.
+Both check the code and the reason as `close()` does.
+
+| The handler after `accept()` | The client gets |
+| --- | --- |
+| Calls `close(code, reason)` | A close frame with `code` and `reason` |
+| Raises `WebSocketClose` or `WebSocketException` | A close frame with the code and the reason of the exception |
+| Returns | A close frame with code 1000 |
+| Raises another exception | A close frame with code 1011 and the reason `Internal error`. Bolt prints the error to stderr. |
+
+`CloseCode` has names for the standard codes, for example `CloseCode.NORMAL` (1000) and `CloseCode.POLICY_VIOLATION` (1008).
+
+## Refuse the handshake
+
+Decide before `accept()` if the connection can open:
+
+```python
+@api.websocket("/ws/drafts/{draft_id}/preview")
+async def draft_preview(websocket: WebSocket, draft_id: int) -> None:
+    if draft_id > 100:
+        await websocket.close()
+        return
+    await websocket.accept()
+    await websocket.send_text(f"Preview of draft {draft_id}")
+```
+
+```bash
+curl -i -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  localhost:8000/ws/drafts/500/preview
+```
+
+```text
+HTTP/1.1 403 Forbidden
+content-type: application/json
+
+{"detail":"WebSocket connection refused"}
+```
+
+| The handler before `accept()` | Response |
+| --- | --- |
 | Calls `close()` | `403 Forbidden` |
 | Returns | `403 Forbidden` |
 | Raises `WebSocketException` or `WebSocketClose` | `403 Forbidden` |
-| Raises a different exception | `500 Internal Server Error` |
+| Raises another exception | `500 Internal Server Error` |
+
+## Check the connection state
+
+`websocket.state` is a `WebSocketState`. The state only moves forward:
+`CONNECTING`, then `CONNECTED` after `accept()`, then `DISCONNECTED` after a close.
+
+| Call | `CONNECTING` | `CONNECTED` | `DISCONNECTED` |
+| --- | --- | --- | --- |
+| `accept()` | Accepts | Does nothing | `RuntimeError` |
+| `send_text()`, `send_bytes()`, `send_json()` | `RuntimeError` | Sends | `RuntimeError` |
+| `receive_text()`, `receive_bytes()`, `receive_json()` | `RuntimeError` | Receives | `WebSocketDisconnect` |
+| `receive()` | Gives `websocket.connect` | Receives | `WebSocketDisconnect` |
+| `close()` | Refuses the handshake with 403 | Closes | Does nothing |
+
+Each `RuntimeError` message names the fix, for example `WebSocket is not accepted: call accept() before send()`.
+
+## Require authentication
+
+Give the route `auth` and `guards`, as for an HTTP route:
 
 ```python
-@api.websocket("/ws/rooms/{room}")
-async def room(websocket: WebSocket, room: str):
-    if room not in OPEN_ROOMS:
-        await websocket.close()  # The client gets 403. The connection does not open.
-        return
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
+
+
+@api.websocket(
+    "/ws/notifications",
+    auth=[JWTAuthentication()],
+    guards=[IsAuthenticated()],
+)
+async def notifications(websocket: WebSocket) -> None:
+    await websocket.accept()
+    await websocket.send_json({"type": "welcome"})
+```
+
+Bolt checks the credential at the handshake, before the handler runs:
+
+| Result | Response |
+| --- | --- |
+| No valid credential | `401 Unauthorized` with `{"detail":"Authentication required"}` |
+| A guard fails | `403 Forbidden` |
+| The token is revoked | `401 Unauthorized` |
+
+A route with no `auth` uses `BOLT_AUTHENTICATION_CLASSES`, as an HTTP route does.
+Bolt checks the token one time. An open connection stays open after the token expires or is revoked.
+
+`SessionAuthentication` does not work on a WebSocket route, because Django middleware does not run there.
+`auth=[SessionAuthentication()]` raises `ImproperlyConfigured`.
+Bolt leaves a session backend of `BOLT_AUTHENTICATION_CLASSES` out of a WebSocket route.
+
+The handler gets no `request.user`.
+The guards decide if the connection opens. They do not give the user to the handler.
+
+### Authenticate a browser
+
+The browser `WebSocket` API cannot set the `Authorization` header.
+It sends cookies, so read the token from a cookie:
+
+```python
+@api.websocket(
+    "/ws/inbox",
+    auth=[JWTAuthentication(cookie="access_token")],
+    guards=[IsAuthenticated()],
+)
+async def inbox(websocket: WebSocket) -> None:
     await websocket.accept()
 ```
 
-A call to `receive()` before `accept()` gives `{"type": "websocket.connect"}`
-one time, as the ASGI specification requires. A second call waits until the
-handler accepts or refuses the handshake.
+`auth` does not read a token from the query string.
+See [Authentication](authentication.md).
 
-### Handling client disconnect
+## Allow cross-origin connections
 
-```python
-from django_bolt import WebSocketDisconnect
+A browser sends an `Origin` header with the handshake.
+Bolt checks it against the CORS settings:
 
-@api.websocket("/ws")
-async def handler(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        async for message in websocket.iter_text():
-            await websocket.send_text(message)
-    except WebSocketDisconnect:
-        print("Client disconnected")
+- A handshake with no `Origin` header is allowed.
+- With `CORS_ALLOWED_ORIGINS`, `CORS_ALLOWED_ORIGIN_REGEXES` or `CORS_ALLOW_ALL_ORIGINS`, Bolt allows the origins that the settings allow.
+- With no CORS settings, Bolt refuses each cross-origin handshake with `403` and `{"detail":"Origin not allowed"}`.
+
+```python title="settings.py"
+CORS_ALLOWED_ORIGINS = ["https://blog.example.com"]
 ```
 
-A send to a client that left raises `WebSocketDisconnect` with code 1006.
-Bolt does not log it as a handler error.
+See [CORS](cors.md).
 
-## Close codes
+## Select a subprotocol
 
-Common WebSocket close codes:
-
-| Code | Name | Description |
-|------|------|-------------|
-| 1000 | Normal Closure | Normal closure |
-| 1001 | Going Away | Server/client going away |
-| 1002 | Protocol Error | Protocol error |
-| 1003 | Unsupported Data | Unsupported data type |
-| 1008 | Policy Violation | Policy violation |
-| 1011 | Server Error | Server encountered error |
-
-Access close codes:
+A client can ask for a subprotocol, for example `graphql-transport-ws`.
+`websocket.subprotocols` lists the subprotocols that the client asked for.
+Give the one that you support to `accept()`:
 
 ```python
-from django_bolt import CloseCode
-
-await websocket.close(code=CloseCode.NORMAL)
-```
-
-## Subprotocols
-
-A client can request one or more subprotocols in the `Sec-WebSocket-Protocol`
-header. `websocket.subprotocols` gives the list, in the order of the client.
-Select one with `accept(subprotocol=...)`. Bolt sends it in the `101` response:
-
-```python
-@api.websocket("/graphql")
-async def graphql(websocket: WebSocket):
+@api.websocket("/ws/graphql")
+async def graphql(websocket: WebSocket) -> None:
     if "graphql-transport-ws" not in websocket.subprotocols:
         await websocket.close()
         return
     await websocket.accept(subprotocol="graphql-transport-ws")
 ```
 
-```javascript
-const ws = new WebSocket("ws://localhost:8000/graphql", ["graphql-transport-ws"]);
-ws.onopen = () => console.log(ws.protocol); // "graphql-transport-ws"
-```
+Bolt puts it in the `Sec-WebSocket-Protocol` header of the `101` response.
+A subprotocol that the client did not ask for raises `ValueError`.
 
-A browser closes the connection if it requests a subprotocol and the `101`
-response does not select one. RFC 6455 lets the server select only a
-subprotocol that the client requested. Thus `accept()` raises `ValueError`
-for any other value, and the handshake gets `500`.
+`accept(headers=[(b"x-room", b"7")])` adds headers to the `101` response.
+A handshake header, such as `upgrade` or `sec-websocket-protocol`, raises `ValueError`.
 
-The scope also has the list, in `scope["subprotocols"]`, as the ASGI
-specification requires.
+## Send a message to many clients
 
-### Response headers
-
-Give `accept()` extra headers for the `101` response as `(name, value)` byte pairs:
+Keep the open connections in a set, and send to each of them:
 
 ```python
-await websocket.accept(headers=[(b"x-session-id", session_id.encode())])
-```
+from collections import defaultdict
 
-The handshake sets `Sec-WebSocket-Protocol`, `Sec-WebSocket-Accept`,
-`Sec-WebSocket-Extensions`, `Upgrade` and `Connection`. `accept()` raises
-`ValueError` for these headers. Select the subprotocol with `subprotocol=...`.
+rooms: dict[int, set[WebSocket]] = defaultdict(set)
 
-## Authentication
 
-Apply authentication to WebSocket endpoints:
-
-```python
-from django_bolt.auth import JWTAuthentication, IsAuthenticated
-
-@api.websocket(
-    "/ws/protected",
-    auth=[JWTAuthentication()],
-    guards=[IsAuthenticated()]
-)
-async def protected(websocket: WebSocket):
+@api.websocket("/ws/articles/{article_id}/live")
+async def live_room(websocket: WebSocket, article_id: int) -> None:
     await websocket.accept()
-    await websocket.send_text("Welcome")
+    rooms[article_id].add(websocket)
+    try:
+        async for text in websocket.iter_text():
+            for reader in list(rooms[article_id]):
+                await reader.send_text(text)
+    finally:
+        rooms[article_id].discard(websocket)
 ```
 
-The handshake reads the token from the request headers. Send the token in
-the `Authorization` header:
+!!! warning
+    The `rooms` dict is in the memory of one process.
+    With `runbolt --processes 2` or more, each process has its own `rooms`.
+    Thus a message reaches only the clients of the same process.
+    Use a message broker, for example Redis pub/sub, to reach the clients of all processes.
+
+## Set the OpenAPI entry
+
+A WebSocket route is in the OpenAPI schema with the `WebSocket` tag.
+`@api.websocket()` takes `tags`, `summary`, `description`, `include_in_schema` and `name`, as an HTTP route does:
 
 ```python
-import websockets
-
-async with websockets.connect(
-    "ws://localhost:8000/ws/protected",
-    additional_headers={"Authorization": f"Bearer {token}"},
-) as ws:
-    print(await ws.recv())
-```
-
-In a test, send the same header. `WebSocketTestClient` has no option that
-replaces the credential, so the test runs the authentication and the guards of
-the server:
-
-```python
-from django_bolt.testing import WebSocketTestClient
-
-async with WebSocketTestClient(
-    api,
-    "/ws/protected",
-    headers={"Authorization": f"Bearer {token}"},
-) as ws:
-    assert await ws.receive_text() == "Welcome"
-```
-
-A connection that the authentication or a guard refuses raises `PermissionError`.
-
-### Revoked tokens
-
-A `revoked_token_handler` or a `revocation_store` of the backend applies to
-the handshake too. When the handler reports the token as revoked, the
-handshake gets `401 Unauthorized` and the connection does not open. Bolt
-checks the token one time, at the handshake. An open connection stays open
-after its token is revoked. To end it, close it from the handler. See
-[Token revocation](authentication.md#token-revocation).
-
-### Authentication from a browser
-
-The browser `WebSocket` API cannot set request headers. Use a cookie instead.
-The browser sends cookies with the handshake:
-
-```python
-@api.websocket(
-    "/ws/protected",
-    auth=[JWTAuthentication(cookie="access_token")],
-    guards=[IsAuthenticated()],
-)
-async def protected(websocket: WebSocket):
+@api.websocket("/ws/internal/metrics", include_in_schema=False)
+async def internal_metrics(websocket: WebSocket) -> None:
     await websocket.accept()
 ```
 
-```javascript
-// The browser sends the access_token cookie with the handshake.
-const ws = new WebSocket("ws://localhost:8000/ws/protected");
-```
+See [OpenAPI](openapi.md).
 
-A query parameter does not authenticate the handshake. `auth=[...]` reads only
-the headers. To use a token from the URL, validate the token in the handler.
-Close the connection if the token is not valid. See
-[Query parameters](#query-parameters).
+## Test a WebSocket route
 
-## WebSocket state
+`WebSocketTestClient` connects to a route in the same process.
+It runs the route matching, the authentication and the guards of the server.
+It is async, so use it in an async test:
 
-Check the connection state:
-
-```python
-from django_bolt import WebSocketState
-
-if websocket.state == WebSocketState.CONNECTED:
-    await websocket.send_text("Still connected")
-```
-
-States:
-
-- `WebSocketState.CONNECTING` - Before `accept()`
-- `WebSocketState.CONNECTED` - After `accept()`
-- `WebSocketState.DISCONNECTED` - After close, or after the client leaves
-
-The state only moves forward. A call that the state does not allow raises `RuntimeError`.
-The message names the state and the method:
-
-| Call | `CONNECTING` | `CONNECTED` | `DISCONNECTED` |
-|------|--------------|-------------|----------------|
-| `accept()` | Accepts | Does nothing | `RuntimeError` |
-| `send_text()`, `send_bytes()`, `send_json()` | `RuntimeError` | Sends | `RuntimeError` |
-| `receive_text()`, `receive_bytes()`, `receive_json()` | `RuntimeError` | Receives | `WebSocketDisconnect` |
-| `receive()` | The first call gives `websocket.connect` | Receives | `WebSocketDisconnect` |
-| `close()` | Refuses the handshake with 403 | Closes | Does nothing |
-
-## OpenAPI metadata
-
-A WebSocket route appears in the OpenAPI schema with the `WebSocket` tag.
-Use `tags` to set different tags.
-Use `summary` and `description` to replace the text from the docstring.
-Set `include_in_schema=False` to keep the route out of the schema:
-
-```python
-@api.websocket(
-    "/ws/stream",
-    tags=["Streaming"],
-    summary="Stream prices",
-    description="Sends each price change.",
-)
-async def stream(websocket: WebSocket):
-    await websocket.accept()
-
-@api.websocket("/ws/internal", include_in_schema=False)
-async def internal(websocket: WebSocket):
-    await websocket.accept()
-```
-
-A route without `include_in_schema` uses the value of its `BoltAPI`, as an HTTP route does.
-
-## Testing WebSockets
-
-Use the `WebSocketTestClient`:
-
-```python
+```python title="blog/tests.py"
 import pytest
 
 from django_bolt.testing import WebSocketTestClient
 
+from blog.api import api
+
 
 @pytest.mark.asyncio
-async def test_echo():
-    async with WebSocketTestClient(api, "/ws/echo") as ws:
-        await ws.send_text("Hello")
-        response = await ws.receive_text()
-        assert response == "Echo: Hello"
+async def test_comment_room_echoes_the_comment():
+    async with WebSocketTestClient(api, "/ws/articles/7/comments") as ws:
+        await ws.send_json({"body": "Nice article"})
+        assert await ws.receive_json() == {"article_id": 7, "body": "Nice article"}
 ```
 
-`WebSocketTestClient` is an async client. Each connection is one `async with` block.
-`TestClient` is for HTTP requests and has no WebSocket method.
+`pytest.mark.asyncio` comes from the `pytest-asyncio` package.
 
-When the handler closes the connection, the receive methods raise `ConnectionClosed`.
-Its `code` attribute has the close code:
+`WebSocketTestClient(api, path, headers=None, query_string="", subprotocols=None)` takes these arguments:
+
+- `headers`: a `dict` of request headers. Send the credential here, for example `{"Authorization": f"Bearer {token}"}`.
+- `query_string`: the query string without `?`, for example `"nickname=ada"`.
+- `subprotocols`: the subprotocols that the client asks for.
+
+The client has `send_text()`, `send_bytes()`, `send_json()`, `receive_text()`, `receive_bytes()`, `receive_json()`, `iter_text()`, `iter_bytes()`, `iter_json()` and `close()`.
+Each receive method waits 5 seconds by default. Give `timeout=` to change it.
+
+| Event | `WebSocketTestClient` raises |
+| --- | --- |
+| The handler closes the connection | `ConnectionClosed` on the next receive, with `code` and `reason` |
+| The handler refuses the handshake | `HandshakeRejected` at `async with`, with `status_code` |
+| The authentication, a guard or the Origin check refuses the handshake | `PermissionError` at `async with` |
+| The handler raises before `accept()` | That exception at `async with` |
+| The handler raises after `accept()` | That exception when the `async with` block ends |
 
 ```python
-from django_bolt.testing import ConnectionClosed, WebSocketTestClient
+from django_bolt.testing import ConnectionClosed, HandshakeRejected
 
-@api.websocket("/ws/once")
-async def once(websocket: WebSocket):
-    await websocket.accept()
-    await websocket.close(code=4001)
 
-async with WebSocketTestClient(api, "/ws/once") as ws:
-    with pytest.raises(ConnectionClosed) as closed:
-        await ws.receive_text()
-assert closed.value.code == 4001
+@pytest.mark.asyncio
+async def test_read_only_article_closes_with_4001():
+    async with WebSocketTestClient(api, "/ws/articles/7/edit") as ws:
+        with pytest.raises(ConnectionClosed) as closed:
+            await ws.receive_text()
+    assert closed.value.code == 4001
+    assert closed.value.reason == "Read-only article"
+
+
+@pytest.mark.asyncio
+async def test_unknown_draft_is_refused():
+    with pytest.raises(HandshakeRejected) as rejected:
+        async with WebSocketTestClient(api, "/ws/drafts/500/preview"):
+            pass
+    assert rejected.value.status_code == 403
 ```
 
-`WebSocketTestClient` waits for the handshake decision of the handler, as the
-server does. A refused handshake fails the `async with`:
+At the end of the `async with` block, the client disconnects with code 1000.
+The handler gets the disconnect and can run to its end.
+The client cancels a handler that still runs after 1 second.
 
-```python
-from django_bolt.testing import HandshakeRejected, WebSocketTestClient
+`TestClient` has no WebSocket method. See [Testing](testing.md).
 
-with pytest.raises(HandshakeRejected) as rejected:
-    async with WebSocketTestClient(api, "/ws/rooms/closed"):
-        pass
-assert rejected.value.status_code == 403
-```
+## Deploy WebSocket routes
 
-An error in the handler before `accept()` fails the `async with` with that error.
+`runbolt` serves WebSocket routes on the same port as HTTP routes.
+A reverse proxy in front of Bolt must pass the `Upgrade` and `Connection` headers.
+In nginx, set `proxy_http_version 1.1`, `proxy_set_header Upgrade $http_upgrade` and `proxy_set_header Connection "upgrade"`.
 
-When the `async with` block ends, the client disconnects. The handler gets the
-disconnect and runs to its end, as on the server. Thus a test can check what
-the handler does after the client leaves. An error of the handler after the
-disconnect fails the `async with`. A `WebSocketDisconnect` that the handler
-does not catch is not an error. The client cancels a handler that still runs
-after 1 second.
+Bolt reads these settings one time, at startup.
+An environment variable with the `DJANGO_BOLT_` prefix overrides the setting, for example `DJANGO_BOLT_WS_MAX_CONNECTIONS`.
 
-## Real-time patterns
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `BOLT_WS_MAX_CONNECTIONS` | `10000` | Open connections in one process. A new handshake over the limit gets `503`. |
+| `BOLT_WS_MAX_MESSAGE_SIZE` | `1048576` (1 MiB) | A larger message closes the connection with code 1009. |
+| `BOLT_WS_HEARTBEAT_INTERVAL` | `5` | Seconds between the pings that Bolt sends. |
+| `BOLT_WS_CLIENT_TIMEOUT` | `10` | Seconds with no frame and no pong from the client. Bolt then closes the connection, and the handler gets code 1001. |
+| `BOLT_WS_CHANNEL_SIZE` | `100` | Messages from the client that wait for the handler. When the handler falls behind and the queue is full, Bolt closes the connection with code 1011. |
 
-### Broadcast to all clients
+When `runbolt` stops or restarts a worker, it closes each open connection with code 1012 (Service Restart).
+A client can connect again and reach a different worker.
 
-```python
-connected_clients = set()
+## See also
 
-@api.websocket("/ws/broadcast")
-async def broadcast(websocket: WebSocket):
-    await websocket.accept()
-    connected_clients.add(websocket)
-
-    try:
-        async for message in websocket.iter_text():
-            # Broadcast to all clients
-            for client in connected_clients:
-                await client.send_text(message)
-    finally:
-        connected_clients.discard(websocket)
-```
-
-### Room-based chat
-
-```python
-rooms = {}  # room_id -> set of websockets
-
-@api.websocket("/ws/room/{room_id}")
-async def room(websocket: WebSocket, room_id: str):
-    await websocket.accept()
-
-    if room_id not in rooms:
-        rooms[room_id] = set()
-    rooms[room_id].add(websocket)
-
-    try:
-        async for message in websocket.iter_text():
-            for client in rooms[room_id]:
-                await client.send_text(f"[{room_id}] {message}")
-    finally:
-        rooms[room_id].discard(websocket)
-```
+- [Server-Sent Events and streaming](sse.md)
+- [Authentication](authentication.md)
+- [Permissions](permissions.md)
+- [ASGI mounts](asgi-mounts.md) for Django Channels and other ASGI WebSocket apps
+- [BoltAPI reference](../ref/api.md)
+- [Testing reference](../ref/testing.md)

@@ -1,195 +1,245 @@
 ---
-icon: lucide/power
+description: Run code when runbolt starts and stops, with an async context manager that you pass to BoltAPI.
 ---
 
 # Lifespan
 
-Django Bolt supports lifespan events for running code during server startup and shutdown. This follows the same pattern as [Starlette's lifespan](https://www.starlette.io/lifespan/), using an async context manager.
+A lifespan is an async context manager. Django-Bolt enters it before the server starts and exits it after the server stops. Use it to load data, to check a service, or to start and stop a background task.
 
-Common use cases:
+## Add a lifespan
 
-- Initializing database connection pools
-- Warming caches
-- Starting background tasks
-- Cleaning up resources on shutdown
+Write a function with `@asynccontextmanager`, and pass it to `BoltAPI(lifespan=...)`. The code before `yield` runs at startup. The code after `yield` runs at shutdown:
 
-## Basic usage
-
-Pass an async context manager factory to the `lifespan` parameter of `BoltAPI`. Code before `yield` runs on startup, code after runs on shutdown:
-
-```python
+```python title="news/api.py"
 from contextlib import asynccontextmanager
+
 from django_bolt import BoltAPI
 
+from blog.models import Article
+
+# The titles of the published articles, loaded once for each process.
+published_titles: set[str] = set()
+
+
 @asynccontextmanager
-async def lifespan(app):
-    # Startup
-    print("Starting up...")
+async def lifespan(app: BoltAPI):
+    async for title in Article.objects.filter(published=True).values_list("title", flat=True):
+        published_titles.add(title)
+    print(f"Loaded {len(published_titles)} published titles")
     yield
-    # Shutdown
-    print("Shutting down...")
+    published_titles.clear()
+    print("Cleared the title cache")
+
 
 api = BoltAPI(lifespan=lifespan)
+
+
+@api.get("/titles/check")
+async def check_title(title: str) -> dict:
+    return {"title": title, "taken": title in published_titles}
 ```
 
-The `app` argument is the `BoltAPI` instance.
+```bash
+python manage.py runbolt
+```
 
-## Resource management
+The last lines of the output, after one request and Ctrl+C:
 
-The context manager pattern guarantees cleanup runs even if the server crashes, making it safer than separate startup/shutdown hooks:
+```text
+  press CTRL+C to stop
+
+Loaded 2 published titles
+INFO - 2026-11-21 20:13:27 - django.server - GET /titles/check 200 0.3ms
+Cleared the title cache
+```
+
+Bolt calls the function with one argument: the `BoltAPI` that has the lifespan.
+
+The lifespan runs in an event loop. Use the async ORM in it, for example `async for`, `acount()` and `aget()`. A sync ORM call there raises `SynchronousOnlyOperation`. Django is ready when the lifespan starts: the apps are loaded, and `AppConfig.ready()` has run.
+
+The function must be async. A `@contextmanager` function raises `TypeError` at startup.
+
+## Clean up when something fails
+
+Put the shutdown code in a `finally` block:
 
 ```python
-from contextlib import asynccontextmanager
-from django_bolt import BoltAPI
-
 @asynccontextmanager
-async def lifespan(app):
-    # Create resources
-    redis = await aioredis.from_url("redis://localhost")
-    app._redis = redis
-
+async def lifespan(app: BoltAPI):
+    published_titles.update([title async for title in Article.objects.values_list("title", flat=True)])
     try:
         yield
     finally:
-        # Always cleaned up, even on crash
-        await redis.close()
-
-api = BoltAPI(lifespan=lifespan)
-
-@api.get("/cached")
-async def get_cached():
-    value = await api._redis.get("key")
-    return {"value": value}
+        published_titles.clear()
 ```
 
-## Database connection pools
+The code after a plain `yield` does not run when an error occurs. Errors can occur in these cases:
+
+- The startup of a lifespan raises an error. `runbolt` then exits with status 1 and serves no request. The lifespans that started before it get the error at their `yield`.
+- The server stops with an error.
+
+On `SIGTERM`, the server stops accepting connections and lets the requests in progress end. Then the shutdown code runs. On `SIGINT` (Ctrl+C), the server stops at once, and the shutdown code runs. On `SIGKILL` or a crash, no shutdown code runs.
+
+## Run a background task
+
+A task that the lifespan starts runs on the event loop of the lifespan. `runbolt` keeps that loop running while the server runs:
 
 ```python
-from contextlib import asynccontextmanager
-from sqlalchemy.ext.asyncio import create_async_engine
-from django_bolt import BoltAPI
+import asyncio
+
+
+async def refresh_titles():
+    while True:
+        await asyncio.sleep(60)
+        titles = {title async for title in Article.objects.filter(published=True).values_list("title", flat=True)}
+        # Add the new titles, then remove the old ones. A handler never sees an empty set.
+        published_titles.update(titles)
+        published_titles.intersection_update(titles)
+
 
 @asynccontextmanager
-async def lifespan(app):
-    engine = create_async_engine("postgresql+asyncpg://localhost/mydb")
-    app._engine = engine
+async def lifespan(app: BoltAPI):
+    task = asyncio.create_task(refresh_titles())
     try:
         yield
     finally:
-        await engine.dispose()
-
-api = BoltAPI(lifespan=lifespan)
+        task.cancel()
 ```
 
-## Cache warming
+## Use objects that belong to an event loop
 
-```python
-from contextlib import asynccontextmanager
-from django_bolt import BoltAPI
+The lifespan runs on its own event loop. Handlers run on the event loops of the Bolt worker threads, one loop for each thread. Some objects work only on the loop that made them. Examples are an `asyncio.Future`, an `asyncio.Lock`, and the connection pool of an async database or HTTP client.
 
-@asynccontextmanager
-async def lifespan(app):
-    # Load frequently accessed data into memory
-    from myapp.models import Setting
-    app._settings_cache = {
-        s.key: s.value
-        async for s in Setting.objects.all()
-    }
-    print(f"Loaded {len(app._settings_cache)} settings")
-    yield
-    app._settings_cache.clear()
+Do not make such an object in the lifespan for the handlers. In a handler, it fails, for example with `RuntimeError: ... got Future <Future pending> attached to a different loop`.
 
-api = BoltAPI(lifespan=lifespan)
+Make one object for each worker loop when a handler first needs it. Each worker loop lives as long as the process, so each client lives as long as the process too:
+
+```python title="news/clients.py"
+import asyncio
+import weakref
+
+import httpx
+
+_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = weakref.WeakKeyDictionary()
+
+
+def search_client() -> httpx.AsyncClient:
+    """Return the search client of the running event loop."""
+    loop = asyncio.get_running_loop()
+    client = _clients.get(loop)
+    if client is None:
+        client = httpx.AsyncClient(base_url="https://search.example.com")
+        _clients[loop] = client
+    return client
 ```
 
-## Multiple APIs
+```python title="news/api.py"
+from .clients import search_client
 
-When multiple `BoltAPI` instances are autodiscovered (multi-app projects), each API's lifespan runs independently. Startup runs in discovery order; shutdown runs in reverse order (LIFO).
 
-```python
-# blog/api.py
-@asynccontextmanager
-async def blog_lifespan(app):
-    print("Blog API starting")
-    yield
-    print("Blog API stopping")
-
-api = BoltAPI(lifespan=blog_lifespan)
-
-# payments/api.py
-@asynccontextmanager
-async def payments_lifespan(app):
-    print("Payments API starting")
-    yield
-    print("Payments API stopping")
-
-api = BoltAPI(lifespan=payments_lifespan)
-
-# Output on startup:
-#   Blog API starting
-#   Payments API starting
-# Output on shutdown:
-#   Payments API stopping
-#   Blog API stopping
+@api.get("/search")
+async def search(q: str) -> dict:
+    response = await search_client().get("/articles", params={"q": q})
+    return response.json()
 ```
 
-## Mounted APIs
+Objects that do not belong to a loop are safe to make in the lifespan. Examples are a `dict`, a `set`, a sync client, and data that you load from the database.
 
-The lifespan of an API that you mount with `api.mount()` runs with the parent API. Startup runs the parent first, then each mounted API in mount order. Shutdown runs in reverse order. Each lifespan gets its own API as `app`.
+## Run more than one lifespan
+
+`runbolt` runs the lifespan of each API that it finds. The startup order is the discovery order: the `BOLT_API` setting, or else the project API, then the apps in `INSTALLED_APPS` order. Shutdown runs in the reverse order.
+
+Take a `blog` app and a `shop` app, in this order in `INSTALLED_APPS`. The lifespan of each app prints its name at startup and at shutdown. The output is:
+
+```text
+blog: start
+shop: start
+shop: stop
+blog: stop
+```
+
+An API that you mount with `api.mount()` brings its lifespan with it. The lifespan of the parent starts first, then the lifespans of the mounted APIs, in mount order. Shutdown runs in the reverse order. Each lifespan gets its own API as `app`:
 
 ```python
-from contextlib import asynccontextmanager
-from django_bolt import BoltAPI
-
-@asynccontextmanager
-async def reports_lifespan(app):
-    app._report_cache = {}
-    yield
-    app._report_cache.clear()
-
 reports_api = BoltAPI(lifespan=reports_lifespan)
-
-api = BoltAPI()
-api.mount("/reports", reports_api)  # reports_lifespan runs with api
-```
-
-## Testing
-
-The `TestClient` is lifespan-aware. When you enter the `with` block, startup runs. When you exit, shutdown runs. No special setup needed:
-
-```python
-from contextlib import asynccontextmanager
-from django_bolt import BoltAPI
-from django_bolt.testing import TestClient
-
-@asynccontextmanager
-async def lifespan(app):
-    app._cache = {"ready": True}
-    yield
-    app._cache.clear()
+search_api = BoltAPI(lifespan=search_lifespan)
 
 api = BoltAPI(lifespan=lifespan)
-
-@api.get("/status")
-async def status():
-    return {"ready": api._cache.get("ready", False)}
-
-# Lifespan runs automatically
-with TestClient(api) as client:
-    response = client.get("/status")
-    assert response.json() == {"ready": True}
+api.mount("/reports", reports_api)
+api.mount("/search", search_api)
 ```
 
-The `AsyncTestClient` also supports lifespan:
+```text
+api: start
+reports: start
+search: start
+search: stop
+reports: stop
+api: stop
+```
+
+## Lifespan and processes
+
+The lifespan runs once in each process that serves requests.
+
+- `runbolt` runs it once.
+- `runbolt --processes 4` runs it in each of the 4 worker processes. The parent process does not run it. Thus each process has its own copy of the state that the lifespan loads.
+- A worker that `runbolt` starts again, for example with `--max-rss` or `--workers-lifetime`, runs the startup of its lifespan. The worker that it replaces runs the shutdown.
+- `runbolt --dev` starts a new process after each code change. The new process runs the lifespan again.
+
+With this lifespan and `--processes 2`, each worker prints its own lines:
 
 ```python
-async with AsyncTestClient(api) as client:
-    response = await client.get("/status")
-    assert response.json() == {"ready": True}
+import os
+
+
+@asynccontextmanager
+async def lifespan(app: BoltAPI):
+    print(f"startup pid={os.getpid()}")
+    yield
+    print(f"shutdown pid={os.getpid()}")
 ```
 
-## How it works
+```text
+startup pid=7874
+startup pid=7875
+  19:59:48 [bolt] Shutting down 2 workers...
+shutdown pid=7875
+shutdown pid=7874
+```
 
-- **`runbolt` command**: Lifespan enters before the Rust server starts and exits after it stops. The server runs in a thread while the async event loop manages the lifespan context.
-- **`TestClient`**: Lifespan enters on `__enter__` and exits on `__exit__`, using a dedicated event loop that stays alive for the duration of the test.
-- **Multi-process mode**: Each process runs its own lifespan independently.
+Do not use the lifespan for work that must run once for the whole deployment, for example a data migration. Run such work before you start `runbolt`.
+
+## Test a lifespan
+
+`TestClient` runs the startup when its `with` block starts, and the shutdown when the block ends. The startup sees the rows that the test made before the block:
+
+```python title="tests/test_lifespan.py"
+import pytest
+from django.contrib.auth.models import User
+
+from blog.models import Article
+from django_bolt.testing import TestClient
+from news.api import api, published_titles
+
+
+@pytest.mark.django_db
+def test_title_cache():
+    author = User.objects.create_user(username="ada")
+    Article.objects.create(title="Hello", body="...", author=author, published=True)
+
+    with TestClient(api) as client:
+        response = client.get("/titles/check", params={"title": "Hello"})
+        assert response.json() == {"title": "Hello", "taken": True}
+
+    assert published_titles == set()
+```
+
+The event loop of the `TestClient` lifespan does not run between startup and shutdown. Thus a background task of the lifespan does not run in such a test. See [Test the lifespan](testing.md#test-the-lifespan).
+
+## See also
+
+- [BoltAPI reference](../ref/api.md): the `lifespan` argument.
+- [Testing](testing.md)
+- [Deployment](deployment.md)
+- [runbolt reference](../ref/runbolt.md)

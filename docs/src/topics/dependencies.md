@@ -1,369 +1,278 @@
 ---
-icon: lucide/plug
+description: Share request logic between handlers with Depends(), with sync and async dependencies, nested dependencies, per-request caching and the current user.
 ---
 
 # Dependencies
 
-Django-Bolt provides a dependency injection system using the `Depends` marker. Dependencies let you extract common logic into reusable functions.
+A dependency is a function that Bolt calls before the handler. Its return value goes to a handler parameter. Use a dependency for logic that several handlers share, for example "load the article or answer 404".
 
-## Basic usage
+## Add a dependency
 
-### Creating a dependency
+Give a handler parameter the default `Depends(function)`:
 
-A dependency is any callable (function or class) that returns a value:
+```python title="blog/api.py"
+import msgspec
 
-```python
 from django_bolt import BoltAPI, Depends
+
+from blog.models import Article
 
 api = BoltAPI()
 
-async def get_current_user(request):
-    """Dependency that extracts the current user."""
-    user_id = request.get("context", {}).get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return await User.objects.aget(id=user_id)
 
-@api.get("/profile")
-async def get_profile(user=Depends(get_current_user)):
-    return {"id": user.id, "username": user.username}
-```
-
-A dependency returns its value. Bolt has no cleanup dependencies, so a generator function (a function with `yield`) is not a dependency. Bolt binds each parameter by its name, so a dependency or a handler cannot have `*args` or `**kwargs`. Bolt raises `TypeError` for these shapes when it registers the route.
-
-### Dependency resolution
-
-When a handler parameter is annotated with `Depends()`, Django-Bolt:
-
-1. Calls the dependency function
-2. Passes the result to the handler
-3. Caches the result for subsequent uses in the same request
-
-When every dependency of a handler is a sync function, Bolt resolves them with no event loop. A sync handler then keeps its sync dispatch, and behind Django middleware its complete request runs on one lane. When a sync handler runs in a worker thread, its sync dependencies run in that thread too. They can use the ORM, and they see the thread-local state of the Django middleware.
-
-## Dependency patterns
-
-### Request access
-
-Dependencies receive the request dict:
-
-```python
-async def get_db_connection(request):
-    """Get database connection from request context."""
-    return request.get("db_connection")
-```
-
-### With parameters
-
-Dependencies can accept the same parameters as handlers:
-
-```python
-from typing import Annotated
-from django_bolt.param_functions import Header
-
-async def get_api_version(
-    x_api_version: Annotated[str, Header()] = "v1"
-):
-    """Extract API version from header."""
-    return x_api_version
-
-@api.get("/data")
-async def get_data(version=Depends(get_api_version)):
-    if version == "v2":
-        return {"format": "new"}
-    return {"format": "legacy"}
-```
-
-### Authentication dependency
-
-```python
-from django_bolt.auth import get_current_user
-
-@api.get("/me")
-async def me(user=Depends(get_current_user)):
-    return {
-        "id": user.id,
-        "username": user.username,
-        "email": user.email
-    }
-```
-
-## Dependency caching
-
-### Default behavior
-
-By default, dependencies are cached per-request:
-
-```python
-call_count = 0
-
-async def expensive_operation(request):
-    global call_count
-    call_count += 1
-    # Expensive computation
-    return {"count": call_count}
-
-@api.get("/test")
-async def test(
-    dep1=Depends(expensive_operation),
-    dep2=Depends(expensive_operation)  # Same dependency
-):
-    # expensive_operation is called ONCE, result is reused
-    return {"dep1": dep1, "dep2": dep2}
-```
-
-The async dependencies of a handler run at the same time. A cached dependency that two of them need runs first. Thus it also runs one time.
-
-### Disabling cache
-
-To force fresh calls, use `use_cache=False`:
-
-```python
-@api.get("/fresh")
-async def fresh(
-    dep=Depends(some_dependency, use_cache=False)
-):
-    # Always gets fresh result
-    return dep
-```
-
-## Sync and async dependencies
-
-Django-Bolt supports both sync and async dependencies:
-
-```python
-# Async dependency
-async def async_dep(request):
-    user = await User.objects.aget(id=1)
-    return user
-
-# Sync dependency
-def sync_dep(request):
-    return {"timestamp": time.time()}
-
-@api.get("/mixed")
-async def mixed(
-    user=Depends(async_dep),
-    data=Depends(sync_dep)
-):
-    return {"user": user.username, "data": data}
-```
-
-## Nested dependencies
-
-Dependencies can depend on other dependencies:
-
-```python
-async def get_settings(request):
-    """Get application settings."""
-    return await Settings.objects.afirst()
-
-async def get_feature_flags(settings=Depends(get_settings)):
-    """Get feature flags based on settings."""
-    return {
-        "new_ui": settings.enable_new_ui,
-        "beta": settings.beta_features,
-    }
-
-@api.get("/features")
-async def features(flags=Depends(get_feature_flags)):
-    return flags
-```
-
-The dependency resolution is:
-1. `get_settings` is called first
-2. Its result is passed to `get_feature_flags`
-3. `get_feature_flags` result is passed to the handler
-
-## Class-based dependencies
-
-Classes can be used as dependencies:
-
-```python
-class DatabaseSession:
-    def __init__(self, request):
-        self.request = request
-        self.connection = None
-
-    async def __aenter__(self):
-        self.connection = await get_connection()
-        return self.connection
-
-    async def __aexit__(self, *args):
-        if self.connection:
-            await self.connection.close()
-
-@api.get("/data")
-async def get_data(db=Depends(DatabaseSession)):
-    async with db:
-        # Use database connection
-        pass
-```
-
-An object with a `__call__` method is also a dependency. Bolt reads the parameters of `__call__`. Bolt awaits the call when `__call__` is `async def`:
-
-```python
-class PageSize:
-    def __init__(self, max_size: int):
-        self.max_size = max_size
-
-    async def __call__(self, size: int = 20) -> int:
-        return min(size, self.max_size)
-
-@api.get("/items")
-async def list_items(size=Depends(PageSize(max_size=100))):
-    return {"size": size}
-```
-
-## Parameter extraction in dependencies
-
-Dependencies can use the same parameter markers as handlers:
-
-```python
-from typing import Annotated
-from django_bolt.param_functions import Header, Cookie
-
-async def verify_token(
-    authorization: Annotated[str, Header()],
-    session_id: Annotated[str, Cookie()]
-):
-    """Verify both token and session."""
-    # Validate authorization header
-    # Validate session cookie
-    return {"valid": True}
-
-@api.get("/secure")
-async def secure_endpoint(auth=Depends(verify_token)):
-    return {"status": "authenticated"}
-```
-
-## Common dependency patterns
-
-### Database session
-
-```python
-async def get_db(request):
-    """Provide a database session."""
-    from django.db import connection
-    await connection.ensure_connection()
-    return connection
-
-@api.get("/users")
-async def list_users(db=Depends(get_db)):
-    return await User.objects.all()[:10]
-```
-
-### Pagination
-
-```python
-from dataclasses import dataclass
-
-@dataclass
-class Pagination:
-    page: int
-    page_size: int
+class PageParams(msgspec.Struct):
     offset: int
+    limit: int
 
-def get_pagination(page: int = 1, page_size: int = 20) -> Pagination:
-    """Extract pagination parameters."""
-    return Pagination(
-        page=page,
-        page_size=min(page_size, 100),  # Max 100 per page
-        offset=(page - 1) * page_size
-    )
 
-@api.get("/items")
-async def list_items(pagination: Pagination = Depends(get_pagination)):
-    items = await Item.objects.all()[
-        pagination.offset:pagination.offset + pagination.page_size
-    ]
-    return {"page": pagination.page, "items": items}
+def page_params(page: int = 1, size: int = 10) -> PageParams:
+    size = min(size, 50)
+    return PageParams(offset=(page - 1) * size, limit=size)
+
+
+@api.get("/articles")
+async def list_articles(paging: PageParams = Depends(page_params)) -> dict:
+    rows = Article.objects.order_by("id")[paging.offset : paging.offset + paging.limit]
+    return {"offset": paging.offset, "titles": [article.title async for article in rows]}
 ```
 
-### Rate limit check
-
-```python
-from django_bolt.exceptions import TooManyRequests
-
-async def check_rate_limit(request):
-    """Check if request is rate limited."""
-    client_ip = request.get("headers", {}).get("x-forwarded-for", "unknown")
-    # Check rate limit logic
-    if is_rate_limited(client_ip):
-        raise TooManyRequests(detail="Rate limit exceeded")
-    return True
-
-@api.get("/api/data")
-async def get_data(_=Depends(check_rate_limit)):
-    return {"data": "value"}
+```bash
+curl "localhost:8000/articles?page=2&size=1"
 ```
 
-### Permission check
+```json
+{"offset": 1, "titles": ["Async ORM"]}
+```
+
+Bolt reads the parameters of the dependency from the request, as for a handler. Here `page` and `size` are query parameters. A dependency can take path, query, header, cookie, body, form and file parameters, the request, and other dependencies. The OpenAPI schema of the route lists the request parameters of its dependencies.
+
+You can also put the marker in `Annotated`. An alias then makes the dependency short to reuse:
+
+<!-- fragment -->
+```python
+from typing import Annotated
+
+Paging = Annotated[PageParams, Depends(page_params)]
+
+
+@api.get("/comments")
+async def list_comments(paging: Paging) -> dict: ...
+```
+
+## Raise an error from a dependency
+
+A dependency can stop the request. Raise an `HTTPException`, or one of its subclasses such as `NotFound` or `Forbidden`. The handler does not run:
 
 ```python
-async def require_admin(request):
-    """Require admin user."""
-    user_id = request.get("context", {}).get("user_id")
-    if not user_id:
-        raise Unauthorized()
+from django_bolt import BoltAPI, CurrentUser, Depends
+from django_bolt.auth import JWTAuthentication
+from django_bolt.exceptions import Forbidden, NotFound
 
-    user = await User.objects.aget(id=user_id)
-    if not user.is_staff:
-        raise Forbidden(detail="Admin access required")
+from blog.models import Article
 
-    return user
+api = BoltAPI()
 
-@api.delete("/users/{user_id}")
-async def delete_user(user_id: int, admin=Depends(require_admin)):
-    await User.objects.filter(id=user_id).adelete()
+
+async def get_article(article_id: int) -> Article:
+    try:
+        return await Article.objects.aget(id=article_id)
+    except Article.DoesNotExist:
+        raise NotFound(detail="Article not found")
+
+
+async def get_own_article(user: CurrentUser, article: Article = Depends(get_article)) -> Article:
+    if article.author_id != user.id:
+        raise Forbidden(detail="You are not the author")
+    return article
+
+
+@api.delete("/articles/{article_id}", auth=[JWTAuthentication()])
+async def delete_article(article: Article = Depends(get_own_article)) -> dict:
+    await article.adelete()
     return {"deleted": True}
 ```
 
-## Dependencies with ViewSets
+| Request | Response |
+| --- | --- |
+| No token | `401 {"detail": "Authentication required"}` |
+| A token of another user | `403 {"detail": "You are not the author"}` |
+| An article that does not exist | `404 {"detail": "Article not found"}` |
+| A token of the author | `200 {"deleted": true}` |
 
-Dependencies work with class-based views:
+`get_article` reads `article_id` from the path of the route. `get_own_article` depends on `get_article` and on the current user. Bolt resolves the nested dependencies first.
+
+## Get the current user
+
+`CurrentUser` and `OptionalCurrentUser` are ready dependencies for the user of the request:
+
+| Type | Without an authenticated user |
+| --- | --- |
+| `CurrentUser` | `401` response |
+| `OptionalCurrentUser` | `None` |
+
+Both load the user and do not block the event loop. A sync handler gets a sync form of the same dependency, which reads `request.user` on the thread of the handler. For your own user model type, make an alias: `Annotated[User, Depends(get_current_user)]`, with `get_current_user` from `django_bolt.auth`.
+
+A guard such as `IsAuthenticated()` runs in Rust before the dependencies. Use a guard for a check of a token claim. Use a dependency for a check that needs the database, as `get_own_article` above. See [Permissions](permissions.md).
+
+## Cache a dependency for one request
+
+Bolt calls each dependency one time for each request, and gives the same value to each parameter that needs it:
 
 ```python
-from django_bolt import ViewSet
-
-@api.viewset("/items")
-class ItemViewSet(ViewSet):
-    queryset = Item.objects.all()
-
-    async def list(self, request, pagination=Depends(get_pagination)) -> list[dict]:
-        items = []
-        queryset = await self.get_queryset()
-        async for item in queryset[pagination.offset:pagination.offset + pagination.page_size]:
-            items.append({"id": item.id, "name": item.name})
-        return items
-```
-
-## Testing with dependencies
-
-Bolt has no API that replaces a dependency in a test. `TestClient` runs each dependency of a route, as `runbolt` does.
-
-To control the value in a test, write the dependency so that it reads data that the test controls. Examples are a request header, a database row or a Django setting:
-
-```python
-from django.conf import settings
-from django.test import override_settings
+from typing import Annotated
 
 from django_bolt import BoltAPI, Depends
-from django_bolt.testing import TestClient
+from django_bolt.param_functions import Header
 
 api = BoltAPI()
 
 
-def get_page_size() -> int:
-    return settings.PAGE_SIZE
+def get_api_version(x_api_version: Annotated[str, Header()] = "1") -> str:
+    return x_api_version
 
 
-@api.get("/items")
-async def list_items(page_size: int = Depends(get_page_size)):
-    return {"page_size": page_size}
+def get_label(version: str = Depends(get_api_version)) -> str:
+    return f"v{version}"
 
 
-def test_list_items_uses_the_page_size_setting():
-    with override_settings(PAGE_SIZE=5), TestClient(api) as client:
-        assert client.get("/items").json() == {"page_size": 5}
+@api.get("/version")
+async def version(label: str = Depends(get_label), version: str = Depends(get_api_version)) -> dict:
+    return {"label": label, "version": version}
 ```
+
+```bash
+curl localhost:8000/version -H "X-API-Version: 2"
+```
+
+```json
+{"label": "v2", "version": "2"}
+```
+
+`get_api_version` runs one time, although two parameters need it. The cache key is the dependency function. The cache lives for one request.
+
+`Depends(function, use_cache=False)` calls the function again for each parameter.
+
+## Use sync and async dependencies
+
+A dependency can be `def` or `async def`. Bolt awaits an async dependency.
+
+- When a handler has two or more async dependencies, Bolt runs them at the same time. A cached dependency that two of them need runs first, so it still runs one time.
+- When each dependency of a handler is sync, Bolt resolves them with no event loop. A sync handler then keeps its fast sync dispatch.
+- A sync handler that runs on a thread pool resolves its sync dependencies on the same thread. They can use the sync ORM. Behind Django middleware, they see the thread-local state of the request.
+
+## Use a class as a dependency
+
+An object with a `__call__` method is a dependency. Bolt reads the parameters of `__call__`. Use this for a dependency with settings:
+
+```python
+from django_bolt import BoltAPI, Depends
+
+api = BoltAPI()
+
+
+class MaxSize:
+    def __init__(self, maximum: int):
+        self.maximum = maximum
+
+    def __call__(self, size: int = 20) -> int:
+        return min(size, self.maximum)
+
+
+@api.get("/sizes")
+async def sizes(size: int = Depends(MaxSize(100))) -> dict:
+    return {"size": size}
+```
+
+```bash
+curl "localhost:8000/sizes?size=500"
+```
+
+```json
+{"size": 100}
+```
+
+Bolt awaits the call when `__call__` is `async def`.
+
+## Read the request in a dependency
+
+A parameter named `request` gets the request object:
+
+```python
+from django_bolt import BoltAPI, Depends, Request
+
+api = BoltAPI()
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    return forwarded.split(",")[0].strip() or "unknown"
+
+
+@api.get("/ip")
+async def show_ip(ip: str = Depends(client_ip)) -> dict:
+    return {"ip": ip}
+```
+
+```bash
+curl localhost:8000/ip -H "X-Forwarded-For: 203.0.113.7, 10.0.0.1"
+```
+
+```json
+{"ip": "203.0.113.7"}
+```
+
+## Limits
+
+- A dependency returns a value. Bolt has no cleanup dependencies. A generator function, with `yield`, raises `TypeError` at registration. Do the cleanup in the handler, or in [middleware](middleware.md).
+- A dependency or a handler cannot have `*args` or `**kwargs`. Bolt raises `TypeError` at registration.
+- `Router` has no `dependencies` argument. Add the dependency to each handler, or use an `Annotated` alias.
+- Bolt has no API that replaces a dependency in a test. Make the dependency read data that the test controls, such as a header, a row or a setting. See [Testing](testing.md).
+
+## Use dependencies in class-based views
+
+The methods of an `APIView` or a `ViewSet` take dependencies as a function handler does:
+
+```python
+import msgspec
+
+from django_bolt import BoltAPI, Depends, ViewSet
+
+from blog.models import Article
+
+api = BoltAPI()
+
+
+class PageParams(msgspec.Struct):
+    offset: int
+    limit: int
+
+
+def page_params(page: int = 1, size: int = 10) -> PageParams:
+    return PageParams(offset=(page - 1) * size, limit=min(size, 50))
+
+
+@api.viewset("/articles")
+class ArticleViewSet(ViewSet):
+    queryset = Article.objects.order_by("id")
+
+    async def list(self, paging: PageParams = Depends(page_params)) -> list[str]:
+        queryset = await self.get_queryset()
+        return [article.title async for article in queryset[paging.offset : paging.offset + paging.limit]]
+```
+
+```bash
+curl "localhost:8000/articles?size=2"
+```
+
+```json
+["Hello Bolt", "Async ORM"]
+```
+
+## See also
+
+- [Requests](requests.md)
+- [Authentication](authentication.md)
+- [Permissions](permissions.md)
+- [Class-based views](class-based-views.md)
+- [Testing](testing.md)
+- [Parameters reference](../ref/params.md)
