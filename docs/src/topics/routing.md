@@ -1,509 +1,410 @@
 ---
-icon: lucide/route
+description: Map HTTP methods and paths to handlers, read path parameters, group routes with Router, and control trailing slashes.
 ---
 
 # Routing
 
-This guide explains how routing works in Django-Bolt and covers all the ways you can define API endpoints.
+A route is an HTTP method and a path. A handler is the function that serves the route.
+You register a route with a decorator on a `BoltAPI` instance or on a `Router`.
 
-## Basic routing
-
-Routes are defined using decorator methods on a `BoltAPI` instance:
-
-```python
+```python title="blog/api.py"
 from django_bolt import BoltAPI
 
 api = BoltAPI()
 
-@api.get("/users")
-async def list_users():
-    return {"users": []}
 
-@api.post("/users")
-async def create_user():
-    return {"created": True}
+@api.get("/articles")
+async def list_articles() -> list[dict]:
+    return [{"id": 1, "title": "Hello"}]
+
+
+@api.get("/articles/{article_id}")
+async def get_article(article_id: int) -> dict:
+    return {"id": article_id, "title": "Hello"}
+
+
+@api.post("/articles", status_code=201)
+async def create_article() -> dict:
+    return {"id": 2, "title": "New"}
 ```
 
-Each method and path has one handler. A second handler for the same method and path stops startup with a `ValueError`.
-
-## HTTP methods
-
-Django-Bolt supports all common HTTP methods:
-
-| Decorator | HTTP Method | Typical use |
-|-----------|-------------|-------------|
-| `@api.get()` | GET | Retrieve resources |
-| `@api.post()` | POST | Create resources |
-| `@api.put()` | PUT | Replace resources |
-| `@api.patch()` | PATCH | Partial updates |
-| `@api.delete()` | DELETE | Remove resources |
-| `@api.head()` | HEAD | Get headers only |
-| `@api.options()` | OPTIONS | Get allowed methods |
-| `@api.query()` | QUERY | Read using a request body |
-
-A request with a method that the path has no route for gets `405 Method Not Allowed`. The `Allow` header lists the methods of the path. A path with no route gets 404.
-
-```python
-@api.get("/reports")
-async def list_reports():
-    return []
-
-# POST /reports  → 405, Allow: GET, OPTIONS
-# POST /missing  → 404
+```bash
+curl localhost:8000/articles/3
 ```
 
-Bolt adds no HEAD route for a GET route. Thus `HEAD /reports` also gets 405. Add `@api.head()` to serve HEAD.
-
-The other slash form of a route path gets the same answer. `GET /reports/` redirects to `/reports`, and `POST /reports/` gets 405 with the `Allow` header of `/reports`.
-
-Example with all methods:
-
-```python
-@api.get("/items")
-async def list_items():
-    return {"items": []}
-
-@api.post("/items")
-async def create_item():
-    return {"created": True}
-
-@api.put("/items/{item_id}")
-async def replace_item(item_id: int):
-    return {"replaced": True}
-
-@api.patch("/items/{item_id}")
-async def update_item(item_id: int):
-    return {"updated": True}
-
-@api.delete("/items/{item_id}")
-async def delete_item(item_id: int):
-    return {"deleted": True}
-
-@api.head("/items")
-async def head_items():
-    return {}  # Body not sent for HEAD
-
-@api.options("/items")
-async def options_items():
-    from django_bolt import Response
-    return Response({}, headers={"Allow": "GET, POST, PUT, PATCH, DELETE"})
+```json
+{"id": 3, "title": "Hello"}
 ```
 
-### The QUERY method
+`runbolt` finds this `api` object when it starts. See [Find the API modules](#find-the-api-modules).
 
-`QUERY` is a safe, idempotent method that carries a request body. It behaves like `GET` — it reads, it doesn't change server state, and it can be retried — but its parameters travel in the body instead of the query string. Reach for it when a query is too large or too structured for a URL (a nested filter, a long list of IDs, a search document) and a `POST` would wrongly read as a write.
+## Use an HTTP method
 
-A `QUERY` handler takes a body the same way a `POST` handler does:
+Bolt has one decorator for each method:
 
-```python
-import msgspec
-from django_bolt import BoltAPI
+| Decorator | Method |
+| --- | --- |
+| `@api.get(path)` | `GET` |
+| `@api.post(path)` | `POST` |
+| `@api.put(path)` | `PUT` |
+| `@api.patch(path)` | `PATCH` |
+| `@api.delete(path)` | `DELETE` |
+| `@api.head(path)` | `HEAD` |
+| `@api.options(path)` | `OPTIONS` |
+| `@api.query(path)` | `QUERY` |
 
-api = BoltAPI()
+A request to a known path with a method that has no route gets `405 Method Not Allowed`.
+The `Allow` header lists the methods of the path.
+A request to an unknown path gets `404 Not Found`.
 
-class Search(msgspec.Struct):
-    term: str
-    limit: int = 20
-
-@api.query("/search")
-async def search(query: Search) -> dict:
-    return {"term": query.term, "limit": query.limit}
+```bash
+curl -i -X DELETE localhost:8000/articles
 ```
 
 ```http
-QUERY /search HTTP/1.1
-Content-Type: application/json
+HTTP/1.1 405 Method Not Allowed
+allow: GET, POST, OPTIONS
+content-type: application/json
 
-{"term": "django", "limit": 5}
+{"detail":"Method Not Allowed"}
 ```
 
-`QUERY` works everywhere the other methods do: on routers (`router.query(...)`), on class-based views (an `async def query` handler), and in the test client (`client.query("/search", json=...)`). It's included in the automatic `Allow` header and the default CORS method list.
+Bolt answers `OPTIONS` for each path. The response is `204 No Content` with the `Allow` header.
+Register `@api.options()` to send your own response.
 
-One caveat for tooling: `query` only becomes a documented operation in the OpenAPI 3.2 draft. Django-Bolt emits 3.1, so the built-in docs UIs render `QUERY` endpoints, but a strict 3.1 validator will reject the operation.
+Bolt does not add a `HEAD` route for a `GET` route. A `HEAD` request to a `GET` route gets 405.
+Register `@api.head()` to serve `HEAD`. Bolt sends the status and headers of the handler, with no body.
 
-## Path parameters
+### Serve more than one method with one handler
 
-Capture dynamic segments of the URL using curly braces:
+Put more than one decorator on the handler:
 
 ```python
-@api.get("/users/{user_id}")
-async def get_user(user_id: int):
-    return {"user_id": user_id}
-
-@api.get("/posts/{post_id}/comments/{comment_id}")
-async def get_comment(post_id: int, comment_id: int):
-    return {"post_id": post_id, "comment_id": comment_id}
+@api.get("/drafts")
+@api.post("/drafts")
+async def drafts() -> dict:
+    return {"drafts": []}
 ```
 
-Give each parameter of a path its own name. A path with one name two times, such as `/d/{x}/{x}`, raises `ValueError` at registration.
+Each decorator registers its own route.
 
-See [Request Handling](requests.md) for details on path parameters, query parameters, headers, cookies, form data, and file uploads.
+### Send a body with QUERY
 
-## Route options
-
-The route decorator accepts additional options:
+`QUERY` is a safe method that has a request body, as `GET` would if it had one.
+Use it for a search that is too large or too structured for a query string.
 
 ```python
-@api.get(
-    "/users/{user_id}",
-    status_code=200,           # Default response status code
-    summary="Get user",        # Short description for OpenAPI
-    description="Get a user by ID",  # Detailed description
-    tags=["users"],            # OpenAPI tags for grouping
-    response_model=UserSchema, # Response validation schema
-)
-async def get_user(user_id: int):
-    """This docstring also appears in OpenAPI docs."""
-    return {"user_id": user_id}
+import msgspec
+
+
+class ArticleSearch(msgspec.Struct):
+    tags: list[str]
+    limit: int = 20
+
+
+@api.query("/articles/search")
+async def search_articles(search: ArticleSearch) -> dict:
+    return {"tags": search.tags, "limit": search.limit}
 ```
 
-## URL names and reversing
+```bash
+curl -X QUERY localhost:8000/articles/search \
+  -H "Content-Type: application/json" -d '{"tags": ["django"]}'
+```
 
-Bolt routes live in Rust's router, not Django's URLconf, so Django can't see them by default. Wire them up once and Django's native `reverse()`, `reverse_lazy()`, and the `{% url %}` template tag resolve Bolt route names like any other view.
+```json
+{"tags": ["django"], "limit": 20}
+```
 
-### Wiring it up
+The OpenAPI 3.1 document that Bolt makes has no `query` operation. A strict OpenAPI 3.1 validator rejects such a route.
 
-Include `django_bolt.urls` in your project's `ROOT_URLCONF`:
+## Read path parameters
+
+Put the parameter name in braces. Give the handler an argument with the same name.
+The type hint of the argument sets the type:
 
 ```python
-# urls.py
-from django.urls import include, path
-
-urlpatterns = [
-    path("", include("django_bolt.urls")),
-    # ... your other patterns
-]
+@api.get("/authors/{author_id}/articles/{slug}")
+async def get_author_article(author_id: int, slug: str) -> dict:
+    return {"author_id": author_id, "slug": slug}
 ```
 
-This contributes a **reverse-only** entry for every named Bolt route. The registered views never run (Bolt still serves these paths in Rust) — they exist purely so Django can reverse the names.
+A value that does not convert to the type gets a 422 response:
 
-### Naming a route
+```bash
+curl localhost:8000/authors/abc/articles/hello
+```
 
-Pass `name=` to any route decorator:
+```json
+{"detail": "Path parameter 'author_id': Invalid integer 'abc': invalid digit found in string"}
+```
+
+The type comes only from the type hint. Bolt ignores a type in the path, such as `{author_id:int}`.
+Give each parameter of a path its own name. A path such as `/d/{x}/{x}` raises `ValueError` when you register it.
+
+[Requests](requests.md#read-path-parameters) shows the types that Bolt converts and how to add limits.
+
+### Match the remainder of a path
+
+Write `{name:path}` to match all the remaining segments, slashes included:
 
 ```python
-@api.get("/missions/{mission_id}", name="mission-detail")
-async def get_mission(mission_id: int):
-    return {"id": mission_id}
+@api.get("/files/{file_path:path}")
+async def get_file(file_path: str) -> dict:
+    return {"file_path": file_path}
 ```
+
+```bash
+curl localhost:8000/files/2026/01/report.pdf
+```
+
+```json
+{"file_path": "2026/01/report.pdf"}
+```
+
+### Route order
+
+The order in which you register routes has no effect.
+A fixed segment wins over a parameter in the same position:
 
 ```python
-from django.urls import reverse
+@api.get("/authors/{username}")
+async def get_author(username: str) -> dict:
+    return {"username": username}
 
-reverse("mission-detail", kwargs={"mission_id": 42})  # "/missions/42"
+
+@api.get("/authors/me")
+async def get_current_author() -> dict:
+    return {"username": "me"}
 ```
 
-```html
-{% url "mission-detail" mission_id=42 %}
-```
+`GET /authors/me` calls `get_current_author`. `GET /authors/ana` calls `get_author`.
 
-Path converters and catch-alls come from Django's own resolver, so `args`/`kwargs`, `query`, and `fragment` all work. A Bolt `{name:path}` catch-all reverses through Django's `<path:name>` converter (accepts slashes); other `{name:type}` hints are untyped on reverse, matching the router.
+Two routes with the same method and path stop the startup with `ValueError`.
+Two routes that are different only in a parameter name, such as `/articles/{slug}` and `/articles/{article_id}`, also stop the startup.
 
-### Derived names
+## Add a prefix to each route
 
-If you omit `name=`, the name is the **verbatim Python identifier** — the function name for routes, the class name for class-based views — with no transformation:
-
-```python
-@api.get("/y")
-async def get_mission():   # name == "get_mission"
-    return {}
-```
-
-Reversing against a derived name that no longer exists raises Django's usual `NoReverseMatch`, so renames surface immediately. Name a route explicitly whenever you intend to reverse it.
-
-### Namespaces
-
-Namespaces are **opt-in**, like Django's `app_name`. Pass `namespace=` to a `BoltAPI` and its routes reverse as `namespace:name`:
-
-```python
-api = BoltAPI(namespace="missions")
-
-@api.get("/missions/{mission_id}", name="detail")
-async def get_mission(mission_id: int):
-    return {}
-
-reverse("missions:detail", kwargs={"mission_id": 42})  # "/missions/42"
-```
-
-A namespaced route reverses **only** under its namespace; the bare name won't resolve.
-
-### Class-based views and viewsets
-
-`view()`, `viewset()`, and `@action` all accept `name=`. A viewset names each route `{base}-{action}`:
-
-```python
-@api.viewset("/users", name="user")
-class UserViewSet(ViewSet):
-    async def list(self, request): ...           # name == "user-list"
-    async def partial_update(self, request): ...  # name == "user-partial_update"
-
-    @action(["GET"], detail=False)
-    async def recent(self, request): ...          # name == "user-recent"
-```
-
-Without `name=`, the base falls back to the verbatim class name (`UserViewSet-list`), so set `name=` on viewsets you intend to reverse.
-
-### Collisions
-
-Names are resolved when the urlpatterns are built:
-
-- Several methods on one path share a name and are deduped (no error).
-- An explicit `name=` wins over a derived name with the same key.
-- Two **explicit** names mapping to different paths raise `ImproperlyConfigured`.
-
-## Sync handlers
-
-While async handlers are recommended, you can also use synchronous functions:
-
-```python
-@api.get("/sync")
-def sync_handler():
-    return {"sync": True}
-```
-
-Sync handlers are automatically wrapped to run in a thread pool.
-
-A handler is a function, a bound method, or an object with `__call__`. For an object, Bolt registers its `__call__` method. A `functools.partial` is not a handler, and the route decorator raises `TypeError` for it. Register a function that calls the partial. The rule is the same for `@api.websocket()`, where the function or the method must be `async`.
-
-## WebSocket routes
-
-Define WebSocket endpoints using `@api.websocket()`:
-
-```python
-from django_bolt import WebSocket
-
-@api.websocket("/ws/echo")
-async def echo(websocket: WebSocket):
-    await websocket.accept()
-    async for message in websocket.iter_text():
-        await websocket.send_text(f"Echo: {message}")
-```
-
-See the [WebSocket guide](websocket.md) for more details.
-
-## Auto-discovery
-
-Django-Bolt automatically discovers `api.py` files in:
-
-1. Your project directory (where `settings.py` is)
-2. Each installed Django app
-
-All routes from discovered files are combined into a single router. This lets you organize routes per app:
-
-```
-myproject/
-    myproject/
-        settings.py
-        api.py              # /health, /docs
-    users/
-        api.py              # /users, /users/{id}
-    products/
-        api.py              # /products, /products/{id}
-```
-
-## Multiple API instances
-
-You can create multiple `BoltAPI` instances and mount them:
-
-```python
-# users/api.py
-from django_bolt import BoltAPI
-
-api = BoltAPI()
-
-@api.get("/users")
-async def list_users():
-    return {"users": []}
-```
-
-```python
-# myproject/api.py
-from django_bolt import BoltAPI
-from users.api import api as users_api
-
-api = BoltAPI()
-
-# Mount users API under /api/v1
-api.mount("/api/v1", users_api)
-```
-
-Routes from `users_api` are now available at `/api/v1/users`.
-
-An API cannot mount itself, and two APIs cannot mount each other. `mount()` raises `ValueError`.
-
-A mount path can have a parameter, such as `api.mount("/tenants/{tenant}", users_api)`. A handler of the mounted API reads the value from `request.params["tenant"]`. It cannot take `tenant` as an argument, because the mounted API compiled its routes without the mount path. `mount()` raises `ValueError` for such a handler. A `Router` with the prefix `/tenants/{tenant}` gives the value as an argument.
-
-## ASGI mounts
-
-If you want to mount Django or other ASGI apps under path prefixes, see [ASGI Mounts](asgi-mounts.md).
-
-## Trailing slash handling
-
-Django-Bolt normalizes trailing slashes at route registration time and uses **Starlette-style redirects** at runtime. By default, trailing slashes are stripped from paths:
-
-```python
-api = BoltAPI()
-
-@api.get("/users/")  # Registered as /users
-async def list_users():
-    return []
-```
-
-### Trailing slash modes
-
-You can control this behavior with the `trailing_slash` parameter:
-
-| Mode | Description | Example |
-|------|-------------|---------|
-| `"strip"` | Remove trailing slashes (default) | `/users/` → `/users` |
-| `"append"` | Add trailing slashes | `/users` → `/users/` |
-| `"keep"` | No normalization | `/users/` → `/users/` |
-
-Another value raises `ValueError` when you make the `BoltAPI`.
-
-### Runtime redirect behavior
-
-When a request URL doesn't exactly match a registered route, Django-Bolt checks if the alternate path (with or without trailing slash) exists. If it does, a **308 Permanent Redirect** is returned to the canonical URL:
-
-```python
-api = BoltAPI(trailing_slash="append")
-
-@api.get("/users")  # Registered as /users/
-async def list_users():
-    return []
-
-# GET /users   → 308 Redirect to /users/
-# GET /users/  → 200 OK (canonical URL)
-```
-
-This Starlette-style approach means:
-- **Both URLs work** - users can access either, but one redirects
-- **SEO-friendly** - search engines see the redirect and index the canonical URL
-- **Minimal overhead** - redirect check only happens when route doesn't match
-
-### Strip mode (default)
-
-The default mode removes trailing slashes, which produces clean URLs:
-
-```python
-api = BoltAPI()  # trailing_slash="strip" is the default
-
-@api.get("/users/")   # Registered as /users
-async def list_users(): ...
-
-@api.get("/items")    # Registered as /items
-async def list_items(): ...
-
-# GET /users/  → 308 Redirect to /users
-# GET /users   → 200 OK
-```
-
-### Append mode
-
-Use append mode to follow Django's URL convention where paths end with slashes:
-
-```python
-api = BoltAPI(trailing_slash="append")
-
-@api.get("/users")    # Registered as /users/
-async def list_users(): ...
-
-@api.get("/items/")   # Registered as /items/
-async def list_items(): ...
-
-# GET /users   → 308 Redirect to /users/
-# GET /users/  → 200 OK
-```
-
-### Keep mode
-
-Use keep mode when you need explicit control over each path:
-
-```python
-api = BoltAPI(trailing_slash="keep")
-
-@api.get("/users")    # Registered as /users
-async def list_users(): ...
-
-@api.get("/items/")   # Registered as /items/
-async def list_items(): ...
-
-# GET /users/  → 308 Redirect to /users (if /users exists)
-# GET /items   → 308 Redirect to /items/ (if /items/ exists)
-```
-
-### WebSocket routes
-
-An HTTP route answers the other form of its path with a redirect. A WebSocket client usually does not follow a redirect. Thus a WebSocket route accepts both forms of its path, in each `trailing_slash` mode:
-
-```python
-@api.websocket("/ws/room/")   # Registered as /ws/room
-async def room(websocket: WebSocket): ...
-
-# /ws/room   → connects
-# /ws/room/  → connects
-```
-
-Django-Bolt stores a WebSocket route path with no trailing slash. It removes the trailing slash of a WebSocket request path before it finds the route. `WebSocketTestClient` follows the same rule.
-
-### Multiple APIs with different settings
-
-When Django-Bolt auto-discovers and merges multiple `api.py` files, **each API's routes keep their own trailing slash format**. This allows different apps to use different conventions:
-
-```python
-# myproject/api.py
-api = BoltAPI(trailing_slash="append")
-
-@api.get("/items")  # Registered as /items/
-async def list_items():
-    return []
-
-# users/api.py
-api = BoltAPI()  # Default: trailing_slash="strip"
-
-@api.get("/users")  # Registered as /users
-async def list_users():
-    return []
-```
-
-After merging:
-- `GET /items` → 308 Redirect to `/items/`
-- `GET /items/` → 200 OK
-- `GET /users/` → 308 Redirect to `/users`
-- `GET /users` → 200 OK
-
-Each route respects its original API's `trailing_slash` setting because routes are normalized at registration time, before the merge happens.
-
-### Mounted APIs
-
-When mounting APIs with `api.mount()`, the **parent's** `trailing_slash` setting is applied to all child routes:
-
-```python
-parent = BoltAPI(trailing_slash="append")
-child = BoltAPI(trailing_slash="strip")  # Child's setting is IGNORED when mounted
-
-@child.get("/users")  # Child normalizes to /users
-async def list_users():
-    return []
-
-parent.mount("/api", child)
-# Route is /api/users/ (parent's "append" mode is applied)
-```
-
-This differs from auto-discovery, where each API keeps its own setting.
-
-## URL prefix
-
-Apply a prefix to all routes using the `prefix` parameter:
+Give `BoltAPI` a `prefix`:
 
 ```python
 api = BoltAPI(prefix="/api/v1")
 
-@api.get("/users")  # Accessible at /api/v1/users
-async def list_users():
+
+@api.get("/articles")  # serves /api/v1/articles
+async def list_articles() -> list[dict]:
     return []
 ```
 
-This is useful for versioning your API or grouping routes under a common path.
+Bolt adds a leading slash to each path and each prefix. Thus `BoltAPI(prefix="api/v1")` with `@api.get("articles")` also serves `/api/v1/articles`.
 
-Bolt gives each path and each prefix a leading slash. Thus `BoltAPI(prefix="api/v1")` with `@api.get("users")` serves `/api/v1/users`. The rule is the same for `Router(prefix=...)`, `include_router(prefix=...)`, `mount()`, views, viewsets and WebSocket routes.
+## Group routes with a router
+
+A `Router` holds a group of routes with a shared prefix, tags, middleware, authentication and guards.
+Include the router in the API with `include_router()`:
+
+```python
+from django_bolt import BoltAPI, Router
+
+comments = Router(prefix="/comments", tags=["comments"])
+
+
+@comments.get("")
+async def list_comments() -> list[dict]:
+    return [{"id": 1, "body": "Nice post"}]
+
+
+@comments.get("/{comment_id}")
+async def get_comment(comment_id: int) -> dict:
+    return {"id": comment_id}
+
+
+api = BoltAPI()
+api.include_router(comments, prefix="/v1")
+```
+
+```bash
+curl localhost:8000/v1/comments/3
+```
+
+```json
+{"id": 3}
+```
+
+A route on a router takes the `tags`, `auth` and `guards` of the router when the route does not set them.
+The router decorators take the same keyword arguments as the `BoltAPI` decorators.
+`Router` has no `websocket()`, `view()` or `viewset()`. Register these on the `BoltAPI`.
+
+### Nest routers
+
+Include a router in another router. The prefixes join, from the outer router to the inner router:
+
+```python
+v1 = Router(prefix="/v1")
+tags = Router(prefix="/tags")
+
+
+@tags.get("")
+async def list_tags() -> list[str]:
+    return ["django", "rust"]
+
+
+v1.include_router(tags)
+api.include_router(v1)  # GET /v1/tags
+```
+
+An inner router takes the `auth`, `guards` and `tags` that it does not set from the nearest outer router that sets them.
+Its routes run the middleware of the outer routers first, then its own middleware.
+
+## Mount an API in another API
+
+`mount()` copies the routes of one `BoltAPI` into another, under a path.
+The mounted API keeps its own middleware and its own `django_middleware`:
+
+```python
+admin_api = BoltAPI(django_middleware=True)
+
+
+@admin_api.get("/stats")
+async def stats() -> dict:
+    return {"articles": 12}
+
+
+api = BoltAPI()
+api.mount("/admin", admin_api)  # GET /admin/stats
+```
+
+Use a `Router` to share auth and guards. Use `mount()` for a group of routes that needs a different middleware stack.
+
+A mount path can have a parameter, for example `/tenants/{tenant}`.
+A handler of the mounted API reads its value from `request.params["tenant"]`. It cannot take `tenant` as an argument, and `mount()` raises `ValueError` for such a handler.
+
+To serve a Django view or another ASGI application under a path, see [ASGI mounts](asgi-mounts.md).
+
+## Control trailing slashes
+
+The `trailing_slash` argument of `BoltAPI` sets the form of each path:
+
+| Value | Effect | `@api.get("/tags/")` serves |
+| --- | --- | --- |
+| `"strip"` (default) | Removes the trailing slash | `/tags` |
+| `"append"` | Adds a trailing slash | `/tags/` |
+| `"keep"` | Keeps the path as you wrote it | `/tags/` |
+
+A request to the other form of a path gets `308 Permanent Redirect` to the registered form.
+The redirect keeps the query string and the method.
+
+```bash
+curl -i localhost:8000/tags/?page=2
+```
+
+```http
+HTTP/1.1 308 Permanent Redirect
+location: /tags?page=2
+```
+
+When the registered form has no route for the method, the request gets 405 with the `Allow` header of the registered form.
+
+Another value of `trailing_slash` raises `ValueError`.
+Each `BoltAPI` keeps its own mode when `runbolt` joins the APIs of a project.
+A mounted API takes the mode of the API that mounts it.
+
+A WebSocket route accepts both forms of its path, in each mode. A WebSocket client usually does not follow a redirect.
+
+## Name a route
+
+Give a route a name with `name=`. Django's `reverse()` and the `{% url %}` tag then find it:
+
+```python
+@api.get("/articles/{article_id}", name="article-detail")
+async def get_article(article_id: int) -> dict:
+    return {"id": article_id}
+```
+
+Include `django_bolt.urls` in your root URLconf one time:
+
+```python title="mysite/urls.py"
+from django.urls import include, path
+
+urlpatterns = [
+    path("", include("django_bolt.urls")),
+]
+```
+
+```pycon
+>>> from django.urls import reverse
+>>> reverse("article-detail", kwargs={"article_id": 42})
+'/articles/42'
+```
+
+`django_bolt.urls` only adds names for `reverse()`. Bolt still serves the paths, and Django does not call these URL patterns.
+
+A route with no `name` gets the name of its handler function, for example `"get_article"`.
+`BoltAPI(namespace="blog")` puts each route of the API in a namespace. Then use `reverse("blog:article-detail", ...)`.
+Two routes with the same explicit name and different paths raise `ImproperlyConfigured`.
+
+## Describe a route in the OpenAPI document
+
+The decorators take arguments for the [OpenAPI document](openapi.md):
+
+```python
+@api.get(
+    "/articles/{article_id}",
+    tags=["articles"],
+    summary="Get an article",
+    description="Return one published article.",
+    deprecated=True,
+)
+async def get_article(article_id: int) -> dict:
+    return {"id": article_id}
+```
+
+- `tags` groups the operation in the documentation UI.
+- `summary` and `description` set the text of the operation. Without them, the first line of the handler docstring is the summary, and the remaining lines are the description.
+- `deprecated=True` marks the operation as deprecated. The route still works.
+- `include_in_schema=False` removes the route from the document. The route still works.
+
+## Use a sync handler
+
+A handler can be a `def` function:
+
+```python
+from django.contrib.auth.models import User
+
+
+@api.get("/authors/count")
+def count_authors() -> dict:
+    return {"count": User.objects.count()}
+```
+
+Bolt reads the source of a sync handler when you register it.
+A sync handler that uses the ORM or blocking I/O runs in a thread pool.
+Each other sync handler runs on the worker thread.
+See [Async and the ORM](async-orm.md).
+
+A handler is a function, a bound method, or an object with a `__call__` method.
+A `functools.partial` raises `TypeError`. Register a function that calls the partial.
+
+## Find the API modules
+
+`runbolt` imports your API objects when it starts. It looks in these places, in this order:
+
+1. The `BOLT_API` setting, if you set it. It is a list of `"module:attribute"` strings, for example `["blog.api:api"]`. Bolt then looks nowhere else.
+2. The `api.py` or `bolt_api.py` module of the project package. The project package is the package of `ROOT_URLCONF`.
+3. The `api.py` or `bolt_api.py` module of each installed app. An app can name another module with a `bolt_api = "module:attribute"` attribute on its `AppConfig`.
+
+In each module, Bolt takes the first top-level assignment of a `BoltAPI()` call, for example `api = BoltAPI()`.
+It reads the source of the module to find it, so `api = make_api()` is not found.
+Bolt joins the routes of each API that it finds into one server.
+An API that another API mounts must come after the main API in the same module.
+
+[Installation](../intro/install.md) shows the minimum project layout.
+
+## See also
+
+- [BoltAPI and Router reference](../ref/api.md)
+- [Requests](requests.md)
+- [Responses](responses.md)
+- [Class-based views](class-based-views.md)
+- [WebSocket](websocket.md)
+- [ASGI mounts](asgi-mounts.md)

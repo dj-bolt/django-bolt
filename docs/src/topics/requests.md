@@ -1,1045 +1,503 @@
 ---
-icon: lucide/arrow-down-to-line
+description: Read path, query, header, cookie, form, file and JSON body values from typed handler arguments, and use the Request object.
 ---
 
-# Request Handling
+# Requests
 
-This guide covers how Django-Bolt processes requests and how to access request data in your handlers.
+Bolt gives each argument of a handler a value from the request.
+The name and the type hint of the argument set where the value comes from and its type.
+Bolt converts and validates each value before the handler runs. A bad value gets a 422 response.
 
-## The request object
+```python title="blog/api.py"
+import msgspec
 
-Access the full request using a `request` parameter:
+from django_bolt import BoltAPI
 
-```python
-@api.get("/info")
-async def request_info(request):
+api = BoltAPI()
+
+
+class ArticleIn(msgspec.Struct):
+    title: str
+    body: str
+    published: bool = False
+
+
+@api.post("/authors/{author_id}/articles")
+async def create_article(author_id: int, article: ArticleIn, notify: bool = False) -> dict:
     return {
-        "method": request.get("method"),
-        "path": request.get("path"),
+        "author_id": author_id,
+        "title": article.title,
+        "published": article.published,
+        "notify": notify,
     }
 ```
 
-## Request properties
-
-The request dict contains:
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `method` | `str` | HTTP method (GET, POST, etc.) |
-| `path` | `str` | Request path |
-| `query` | `dict` | Query parameters |
-| `params` | `dict` | Path parameters |
-| `headers` | `dict` | Request headers |
-| `body` | `bytes` | Raw request body |
-| `context` | `dict` | Authentication context |
-| `scheme` | `str` | `"http"` or `"https"`. `request.is_secure()` is `True` for `"https"` |
-
-### Absolute URLs
-
-Django's `HttpRequest.build_absolute_uri()` builds the URL of `request.build_absolute_uri()`. Thus Django joins a relative location to the request URL and encodes the result. When Django builds the URL from the request host, it checks that host against `ALLOWED_HOSTS`. A host that is not in the list raises `DisallowedHost`, and the response is 400. An absolute location, such as `https://cdn.example/a`, comes back as it is, with no host check, as in Django. Django reads `X-Forwarded-Host` only when `USE_X_FORWARDED_HOST` is `True`. The scheme follows [BOLT_TRUSTED_PROXIES](../ref/settings.md#bolt_trusted_proxies), and `SECURE_PROXY_SSL_HEADER` applies on top of it, as in Django. Bolt keeps the path and the query of the request as the client sent them.
-
-### Scheme
-
-`request.scheme` is `"http"` or `"https"`, and `request.is_secure()` is `True` for `"https"`. They give the scheme of `request.build_absolute_uri()`. The scheme follows [BOLT_TRUSTED_PROXIES](../ref/settings.md#bolt_trusted_proxies), and `SECURE_PROXY_SSL_HEADER` applies on top of it, as in Django. Bolt does not end TLS. Thus the scheme is `"https"` only when a proxy sets it.
-
-```python
-@api.get("/login-link")
-async def login_link(request):
-    if not request.is_secure():
-        return {"detail": "Use HTTPS"}
-    return {"url": request.build_absolute_uri("/login")}
+```bash
+curl -X POST "localhost:8000/authors/7/articles?notify=true" \
+  -H "Content-Type: application/json" -d '{"title": "Hello", "body": "First post"}'
 ```
 
-## Type-safe request
-
-For better IDE support, use the `Request` type:
-
-```python
-from django_bolt import Request
-
-@api.get("/profile", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
-async def profile(request: Request):
-    # IDE knows about .user, .context, .get(), etc.
-    return {"user_id": request.user.id}
+```json
+{"author_id": 7, "title": "Hello", "published": false, "notify": true}
 ```
 
-The `Request` type provides:
+`author_id` is in the path, so it is a path parameter.
+`article` is a `msgspec.Struct`, so it is the JSON body.
+`notify` is a simple type, so it is a query parameter.
 
-- `request.user` - Authenticated user (lazy loaded)
-- `request.session` - Django session (requires SessionMiddleware)
-- `await request.auser()` - Async user getter
-- `request.context` - Authentication context dict
-- `request.get(key, default)` - Get request property
-- `request[key]` - Access request property
+## How Bolt finds the source of an argument
 
-## Path parameters
+Bolt applies these rules in order:
 
-Extract path parameters using curly braces in the route and matching function arguments:
+| The argument | Source |
+| --- | --- |
+| Has a marker from `django_bolt.params`, such as `Header()` | The source of the marker |
+| Has a name that is in the path, such as `{author_id}` | Path |
+| Is named `request` or `req` | The [`Request` object](#use-the-request-object) |
+| Has a simple type (`str`, `int`, `float`, `bool`, `Decimal`, `UUID`, a date or time type, an `Enum`, a `Literal`), or a list of a simple type | Query string |
+| Is a `msgspec.Struct`, a dataclass, or a list of them | JSON body |
+| Is a `dict`, or another type that only JSON can hold, on a `POST`, `PUT` or `PATCH` route | JSON body |
+| Anything else | Query string |
 
-```python
-@api.get("/users/{user_id}/posts/{post_id}")
-async def get_post(user_id: int, post_id: int):
-    return {"user_id": user_id, "post_id": post_id}
-```
-
-Type conversion happens automatically:
-
-- `int` - Converts to integer
-- `float` - Converts to float
-- `str` - Keeps as string (default)
-
-Invalid conversions return a 422 Unprocessable Entity.
-
-Path parameters are also available on the request object itself:
-
-```python
-from django_bolt import Request
-
-@api.get("/users/{user_id}")
-async def get_user(request: Request):
-    return {"user_id": request.params["user_id"]}
-```
-
-This is especially handy inside `ViewSet` helpers such as `get_object()`, which
-use `request.params` by default.
-
-## Query parameters
-
-Parameters without path placeholders become query parameters:
-
-```python
-@api.get("/search")
-async def search(
-    q: str,              # Required
-    page: int = 1,       # Optional with default
-    limit: int = 20,     # Optional with default
-    sort: str | None = None  # Optional, None if not provided
-):
-    return {"q": q, "page": page, "limit": limit, "sort": sort}
-```
-
-If no type annotation is provided, the parameter is treated as a string.
-
-Bolt decodes query keys and values as Django `QueryDict` does:
-
-- A `+` is a space, and `%2B` is a literal `+`. Thus a client must send a literal `+` as `%2B`.
-- Bytes that are not UTF-8 become U+FFFD (`�`).
-- A key with no `=` has an empty value. A repeated key keeps its last value, but a sequence parameter takes each value.
-
-A `+` in a path parameter stays a `+`. `request.META["QUERY_STRING"]`, `request.get_full_path()` and `request.build_absolute_uri()` keep the query as the client sent it.
-
-### Repeated query keys
-
-Declare a `list`, `set`, `frozenset` or `tuple` to take each value of a repeated key:
+Put a marker in `Annotated` to choose the source:
 
 ```python
 from typing import Annotated
-from django_bolt.param_functions import Query
 
-@api.get("/items")
-async def items(tag: Annotated[set[int], Query()]):
-    # /items?tag=1&tag=2&tag=1 gives {1, 2}
-    return {"tags": sorted(tag)}
+from django_bolt.params import Header
+
+
+@api.get("/whoami")
+async def whoami(user_agent: Annotated[str, Header(alias="User-Agent")]) -> dict:
+    return {"user_agent": user_agent}
 ```
 
-Bolt converts each value to the item type. A bad item gives a 422.
-A bare `list`, `set`, `frozenset` or `tuple` keeps each item as a string.
-A `tuple[int, str]` needs exactly one value for each position.
-A form field takes each value of its name in the same way.
-A WebSocket route takes each value of a repeated query key in the same way.
-A header or a cookie gives a sequence of one item.
-A path, header or cookie type that cannot hold one item, such as `tuple[int, str]`, raises `TypeError` when the route registers.
+The markers are `Path`, `Query`, `Header`, `Cookie`, `Form`, `File` and `Body`. See the [parameters reference](../ref/params.md).
 
-### Constraints
+A type that Bolt cannot build from text raises `TypeError` when you register the route.
+An example is a `dict` query parameter on a `GET` route. The error names the handler, the argument and the type.
 
-Add `msgspec.Meta` to limit a value. A value outside the limits gives a 422:
+## Read path parameters
+
+A path parameter has the name of a `{name}` part of the path. The type hint sets its type:
 
 ```python
-import msgspec
+@api.get("/articles/{article_id}")
+async def get_article(article_id: int) -> dict:
+    return {"id": article_id}
+```
 
+Add limits with `Path()`:
+
+```python
+from django_bolt.params import Path
+
+
+@api.get("/articles/{article_id}/revisions/{number}")
+async def get_revision(article_id: int, number: Annotated[int, Path(ge=1)]) -> dict:
+    return {"article_id": article_id, "number": number}
+```
+
+```bash
+curl localhost:8000/articles/3/revisions/0
+```
+
+```json
+{"detail": [{"type": "validation_error", "loc": ["path", "number"], "msg": "Expected `int` >= 1", "input": 0}]}
+```
+
+A path parameter is always required. `Path(default=...)` raises `ValueError`.
+[Routing](routing.md#read-path-parameters) shows the `{name:path}` form, which matches slashes.
+
+## Read query parameters
+
+An argument with a simple type is a query parameter. Give it a default to make it optional:
+
+```python
 @api.get("/articles")
-async def articles(
-    page: Annotated[int, msgspec.Meta(ge=1)] = 1,
-    code: Annotated[str, msgspec.Meta(pattern=r"^[A-Z]{3}$"), Query()] = "ABC",
-):
-    return {"page": page, "code": code}
+async def list_articles(page: int = 1, search: str | None = None, tag: list[str] | None = None) -> dict:
+    return {"page": page, "search": search, "tag": tag}
 ```
 
-The constraints apply to path, query, header, cookie and form parameters.
-On `int | None`, they apply to the `int` value, and the parameter stays optional.
-The OpenAPI schema shows them, for example `minimum: 1`.
-A constraint that msgspec cannot apply, for example `ge` on a `Decimal`, raises `TypeError` when the route registers.
-The types in `django_bolt.serializers.types`, such as `PositiveInt`, work the same way.
+```bash
+curl "localhost:8000/articles?page=2&search=django&tag=python&tag=web"
+```
 
-`Query()` and `Path()` also take the constraint arguments `gt`, `ge`, `lt`, `le`, `min_length`, `max_length` and `pattern`.
-Bolt applies them as `msgspec.Meta`:
+```json
+{"page": 2, "search": "django", "tag": ["python", "web"]}
+```
+
+- An argument with no default is required. A request without it gets a 422.
+- A `list`, `set`, `frozenset` or `tuple` takes each value of a repeated key. Another type takes the last value.
+- A `bool` takes `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`.
+- A `+` in the query string is a space, as in Django. Send a literal `+` as `%2B`.
+
+### Rename and limit a query parameter
+
+Use `Query()` to read another key or to add limits:
 
 ```python
+from django_bolt.params import Query
+
+
 @api.get("/search")
 async def search(
-    name: str = Query(min_length=3, description="The name to find"),
-    category: str = Query(default="all"),
+    q: Annotated[str, Query(alias="query", min_length=3)],
     page: Annotated[int, Query(ge=1)] = 1,
-):
-    return {"name": name, "category": category, "page": page}
+) -> dict:
+    return {"q": q, "page": page}
 ```
 
-The marker can be the default of the parameter, or an item of `Annotated`.
-After `=`, the `default` of the marker gives the value of a missing parameter.
-Without `default`, the parameter is required.
-In `Annotated`, write the default after `=`, as in FastAPI.
-A default in an `Annotated` marker raises `TypeError` when the route registers.
-The first argument of a marker is its default, not its alias.
-Use `Query(alias="q")` to read another key.
-`Header()`, `Cookie()` and `Form()` take `default` in the same way.
-The OpenAPI schema shows the `description`, `example` and `deprecated` arguments of the marker.
+```bash
+curl "localhost:8000/search?query=dj"
+```
 
-### NewType and type aliases
+```json
+{"detail": [{"type": "validation_error", "loc": ["query", "query"], "msg": "Expected `str` of length >= 3", "input": "dj"}]}
+```
 
-A `NewType` or a `type` alias converts as the type that it names:
+`Query()` takes `gt`, `ge`, `lt`, `le`, `min_length`, `max_length` and `pattern`.
+A `msgspec.Meta` in `Annotated` works the same way, for example `Annotated[int, msgspec.Meta(ge=1)]`.
+A `Literal` takes only its values, and an `Enum` takes only the values of its members.
+
+Write the default after `=`, not in the marker. `Annotated[str, Query("x")]` raises `TypeError`.
+The marker can also be the default: `page: int = Query(1, ge=1)`.
+
+## Read a JSON body
+
+A `msgspec.Struct` argument reads the JSON body. Bolt decodes and validates it in one step:
 
 ```python
-from typing import NewType
+class ArticleIn(msgspec.Struct):
+    title: str
+    body: str
+    published: bool = False
 
-UserId = NewType("UserId", int)
-type Page = int
 
-@api.get("/users/{user_id}")
-async def user(user_id: UserId, page: Page = 1):
-    return {"user_id": user_id, "page": page}
+@api.post("/articles")
+async def create_article(article: ArticleIn) -> dict:
+    return {"title": article.title, "published": article.published}
 ```
 
-The handler gets an `int`, and `/users/abc` gives a 422.
-A parameterized alias gets its arguments. With `type Pair[T] = list[T]`, a `Pair[int]` parameter converts as `list[int]`.
+A dataclass works the same way. A `list[ArticleIn]` reads a JSON array.
+A `GET`, `HEAD`, `DELETE` or `OPTIONS` route cannot have a body argument. Bolt raises `TypeError` when you register it.
 
-### Enum and Literal
-
-An `Enum` parameter gets the member with the value from the request. A `Literal` parameter takes only its listed values:
+A request with no body gets a 422. Give the argument a default to make the body optional:
 
 ```python
-import enum
-from typing import Literal
-
-class Color(enum.Enum):
-    RED = "red"
-    BLUE = "blue"
-
-@api.get("/paint")
-async def paint(color: Color, order: Literal["asc", "desc"] = "asc"):
-    return {"color": color.name, "order": order}
+@api.post("/articles/preview")
+async def preview(article: ArticleIn | None = None) -> dict:
+    return {"has_article": article is not None}
 ```
 
-`/paint?color=red` gives `Color.RED`. Another value, such as `/paint?color=green`, gives a 422.
-An `IntEnum` or a `Literal` of numbers converts the text to a number first.
-This applies to path, query, header, cookie and form parameters.
+### Read a JSON object with no fixed fields
 
-### Durations
-
-A `datetime.timedelta` parameter takes an ISO 8601 duration, such as `PT5S` or `P1DT2H`. It also takes a number of seconds, such as `90`:
-
-```python
-import datetime
-
-@api.get("/wait")
-async def wait(timeout: datetime.timedelta):
-    return {"seconds": timeout.total_seconds()}
-```
-
-`/wait?timeout=PT5S` gives `timedelta(seconds=5)`. Text that is not a duration gives a 422.
-This applies to path, query, header, cookie and form parameters.
-
-### bytes parameters
-
-A `bytes` parameter gets the UTF-8 bytes of the text value:
-
-```python
-@api.get("/echo")
-async def echo(token: bytes):
-    return {"length": len(token)}
-```
-
-`GET /echo?token=abc` gives the handler `b"abc"`. Bolt does not decode base64.
-This rule applies to a path, query, header, cookie and form parameter.
-It also applies to `bytearray`, to a sequence such as `list[bytes]`, and to a `bytes` item of a tuple such as `tuple[bytes, int]`.
-A `msgspec.Meta` constraint such as `max_length` counts the bytes.
-
-A `bytes` field of a [parameter model](#parameter-models) follows the same rule. The model can be a `Query()`, `Form()`, `Header()` or `Cookie()` model.
-
-A JSON body is different. JSON has no bytes type, so msgspec reads the text of a `bytes` field in a JSON body as base64. The OpenAPI document shows this difference. A `bytes` parameter, form field or field of a parameter model is `{"type": "string"}`. A `bytes` field of a JSON body is `{"type": "string", "contentEncoding": "base64"}`.
-
-### Types that Bolt cannot convert
-
-A path, query, header, cookie or form parameter gets text from the request.
-Bolt converts the text to `str`, `int`, `float`, `bool`, `Decimal`, `UUID`, `date`, `datetime`, `time`, `timedelta`, an `Enum` and a `Literal`.
-It also builds one `list`, `set`, `frozenset` or `tuple` of these types.
-A parameter with no annotation, or of the type `Any`, gets the text.
-
-Text cannot give each other type, for example `complex`, `dict`, a dataclass or your own class.
-A parameter of such a type stops the registration with a `TypeError`. The error names the handler, the parameter and the type.
-A `File()` parameter takes `UploadFile`, `bytes`, `dict`, or a list of one of them. Each other type gets the same error.
-
-## Request body
-
-### JSON body
-
-Use `msgspec.Struct` for validated JSON bodies:
-
-```python
-import msgspec
-
-class CreateUser(msgspec.Struct):
-    username: str
-    email: str
-    age: int | None = None
-
-@api.post("/users")
-async def create_user(user: CreateUser):
-    return {"username": user.username}
-```
-
-A list of structs reads a JSON array:
-
-```python
-@api.post("/users/bulk")
-async def create_users(users: list[CreateUser]):
-    return {"count": len(users)}
-```
-
-A request with no body gives a 422. To make the body optional, give the parameter a default:
-
-```python
-@api.post("/search")
-async def search(filters: CreateUser | None = None):
-    return {"filtered": filters is not None}
-```
-
-A request with no body then gives the default. A body that is present must be valid JSON of the type.
-
-### Body options
-
-`Body()` marks a parameter as the JSON body and takes options:
-
-```python
-from typing import Annotated
-from django_bolt.params import Body
-
-@api.post("/items")
-async def create_item(
-    item: Annotated[CreateUser, Body(embed=True, description="The new item", example={"username": "ana"})],
-):
-    return {"username": item.username}
-
-@api.post("/counters")
-async def set_counter(count: Annotated[int, Body(embed=True, alias="item-count")] = 0):
-    return {"count": count}
-```
-
-| Option | Effect |
-|--------|--------|
-| `embed=True` | The body is a JSON object, and the value is at the key of the parameter name. `/items` reads `{"item": {"username": "ana"}}`. Bolt does not read the other keys of the object. |
-| `alias` | The key name with `embed=True`. `/counters` reads `{"item-count": 3}`. Without `embed`, `alias` has no effect. |
-| `default` | The value for a request with no body. With `embed=True`, it is also the value for an object that does not have the key. Set it with `=`, or as the first argument of `Body()`. |
-| `description` | The description of the request body in the OpenAPI document. |
-| `example` | The example of the request body in the OpenAPI document. |
-
-With `embed=True`, a body that is not a JSON object, or that does not have the key of a required parameter, gets a 422.
-The OpenAPI document shows the wrapper object. `Form(description=..., example=...)` documents a form field in the same way.
-
-### Raw body access
-
-Access the raw body bytes:
-
-```python
-@api.post("/raw")
-async def raw_body(request):
-    body = request.get("body", b"")
-    return {"size": len(body)}
-```
-
-### JSON object without a schema
-
-A `dict` parameter reads a JSON object that has no fixed fields. The route must be a `POST`, `PUT` or `PATCH` route:
+A `dict` argument on a `POST`, `PUT` or `PATCH` route reads a JSON object:
 
 ```python
 @api.post("/events")
-async def create_event(payload: dict):
+async def create_event(payload: dict) -> dict:
     return {"keys": sorted(payload)}
-
-@api.put("/counters")
-async def set_counters(counters: dict[str, int]):
-    return {"total": sum(counters.values())}
 ```
 
-A `dict[K, V]` type validates the keys and the values. A body that is not a JSON object gets a 422.
+`dict[str, int]` also validates the keys and the values.
 
-Each other type that only JSON can give is the body too. Examples are `list[dict]`, `list[list[int]]` and a `TypedDict`.
-A parameter of the type `Any` stays a query parameter. Use `Body()` to read an `Any` value from the body.
+### Read one value from a JSON object
 
-A `GET`, `HEAD`, `DELETE` or `OPTIONS` request has no body. On such a route, a parameter of one of these types stops the registration with a `TypeError`.
-
-## Headers
-
-### Using Annotated
-
-Extract specific headers:
+`Body(embed=True)` reads the value at the key of the argument name:
 
 ```python
-from typing import Annotated
-from django_bolt.param_functions import Header
+from django_bolt.params import Body
 
-@api.get("/auth")
-async def check_auth(
-    authorization: Annotated[str, Header(alias="Authorization")]
-):
-    return {"auth": authorization}
+
+@api.post("/articles/{article_id}/rating")
+async def rate_article(article_id: int, stars: Annotated[int, Body(embed=True)]) -> dict:
+    return {"article_id": article_id, "stars": stars}
 ```
 
-### Optional headers
+This route reads `{"stars": 4}`. Use `Body(embed=True, alias="star-count")` to read another key.
+
+### Read the raw body
+
+`request.body` is the body as `bytes`:
 
 ```python
-@api.get("/optional-header")
-async def optional_header(
-    custom: Annotated[str | None, Header(alias="X-Custom")] = None
-):
-    return {"custom": custom}
+from django_bolt import Request
+
+
+@api.post("/webhooks/mailer")
+async def mailer_webhook(request: Request) -> dict:
+    return {"size": len(request.body)}
 ```
 
-### Typed headers
+## Read headers
 
-Declare a header as `int`, `float`, `bool`, `uuid.UUID`, `decimal.Decimal`,
-`datetime`, `date` or `time`. Rust converts the value before the handler runs.
-A value that does not convert gives a 422 that names the header:
+Use `Header()`. Without an `alias`, Bolt reads the header with the argument name in lower case, with `-` for each `_`:
 
 ```python
-@api.get("/items")
-async def list_items(x_page_size: Annotated[int, Header()] = 20):
+@api.get("/articles/export")
+async def export_articles(
+    x_api_key: Annotated[str, Header()],
+    x_page_size: Annotated[int, Header()] = 50,
+) -> dict:
     return {"page_size": x_page_size}
 ```
 
-`X-Page-Size: 50` gives the integer `50`. `X-Page-Size: abc` gives this 422:
+This route reads `X-Api-Key` and `X-Page-Size`. Header names are not case-sensitive.
+A typed header converts as a query parameter does:
+
+```bash
+curl localhost:8000/articles/export -H "X-Api-Key: secret" -H "X-Page-Size: abc"
+```
 
 ```json
 {"detail": "Header 'x-page-size': Invalid integer 'abc': invalid digit found in string"}
 ```
 
-The converted value also replaces the string in `request.headers` and
-`request.cookies`. Django middleware still gets the strings as they
-arrived: `request.META` and `HttpRequest.COOKIES` hold the original text,
-so a value such as `0005` keeps its leading zeros there.
+To read all the headers, use `request.headers`. It is a `dict` with lower-case names.
 
-A value that Rust can parse but Python cannot build is also a 422. This
-covers a `date` or `datetime` with a year outside 1 to 9999, and a
-`Decimal` with an exponent that Python's `decimal` module rejects.
+## Read cookies
 
-### All headers
-
-Access all headers from the request:
+Use `Cookie()`. Without an `alias`, Bolt reads the cookie with the argument name:
 
 ```python
-@api.get("/headers")
-async def all_headers(request):
-    headers = request.get("headers", {})
-    return {"headers": dict(headers)}
+from django_bolt.params import Cookie
+
+
+@api.get("/preferences")
+async def preferences(theme: Annotated[str, Cookie()] = "light") -> dict:
+    return {"theme": theme}
 ```
 
-## Cookies
+To read all the cookies, use `request.cookies`.
 
-Extract cookie values:
+## Read form data
 
-```python
-from typing import Annotated
-from django_bolt.param_functions import Cookie
-
-@api.get("/session")
-async def get_session(
-    session_id: Annotated[str, Cookie(alias="sessionid")]
-):
-    return {"session_id": session_id}
-```
-
-Typed cookies work as typed headers do. Rust converts the value, and a value
-that does not convert gives a 422 that names the cookie:
+Use `Form()`. Bolt reads URL-encoded bodies and multipart bodies:
 
 ```python
-@api.get("/feed")
-async def feed(page: Annotated[int, Cookie()] = 1):
-    return {"page": page}
-```
+from django_bolt.params import Form
 
-## Sessions
-
-Access Django sessions when using `django_middleware=True` or `DjangoMiddleware(SessionMiddleware)`.
-
-### Reading and writing session data
-
-Use Django's async session methods in async handlers:
-
-```python
-@api.post("/counter")
-async def increment_counter(request: Request):
-    session = request.session
-
-    # Async read with default
-    count = await session.aget("count", 0)
-
-    # Async write
-    await session.aset("count", count + 1)
-
-    return {"count": count + 1}
-```
-
-### Available async methods
-
-| Method | Description |
-|--------|-------------|
-| `await session.aget(key, default)` | Get a session value |
-| `await session.aset(key, value)` | Set a session value |
-| `await session.apop(key, default)` | Remove and return a value |
-| `await session.akeys()` | Get all session keys |
-| `await session.aitems()` | Get all key-value pairs |
-| `await session.aflush()` | Delete session and create new |
-| `await session.acycle_key()` | Regenerate key, keep data |
-
-### Sync properties (no DB access)
-
-These are safe to use in async handlers as they don't access the database:
-
-```python
-session_key = request.session.session_key  # Current session key
-request.session.clear()  # Clear cached data
-```
-
-!!! warning "Use async methods in async handlers"
-    Using sync methods like `session["key"]` or `session.get()` in async handlers will raise `SynchronousOnlyOperation`. Always use `aget`, `aset`, etc.
-
-### Complete example
-
-```python
-from django_bolt import BoltAPI, Request
-from django.contrib.auth import alogin, alogout
-
-api = BoltAPI(django_middleware=True)
-
-@api.post("/login")
-async def login(request: Request, username: str, password: str):
-    user = await User.objects.filter(username=username).afirst()
-    if user and user.check_password(password):
-        await alogin(request, user)
-        await request.session.aset("login_time", str(datetime.now()))
-        return {"status": "ok"}
-    return {"status": "error"}
-
-@api.get("/profile")
-async def profile(request: Request):
-    user = await request.auser()
-    if not user.is_authenticated:
-        return {"error": "not logged in"}
-
-    return {
-        "username": user.username,
-        "login_time": await request.session.aget("login_time"),
-    }
-
-@api.post("/logout")
-async def logout(request: Request):
-    await alogout(request)
-    return {"status": "logged out"}
-```
-
-## Form data
-
-### URL-encoded forms
-
-```python
-from typing import Annotated
-from django_bolt.param_functions import Form
 
 @api.post("/login")
 async def login(
     username: Annotated[str, Form()],
-    password: Annotated[str, Form()]
-):
-    return {"username": username}
+    password: Annotated[str, Form()],
+    remember: Annotated[bool, Form()] = False,
+) -> dict:
+    return {"username": username, "remember": remember}
 ```
 
-A repeated field keeps its last value, as a repeated query key does. Declare a `list`, `set`, `frozenset` or `tuple` to take each value.
-
-A URL-encoded body can have 1000 fields or fewer. Django has the same default limit, `DATA_UPLOAD_MAX_NUMBER_FIELDS`. A repeated key counts once for each field. A body with more fields gets 422 with the error type `too_many_fields`. A multipart body can have 100 parts or fewer.
-
-### Multipart forms
-
-```python
-@api.post("/profile")
-async def update_profile(
-    name: Annotated[str, Form()],
-    bio: Annotated[str, Form()] = ""
-):
-    return {"name": name, "bio": bio}
+```bash
+curl -X POST localhost:8000/login -d "username=ana&password=secret&remember=true"
 ```
-
-## Parameter models
-
-You can use `msgspec.Struct` or `Serializer` to group related parameters into a single validated object. This works with `Form()`, `Query()`, `Header()`, and `Cookie()`.
-
-### Form models
-
-Group form fields into a struct:
-
-```python
-import msgspec
-from typing import Annotated
-from django_bolt.param_functions import Form
-
-class LoginForm(msgspec.Struct):
-    username: str
-    password: str
-    remember_me: bool = False
-
-@api.post("/login")
-async def login(form: Annotated[LoginForm, Form()]):
-    return {"username": form.username, "remember": form.remember_me}
-```
-
-With `Serializer` for custom validation:
-
-```python
-from django_bolt.serializers import Serializer, field_validator
-
-class RegisterForm(Serializer):
-    username: str
-    email: str
-    password: str
-
-    @field_validator("username")
-    def validate_username(cls, value):
-        if len(value) < 3:
-            raise ValueError("Username must be at least 3 characters")
-        return value
-
-@api.post("/register")
-async def register(form: Annotated[RegisterForm, Form()]):
-    return {"username": form.username}
-```
-
-### Query models
-
-Group query parameters:
-
-```python
-class FilterParams(msgspec.Struct):
-    limit: int = 10
-    offset: int = 0
-    search: str | None = None
-    sort_by: str = "created_at"
-
-@api.get("/items")
-async def list_items(params: Annotated[FilterParams, Query()]):
-    return {
-        "limit": params.limit,
-        "offset": params.offset,
-        "search": params.search
-    }
-```
-
-Request: `GET /items?limit=20&search=test`
-
-### Header models
-
-Group headers into a struct. Field names are converted from `snake_case` to `kebab-case` for HTTP header lookup:
-
-```python
-class AuthHeaders(msgspec.Struct):
-    x_api_key: str           # maps to X-Api-Key header
-    x_request_id: str | None = None  # maps to X-Request-Id header
-
-@api.get("/secure")
-async def secure_endpoint(headers: Annotated[AuthHeaders, Header()]):
-    return {"api_key": headers.x_api_key}
-```
-
-Request: `GET /secure` with headers `X-Api-Key: secret123`
-
-A `list`, `set`, `frozenset` or `tuple` field gets a sequence of one item, the value of the header. Bolt does not split the value at a comma.
-
-### Cookie models
-
-Group cookies:
-
-```python
-class SessionCookies(msgspec.Struct):
-    session_id: str
-    theme: str = "light"
-    language: str = "en"
-
-@api.get("/preferences")
-async def get_preferences(cookies: Annotated[SessionCookies, Cookie()]):
-    return {"theme": cookies.theme, "language": cookies.language}
-```
-
-The OpenAPI document shows a query, header or cookie model as one parameter for each field. The name of each parameter is the name that Bolt reads. For a header field, that name is in lower case with `-` for each `_`, for example `x-api-key`.
-
-### Optional models
-
-Give the parameter a default to make the model optional:
-
-```python
-@api.get("/items/search")
-async def search_items(params: Annotated[FilterParams | None, Query()] = None):
-    return {"filtered": params is not None}
-```
-
-A request with none of the keys of the model gives the default.
-A request with one of the keys validates the model, so a missing required field gives a 422.
-This applies to `Query()`, `Header()`, `Cookie()` and `Form()` models.
-
-### Unknown keys
-
-A parameter model ignores a key that it does not declare. To reject such a key, set `forbid_unknown_fields=True`:
-
-```python
-class StrictFilters(msgspec.Struct, forbid_unknown_fields=True):
-    page: int = 1
-
-@api.get("/strict")
-async def strict(filters: Annotated[StrictFilters, Query()], limit: int = 10):
-    return {"page": filters.page, "limit": limit}
-```
-
-`/strict?page=2&limit=5` passes, because `limit` is a parameter of the handler.
-`/strict?page=2&other=1` gives a 422 with the type `unknown_field` and the `loc` `["query", "other"]`.
-The keys of a dependency are not parameters of the handler, so the model rejects them.
-
-### Benefits of parameter models
-
-| Feature | Individual params | Parameter models |
-|---------|-------------------|------------------|
-| Reusability | Copy-paste params | Define once, use everywhere |
-| Validation | Per-field only | Custom `@field_validator` |
-| Defaults | Per-field | Centralized in struct |
-| IDE support | Basic | Full autocomplete |
-| Documentation | Manual | Auto-generated from struct |
-
-## File uploads
-
-### File size limits: global vs per-view
-
-There are two levels of file size validation in Django-Bolt:
-
-- **Global limit**: Set by `BOLT_MAX_UPLOAD_SIZE` in your Django settings. This is the maximum file size the server will accept for any upload. If a file exceeds this, the request is rejected with a 413 error before your view runs.
-- **Per-view limit**: Set by the `max_size` argument to the `File()` parameter in your view. This allows you to set a stricter limit for a specific endpoint, but it can never exceed the global limit.
-
-**Example:**
-
-```python
-# settings.py
-BOLT_MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
-
-# In your view
-from django_bolt import FileSize, UploadFile
-from django_bolt.param_functions import File
-from typing import Annotated
-
-@api.post("/upload")
-async def upload_file(
-    file: Annotated[
-        UploadFile | None,
-        File(max_size=FileSize.MB_10),  # 10 MB per-view limit
-    ] = None,
-):
-    return {"filename": file.filename, "size": file.size}
-```
-
-In this example, files over 10 MB are rejected by the view, and files over 50 MB are rejected by the server. If you set `File(max_size=...)` higher than `BOLT_MAX_UPLOAD_SIZE`, the global limit always wins.
-
-!!! warning
-    The global limit (`BOLT_MAX_UPLOAD_SIZE`) is enforced **before** your view handler runs. You cannot override it in your view. Always set it to the maximum file size your server should ever accept.
-
-
-Django-Bolt provides the `UploadFile` class for handling file uploads with Django integration.
-
-### Basic file upload
-
-```python
-from typing import Annotated
-from django_bolt import UploadFile
-from django_bolt.params import File
-
-@api.post("/upload")
-async def upload(file: Annotated[UploadFile, File()]):
-    content = await file.read()
-    return {
-        "filename": file.filename,
-        "size": file.size,
-        "content_type": file.content_type,
-    }
-```
-
-### UploadFile properties
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `filename` | `str` | Original filename |
-| `content_type` | `str` | MIME type |
-| `size` | `int` | Size in bytes |
-| `file` | `Django File` | Django File object for FileField |
-| `headers` | `dict` | Multipart headers |
-
-### UploadFile methods
-
-| Method | Description |
-|--------|-------------|
-| `await read(size=-1)` | Read file content (async) |
-| `await seek(offset)` | Seek to position (async) |
-| `await close()` | Close the file (async) |
-| `file.read()` | Read file content (sync) |
-
-### File validation
-
-Use `File()` parameters to validate uploads:
-
-```python
-from django_bolt import FileSize
-
-@api.post("/upload")
-async def upload(
-    file: Annotated[UploadFile, File(
-        max_size=FileSize.MB_10,           # Maximum 10MB
-        min_size=1024,                      # Minimum 1KB
-        allowed_types=["image/*", "application/pdf"],  # MIME types (wildcards supported)
-    )]
-):
-    return {"filename": file.filename}
-```
-
-`max_size` and `min_size` take an int of 0 or more, in bytes. `max_files` takes
-an int of 1 or more. A value of another type, such as `"10MB"`, a float or a
-`bool`, raises `TypeError`. A value out of range raises `ValueError`. So does a
-`min_size` above `max_size`. Each error is raised when you write the `File()`
-call. Omit a limit, or pass `None`, to set no limit.
-
-`allowed_types` takes a list, a tuple or another iterable of MIME type
-strings. A str such as `"image/*"` raises `TypeError`. An item that is not a
-str also raises `TypeError`. An empty iterable raises `ValueError`. Omit
-`allowed_types` to allow each type.
-
-### FileSize enum
-
-Use the `FileSize` enum for readable size limits:
-
-```python
-from django_bolt import FileSize
-
-File(max_size=FileSize.MB_1)   # 1 MB
-File(max_size=FileSize.MB_5)   # 5 MB
-File(max_size=FileSize.MB_10)  # 10 MB
-File(max_size=FileSize.MB_50)  # 50 MB
-File(max_size=FileSize.MB_100) # 100 MB
-```
-
-### Multiple file uploads
-
-```python
-@api.post("/upload-multiple")
-async def upload_multiple(
-    files: Annotated[list[UploadFile], File(
-        max_files=5,              # Maximum 5 files
-        max_size=FileSize.MB_5,   # 5MB per file
-    )]
-):
-    return {
-        "count": len(files),
-        "filenames": [f.filename for f in files],
-    }
-```
-
-### File content as bytes
-
-Use `bytes` when the handler needs only the content of the file. Use `list[bytes]` for the content of each file:
-
-```python
-@api.post("/checksum")
-async def checksum(data: Annotated[bytes, File(max_size=FileSize.MB_5)]):
-    return {"size": len(data)}
-
-@api.post("/checksums")
-async def checksums(parts: Annotated[list[bytes], File(max_files=5)]):
-    return {"sizes": [len(part) for part in parts]}
-```
-
-Bolt reads the complete file into memory for a `bytes` parameter. Set `max_size`. Use `UploadFile` for a large file, or when you need the filename or the content type.
-
-### Saving to Django FileField / ImageField
-
-When a multipart request arrives, Django-Bolt parses it in Rust for performance — extracting file content, filename, content type, and size. The result is wrapped in an `UploadFile` object on the Python side, which gives you async read/write methods and automatic cleanup.
-
-However, Django's `FileField` and `ImageField` don't know about `UploadFile` — they expect a `django.core.files.base.File` object. The `.file` property bridges this gap: it wraps the Rust-parsed file data in a Django `File` without an additional memory copy, so you can assign it directly to any model field:
-
-```python
-from myapp.models import Document, UserProfile
-
-# Async handler with FileField
-@api.post("/documents")
-async def create_document(
-    title: Annotated[str, Form()],
-    upload: Annotated[UploadFile, File(max_size=FileSize.MB_10)],
-):
-    doc = Document(title=title)
-    doc.file = upload.file  # assign Django File to FileField
-    await doc.asave()
-    return {"id": doc.id, "url": doc.file.url}
-
-# ImageField works the same way
-@api.post("/avatar")
-async def upload_avatar(
-    avatar: Annotated[UploadFile, File(
-        max_size=FileSize.MB_5,
-        allowed_types=["image/*"],
-    )],
-    request,
-):
-    profile = await UserProfile.objects.aget(user=request.user)
-    profile.avatar = avatar.file  # assign Django File to ImageField
-    await profile.asave()
-    return {"avatar_url": profile.avatar.url}
-
-# Sync handlers work too
-@api.post("/sync-upload")
-def sync_upload(upload: Annotated[UploadFile, File()]):
-    doc = Document(title="Uploaded doc")
-    doc.file = upload.file
-    doc.save()
-    return {"id": doc.id}
-```
-
-Since `.file` returns a standard Django `File`, it works transparently with any storage backend you have configured — `FileSystemStorage`, S3 via `django-storages`, Google Cloud Storage, etc.
-
-### Mixed form and files
-
-```python
-@api.post("/submit")
-async def submit(
-    title: Annotated[str, Form()],
-    description: Annotated[str, Form()],
-    attachment: Annotated[UploadFile, File()] = None,
-):
-    return {
-        "title": title,
-        "has_attachment": attachment is not None,
-    }
-```
-
-### Form struct with files
-
-Combine form fields and file uploads in a struct:
-
-```python
-import msgspec
-
-class ProfileForm(msgspec.Struct):
-    name: str
-    bio: str = ""
-    avatar: UploadFile
-
-@api.post("/profile")
-async def update_profile(data: Annotated[ProfileForm, Form()]):
-    return {
-        "name": data.name,
-        "avatar_filename": data.avatar.filename,
-    }
-```
-
-### Validation errors
-
-File validation returns structured errors:
 
 ```json
-{
-    "detail": [
-        {
-            "type": "file_too_large",
-            "loc": ["body", "avatar"],
-            "msg": "File exceeds maximum size of 10000000 bytes",
-            "ctx": {"max_size": 10000000, "actual_size": 15000000}
-        }
-    ]
-}
+{"username": "ana", "remember": true}
 ```
 
-Error types:
+A repeated field takes its last value. Declare a `list` to take each value.
 
-| Type | Description |
-|------|-------------|
-| `file_missing` | Required file not uploaded |
-| `file_too_large` | Exceeds `max_size` |
-| `file_too_small` | Below `min_size` |
-| `file_too_many` | Exceeds `max_files` |
-| `file_invalid_content_type` | Not in `allowed_types` |
+## Upload files
 
-### Disk spooling
-
-During multipart parsing, Rust keeps small files (<= `BOLT_MEMORY_SPOOL_THRESHOLD`, default 1 MB) in memory and writes larger files to a temporary file on disk to avoid memory spikes. `UploadFile` handles this transparently — disk-spooled files are lazily opened only when accessed. Temp files are cleaned up automatically after the request.
-
-### Global upload settings
-
-Configure file upload limits in settings:
+Use `UploadFile` with `File()`:
 
 ```python
-# settings.py
-from django_bolt import FileSize
+from django_bolt import FileSize, UploadFile
+from django_bolt.params import File
 
-# Maximum upload size (requests exceeding this are rejected)
-BOLT_MAX_UPLOAD_SIZE = FileSize.MB_10  # 10 MB global limit
 
-# Memory threshold before spooling to disk (default: 1 MB)
-# Files smaller than this are kept in memory; larger files are written to temp files
-BOLT_MEMORY_SPOOL_THRESHOLD = 5 * 1024 * 1024  # 5 MB
+@api.post("/articles/{article_id}/cover")
+async def upload_cover(
+    article_id: int,
+    cover: Annotated[UploadFile, File(max_size=FileSize.MB_5, allowed_types=["image/*"])],
+) -> dict:
+    data = await cover.read()
+    return {"filename": cover.filename, "content_type": cover.content_type, "size": len(data)}
 ```
 
-See [Settings Reference](../ref/settings.md#file-upload-settings) for more details.
+```bash
+curl -X POST localhost:8000/articles/1/cover -F "cover=@cover.png;type=image/png"
+```
 
-## Dependency injection
+```json
+{"filename": "cover.png", "content_type": "image/png", "size": 8}
+```
 
-Use `Depends` for reusable parameter extractors:
+`File()` checks each file before the handler runs:
+
+| Argument | Check | Error `type` |
+| --- | --- | --- |
+| (required argument) | The file is present | `file_missing` |
+| `max_size` | Size in bytes is not above the limit | `file_too_large` |
+| `min_size` | Size in bytes is not below the limit | `file_too_small` |
+| `allowed_types` | The content type matches one item. `"image/*"` matches each image type | `file_invalid_content_type` |
+| `max_files` | A `list[UploadFile]` has not more files than the limit | `file_too_many` |
+
+```json
+{"detail": [{"ctx": {"actual_type": "text/plain", "allowed_types": ["image/*"]}, "loc": ["body", "cover"], "msg": "Invalid content type 'text/plain'", "type": "file_invalid_content_type"}]}
+```
+
+The `BOLT_MAX_UPLOAD_SIZE` setting limits the whole request body, before `File()` runs. The default is 1 MiB. A larger body gets 413.
+Set it as high as your largest upload. See the [settings reference](../ref/settings.md).
+
+### Use an upload in the handler
+
+`UploadFile` has these members:
+
+- `filename`, `content_type`, `size` and `headers` describe the file.
+- `await read(size=-1)`, `await seek(offset)`, `await write(data)` and `await close()` work on the content.
+- `file` is a Django `File`. Assign it to a `FileField` or an `ImageField`.
 
 ```python
-from django_bolt import Depends
-
-async def get_pagination(page: int = 1, limit: int = 20):
-    return {"page": page, "limit": limit, "offset": (page - 1) * limit}
-
-@api.get("/items")
-async def list_items(pagination=Depends(get_pagination)):
-    return {"pagination": pagination}
+article.cover = cover.file
+await article.asave()
 ```
 
-Dependencies can be chained and cached. See [Dependency Injection](../ref/api.md#dependency-injection) for more details.
+Bolt keeps a small file in memory and writes a large file to a temporary file.
+Bolt closes the files after the response.
+
+### Take more than one file, or only the bytes
+
+```python
+@api.post("/articles/{article_id}/attachments")
+async def add_attachments(article_id: int, files: Annotated[list[UploadFile], File(max_files=3)]) -> dict:
+    return {"names": [f.filename for f in files]}
+
+
+@api.post("/checksum")
+async def checksum(data: Annotated[bytes, File(max_size=FileSize.MB_1)]) -> dict:
+    return {"size": len(data)}
+```
+
+A `bytes` argument holds the full content in memory. Set `max_size` for it.
+
+## Group parameters in a model
+
+Give a `Query()`, `Header()`, `Cookie()` or `Form()` marker a `msgspec.Struct` type. Each field of the struct is one parameter:
+
+```python
+class ArticleFilters(msgspec.Struct):
+    page: int = 1
+    page_size: int = 20
+    search: str | None = None
+    tag: list[str] = []
+
+
+@api.get("/articles/filtered")
+async def filtered_articles(filters: Annotated[ArticleFilters, Query()]) -> dict:
+    return {"page": filters.page, "search": filters.search, "tag": filters.tag}
+```
+
+```bash
+curl "localhost:8000/articles/filtered?page=2&search=bolt&tag=a&tag=b"
+```
+
+```json
+{"page": 2, "search": "bolt", "tag": ["a", "b"]}
+```
+
+- A header model reads each field name in lower case, with `-` for each `_`. The field `x_api_key` reads `X-Api-Key`.
+- A form model can have `UploadFile` fields.
+- A model ignores keys that it does not declare. Use `msgspec.Struct` with `forbid_unknown_fields=True` to reject them.
+- With a default of `None`, the model is `None` when the request has none of its keys.
+
+## Use the Request object
+
+Name an argument `request` or `req` to get the request. The `Request` type hint is optional. It gives your editor the attribute names:
+
+```python
+from django_bolt import Request
+
+
+@api.get("/debug/request")
+async def show_request(request: Request) -> dict:
+    return {
+        "method": request.method,
+        "path": request.path,
+        "query": request.query,
+        "url": request.build_absolute_uri(),
+    }
+```
+
+```bash
+curl "localhost:8000/debug/request?page=2"
+```
+
+```json
+{"method": "GET", "path": "/debug/request", "query": {"page": "2"}, "url": "http://localhost:8000/debug/request?page=2"}
+```
+
+An argument with another name, such as `r: Request`, is a query parameter, and Bolt raises `TypeError`.
+
+These are the most used attributes. The [Request reference](../ref/request.md) lists each one.
+
+| Attribute | Value |
+| --- | --- |
+| `method`, `path` | The HTTP method and the path, as `str` |
+| `body` | The raw body, as `bytes` |
+| `headers`, `cookies`, `query` | `dict` of the headers, cookies and query values |
+| `params` | `dict` of the path parameters, converted to their types |
+| `state` | A `dict` for your own data during the request, for example from middleware |
+| `user` | The user that an authentication backend found, or `None` |
+| `context` | The authentication data, for example the JWT claims, or `None` |
+
+### Get the current user
+
+On a route with an authentication backend, `await request.auser()` returns the user. It returns `AnonymousUser` when no user is authenticated.
+
+```python
+from django_bolt import IsAuthenticated, JWTAuthentication
+
+
+@api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+async def me(request: Request) -> dict:
+    user = await request.auser()
+    return {"username": user.username}
+```
+
+`request.user` also works. In an async handler, it loads the user with a blocking database query. Use `await request.auser()` there.
+See [Authentication](authentication.md).
+
+### Build absolute URLs
+
+`request.build_absolute_uri(location=None)`, `request.scheme` and `request.is_secure()` work as in Django.
+`build_absolute_uri()` checks the host against `ALLOWED_HOSTS`. A host that is not allowed gets a 400 response.
+
+Bolt does not end TLS, so the scheme is `"https"` only when a trusted proxy says so.
+Set the proxies in [`BOLT_TRUSTED_PROXIES`](../ref/settings.md). Django's `SECURE_PROXY_SSL_HEADER` also applies.
 
 ## Validation errors
 
-When request validation fails, Django-Bolt returns a 422 Unprocessable Entity with details:
+A value that fails conversion or validation gets a 422 response. The handler does not run.
+The body has one of two forms.
+
+A value that Bolt converts before Python runs gives a `detail` string. This covers a path, query, header, cookie or form value with the wrong type, and a missing value of these kinds:
 
 ```json
-{
-    "detail": [
-        {
-            "loc": ["body", "email"],
-            "msg": "Expected `str` - at `$.email`",
-            "type": "validation_error"
-        }
-    ]
-}
+{"detail": "Query parameter 'page': Invalid integer 'x': invalid digit found in string"}
 ```
 
-Common validation scenarios that return 422:
+```json
+{"detail": "Missing required query parameter: query"}
+```
 
-| Scenario | Example Message |
-|----------|-----------------|
-| Missing required query param | `Missing required query parameter: page` |
-| Missing required header | `Missing required header: x-api-key` |
-| Missing required cookie | `Missing required cookie: session` |
-| Missing required form field | `Missing required form field: username` |
-| Missing required file | `Missing required file: document` |
-| Type conversion failure | `Invalid integer value: 'abc'` |
-| Header type conversion failure | `Header 'x-count': Invalid integer 'abc': ...` |
-| Cookie type conversion failure | `Cookie 'page': Invalid integer 'abc': ...` |
-| Struct field validation | `name: Name must be at least 3 characters` |
+Each other error gives a `detail` list. This covers the JSON body, limits, parameter models and files:
+
+```json
+{"detail": [{"loc": ["body", "title"], "msg": "Object missing required field `title`", "type": "missing_field"}]}
+```
+
+Each item has `loc`, `msg` and `type`. Some items also have `input` and `ctx`.
+`loc` starts with the source: `"path"`, `"query"`, `"header"`, `"cookie"` or `"body"`.
+
+Use an error formatter to give each error the same form. See [Error handling](error-handling.md#change-the-error-format).
+
+## See also
+
+- [Parameters reference](../ref/params.md)
+- [Request reference](../ref/request.md)
+- [Responses](responses.md)
+- [Error handling](error-handling.md)
+- [Dependencies](dependencies.md)
+- [Serializers](serializers.md)
