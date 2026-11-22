@@ -35,13 +35,13 @@ from typing import TYPE_CHECKING, Any, Literal, NoReturn, Union, get_args, get_o
 
 import msgspec
 from django.core.exceptions import FieldError
-from django.db.models import QuerySet
+from django.db.models import Model, QuerySet
 from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 from django.template.response import SimpleTemplateResponse, TemplateResponse
 
 from . import _json
-from ._kwargs import compile_response_coercer, compile_struct_row_readers
+from ._kwargs import compile_response_coercer, compile_struct_relation_loader, compile_struct_row_readers
 from ._response_dump import compile_serializer_dumper
 from ._template_response import render_template_response
 from .concurrency import run_in_orm_executor, run_orm_blocking
@@ -60,6 +60,7 @@ from .responses import (
     format_sse_event,
 )
 from .responses import Response as ResponseClass
+from .typing import unwrap_optional
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -760,6 +761,20 @@ def _compile_model_projector(meta: HandlerMetadata | dict[str, Any]) -> Any:
     return None if readers is None else readers[1]
 
 
+def _compile_relation_loader(meta: HandlerMetadata | dict[str, Any]) -> Any:
+    """The relation loader of a ``Struct`` or ``list[Struct]`` response type with a nested Struct, or None.
+
+    A Bolt Serializer loads its own relations.
+    """
+    response_type = unwrap_optional(meta.get("response_type"))
+    if get_origin(response_type) is list:
+        args = get_args(response_type)
+        response_type = args[0] if args else None
+    if not _is_plain_struct(response_type):
+        return None
+    return compile_struct_relation_loader(response_type)
+
+
 def _extract_stream_item_type(annotation: Any) -> tuple[bool, Any | None]:
     """Return (is_stream_annotation, item_type) for streaming return annotations."""
     if annotation is None:
@@ -1051,6 +1066,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 _values_serializer_cls
             )
     model_projector = _compile_model_projector(meta)
+    # A model instance with a nested Struct of a relation loads the relation first.
+    relation_loader = _compile_relation_loader(meta)
     # Without the inline path, the slow path gives the same response.
     inline_validator = _compile_inline_response_validator(meta)  # pragma: no mutate
 
@@ -1133,6 +1150,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, dict):
             return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, list):
+            if relation_loader is not None:
+                await relation_loader.aload(result)
             return await _serialize_json_payload_async(prepare_list(result), current_status, validator_async)
         if struct_first and isinstance(result, msgspec.Struct):
             if is_serializer_response:
@@ -1172,6 +1191,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 result = await run_in_orm_executor(list, result)
             return await _serialize_json_payload_async(result, current_status, validator_async)
 
+        if relation_loader is not None and isinstance(result, Model):
+            await run_in_orm_executor(relation_loader.load, [result])
         if isinstance(result, msgspec.Struct) or validator_async is not None:
             return await _serialize_json_payload_async(result, current_status, validator_async)
 
@@ -1193,6 +1214,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, dict):
             return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, list):
+            if relation_loader is not None and result and isinstance(result[0], Model):
+                relation_loader.load(result)
             return _serialize_json_payload_sync(prepare_list(result), current_status, validator_sync)
         if struct_first and isinstance(result, msgspec.Struct):
             if not is_serializer_response:

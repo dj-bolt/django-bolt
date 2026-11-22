@@ -15,7 +15,8 @@ from typing import Annotated, Any, Literal, get_args, get_origin
 
 import msgspec
 from django.core.exceptions import FieldDoesNotExist
-from django.db.models import QuerySet
+from django.db.models import Model, QuerySet, prefetch_related_objects
+from django.db.models.query import ModelIterable
 
 from .._field_marker import _FieldMarker
 from .._serializer_before import RAW_VALIDATED, before_plan, run_before_validators
@@ -41,8 +42,10 @@ __all__ = [
     "create_file_extractor",
     "create_body_extractor",
     "compile_response_coercer",
+    "compile_struct_relation_loader",
     "compile_struct_row_readers",
     "get_msgspec_decoder",
+    "StructRelationLoader",
 ]
 
 
@@ -1377,14 +1380,8 @@ def compile_struct_row_readers(
     def project(items: list[Any]) -> list[dict[str, Any]]:
         return [{wire: getattr(item, name, None) for name, wire in pairs} for item in items]
 
-    try:
-        fields = msgspec.structs.fields(item_type)
-    except NameError:
-        # A forward reference can resolve after the route registers. The
-        # nested reader resolves the fields on the first QuerySet.
-        return _compile_nested_row_loader(item_type), project
-    if any(is_msgspec_struct(_field_value_type(field.type)) for field in fields):
-        return _compile_nested_row_loader(item_type), project
+    if _has_nested_struct(item_type):
+        return _compile_nested_row_loader(item_type), _compile_nested_projector(item_type)
 
     if names == wire_names:
 
@@ -1399,7 +1396,7 @@ def compile_struct_row_readers(
     return load_rows, project
 
 
-_RowPlan = tuple[tuple[str, ...], Callable[[dict[str, Any]], dict[str, Any]]]
+_RowPlan = tuple[tuple[str, ...], Callable[[dict[str, Any]], dict[str, Any]], tuple[str, ...]]
 
 
 def _field_value_type(annotation: Any) -> Any:
@@ -1410,54 +1407,196 @@ def _field_value_type(annotation: Any) -> Any:
     return annotation
 
 
-def _compile_nested_row_loader(item_type: type) -> Callable[[QuerySet], list[dict[str, Any]]]:
-    """Build the row reader of a Struct with a nested Struct field, once per route.
+def _nested_struct_type(annotation: Any) -> Any:
+    """Return the Struct of a field typed ``Struct`` or ``list[Struct]``, or None."""
+    value_type = _field_value_type(annotation)
+    if get_origin(value_type) is list:
+        args = get_args(value_type)
+        value_type = _field_value_type(args[0]) if args else None
+    return value_type if is_msgspec_struct(value_type) else None
 
-    A nested Struct names a foreign key or a one-to-one relation. ``.values()``
-    reads its fields across the relation, so one query loads all rows. The
-    relations depend on the model of the QuerySet. Thus the reader makes the
-    plan of a model on its first QuerySet and keeps it.
+
+def _has_nested_struct(item_type: type) -> bool:
+    """Return True if a field of ``item_type`` holds a Struct or a list of Structs.
+
+    A forward reference can resolve after the route registers. Such a Struct
+    counts as nested: its readers resolve the fields on first use.
+    """
+    try:
+        fields = msgspec.structs.fields(item_type)
+    except NameError:
+        return True
+    return any(_nested_struct_type(field.type) is not None for field in fields)
+
+
+def _compile_plan_getter(item_type: type) -> Callable[[type], _RowPlan]:
+    """Return the function that gives the plan of ``item_type`` for a model.
+
+    The relations depend on the model. Thus each model gets its plan on first
+    use, and the plan is kept.
     """
     plans: dict[type, _RowPlan] = {}
 
-    def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
-        model = queryset.model
+    def plan_of(model: type) -> _RowPlan:
         plan = plans.get(model)
         if plan is None:
             # Benign race: two threads make the same plan.
             plan = plans[model] = _row_plan(model, item_type, "", (item_type,))
-        paths, build = plan
+        return plan
+
+    return plan_of
+
+
+def _compile_nested_row_loader(item_type: type) -> Callable[[QuerySet], list[dict[str, Any]]]:
+    """Build the row reader of a Struct with a nested Struct field, once per route.
+
+    A nested Struct names a foreign key or a one-to-one relation. ``.values()``
+    reads its fields across the relation, so one query loads all rows.
+    """
+    plan_of = _compile_plan_getter(item_type)
+
+    def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
+        paths, build, _ = plan_of(queryset.model)
         return [build(row) for row in queryset.values(*paths)]
 
     return load_rows
 
 
-def _single_relation(model: type, name: str) -> Any:
-    """Return the model field of a foreign key or one-to-one relation ``name``, or None."""
+def _compile_nested_projector(item_type: type) -> Callable[[list[Any]], list[dict[str, Any]]]:
+    """Build the reader of objects for a Struct with a nested Struct field, once per route.
+
+    A field of a nested Struct that holds a model instance gives the row of
+    that instance, not the instance. A relation with no object gives None.
+    """
+    readers: dict[type, Callable[[Any], dict[str, Any]]] = {}
+
+    def reader_of(struct_type: type) -> Callable[[Any], dict[str, Any]]:
+        reader = readers.get(struct_type)
+        if reader is not None:
+            return reader
+        fields = tuple(
+            (field.name, field.encode_name, _nested_struct_type(field.type))
+            for field in msgspec.structs.fields(struct_type)
+        )
+
+        def reader(item: Any) -> dict[str, Any]:
+            row = {}
+            for name, wire, nested_type in fields:
+                value = getattr(item, name, None)
+                if nested_type is not None and isinstance(value, Model):
+                    value = reader_of(nested_type)(value)
+                row[wire] = value
+            return row
+
+        readers[struct_type] = reader
+        return reader
+
+    def project(items: list[Any]) -> list[dict[str, Any]]:
+        read = reader_of(item_type)
+        return [read(item) for item in items]
+
+    return project
+
+
+class StructRelationLoader:
+    """Load the relations that a nested Struct names, before Bolt reads model instances.
+
+    msgspec reads a model instance by attribute. A relation that is not loaded
+    makes a query for each instance, and it cannot load on the event loop.
+    The loader uses the relations of the ``.values()`` plan. Thus all
+    instances of a page cost one query for each relation, or no query.
+    """
+
+    __slots__ = ("_plan_of",)
+
+    def __init__(self, item_type: type) -> None:
+        self._plan_of = _compile_plan_getter(item_type)
+
+    def select_related(self, queryset: QuerySet) -> QuerySet:
+        """Return ``queryset`` with a join for each relation, when the join is safe.
+
+        A ``values()`` QuerySet gives no instances. A union cannot join.
+        ``select_related()`` with no fields follows all relations: more fields
+        would replace them. A deferred field can be a relation, which cannot
+        join. Bolt does not change such a QuerySet: :meth:`load` loads the
+        relations after the query.
+        """
+        query = queryset.query
+        if (
+            not issubclass(queryset._iterable_class, ModelIterable)
+            or query.combinator
+            or query.select_related is True
+            or query.deferred_loading[0]
+        ):
+            return queryset
+        relations = self._plan_of(queryset.model)[2]
+        return queryset.select_related(*relations) if relations else queryset
+
+    def load(self, items: list[Any]) -> None:
+        """Load the relations of the model instances in ``items``. Run it where sync ORM calls are safe.
+
+        A relation that is already loaded makes no query.
+        """
+        groups: dict[type, list[Model]] = {}
+        for item in items:
+            if isinstance(item, Model):
+                groups.setdefault(type(item), []).append(item)
+        for model, instances in groups.items():
+            relations = self._plan_of(model)[2]
+            if relations:
+                prefetch_related_objects(instances, *relations)
+
+    async def aload(self, items: list[Any]) -> None:
+        """Run :meth:`load` on the ORM executor, if ``items`` holds model instances."""
+        if items and isinstance(items[0], Model):
+            await run_in_orm_executor(self.load, items)
+
+    def evaluate(self, queryset: QuerySet) -> list[Any]:
+        """Evaluate ``queryset`` with its relations loaded."""
+        items = list(self.select_related(queryset))
+        self.load(items)
+        return items
+
+
+def compile_struct_relation_loader(item_type: type) -> StructRelationLoader | None:
+    """Return the relation loader of ``item_type``, or None if no field holds a Struct."""
+    return StructRelationLoader(item_type) if _has_nested_struct(item_type) else None
+
+
+def _relation_field(model: type, name: str) -> Any:
+    """Return the model field of the relation ``name``, or None."""
     try:
         field = model._meta.get_field(name)
     except FieldDoesNotExist:
         return None
-    if (field.many_to_one or field.one_to_one) and field.related_model is not None:
+    if field.is_relation and field.related_model is not None:
         return field
     return None
 
 
 def _row_plan(model: type, struct_type: type, prefix: str, outer: tuple[type, ...]) -> _RowPlan:
-    """Return the ``.values()`` paths of ``struct_type`` and the function that nests a row.
+    """Return the ``.values()`` paths of ``struct_type``, the function that nests a row, and the relations.
 
     A nested Struct field of a relation reads the relation itself first. A
     row with no related object gives None for the field. ``outer`` holds
-    ``struct_type`` and the Structs that contain it.
+    ``struct_type`` and the Structs that contain it. The relations are the
+    ``select_related()`` paths of the nested Struct fields.
     """
     paths: list[str] = []
+    relations: list[str] = []
     readers: list[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]] | None]] = []
     for field in msgspec.structs.fields(struct_type):
         path = prefix + field.name
         paths.append(path)
-        nested_type = _field_value_type(field.type)
-        relation = _single_relation(model, field.name) if is_msgspec_struct(nested_type) else None
-        if relation is None:
+        nested_type = _nested_struct_type(field.type)
+        relation = _relation_field(model, field.name) if nested_type is not None else None
+        if relation is not None and (relation.one_to_many or relation.many_to_many):
+            raise TypeError(
+                f"{struct_type.__name__}.{field.name} is a relation with many rows. "
+                "A plain Struct response cannot load it. "
+                "Use a Bolt Serializer for this response: it loads the rows with prefetch_related()."
+            )
+        if relation is None or not is_msgspec_struct(_field_value_type(field.type)):
             readers.append((field.encode_name, path, None))
             continue
         if nested_type in outer:
@@ -1465,8 +1604,12 @@ def _row_plan(model: type, struct_type: type, prefix: str, outer: tuple[type, ..
                 f"{nested_type.__name__} nests itself across the relation {struct_type.__name__}.{field.name}. "
                 "One .values() query cannot load it. Build the Structs in the handler and return them."
             )
-        nested_paths, nested_build = _row_plan(relation.related_model, nested_type, path + "__", (*outer, nested_type))
+        nested_paths, nested_build, nested_relations = _row_plan(
+            relation.related_model, nested_type, path + "__", (*outer, nested_type)
+        )
         paths.extend(nested_paths)
+        relations.append(path)
+        relations.extend(nested_relations)
         readers.append((field.encode_name, path, nested_build))
 
     def build(row: dict[str, Any]) -> dict[str, Any]:
@@ -1474,7 +1617,7 @@ def _row_plan(model: type, struct_type: type, prefix: str, outer: tuple[type, ..
             wire: row[path] if nested is None or row[path] is None else nested(row) for wire, path, nested in readers
         }
 
-    return tuple(paths), build
+    return tuple(paths), build, tuple(relations)
 
 
 def _compile_struct_coercer(annotation: type) -> Callable[[Any], Any]:
