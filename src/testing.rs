@@ -648,8 +648,7 @@ pub fn test_request(
                         },
                         static_files_config: config.static_files_config,
                         media_files_config: config.media_files_config,
-                        access_logger: None,
-                        access_log_levels: 0,
+                        access_loggers: Vec::new(),
                         error_renderer,
                     });
 
