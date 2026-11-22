@@ -325,6 +325,7 @@ class TestClient(httpx.Client):
         use_http_layer: bool = True,  # Ignored - kept for backward compatibility
         static_files_config: dict | None = None,
         share_db_connection: bool = True,
+        follow_redirects: bool = True,
         **kwargs: Any,
     ):
         """Initialize test client.
@@ -349,6 +350,8 @@ class TestClient(httpx.Client):
                                  the test. Set False for a test that holds a cursor
                                  open across a request; then use ``TransactionTestCase``
                                  or ``django_db(transaction=True)``.
+            follow_redirects: If True (the default), follow a redirect response.
+                              Set False to get the redirect response itself.
             **kwargs: Additional arguments passed to httpx.Client
         """
         # use_http_layer is ignored - we always use the HTTP layer now
@@ -418,7 +421,7 @@ class TestClient(httpx.Client):
         super().__init__(
             base_url=base_url,
             transport=BoltTestTransport(self.app_id, raise_server_exceptions),
-            follow_redirects=True,
+            follow_redirects=follow_redirects,
             **kwargs,
         )
         self.api = api
@@ -668,6 +671,7 @@ class AsyncTestClient(httpx.AsyncClient):
         cors_allowed_origins: list[str] | None = None,
         read_django_settings: bool = True,
         static_files_config: dict | None = None,
+        follow_redirects: bool = True,
         **kwargs: Any,
     ):
         """Initialize async test client.
@@ -685,6 +689,8 @@ class AsyncTestClient(httpx.AsyncClient):
             static_files_config: Static files configuration dict with keys:
                                  url_prefix, directories, csp_header, cache_control.
                                  It replaces the static settings.
+            follow_redirects: If True (the default), follow a redirect response.
+                              Set False to get the redirect response itself.
             **kwargs: Additional arguments passed to httpx.AsyncClient
         """
         # Validate before allocating native test-app state. A failed constructor
@@ -749,7 +755,7 @@ class AsyncTestClient(httpx.AsyncClient):
         super().__init__(
             base_url=base_url,
             transport=AsyncBoltTestTransport(self.app_id, raise_server_exceptions),
-            follow_redirects=True,
+            follow_redirects=follow_redirects,
             **kwargs,
         )
         self.api = api

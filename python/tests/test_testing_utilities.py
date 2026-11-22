@@ -12,7 +12,7 @@ from django.http import QueryDict
 
 from django_bolt import BoltAPI, _core
 from django_bolt.param_functions import Header
-from django_bolt.responses import PlainText
+from django_bolt.responses import PlainText, Redirect
 from django_bolt.testing import AsyncTestClient, TestClient
 
 
@@ -274,6 +274,47 @@ def test_percent_encoded_path_params_async_client():
             return bad.status_code, spaced.status_code, spaced.json()
 
     assert asyncio.run(run()) == (422, 200, {"value": "hello world"})
+
+
+def _redirect_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.get("/old")
+    async def old():
+        return Redirect("/new")
+
+    @api.get("/new")
+    async def new():
+        return {"page": "new"}
+
+    return api
+
+
+def test_client_follows_redirects_by_default():
+    """TestClient follows a redirect when the caller gives no follow_redirects value."""
+    with TestClient(_redirect_api()) as client:
+        response = client.get("/old")
+    assert response.status_code == 200
+    assert response.json() == {"page": "new"}
+
+
+def test_client_uses_follow_redirects_of_the_caller():
+    """TestClient(follow_redirects=False) returns the redirect response itself (#915)."""
+    with TestClient(_redirect_api(), follow_redirects=False) as client:
+        response = client.get("/old")
+    assert response.status_code == 307
+    assert response.headers["location"] == "/new"
+
+
+def test_async_client_uses_follow_redirects_of_the_caller():
+    """AsyncTestClient(follow_redirects=False) returns the redirect response itself (#915)."""
+
+    async def run():
+        async with AsyncTestClient(_redirect_api(), follow_redirects=False) as client:
+            response = await client.get("/old")
+            return response.status_code, response.headers["location"]
+
+    assert asyncio.run(run()) == (307, "/new")
 
 
 def test_invalid_uri_raises_value_error():
