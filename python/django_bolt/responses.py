@@ -27,37 +27,9 @@ T = TypeVar("T", bound="CookieMixin")
 
 
 class CookieMixin:
-    """Mixin providing set_cookie() and delete_cookie() methods for response classes.
-
-    It also gives the ``headers`` of each response class.
-    """
+    """Mixin providing set_cookie() and delete_cookie() methods for response classes."""
 
     _cookies: list[Cookie]
-    # The dict of the caller, or the copy after the first read of headers.
-    # The serializers read it with no copy.
-    _headers: dict[str, str]
-    # True when _headers is a copy that the response owns. The class value
-    # is False, so a constructor sets nothing.
-    _headers_owned = False
-
-    @property
-    def headers(self) -> dict[str, str]:
-        """Return the headers of the response. The response owns this dict.
-
-        The first read copies the dict that the caller gave (issue #867).
-        Thus a change through ``response.headers`` does not change a dict that
-        other responses use. A response that nobody reads pays for no copy.
-        """
-        if self._headers_owned:
-            return self._headers
-        headers = self._headers = dict(self._headers)
-        self._headers_owned = True
-        return headers
-
-    @headers.setter
-    def headers(self, headers: dict[str, str]) -> None:
-        self._headers = headers
-        self._headers_owned = False
 
     def set_cookie(
         self: T,
@@ -217,7 +189,7 @@ class Response(CookieMixin):
     ):
         self.content = content if content is not None else {}
         self.status_code = status_code
-        self._headers = headers or {}
+        self.headers = dict(headers) if headers else {}
         self.media_type = media_type
 
     def to_bytes(self) -> bytes:
@@ -240,7 +212,7 @@ class JSON(CookieMixin):
     def __init__(self, data: Any, status_code: int = 200, headers: dict[str, str] | None = None):
         self.data = data
         self.status_code = status_code
-        self._headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
     def to_bytes(self) -> bytes:
         return _json.encode(self.data)
@@ -250,7 +222,7 @@ class PlainText(CookieMixin):
     def __init__(self, text: str, status_code: int = 200, headers: dict[str, str] | None = None):
         self.text = text
         self.status_code = status_code
-        self._headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
     def to_bytes(self) -> bytes:
         return self.text.encode()
@@ -260,7 +232,7 @@ class HTML(CookieMixin):
     def __init__(self, html: str, status_code: int = 200, headers: dict[str, str] | None = None):
         self.html = html
         self.status_code = status_code
-        self._headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
     def to_bytes(self) -> bytes:
         return self.html.encode()
@@ -270,7 +242,7 @@ class Redirect(CookieMixin):
     def __init__(self, url: str, status_code: int = 307, headers: dict[str, str] | None = None):
         self.url = url
         self.status_code = status_code
-        self._headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
 
 class File(CookieMixin):
@@ -287,7 +259,7 @@ class File(CookieMixin):
         self.media_type = media_type
         self.filename = filename
         self.status_code = status_code
-        self._headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
     def read_bytes(self) -> bytes:
         # The lookup of FileResponse, so a path that names no regular file is a 404.
@@ -311,7 +283,7 @@ class FileResponse(CookieMixin):
         self.media_type = media_type
         self.filename = filename
         self.status_code = status_code
-        self._headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
 
 class StreamingResponse(CookieMixin):
@@ -340,7 +312,7 @@ class StreamingResponse(CookieMixin):
         self.content = content
         self.status_code = status_code
         self.media_type = media_type or "application/octet-stream"
-        self._headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
         # Detect generator type at instantiation time (once per request, not per chunk)
         # This avoids repeated Python inspect calls in Rust streaming loop

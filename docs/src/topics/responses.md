@@ -307,11 +307,9 @@ async def options_items():
     )
 ```
 
-You can give the same `headers` dict to many responses, for example a module-level dict.
-A change through `response.headers` does not change that dict.
-The first read of `response.headers` gives the response its own copy.
-A response that nobody reads does not copy the dict.
-Do not change the dict itself before Bolt sends each response that uses it.
+Each response copies its `headers` dict.
+A change through `response.headers` does not change the dict that you gave.
+Thus many responses can use one module-level dict.
 
 ```python
 from django_bolt import JSON

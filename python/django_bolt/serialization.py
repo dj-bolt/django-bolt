@@ -869,8 +869,8 @@ def _to_stream_wire(stream_response: StreamingResponse) -> ResponseWireV1:
     custom_headers: dict[str, str] = {
         "content-type": stream_response.media_type,  # pragma: no mutate
     }
-    if stream_response._headers:
-        custom_headers.update(stream_response._headers)
+    if stream_response.headers:
+        custom_headers.update(stream_response.headers)
     cookies = getattr(stream_response, "_cookies", None)
     resp_meta = _build_response_meta(
         "streaming",  # pragma: no mutate
@@ -1240,7 +1240,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             else:
                 data_bytes = result.to_bytes()
             cookies = getattr(result, "_cookies", None)
-            return _wire_bytes(result.status_code, _build_wire_meta("json", result._headers, cookies), data_bytes)
+            return _wire_bytes(result.status_code, _build_wire_meta("json", result.headers, cookies), data_bytes)
         if cls is ResponseClass:
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
@@ -1259,7 +1259,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             else:
                 body = _render_response_body(result.content, result.media_type)
             cookies = getattr(result, "_cookies", None)
-            meta = _response_class_wire_meta(result.media_type, result._headers, cookies)
+            meta = _response_class_wire_meta(result.media_type, result.headers, cookies)
             return _wire_bytes(result.status_code, meta, body)
         return _RESPONSE_SERIALIZERS[cls](result)
 
@@ -1279,7 +1279,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             else:
                 data_bytes = result.to_bytes()
             cookies = getattr(result, "_cookies", None)
-            return _wire_bytes(result.status_code, _build_wire_meta("json", result._headers, cookies), data_bytes)
+            return _wire_bytes(result.status_code, _build_wire_meta("json", result.headers, cookies), data_bytes)
         if cls is ResponseClass:
             # Bytes-like content is a pre-encoded body — skip the response
             # validator, it only applies to structured data (issue #305).
@@ -1298,7 +1298,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             else:
                 body = _render_response_body(result.content, result.media_type)
             cookies = getattr(result, "_cookies", None)
-            meta = _response_class_wire_meta(result.media_type, result._headers, cookies)
+            meta = _response_class_wire_meta(result.media_type, result.headers, cookies)
             return _wire_bytes(result.status_code, meta, body)
         return _RESPONSE_SERIALIZERS[cls](result)
 
@@ -1420,7 +1420,7 @@ def serialize_plaintext_response(result: PlainText) -> ResponseWireV1:
     Uses the new ResponseMeta tuple format for Rust-side header building.
     """
     cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_wire_meta("plaintext", result._headers, cookies)
+    resp_meta = _build_wire_meta("plaintext", result.headers, cookies)
     return _wire_bytes(result.status_code, resp_meta, result.to_bytes())
 
 
@@ -1430,7 +1430,7 @@ def serialize_html_response(result: HTML) -> ResponseWireV1:
     Uses the new ResponseMeta tuple format for Rust-side header building.
     """
     cookies = getattr(result, "_cookies", None)
-    resp_meta = _build_wire_meta("html", result._headers, cookies)
+    resp_meta = _build_wire_meta("html", result.headers, cookies)
     return _wire_bytes(result.status_code, resp_meta, result.to_bytes())
 
 
@@ -1441,8 +1441,8 @@ def serialize_redirect_response(result: Redirect) -> ResponseWireV1:
     """
     # Build custom headers with location
     custom_headers: dict[str, str] = {"location": result.url}
-    if result._headers:
-        custom_headers.update(result._headers)
+    if result.headers:
+        custom_headers.update(result.headers)
 
     cookies = getattr(result, "_cookies", None)
     resp_meta = _build_wire_meta("redirect", custom_headers, cookies)
@@ -1492,8 +1492,8 @@ def serialize_file_response(result: File) -> ResponseWireV1:
     }
     if result.filename:
         custom_headers["content-disposition"] = f'attachment; filename="{result.filename}"'
-    if result._headers:
-        custom_headers.update(result._headers)
+    if result.headers:
+        custom_headers.update(result.headers)
 
     cookies = getattr(result, "_cookies", None)
     resp_meta = _build_wire_meta(
@@ -1518,8 +1518,8 @@ def serialize_file_streaming_response(result: FileResponse) -> ResponseWireV1:
     }
     if result.filename:
         custom_headers["content-disposition"] = f'attachment; filename="{result.filename}"'
-    if result._headers:
-        custom_headers.update(result._headers)
+    if result.headers:
+        custom_headers.update(result.headers)
 
     cookies = getattr(result, "_cookies", None)
     resp_meta = _build_wire_meta(
@@ -1567,9 +1567,9 @@ def serialize_bolt_response(result: Any) -> ResponseWireV1:
         cls = _response_base_class(result)
     if cls is JSON:
         cookies = getattr(result, "_cookies", None)
-        return _wire_bytes(result.status_code, _build_wire_meta("json", result._headers, cookies), result.to_bytes())
+        return _wire_bytes(result.status_code, _build_wire_meta("json", result.headers, cookies), result.to_bytes())
     if cls is ResponseClass:
         cookies = getattr(result, "_cookies", None)
-        meta = _response_class_wire_meta(result.media_type, result._headers, cookies)
+        meta = _response_class_wire_meta(result.media_type, result.headers, cookies)
         return _wire_bytes(result.status_code, meta, _render_response_body(result.content, result.media_type))
     return _RESPONSE_SERIALIZERS[cls](result)
