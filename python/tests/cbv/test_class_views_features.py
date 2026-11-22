@@ -561,7 +561,7 @@ def test_unhandled_exception_in_class_view(api):
         async def get(self, request):
             raise ValueError("Something went wrong!")
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/buggy")
         assert response.status_code == 500
         assert "detail" in response.json()
