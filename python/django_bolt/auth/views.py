@@ -174,7 +174,7 @@ class JWTAuthViews:
         async def refresh(request: Any):
             # The default login accepts only an active Django user. Thus, refresh
             # gives no new tokens when that user is inactive or has no row.
-            if check_user and await request.auser() is None:
+            if check_user and not await request.auser():
                 raise HTTPException(status_code=401, detail="Invalid token")
             try:
                 pair = await rotate_refresh_token(

@@ -344,12 +344,14 @@ class Request(Protocol):
 
         Returns:
             Django User model instance (wrapped in LazyUser proxy) if authentication context
-            exists, None if no authentication.
+            exists. Else ``AnonymousUser``, as in Django. Bolt makes it on the first
+            read, and each read gives the same object. Use ``user.is_authenticated``
+            to find an anonymous request. ``AnonymousUser`` is truthy.
 
             Bolt does not load the user before the first read. Thus, for a valid
-            credential whose user does not exist, the value is a falsy LazyUser and
-            not None: ``not request.user`` is True, and ``await request.auser()``
-            gives None. The read of an attribute, such as ``request.user.id``,
+            credential whose user does not exist or is inactive, the value is a falsy
+            LazyUser: ``not request.user`` is True. ``await request.auser()`` gives
+            the same object. The read of an attribute, such as ``request.user.id``,
             raises ``Unauthorized``, and the client gets a 401.
 
         Performance:
@@ -370,7 +372,7 @@ class Request(Protocol):
             @api.get("/profile")
             async def get_profile(request):
                 user = await request.auser()
-                if user:
+                if user.is_authenticated:
                     return {"username": user.username}
                 return {"anonymous": True}
             ```
@@ -382,7 +384,9 @@ class Request(Protocol):
         Load the user of the request without blocking the event loop (Django-style).
 
         Use it in async code. ``request.user`` then returns the same user with no
-        second query. With no authentication, it returns ``AnonymousUser``.
+        second query. With no user, it returns the ``AnonymousUser`` of
+        ``request.user``. For a credential whose user does not exist or is
+        inactive, it returns the falsy LazyUser of ``request.user``.
 
         Example:
             ```python

@@ -147,7 +147,8 @@ async def get_current_user(request: Request) -> Any:
         ``Annotated[User, Depends(get_current_user)]``.
     """
     user = await request.auser()
-    if user is None or not user.is_authenticated:
+    # A user ID with no row gives a falsy lazy user, as in the sync form.
+    if not user or not user.is_authenticated:
         return None
     return user
 

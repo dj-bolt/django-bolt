@@ -71,7 +71,7 @@ class Request(Protocol):
 
     @property
     def user(self) -> Any:
-        """Authenticated user (set by middleware)"""
+        """Authenticated user (set by auth or middleware), else ``AnonymousUser``"""
         ...
 
     @user.setter

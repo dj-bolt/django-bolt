@@ -83,8 +83,8 @@ class LazyUser(SimpleLazyObject):
 
     The object is never None itself, because Bolt does not load the user
     before the first read. When the user ID has no row, the object is falsy,
-    :meth:`aload` gives None, and the read of an attribute raises
-    ``Unauthorized`` (401).
+    ``await request.auser()`` gives this object too, and the read of an
+    attribute raises ``Unauthorized`` (401).
     """
 
     def __init__(self, loaders: UserLoaders, user_id: str, auth_context: dict | None) -> None:
@@ -133,10 +133,16 @@ class LazyUser(SimpleLazyObject):
 
 
 async def aload_bolt_user(user: Any) -> Any:
-    """The result of ``await request.auser()`` for a user that Bolt set on the request."""
+    """The result of ``await request.auser()`` for the user of ``request.user``.
+
+    A user ID with no row, or with an inactive user, loads as None. Then the
+    result is the lazy user itself, as ``request.user`` gives. It is falsy, and
+    the read of an attribute raises ``Unauthorized`` (401).
+    """
     # ``isinstance`` on a lazy object forces it. ``type`` does not.
     if type(user) is LazyUser:
-        return await user.aload()
+        loaded = await user.aload()
+        return user if loaded is None else loaded
     return user
 
 

@@ -28,6 +28,7 @@ import msgspec
 
 from .._core import RequestLane, populate_response_cookies
 from .._template_response import DJANGO_HOOKS, HOOK_ERROR_ATTR, render_template_response
+from ..auth.user_loader import LazyUser
 from ..concurrency import drive_on_lane, in_lane_mode, run_orm_blocking
 from ..exceptions import HTTPException, ValidationException
 from ..middleware_response import (
@@ -1233,7 +1234,8 @@ def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
     never run).
 
     Rules:
-    - No Bolt user set → adopt Django's user (plain Django behavior).
+    - No Bolt user set, or the ``AnonymousUser`` of a read of ``request.user``
+      → adopt Django's user (plain Django behavior).
     - Django user is already the request user → adopt it again. Each
       ``DjangoMiddleware`` wrapper copies the attributes, and a later copy
       must keep Django's ``auser`` for a user that an earlier copy adopted.
@@ -1245,6 +1247,9 @@ def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
     """
     bolt_user = bolt_request.user
     if bolt_user is None or bolt_user is django_user:
+        return True
+    # The attribute of a LazyUser loads the user, so check the type first.
+    if type(bolt_user) is not LazyUser and getattr(bolt_user, "is_anonymous", False):
         return True
     if isinstance(django_user, LazyObject) and django_user._wrapped is empty:
         return False

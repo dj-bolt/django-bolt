@@ -15,7 +15,7 @@ import jwt
 import pytest
 from django.contrib.auth.models import User
 
-from django_bolt import BoltAPI, CurrentUser
+from django_bolt import BoltAPI, CurrentUser, OptionalCurrentUser
 from django_bolt.auth import (
     APIKeyAuthentication,
     IsAuthenticated,
@@ -58,7 +58,7 @@ def jwt_api():
     async def get_profile(request):
         """Public endpoint - request.user should not be loaded."""
         user = request.user
-        return {"is_authenticated": bool(user)}
+        return {"is_authenticated": user.is_authenticated}
 
     return api
 
@@ -79,7 +79,7 @@ def api_key_api():
         # APIKeyAuthentication doesn't provide user mapping by default
         return {
             "data": "sensitive",
-            "user_loaded": bool(user),
+            "user_loaded": user.is_authenticated,
         }
 
     return api
@@ -159,7 +159,7 @@ class TestJWTUserLoading:
 
         @api.get("/auser", auth=auth)
         async def auser(request):
-            return {"user": await request.auser() is not None}
+            return {"user": bool(await request.auser())}
 
         @api.get("/current-user", auth=auth)
         async def current_user(user: CurrentUser):
@@ -320,6 +320,72 @@ class TestJWTUserLoading:
         assert response.status_code == 200, response.text
         assert response.json() == {"is_anonymous": True, "is_authenticated": False}
 
+    @pytest.mark.parametrize("auth", [None, [JWTAuthentication(secret="test-secret")]], ids=["no-auth", "jwt"])
+    def test_user_and_auser_give_one_anonymous_user_without_a_credential(self, auth):
+        """With no credential, ``request.user`` and ``await request.auser()`` give the same AnonymousUser (#916)."""
+        api = BoltAPI(django_middleware=[])
+
+        @api.get("/async", auth=auth)
+        async def read_async(request):
+            user = request.user
+            auser = await request.auser()
+            return {
+                "user": type(user).__name__,
+                "same": auser is user and request.user is user,
+                "is_authenticated": user.is_authenticated,
+            }
+
+        @api.get("/sync", auth=auth)
+        def read_sync(request):
+            return {"user": type(request.user).__name__, "is_authenticated": request.user.is_authenticated}
+
+        with TestClient(api) as client:
+            async_response = client.get("/async")
+            sync_response = client.get("/sync")
+
+        assert async_response.status_code == 200, async_response.text
+        assert async_response.json() == {"user": "AnonymousUser", "same": True, "is_authenticated": False}
+        assert sync_response.status_code == 200, sync_response.text
+        assert sync_response.json() == {"user": "AnonymousUser", "is_authenticated": False}
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize("deleted", [True, False], ids=["deleted", "inactive"])
+    def test_user_and_auser_give_one_user_for_a_token_with_no_active_user(self, deleted):
+        """A valid token of a deleted or inactive user gives the same falsy user on both getters (#916).
+
+        The read of an attribute of this user gives a 401 on both getters.
+        """
+        api = BoltAPI(django_middleware=[])
+        auth = [JWTAuthentication(secret="test-secret")]
+
+        @api.get("/both", auth=auth)
+        async def both(request):
+            auser = await request.auser()
+            return {"same": auser is request.user, "falsy": not auser}
+
+        @api.get("/auser-id", auth=auth)
+        async def auser_id(request):
+            return {"id": (await request.auser()).id}
+
+        @api.get("/optional", auth=auth)
+        async def optional(user: OptionalCurrentUser):
+            return {"user": user}
+
+        user = User.objects.create(username="gone_jwt_user", is_active=deleted)
+        headers = {"Authorization": f"Bearer {create_jwt_token(user_id=str(user.pk))}"}
+        if deleted:
+            user.delete()
+        with TestClient(api, raise_server_exceptions=False) as client:
+            both_response = client.get("/both", headers=headers)
+            auser_id_response = client.get("/auser-id", headers=headers)
+            optional_response = client.get("/optional", headers=headers)
+
+        assert both_response.json() == {"same": True, "falsy": True}
+        assert auser_id_response.status_code == 401, auser_id_response.text
+        assert auser_id_response.headers["www-authenticate"] == "Bearer"
+        assert optional_response.status_code == 200, optional_response.text
+        assert optional_response.json() == {"user": None}
+
     @pytest.mark.django_db(transaction=True)  # Use real database transaction
     def test_authenticated_request_has_user(self, jwt_api):
         """Test that authenticated request with existing user returns 200."""
@@ -367,7 +433,7 @@ class TestJWTUserLoading:
         @api.get("/checked", auth=auth, guards=[IsAuthenticated()])
         async def checked(request):
             user = request.user
-            return {"is_none": user is None, "falsy": not user, "auser_is_none": await request.auser() is None}
+            return {"is_none": user is None, "falsy": not user, "auser_is_user": await request.auser() is user}
 
         headers = {"Authorization": f"Bearer {create_jwt_token(user_id='424242')}"}
         with TestClient(api, raise_server_exceptions=False) as client:
@@ -378,7 +444,7 @@ class TestJWTUserLoading:
         assert response.json() == {"detail": "Authentication required"}
         assert response.headers["www-authenticate"] == "Bearer"
         # The read of request.user does not load the user, so the value is not None itself.
-        assert checked_response.json() == {"is_none": False, "falsy": True, "auser_is_none": True}
+        assert checked_response.json() == {"is_none": False, "falsy": True, "auser_is_user": True}
 
     @pytest.mark.parametrize("path", ["/async", "/sync"])
     def test_the_401_of_a_user_with_no_row_names_the_scheme_of_the_route(self, path):
