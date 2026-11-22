@@ -1,588 +1,108 @@
-# MCP Server (bolt-mcp)
+---
+description: Build an MCP server on a Bolt API with bolt-mcp, with tools, resources, prompts, progress, middleware, authentication and tests.
+---
 
-[Model Context Protocol (MCP)](https://modelcontextprotocol.io) is the open standard for exposing tools, data, and prompts to LLM clients (Claude Desktop, Claude Code, MCP Inspector, …). **bolt-mcp** lets you build an MCP server on top of Django-Bolt, served over the MCP **Streamable HTTP** transport by the official MCP Rust SDK ([rmcp](https://github.com/modelcontextprotocol/rust-sdk)) embedded in Django-Bolt's Rust core — no Starlette or Python-SDK stack in the request path.
+# MCP servers
 
-The server is **dual-era**: it speaks the current **2026-07-28** revision (stateless, per-request metadata, MRTR elicitation, `server/discover`, required routing headers) *and* the earlier session-based revisions (`initialize` handshake, `Mcp-Session-Id`) on the same endpoint. 2026-07-28 requests are always served statelessly, so they are multi-worker safe.
+The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) lets an LLM client call your code.
+A client, for example Claude Code or MCP Inspector, reads the list of your tools and calls them for the model.
+The `bolt-mcp` package serves an MCP server from a `BoltAPI`, on the same port as your routes.
 
-`bolt-mcp` is a **separate, pure-Python package** (it depends on `django-bolt`), released on its own cadence. Install it only when you need MCP.
+Bolt serves the MCP Streamable HTTP transport in its Rust core, with the official MCP Rust SDK (rmcp).
+Your tools, resources and prompts are Python functions.
 
-## Installation
+## Install bolt-mcp
 
 ```bash
-pip install bolt-mcp
+pip install "django-bolt[mcp]"
 ```
 
-Or with uv:
+`bolt-mcp` is a separate package with its own version. The `mcp` extra installs it.
 
-```bash
-uv add bolt-mcp
-```
+## Create a server
 
-Requires `django-bolt` and Python 3.12+. The MCP endpoint is mounted on an ordinary `BoltAPI`, so everything you already use — async ORM, auth, guards, dependencies — works inside tools.
+Create an `MCP` object, register functions on it, and mount it on the API:
 
-## Quick start
-
-```python
-from django_bolt import BoltAPI
+```python title="blog/api.py"
 from bolt_mcp import MCP
 
+from django_bolt import BoltAPI
+
 api = BoltAPI()
-mcp = MCP("my-server", "1.0.0")
+mcp = MCP("blog", "1.0.0", instructions="Tools for the articles of the blog.")
 
-
-@mcp.tool
-async def add(a: int, b: int) -> dict:
-    """Add two integers."""
-    return {"sum": a + b}
-
-
-@mcp.resource("config://app", mime_type="application/json")
-async def app_config() -> str:
-    return '{"env": "prod"}'
-
-
-@mcp.prompt
-async def summarize(topic: str) -> str:
-    return f"Please write a concise summary of: {topic}"
-
-
-api.mount_mcp(mcp)  # serves the MCP Streamable HTTP endpoint at /mcp
-```
-
-Run the server and point an MCP client at `http://<host>/mcp`:
-
-```bash
-python manage.py runbolt --processes 1
-```
-
-`api.mount_mcp(mcp)` is the first-class method on `BoltAPI`. The free function `mount_mcp(api, mcp)` is the underlying implementation and is equivalent if you prefer it.
-
-!!! note "`/mcp` is not a browsable URL"
-
-    `/mcp` is a JSON-RPC endpoint driven by HTTP `POST`. Opening it in a browser issues a `GET`, which is reserved for the server→client listen channel and returns an error. Test it with an MCP client (MCP Inspector, Claude Desktop) or a `curl` `POST`.
-
-### Connecting a client
-
-For a project-local Claude config, drop an `.mcp.json` next to your project:
-
-```json
-{
-  "mcpServers": {
-    "django-bolt": { "type": "http", "url": "http://127.0.0.1:8000/mcp" }
-  }
+ARTICLES = {
+    1: {"id": 1, "title": "Hello Bolt", "published": True},
+    2: {"id": 2, "title": "Draft notes", "published": False},
 }
-```
 
-Or smoke-test the handshake with `curl`:
-
-```bash
-curl -s http://localhost:8000/mcp \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize",
-       "params":{"protocolVersion":"2025-06-18","capabilities":{},
-                 "clientInfo":{"name":"curl","version":"1"}}}'
-```
-
-## Tools
-
-A tool is a callable an MCP client can invoke. Parameters become the tool's JSON Schema `inputSchema` (derived from type hints via `msgspec`); the return value is mapped to an MCP `CallToolResult`.
-
-```python
-@mcp.tool
-async def count_users() -> dict:
-    """Count users (Django async ORM inside an MCP tool)."""
-    return {"count": await User.objects.acount()}
-```
-
-Both sync and async functions are supported (sync tools run in a worker thread). Options:
-
-```python
-@mcp.tool(
-    name="add",                       # defaults to the function name
-    title="Add numbers",              # optional human-readable title
-    description="Add two integers",   # defaults to the docstring
-    output_schema={...},              # optional JSON Schema for the result
-    meta={"ui": {"resourceUri": "ui://add/view.html"}},  # optional tool `_meta`
-    guards=[Requires("permissions", "calc")],   # per-tool authorization (see below)
-)
-async def add(a: int, b: int) -> dict:
-    return {"sum": a + b}
-```
-
-`meta` is sent as the tool's `_meta` in `tools/list`. [MCP Apps](https://modelcontextprotocol.io/extensions/apps) read it: `ui.resourceUri` names the resource that renders the tool's results, and `ui.visibility: ["app"]` hides the tool from the model.
-
-**Return values** map as follows:
-
-| Return type | MCP result |
-| --- | --- |
-| `str` | `content` text |
-| `dict` | `content` text **and** `structuredContent` |
-| other (Struct, dataclass, list, …) | serialized to text + `structuredContent` |
-| `ToolResult` | its `content` as the content, `structured` as `structuredContent`, `meta` as `_meta` |
-
-By default the text content is the JSON of the structured content. Return a `ToolResult` to set the text apart from it, for example a short summary for the model while an [MCP App](https://modelcontextprotocol.io/extensions/apps) renders the full data:
-
-```python
-from bolt_mcp import ToolResult
-
-@mcp.tool(output_schema={"type": "object", "properties": {"days": {"type": "array"}}})
-async def forecast(city: str) -> ToolResult:
-    days = await weather.forecast(city)
-    return ToolResult(
-        content=f"{len(days)} days of forecast for {city}.",
-        structured={"days": days},
-    )
-```
-
-`content` is a string or a list of MCP content blocks (text, image, resource link). `structured` is optional, and a value that is not an object is sent as `{"result": ...}`. `output_schema="auto"` cannot read a schema from `-> ToolResult`, or from a union that contains `ToolResult`. It raises `TypeError`, so pass the schema of `structured` as a dict.
-
-Bolt does not validate the structured content against the `output_schema` of the tool. This applies to `ToolResult.structured` and to a `dict` or other return value. A `ToolResult` without `structured` sends no `structuredContent`, also when the tool declares an `output_schema`. Make sure that each result agrees with the schema that you declare.
-
-**Errors are in-band.** A `raise` inside a tool becomes a `CallToolResult` with `isError: true` (the MCP convention), not a transport-level error — so the client sees a normal tool failure it can reason about.
-
-Raise `ToolError` for a message the client and the model may read. Bolt sends its text to the client.
-
-Bolt masks the text of every other exception. The client gets `Tool 'name' failed.` in place of the text. Thus database errors, host names, passwords and file paths stay on the server. Bolt logs the full traceback on the `bolt_mcp._execute` logger.
-
-A resource or prompt handler that raises gives a JSON-RPC internal error. The client gets `Resource 'uri' failed.` or `Prompt 'name' failed.`. Bolt logs the traceback on the `bolt_mcp._dispatch` logger. For a message the client may read, raise `JsonRpcError` (see [Resource and prompt middleware](#resource-and-prompt-middleware)).
-
-To send the exception text to the client during development, use `MCP("billing", mask_error_details=False)`. Do not use this setting in production.
-
-```python
-from bolt_mcp import MCP, ToolError
-
-mcp = MCP("billing")
 
 @mcp.tool
-async def pay_invoice(invoice_id: int) -> dict:
-    invoice = await Invoice.objects.filter(pk=invoice_id).afirst()
-    if invoice is None:
-        raise ToolError(f"No invoice {invoice_id}.")   # sent to the client
-    return await payments.pay(invoice)                  # any error here is logged and masked
-```
+async def get_article(article_id: int) -> dict:
+    """Return one article by its id."""
+    return ARTICLES[article_id]
 
-**Accessing the request.** Declare a `request` (or `req`) parameter to receive the Django-Bolt `Request` — injected automatically and excluded from the tool's input schema. Read the authenticated principal with `bolt_mcp.principal(request)`, which returns `{user_id, is_staff, is_superuser, permissions, auth_claims}` and works under **every** auth tier (Tier 1 fills `request.context`; the OAuth tiers stash it on `request.state` — `principal()` reads both, so prefer it over `request.context` directly).
 
-### Tool middleware
+@mcp.resource("blog://about", mime_type="text/plain")
+async def about() -> str:
+    """A short description of the blog."""
+    return "A blog about Django-Bolt."
 
-`@mcp.tool_middleware` registers an async function that runs around each `tools/call` that passes authentication and the guards of the tool. Bolt rejects a call to an unknown or denied tool in Rust, before middleware runs. Thus a log or a metric from middleware does not show these calls. The function gets a `ToolCall` with the tool `name`, the raw `arguments`, the request `meta` (the `_meta` the client sent) and the `principal`, and `call_next()` runs the tool. MCP calls do not pass through Django or Bolt HTTP middleware, so this is where per-call logging, metrics and tracing go.
 
-```python
-from opentelemetry import propagate, trace
-from bolt_mcp import ToolCall
-
-tracer = trace.get_tracer("my-server")
-
-@mcp.tool_middleware
-async def trace_tool(call: ToolCall, call_next) -> dict:
-    parent = propagate.extract({k: v for k, v in call.meta.items() if isinstance(v, str)})
-    with tracer.start_as_current_span(f"tools/call {call.name}", context=parent) as span:
-        result = await call_next()
-        if result.get("isError"):
-            span.set_status(trace.Status(trace.StatusCode.ERROR))
-        return result
-```
-
-`call_next()` returns the `CallToolResult` dict, and a tool exception or an argument error is already an `isError` result there. The middleware returns that dict or another one. Bolt adds `"resultType": "complete"` to a returned dict that does not have it. An exception that middleware raises gets the same treatment as a tool exception: Bolt logs it and masks its text. The first registered middleware runs outermost. Register middleware before the server is mounted.
-
-When a tool asks a 2026-07-28 client for input (elicitation or sampling), the request passes up through the middleware as a `BaseException`. Let it propagate.
-
-The client sets `call.meta`, so do not trust it. For example, a client can send any `traceparent`. `call.principal` and `call.arguments` can hold tokens or personal data. Do not write them to a log as they are.
-
-### Resource and prompt middleware
-
-`@mcp.resource_middleware` runs around every `resources/read` and gets a `ResourceRead` with the `uri`, `meta` and `principal`. `@mcp.prompt_middleware` runs around every `prompts/get` and gets a `PromptGet` with the prompt `name`, the raw `arguments`, `meta` and `principal`. `call_next()` returns the `ReadResourceResult` or `GetPromptResult` dict.
-
-```python
-from bolt_mcp import PromptGet, ResourceRead
-
-@mcp.resource_middleware
-async def trace_resource(read: ResourceRead, call_next) -> dict:
-    parent = propagate.extract({k: v for k, v in read.meta.items() if isinstance(v, str)})
-    with tracer.start_as_current_span("resources/read", context=parent) as span:
-        span.set_attribute("mcp.resource.uri", read.uri)
-        return await call_next()
-
-@mcp.prompt_middleware
-async def trace_prompt(get: PromptGet, call_next) -> dict:
-    parent = propagate.extract({k: v for k, v in get.meta.items() if isinstance(v, str)})
-    with tracer.start_as_current_span(f"prompts/get {get.name}", context=parent):
-        return await call_next()
-```
-
-Unlike a tool, a failed read or prompt is a JSON-RPC error, not a result. An unknown URI or prompt, or invalid arguments, raises a `JsonRpcError` out of `call_next()`. An exception in the handler also raises out of `call_next()`. Let it propagate so the client gets the error. Bolt logs an exception from the handler or from middleware and masks its text, as for a handler with no middleware. Bolt does not mask a `JsonRpcError`.
-
-Bolt checks the `auth` and `guards` of the mount in Rust, before middleware runs. Resources and prompts have no guards of their own. To refuse a read or a prompt, raise `JsonRpcError` in the middleware. A resource or prompt function can raise it too. The client gets a JSON-RPC error with your message.
-
-```python
-from bolt_mcp import JsonRpcError, ResourceRead
-
-@mcp.resource_middleware
-async def staff_only(read: ResourceRead, call_next) -> dict:
-    if read.uri.startswith("admin://") and not read.principal.get("is_staff"):
-        raise JsonRpcError("Staff only", kind="resource_not_found")
-    return await call_next()
-```
-
-The `kind` sets the error code. `"invalid_params"` (the default) gives -32602. `"resource_not_found"` gives -32002 to a legacy client and -32602 to a 2026-07-28 client. Use `"resource_not_found"` to hide that a resource exists. Any other exception gives an internal error (-32603).
-
-The client sets `read.meta` and `get.meta`, so do not trust them. `principal` and the prompt `arguments` can hold tokens or personal data. Do not write them to a log as they are.
-
-Register all middleware before you call `mount_mcp`. Registration after the mount raises `RuntimeError`, because the mount tells Rust which middleware exists.
-
-## Resources
-
-Resources expose readable data addressed by URI. The handler returns the resource's text.
-
-```python
-import msgspec
-
-@mcp.resource("config://example", name="example-config", mime_type="application/json")
-async def example_config() -> str:
-    return msgspec.json.encode({"app": "demo", "env": "dev"}).decode()
-```
-
-`meta` is sent as `_meta` on the `resources/read` contents. [MCP Apps](https://modelcontextprotocol.io/extensions/apps) read the iframe settings of an app from it, such as its content security policy:
-
-```python
-@mcp.resource(
-    "ui://weather/view.html",
-    mime_type="text/html;profile=mcp-app",
-    meta={"ui": {"csp": {"connectDomains": ["https://api.example.com"]}}},
-)
-async def weather_view() -> str:
-    return WEATHER_HTML
-```
-
-### Resource templates
-
-A URI containing `{var}` placeholders registers a **resource template** — a parameterized resource. Reading a concrete URI extracts the variables, coerces them to the handler's annotated types, and calls the handler. The handler's parameters must match the placeholders exactly.
-
-```python
-@mcp.resource("users://{user_id}/profile", name="user-profile", mime_type="application/json")
-async def user_profile(user_id: int) -> str:
-    user = await User.objects.filter(pk=user_id).afirst()
-    if user is None:
-        return msgspec.json.encode({"error": f"no user {user_id}"}).decode()
-    return msgspec.json.encode({"id": user.id, "username": user.username}).decode()
-```
-
-Clients discover templates via `resources/templates/list` and expand them themselves. Reading `users://42/profile` coerces `42` to `int` before calling `user_profile`.
-
-## Prompts
-
-Prompts are reusable message templates. Return a string (becomes a single user message) or a list of message dicts. Arguments are derived from the function signature.
-
-```python
 @mcp.prompt
-async def summarize(topic: str) -> str:
-    """Prompt template asking the model to summarize a topic."""
-    return f"Please write a concise summary of: {topic}"
-```
-
-## Streaming tools: progress, logging, sampling, elicitation
-
-A tool that declares a `Context` parameter can interact with the client **while it runs**. The `Context` is injected by type annotation (excluded from the input schema, like `request`).
-
-```python
-import asyncio
-from bolt_mcp import Context
-
-@mcp.tool
-async def crunch(steps: int, ctx: Context) -> dict:
-    for i in range(steps):
-        await asyncio.sleep(1)
-        await ctx.report_progress(i + 1, steps, message=f"processed {i + 1}/{steps}")
-    await ctx.info("done")
-    return {"processed": steps}
-```
-
-`ctx.report_progress(...)` pushes live `notifications/progress` events onto the POST SSE stream as the tool runs, then the return value is sent as the final result. (Progress is only emitted when the client included a `progressToken`.)
-
-`ctx.debug/info/warning/error(...)` emit `notifications/message` log lines. For **2026-07-28 clients**, they are sent on the request's own stream, but only when the request carried `io.modelcontextprotocol/logLevel` in `_meta` — and only at or above that severity (per spec). For **legacy session clients**, they are delivered on the session's standalone GET stream, following the classic session model. Logging is deprecated by the 2026-07-28 spec (SEP-2577) but stays fully functional.
-
-The `Context` can also **read this server's own resources** locally (no client round-trip):
-
-```python
-@mcp.tool
-async def show_settings(ctx: Context) -> dict:
-    return {"settings": await ctx.read_resource("config://settings")}
-```
-
-### Calling back into the client
-
-`ctx.sample` and `ctx.elicit` send a request **to the client** and await the reply — `sample` asks the client's LLM to generate, `elicit` asks the user for input:
-
-```python
-@mcp.tool
-async def summarize_with_llm(text: str, ctx: Context) -> dict:
-    reply = await ctx.sample(f"Summarize in one sentence:\n\n{text}", max_tokens=200)
-    return {"summary": reply["content"]["text"]}
+async def summarize_article(article_id: str) -> str:
+    """Ask the model for a summary of one article."""
+    return f"Summarize the article with id {article_id} in two sentences."
 
 
-@mcp.tool
-async def deploy(target: str, ctx: Context) -> dict:
-    answer = await ctx.elicit(f"Deploy to {target!r}?")
-    if answer.get("action") != "accept":
-        return {"deployed": False, "reason": "cancelled by user"}
-    return {"deployed": True, "target": target}
-```
-
-An elicitation reply has two independent parts. `action` (`accept` / `decline` / `cancel`) is always present, so the client always offers an accept/decline choice — for a plain confirmation like `deploy` above, pass **no** `schema` and the client renders just the message and those two buttons. `content` is the filled-in form, built from the `schema` you pass; add one only when you want data back, and then actually read it:
-
-```python
-answer = await ctx.elicit(
-    f"Deploy to {target!r}?",
-    schema={"type": "object", "properties": {"version": {"type": "string"}}},
-)
-if answer.get("action") != "accept":
-    return {"deployed": False, "reason": "cancelled by user"}
-return {"deployed": True, "target": target, "version": answer["content"]["version"]}
-```
-
-Asking for a boolean `confirm` field *and* relying on `action` duplicates the same question: the user can leave the box unset, press **Accept**, and the tool still proceeds.
-
-How `elicit` reaches the client depends on the client's protocol era:
-
-- **2026-07-28 clients** use **MRTR** (Multi Round-Trip Requests): the tool call ends with an `input_required` result carrying the elicitation request and a signed, opaque `requestState`; the client gathers the answer and retries the call with `inputResponses` attached. **The tool function re-runs from the top on each retry** — earlier `elicit` calls return instantly from the replayed answers. This works statelessly across any number of workers.
-- **Legacy session clients** get the live path: the server sends the request on the tool call's SSE stream and the tool suspends until the client replies on a separate POST. This requires the default stateful mode and a single worker.
-
-!!! warning "MRTR replay: write idempotent pre-elicit code"
-
-    On 2026-07-28 clients, code **before** an `elicit` call runs once per round trip. Keep side effects after the last `elicit`, make them idempotent, or guard them with `ctx.is_replay`. If the *sequence* of `elicit` calls is not deterministic for the same arguments, name each input point with `ctx.elicit(..., key="...")`. The `requestState` is HMAC-sealed (keyed from `SECRET_KEY`) and bound to the tool, its arguments, and the authenticated principal — a tampered or replayed state is rejected.
-
-!!! note "sampling is deprecated"
-
-    `ctx.sample` (asking the client's LLM to generate) is deprecated by the 2026-07-28 spec (SEP-2577). It still works for legacy session clients that advertised the `sampling` capability; on 2026-07-28 clients it raises, surfaced as an in-band tool error — integrate with an LLM provider API directly instead. A client that never advertised the capability also gets a clear in-band error.
-
-## Exposing existing REST routes as tools
-
-You can surface existing Django-Bolt endpoints as MCP tools without rewriting them. Exposure is **explicit and per-handler** — there is no "expose everything" switch, because a stray marker must never silently turn a route into an AI-callable tool.
-
-Pass an allowlist of route handlers to `expose`:
-
-```python
-@api.get("/items/{item_id}")
-async def get_item(item_id: int) -> dict:
-    """Fetch an item by id."""
-    return {"id": item_id}
-
-
-api.mount_mcp(mcp, expose=[get_item])  # tool "get_item", description from the docstring
-```
-
-The tool name comes from the function name and the description from the route's OpenAPI description/docstring. Use `@expose_as_tool(name=..., description=...)` only to override those:
-
-```python
-from bolt_mcp import expose_as_tool
-
-@api.get("/items/{item_id}")
-@expose_as_tool(name="lookup_item", description="Look up an item")
-async def get_item(item_id: int) -> dict:
-    return {"id": item_id}
-```
-
-A handler that isn't a route on the API, that takes `File`/`Form` parameters (can't be represented as JSON tool arguments), or whose name collides with another tool raises `ValueError` rather than being silently dropped or shadowed.
-
-For deliberate bulk selection, call `expose_routes` directly before mounting:
-
-```python
-from bolt_mcp import expose_routes
-
-expose_routes(mcp, api, include=["/api/*"], methods=("GET", "POST"))
 api.mount_mcp(mcp)
 ```
 
-## Authentication
+`api.mount_mcp(mcp)` serves the MCP endpoint at `/mcp`.
+Start the server, and send an `initialize` request to check it:
 
-bolt-mcp offers three layers, smallest to largest:
-
-- **Tier 1** reuses Django-Bolt's own authentication + per-tool guards (you mint tokens).
-- **Tier 2** turns the server into an OAuth 2.1 *Resource Server* that validates tokens issued by an external IdP.
-- **Tier 3** makes it a full OAuth 2.1 *Authorization Server* that issues its own tokens — so OAuth-native clients (Claude.ai, ChatGPT, the Claude Code CLI) link once and refresh silently.
-
-### Tier 1 — reuse Django-Bolt auth
-
-Pass `auth` / `guards` to `mount_mcp` — the same authentication and permission classes you use on any route (see [Authentication](authentication.md) and [Permissions](permissions.md)), enforced in Rust before the handler.
-
-`auth` *attempts* to validate a Bearer token but does **not** reject anonymous callers: a valid token's claims land in `request.context`, while requests without one still reach unguarded tools. So a single `/mcp` endpoint can serve both public and protected tools:
-
-```python
-from django_bolt import JWTAuthentication
-
-api.mount_mcp(mcp, auth=[JWTAuthentication()])   # validate tokens; don't block anonymous
-```
-
-**Per-tool guards** do the gating. A tool whose guard fails is hidden from `tools/list` *and* rejected on `tools/call`, so an anonymous client never even sees the protected tools:
-
-```python
-from django_bolt import IsAuthenticated, Request, Requires
-
-@mcp.tool(guards=[IsAuthenticated()])          # any valid token
-async def whoami(request: Request) -> dict:
-    return request.context                     # {user_id, is_staff, is_superuser, permissions}
-
-@mcp.tool(guards=[Requires("permissions", "reports:read")])
-async def read_report() -> dict:
-    return {"report": "Q3 revenue up 42%"}
-
-@mcp.tool(guards=[Requires("is_superuser", True)])  # superuser only
-async def purge_users() -> dict:
-    return {"purged": 0}
-```
-
-To require authentication for *every* tool, add a blanket guard at the mount: `api.mount_mcp(mcp, auth=[JWTAuthentication()], guards=[IsAuthenticated()])`.
-
-### Tier 2 — OAuth 2.1 Resource Server
-
-Pass `oauth=ProtectedResource(...)` to enable the [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) protected-resource-metadata route and a `WWW-Authenticate` challenge. The `token_verifier` receives the bearer token and returns claims (or `None` to reject).
-
-```python
-from bolt_mcp import ProtectedResource
-
-api.mount_mcp(mcp, oauth=ProtectedResource(
-    resource_url="https://api.example.com/mcp",
-    authorization_servers=["https://idp.example.com"],
-    token_verifier=my_verifier,   # (token: str) -> claims | None
-))
-```
-
-### Tier 3 — built-in OAuth 2.1 Authorization Server
-
-Tiers 1 and 2 still leave token *issuance* to you. Tier 3 makes Django-Bolt the **Authorization Server** itself, so OAuth-native clients can link your server, run the OAuth flow **once**, and refresh silently — no pasting tokens, no re-adding the connector. It implements the full MCP authorization handshake end to end:
-
-1. Client hits `/mcp` with no token → `401` + `WWW-Authenticate: Bearer resource_metadata="…"`
-2. Client fetches **Protected Resource Metadata** ([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)) → discovers the authorization server
-3. Client fetches **Authorization Server Metadata** ([RFC 8414](https://www.rfc-editor.org/rfc/rfc8414)) → discovers the endpoints
-4. Client **registers itself** via Dynamic Client Registration ([RFC 7591](https://www.rfc-editor.org/rfc/rfc7591))
-5. **Authorization Code + PKCE** (S256): the user signs in with their Django credentials and consents
-6. Client exchanges the code for an **access token + refresh token**, then refreshes silently
-
-Issued tokens are `HS256` JWTs signed with Django's `SECRET_KEY`, carrying the exact claims Django-Bolt's auth already reads (`sub`, `is_staff`, `is_superuser`, `permissions`, plus `scope`/`iss`/`aud`/`jti`). So they validate on `/mcp` and drive the same per-tool `guards` as Tier 1 — no extra verifier code.
-
-#### Setup
-
-`bolt_mcp.oauth` is a Django app (it persists registered clients, authorization codes, and refresh tokens). Add it to `INSTALLED_APPS` and migrate:
-
-```python
-# settings.py
-INSTALLED_APPS = [..., "bolt_mcp.oauth"]
+```bash
+python manage.py runbolt
 ```
 
 ```bash
-python manage.py migrate
+curl localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
 ```
 
-Then mount with an `AuthorizationServer`:
+```text
+data: 
+id: 0
+retry: 3000
 
-```python
-from bolt_mcp.oauth import AuthorizationServer
+data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"logging":{},"prompts":{},"resources":{},"tools":{}},"serverInfo":{"name":"blog","version":"1.0.0"},"instructions":"Tools for the articles of the blog."}}
 
-api.mount_mcp(mcp, oauth=AuthorizationServer(issuer="https://api.example.com"))
 ```
 
-Users sign in at `/oauth/authorize` with their **Django credentials** (Django's own session framework + password hashing). Because the `401` challenge is what triggers OAuth discovery, the **entire `/mcp` endpoint requires a valid token** under Tier 3 — there are no anonymous tools (unlike Tier 1). Read the principal in a tool with `principal(request)`:
+`/mcp` is not a page for a browser.
+A `GET` from a browser gets `406 Not Acceptable`.
 
-```python
-from bolt_mcp import principal
+## Connect a client
 
-@mcp.tool(guards=[IsAuthenticated()])
-async def whoami(request: Request) -> dict:
-    return principal(request)   # {user_id, is_staff, is_superuser, permissions, auth_claims}
-```
+Give the client the URL of the endpoint, for example `http://127.0.0.1:8000/mcp`.
 
-!!! warning "`issuer` must match the public URL exactly"
-
-    The `issuer` is baked into every token (`iss`/`aud`) and into the discovery documents, and clients compare it byte-for-byte. It must equal the scheme + host (+ port) clients actually reach. If unset it defaults to `http://localhost:8000` (dev only, with a warning) — set it explicitly anywhere else, including behind a reverse proxy.
-
-#### Customizing — subclass and override (Django CBV style)
-
-`AuthorizationServer` is configured like a Django class-based view: **class attributes** for config, **method overrides** for behavior.
-
-```python
-class MyMcpAuth(AuthorizationServer):
-    issuer = "https://api.example.com"
-    access_token_ttl = 1800
-
-    # add claims to every token — sees the requested scopes + the calling client
-    def get_extra_claims(self, user, *, scopes, client_id):
-        return {"tenant_id": user.profile.tenant_id, "roles": [g.name for g in user.groups.all()]}
-
-    # render your own login / consent pages
-    def render_consent(self, params, *, client_name, username):
-        return my_template.render(...)
-
-    # swap the credential check (MFA, an external user store, …)
-    async def authenticate(self, username, password):
-        ...
-
-api.mount_mcp(mcp, oauth=MyMcpAuth())
-```
-
-For trivial cases set attributes inline instead of subclassing: `AuthorizationServer(issuer="…", access_token_ttl=1800)`.
-
-**Configuration attributes**
-
-| Attribute | Default | Purpose |
-| --- | --- | --- |
-| `issuer` | `http://localhost:8000` (dev) | Public origin; token `iss`/`aud` + discovery base. Set in prod. |
-| `resource_url` | `issuer` | OAuth resource identifier / token audience. |
-| `scopes_supported` | `("mcp",)` | Scopes advertised in metadata. |
-| `required_scopes` | `()` | Scopes a token must carry to call `/mcp`. |
-| `access_token_ttl` | `3600` | Access-token lifetime (seconds). |
-| `refresh_token_ttl` | `2592000` | Refresh-token lifetime (30 days). |
-| `auth_code_ttl` | `300` | Authorization-code lifetime. |
-| `jwt_secret` / `jwt_algorithm` | `SECRET_KEY` / `HS256` | Signing key & algorithm. |
-| `auto_consent` | `False` | Skip the consent screen once signed in. |
-| `allow_dynamic_registration` | `True` | Enable `/oauth/register` (DCR). |
-| `endpoint_prefix` | `/oauth` | Path prefix for authorize / token / register / revoke. |
-
-**Overridable methods**
-
-| Method | Called | Override to |
-| --- | --- | --- |
-| `get_extra_claims(user, *, scopes, client_id)` | minting a token | add tenant / role / plan claims |
-| `authenticate(username, password)` *(async)* | login POST | change credential checking / add MFA |
-| `resolve_user(request)` *(async)* | every `/authorize` | change how the session maps to a user |
-| `load_user(user_id)` *(async)* | minting a token | change how the user is loaded |
-| `render_login(params, *, error=None)` | no session | custom sign-in HTML |
-| `render_consent(params, *, client_name, username)` | signed in | custom consent HTML |
-| `redirect_uri_allowed(registered, redirect_uri)` | `/authorize` | change redirect-URI matching |
-| `code_redirect_response(redirect_url)` | consent approved | change how the code reaches the client |
-
-**Loopback clients.** After consent, an `https` redirect URI receives a plain 302. A loopback redirect URI (`http://localhost`, `http://127.0.0.1`, `http://[::1]`) receives an interstitial page. Some browsers block the `https → http://localhost` redirect. Firefox with HTTPS-Only mode is one example. Then the "Allow" button seems to do nothing. The interstitial page prevents this. It navigates with JavaScript, keeps a click-through link, and shows the code for copy-paste. To force the raw 302, override `code_redirect_response(redirect_url)`. Return `Redirect(redirect_url, status_code=302)` from `django_bolt.responses`.
-
-#### Endpoints
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/.well-known/oauth-authorization-server` | AS metadata (RFC 8414) |
-| `GET` | `/.well-known/oauth-protected-resource/mcp` | resource metadata (RFC 9728, path-aware for the `/mcp` resource) |
-| `POST` | `/oauth/register` | Dynamic Client Registration (RFC 7591) |
-| `GET` / `POST` | `/oauth/authorize` | login + consent (Authorization Code + PKCE) |
-| `POST` | `/oauth/token` | `authorization_code` and `refresh_token` grants |
-| `POST` | `/oauth/revoke` | token revocation (RFC 7009) |
-
-#### Security
-
-Secure by default: **PKCE S256 required** (`plain` rejected), **exact redirect-URI matching** (no open redirect), **single-use** authorization codes (atomic consume), **refresh-token rotation with reuse detection** (replaying a rotated token revokes the whole chain), authorization codes and refresh tokens **stored only as SHA-256 hashes**, an **Origin-header CSRF check** on the browser consent POST, and Django's own password hashing + session framework for login. All state lives in the database, so client registrations and refresh tokens survive restarts and are shared across worker processes.
-
-#### Connecting an OAuth client
-
-=== "Claude Code CLI"
-
-    The CLI speaks OAuth and can reach `localhost`:
+=== "Claude Code"
 
     ```bash
-    claude mcp add --transport http my-server http://localhost:8000/mcp
+    claude mcp add --transport http blog http://127.0.0.1:8000/mcp
     ```
 
-    Then run `/mcp` in the TUI → **Authenticate**. A browser opens at `/oauth/authorize`; sign in and click **Allow**. Tokens are stored and refreshed automatically.
+    Or put a `.mcp.json` file in the root of your project:
 
-=== "Claude.ai / ChatGPT"
-
-    Add a **custom connector** pointing at `https://your-domain.com/mcp`. These run server-side and **cannot reach `localhost`** — expose a public HTTPS URL (e.g. a `cloudflared`/`ngrok` tunnel) and set `issuer` to that exact URL.
+    ```json
+    {
+      "mcpServers": {
+        "blog": {"type": "http", "url": "http://127.0.0.1:8000/mcp"}
+      }
+    }
+    ```
 
 === "MCP Inspector"
 
@@ -590,66 +110,673 @@ Secure by default: **PKCE S256 required** (`plain` rejected), **exact redirect-U
     npx @modelcontextprotocol/inspector
     ```
 
-    Transport **Streamable HTTP**, URL `http://localhost:8000/mcp`, **Connect** → it registers itself and runs the OAuth flow.
+    Select the transport **Streamable HTTP**, enter the URL and click **Connect**.
 
-#### Prefer an external IdP?
+By default, the endpoint accepts only the `Host` values `localhost`, `127.0.0.1` and `[::1]`.
+On a public server, set `allowed_hosts`. See [Deploy the server](#deploy-the-server).
 
-If you don't want to be the authorization server, stay a pure Resource Server (Tier 2): point `ProtectedResource(authorization_servers=[...], token_verifier=...)` at Auth0 / WorkOS / Keycloak / Entra and let it issue the tokens.
+## Write a tool
 
-## Deployment modes
-
-**2026-07-28 clients are always served statelessly** — every request is self-contained, MRTR elicitation works, and any worker can answer it. The `MCP(...)` constructor selects how **legacy** (session-era) clients are served:
-
-| Mode | Constructor | Legacy sessions / GET channel | Live progress | Live sample / elicit (legacy) | Multi-worker |
-| --- | --- | --- | --- | --- | --- |
-| **Stateful streaming** (default) | `MCP(...)` | ✅ | ✅ | ✅ | ❌ single worker¹ |
-| **JSON response** | `MCP(json_response=True)` | ❌ (sessionless) | ✅ (SSE fallback) | ❌ | ✅ |
-| **Stateless** | `MCP(stateless=True)` | ❌ | ✅ (per-request SSE) | ❌ | ✅ |
-
-¹ Only legacy sessions pin a process. Modern traffic on the same mount is multi-worker safe regardless.
-
-- **Stateful streaming** is the default and the most capable for legacy clients — required for live `sample`/`elicit` and the GET listen channel. Run with `runbolt --processes 1` (or sticky sessions) so a session always lands on the process that owns it.
-- **JSON response** answers legacy POSTs with a single `application/json` object when the response is just a result; a tool that emits notifications first automatically falls back to SSE so they are preserved.
-- **Stateless** drops legacy sessions entirely. Use it for plain request/response tools that don't need legacy callbacks.
-
-The transport defaults to localhost-only Host validation for DNS-rebinding protection (403 on mismatch). Deployed servers must pass their public authorities with `mount_mcp(..., allowed_hosts=[...])`; `allowed_origins=[...]` additionally validates browser origins. Pass an empty `allowed_hosts` list only when a trusted proxy already enforces Host validation.
-
-## Testing
-
-Use Django-Bolt's `TestClient` — it runs requests through the full Rust pipeline in-process, so MCP tools, framing, and auth are exercised end to end:
+A tool is a function that the client can call.
+Register it with `@mcp.tool`:
 
 ```python
-from django_bolt import BoltAPI
-from django_bolt.testing import TestClient
-from bolt_mcp import MCP
+@mcp.tool(annotations={"readOnlyHint": True})
+async def list_articles(published: bool = True) -> list[dict]:
+    """List the articles. Set published to false for the drafts."""
+    return [a for a in ARTICLES.values() if a["published"] == published]
+```
 
-api = BoltAPI()
-mcp = MCP("test-server")
+The client sees this entry in `tools/list`:
+
+```json
+{"name": "list_articles", "description": "List the articles. Set published to false for the drafts.", "inputSchema": {"properties": {"published": {"type": "boolean", "default": true}}, "type": "object"}, "annotations": {"readOnlyHint": true}}
+```
+
+The type hints of the arguments give the JSON Schema of the input.
+The docstring is the description. The model reads it, so write what the tool does and when to use it.
+Bolt converts and checks the arguments with msgspec.
+A bad argument gives an error result, for example `Invalid arguments: Expected int, got str - at $.article_id`.
+
+A `def` tool runs on a worker thread. An `async def` tool runs on the event loop.
+
+`@mcp.tool` takes these options:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `name` | the function name | The tool name. `@mcp.tool("find")` also sets it. |
+| `title` | `None` | A name for people. |
+| `description` | the docstring | The description for the model. |
+| `output_schema` | `None` | A JSON Schema dict of the structured result, or `"auto"` to read it from the return type. |
+| `annotations` | `None` | MCP tool annotations, for example `{"readOnlyHint": True}`. |
+| `icons` | `None` | A list of MCP icon dicts. |
+| `meta` | `None` | Sent as `_meta` of the tool in `tools/list`, for example `{"ui": {"resourceUri": "ui://blog/view.html"}}` for MCP Apps. |
+| `guards` | `[]` | Guards for this tool. See [Require authentication](#require-authentication). |
+
+`output_schema="auto"` works for a return type that gives a JSON object, for example a `msgspec.Struct`.
+For any other type it gives no schema.
+
+### Return a result
+
+Bolt maps the return value to the MCP result:
+
+| Return value | Result |
+| --- | --- |
+| `str` | One text content |
+| `dict` | A text content with the JSON of the dict, and `structuredContent` |
+| Another value, for example a `msgspec.Struct` or a `list` | Its JSON as text, and `structuredContent`. A value that is not an object goes in `{"result": ...}`. |
+| `ToolResult` | Its `content`, `structured` and `meta`. See below. |
+
+For `get_article(article_id=1)`, the result is:
+
+```json
+{"content": [{"type": "text", "text": "{\"id\":1,\"title\":\"Hello Bolt\",\"published\":true}"}], "structuredContent": {"id": 1, "published": true, "title": "Hello Bolt"}, "isError": false}
+```
+
+Return a `ToolResult` to give the model a short text and the client the full data:
+
+```python
+from bolt_mcp import ToolResult
+
 
 @mcp.tool
-async def greet(name: str) -> dict:
-    return {"greeting": f"Hello, {name}!"}
-
-api.mount_mcp(mcp)
-
-INIT = {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "pytest", "version": "1"}}
-HEADERS = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
-
-with TestClient(api) as client:
-    resp = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": INIT}, headers=HEADERS)
-    session_id = resp.headers["mcp-session-id"]
-
-    resp = client.post(
-        "/mcp",
-        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-        headers={**HEADERS, "Mcp-Session-Id": session_id},
+async def article_stats(article_id: int) -> ToolResult:
+    """Count the words of an article."""
+    words = len(ARTICLES[article_id]["title"].split())
+    return ToolResult(
+        content=f"The article has {words} words.",
+        structured={"article_id": article_id, "words": words},
     )
 ```
 
-See the [Testing guide](testing.md) for more on `TestClient`.
+```json
+{"content": [{"type": "text", "text": "The article has 2 words."}], "structuredContent": {"article_id": 1, "words": 2}, "isError": false}
+```
+
+`content` is a string or a list of MCP content blocks. `meta` becomes the `_meta` of the result.
+`output_schema="auto"` cannot read a schema from `ToolResult`, so it raises `TypeError`. Give a dict.
+Bolt does not check a result against `output_schema`.
+
+### Report an error
+
+A tool error is part of the result: `isError` is `true`. The model can read it and try again.
+Raise `ToolError` for a message that the client may read:
+
+```python
+from bolt_mcp import ToolError
+
+
+@mcp.tool
+async def find_article(article_id: int) -> dict:
+    """Return one article, or an error when it does not exist."""
+    article = ARTICLES.get(article_id)
+    if article is None:
+        raise ToolError(f"No article with id {article_id}.")
+    return article
+```
+
+```json
+{"content": [{"type": "text", "text": "No article with id 5."}], "isError": true}
+```
+
+Bolt hides the text of each other exception, because it can contain passwords, hosts or file paths.
+The client gets `Tool 'get_article' failed.`, and Bolt logs the traceback on the `bolt_mcp._execute` logger.
+For example, `get_article(article_id=9)` raises `KeyError`, and the client sees only that message.
+
+To send the exception text during development, use `MCP("blog", mask_error_details=False)`.
+Do not use it in production.
+
+### Read the request
+
+A tool with a `request` or `req` argument gets the Bolt `Request`.
+The argument is not in the input schema.
+`bolt_mcp.principal(request)` gives the authenticated caller:
+
+```python
+from bolt_mcp import principal
+
+from django_bolt import Request
+
+
+@mcp.tool
+async def whoami(request: Request) -> dict:
+    """Return the caller."""
+    return principal(request)
+```
+
+For a caller with a JWT of the user `ada`, the structured result is:
+
+```json
+{"user_id": "1", "is_staff": false, "is_superuser": false, "auth_backend": "jwt", "auth_backend_index": 0, "auth_claims": {"sub": "1", "exp": 1795316703, "iat": 1795313103, "is_staff": false, "is_superuser": false, "username": "ada"}}
+```
+
+For an anonymous caller, `principal()` gives `{}`.
+
+## Write a resource
+
+A resource is data that the client reads by its URI. The function returns the text:
+
+```python
+@mcp.resource("blog://style-guide", name="style-guide", mime_type="text/markdown")
+async def style_guide() -> str:
+    """The writing rules of the blog."""
+    return "# Style guide\n\nUse short sentences."
+```
+
+`@mcp.resource(uri, *, name=None, mime_type="text/plain", description=None, meta=None)` takes these options.
+`name` defaults to the function name, and `description` to the docstring.
+`meta` is sent as `_meta` of the contents. MCP Apps read settings from it, for example `{"ui": {"csp": {...}}}`.
+
+### Read a resource with parameters
+
+A URI with `{name}` parts registers a resource template.
+The function arguments must have the same names as the parts:
+
+```python
+import msgspec
+
+
+@mcp.resource("articles://{article_id}", mime_type="application/json")
+async def article_resource(article_id: int) -> str:
+    """One article as JSON."""
+    return msgspec.json.encode(ARTICLES[article_id]).decode()
+```
+
+The client finds the template with `resources/templates/list`.
+A read of `articles://1` converts `1` to `int` and gives:
+
+```json
+{"contents": [{"uri": "articles://1", "mimeType": "application/json", "text": "{\"id\":1,\"title\":\"Hello Bolt\",\"published\":true}"}]}
+```
+
+Each part matches one path segment. Different names in the URI and the function raise `ValueError`.
+
+A resource error is a JSON-RPC error, not a result.
+Bolt hides the text of an exception and logs it on the `bolt_mcp._dispatch` logger.
+The client gets `Resource 'articles://9' failed.`
+
+## Write a prompt
+
+A prompt is a message template that the user selects in the client:
+
+```python
+@mcp.prompt
+async def review_article(title: str, tone: str = "friendly") -> str:
+    """Ask for a review of an article."""
+    return f"Review the article '{title}' in a {tone} tone."
+```
+
+A string becomes one user message.
+A function can also return a list of MCP message dicts, for example `[{"role": "user", "content": {"type": "text", "text": "..."}}]`.
+The arguments come from the signature. An argument with no default is required.
+
+!!! note
+    An MCP client sends each prompt argument as a string.
+    Declare each argument as `str`. An `int` argument refuses the string `"1"` with an invalid-params error.
+
+## Report progress and log messages
+
+Add a `Context` argument to a tool. The argument is not in the input schema:
+
+```python
+import asyncio
+
+from bolt_mcp import Context
+
+
+@mcp.tool
+async def reindex(ctx: Context) -> dict:
+    """Rebuild the search index of the articles."""
+    for step in range(1, 4):
+        await asyncio.sleep(0.5)
+        await ctx.report_progress(step, 3, message=f"Batch {step} of 3")
+    await ctx.info("Index rebuilt")
+    return {"indexed": len(ARTICLES)}
+```
+
+The client gets each notification while the tool runs, then the result:
+
+```text
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"Batch 1 of 3","progress":1.0,"progressToken":"p1","total":3.0}}
+
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"Batch 2 of 3","progress":2.0,"progressToken":"p1","total":3.0}}
+
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"Batch 3 of 3","progress":3.0,"progressToken":"p1","total":3.0}}
+
+data: {"jsonrpc":"2.0","method":"notifications/message","params":{"data":"Index rebuilt","level":"info"}}
+
+data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"indexed\":2}"}],"structuredContent":{"indexed":2},"isError":false}}
+```
+
+- `ctx.report_progress(progress, total=None, message=None)` sends a progress notification. Bolt drops it when the client sent no `progressToken`.
+- `ctx.debug()`, `ctx.info()`, `ctx.warning()` and `ctx.error()` send a log message. A client of the 2026-07-28 revision gets it only when its request sets a log level, and only at that level or above.
+- `ctx.read_resource(uri)` reads a resource of this server and returns its text.
+- `ctx.meta` is the `_meta` object of the request.
+
+## Ask the user for input
+
+`ctx.elicit(message, schema=None)` asks the user a question in the client:
+
+```python
+@mcp.tool
+async def publish_article(article_id: int, ctx: Context) -> dict:
+    """Publish an article after the user confirms."""
+    answer = await ctx.elicit(f"Publish article {article_id}?")
+    if answer["action"] != "accept":
+        return {"published": False}
+    return {"published": True, "article_id": article_id}
+```
+
+The answer has an `action`: `accept`, `decline` or `cancel`.
+To ask for data, give a JSON Schema of an object as `schema`. The data is then in `answer["content"]`.
+
+The way this works depends on the protocol revision of the client:
+
+- A 2026-07-28 client: the tool call ends with an `input_required` result. The client asks the user, then calls the tool again with the answer. **The tool runs again from the start.** The earlier `elicit()` calls return the answers at once.
+- An earlier client: the tool waits while the client asks the user. This needs a session, so use the default mode and one process.
+
+!!! warning
+    For a 2026-07-28 client, the code before an `elicit()` runs one time for each answer.
+    Put side effects after the last `elicit()`, or check `ctx.is_replay`.
+    When the order of the `elicit()` calls can change, give each call a fixed `key=`.
+
+Bolt signs the state of the call with `SECRET_KEY`, and binds it to the tool, the arguments and the caller.
+A changed state gets an error.
+
+`ctx.sample()` asks the LLM of the client for a completion.
+The 2026-07-28 revision removed it, so it works only with an earlier client that supports sampling.
+Otherwise it raises `McpClientError`, and the client gets the message as a tool error.
+
+## Add middleware
+
+MCP calls do not go through Bolt or Django HTTP middleware.
+Use MCP middleware for logging, metrics and tracing of each call:
+
+```python
+from bolt_mcp import ToolCall
+
+logger = logging.getLogger("blog.mcp")
+
+
+@mcp.tool_middleware
+async def log_tool_calls(call: ToolCall, call_next) -> dict:
+    started = time.perf_counter()
+    result = await call_next()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    logger.info("tools/call %s error=%s %.1f ms", call.name, result["isError"], elapsed_ms)
+    return result
+```
+
+Add `import logging` and `import time` at the top of the module.
+
+A `ToolCall` has these attributes:
+
+- `name`: the tool name.
+- `arguments`: the arguments as the client sent them, before the check.
+- `meta`: the `_meta` of the request, for example with `traceparent`. The client sets it, so do not trust it.
+- `principal`: the same dict as `principal(request)`.
+
+`call_next()` runs the tool and returns the result dict. A tool exception is already an `isError` result there.
+The middleware returns that dict or another dict.
+An exception in the middleware gets the same treatment as a tool exception.
+
+Bolt refuses a call to an unknown tool, or a call that fails authentication or the guards, before the middleware runs.
+The first middleware that you register runs outermost.
+
+`@mcp.resource_middleware` runs around each `resources/read`, and gets a `ResourceRead` with `uri`, `meta` and `principal`.
+`@mcp.prompt_middleware` runs around each `prompts/get`, and gets a `PromptGet` with `name`, `arguments`, `meta` and `principal`.
+To refuse a read or a prompt, raise `JsonRpcError`:
+
+```python
+from bolt_mcp import JsonRpcError, ResourceRead
+
+
+@mcp.resource_middleware
+async def staff_only_drafts(read: ResourceRead, call_next) -> dict:
+    if read.uri.startswith("drafts://") and not read.principal.get("is_staff"):
+        raise JsonRpcError("Resource not found", kind="resource_not_found")
+    return await call_next()
+```
+
+```json
+{"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "Resource not found"}}
+```
+
+`kind="invalid_params"` (the default) gives code -32602.
+`kind="resource_not_found"` gives -32002 to an earlier client and -32602 to a 2026-07-28 client.
+Bolt does not hide the message of a `JsonRpcError`.
+
+Register each middleware before `mount_mcp()`. A later registration raises `RuntimeError`.
+A middleware must be an `async def` function, else Bolt raises `TypeError`.
+
+## Expose existing routes as tools
+
+Give the handlers of existing routes to `expose`:
+
+```python
+@api.get("/articles/{article_id}")
+async def read_article(article_id: int) -> dict:
+    """Read one article."""
+    return ARTICLES[article_id]
+
+
+api.mount_mcp(mcp, expose=[read_article])
+```
+
+The tool name is the function name, and the description is the docstring.
+The path, query, header and cookie parameters, and the body, become the tool arguments.
+
+!!! warning
+    An exposed route runs without its `auth`, its guards and its middleware.
+    A client of the MCP endpoint can call it with the auth of the mount only.
+    Do not expose a route that needs a guard. Write an `@mcp.tool` with `guards=` for it.
+
+Bolt never exposes a route that you do not name.
+A handler that is not a route of the API, a handler with `File` or `Form` parameters, or a duplicate tool name raises `ValueError`.
+
+To change the name or the description, use `@expose_as_tool`:
+
+```python
+from bolt_mcp import expose_as_tool
+
+
+@api.get("/articles/{article_id}/comments")
+@expose_as_tool(name="list_comments", description="List the comments of an article.")
+async def article_comments(article_id: int) -> list[dict]:
+    return []
+```
+
+`expose_routes(mcp, api, include=["/articles/*"], methods=("GET",))` exposes the routes with `@expose_as_tool` that match the patterns.
+Call it before `mount_mcp()`. `only_marked=False` also exposes the routes without the decorator.
+
+## Require authentication
+
+### Use Bolt authentication
+
+Give `auth` and `guards` to `mount_mcp()`, as for a route:
+
+```python
+from django_bolt.auth import IsAuthenticated, JWTAuthentication, Requires
+
+private = MCP("blog-admin")
+
+
+@private.tool(guards=[Requires("is_staff", True)])
+async def delete_article(article_id: int) -> dict:
+    """Delete an article. Staff only."""
+    return {"deleted": article_id}
+
+
+api.mount_mcp(private, "/mcp-admin", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+```
+
+- `auth` reads the credential. It does not refuse a request with no credential.
+- `guards` of the mount refuse a request before the protocol runs. A request with no valid token gets `401`.
+- `guards` of a tool hide the tool in `tools/list` for a caller that fails them. A call gets the error result `Permission denied for tool 'delete_article'`.
+
+With `auth` and no mount `guards`, one endpoint serves public and private tools.
+An anonymous client sees only the tools that it can call.
+
+A mount with no `auth` uses `BOLT_AUTHENTICATION_CLASSES`.
+`SessionAuthentication` does not work on an MCP mount, because Django middleware does not run there.
+
+### Verify tokens from your identity provider
+
+Use `ProtectedResource` when an OAuth 2.1 authorization server, for example Auth0 or Keycloak, issues the tokens:
+
+```python
+from bolt_mcp import ProtectedResource
+
+
+def verify_token(token: str) -> dict | None:
+    # Check the signature, the audience and the expiry with your provider.
+    return None
+
+
+api.mount_mcp(
+    mcp,
+    oauth=ProtectedResource(
+        resource_url="https://blog.example.com/mcp",
+        authorization_servers=["https://login.example.com"],
+        required_scopes=("articles:read",),
+        token_verifier=verify_token,
+    ),
+)
+```
+
+`token_verifier` is a `def` function. It gets the bearer token and returns the claims as a dict, or `None` to refuse the token.
+Bolt reads `sub`, `is_staff`, `is_superuser` and `permissions` from the claims for the guards.
+With `required_scopes`, the `scope` or `scp` claim must have each scope.
+
+Bolt serves the metadata of [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) at `/.well-known/oauth-protected-resource/mcp`.
+A request with no valid token gets `401` with a `WWW-Authenticate` header that points to it.
+A client then finds the authorization server and starts the OAuth flow.
+
+With `oauth`, Bolt ignores the `guards` of the mount. Use tool guards.
+
+### Run the built-in authorization server
+
+`AuthorizationServer` makes your Django project the OAuth 2.1 authorization server.
+A client, for example Claude.ai or Claude Code, then signs in the user one time and refreshes the token itself.
+The user signs in with a Django username and password.
+
+Add the app to the settings and create its tables:
+
+```python title="settings.py"
+INSTALLED_APPS = [
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django_bolt",
+    "bolt_mcp.oauth",
+]
+```
+
+```bash
+python manage.py migrate
+```
+
+Mount the server with it:
+
+```python
+from bolt_mcp import AuthorizationServer
+
+api.mount_mcp(mcp, oauth=AuthorizationServer(issuer="https://blog.example.com"))
+```
+
+Each request to `/mcp` then needs a token:
+
+```bash
+curl -i -X POST localhost:8000/mcp
+```
+
+```text
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer resource_metadata="https://blog.example.com/.well-known/oauth-protected-resource/mcp"
+
+{"detail":"Unauthorized"}
+```
+
+!!! warning
+    `issuer` must be the exact public origin of the server, for example `https://blog.example.com`.
+    Clients compare it byte by byte, and each token holds it.
+    Without `issuer`, the default is `http://localhost:8000`, and Python shows a warning.
+
+The server adds these routes:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/.well-known/oauth-authorization-server` | Authorization server metadata (RFC 8414) |
+| `GET` | `/.well-known/oauth-protected-resource/mcp` | Resource metadata (RFC 9728) |
+| `POST` | `/oauth/register` | Dynamic client registration (RFC 7591) |
+| `GET`, `POST` | `/oauth/authorize` | Sign-in and consent pages |
+| `POST` | `/oauth/token` | Gives access tokens and refresh tokens |
+| `POST` | `/oauth/revoke` | Revokes a token (RFC 7009) |
+
+The access tokens are HS256 JWTs, signed with `SECRET_KEY`.
+They have the claims that Bolt auth reads, so tool guards work as with `JWTAuthentication`.
+The server requires PKCE with S256, and it accepts only the exact redirect URIs of a client.
+It stores codes and refresh tokens as SHA-256 hashes. A reused refresh token revokes its chain.
+
+Set the options as keyword arguments, or as class attributes of a subclass:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `issuer` | `None` (`http://localhost:8000`) | The public origin. The `iss` claim and the base of each URL. |
+| `resource_url` | `issuer` + mount path | The resource and the `aud` claim of the tokens. |
+| `scopes_supported` | `("mcp",)` | The scopes in the metadata. |
+| `required_scopes` | `()` | The scopes that a token needs for `/mcp`. |
+| `access_token_ttl` | `3600` | Seconds that an access token is valid. |
+| `refresh_token_ttl` | `2592000` | Seconds that a refresh token is valid (30 days). |
+| `auth_code_ttl` | `300` | Seconds that an authorization code is valid. |
+| `jwt_secret` | `None` (`SECRET_KEY`) | The signing key. |
+| `jwt_algorithm` | `"HS256"` | The signing algorithm. |
+| `auto_consent` | `False` | Skip the consent page right after the user signs in. |
+| `allow_dynamic_registration` | `True` | Serve `/oauth/register`. |
+| `endpoint_prefix` | `"/oauth"` | The prefix of the authorize, token, register and revoke routes. |
+
+Override a method in a subclass to change the behavior:
+
+```python
+class BlogAuthorizationServer(AuthorizationServer):
+    issuer = "https://blog.example.com"
+    access_token_ttl = 1800
+
+    def get_extra_claims(self, user, *, scopes: list[str], client_id: str) -> dict:
+        return {"username": user.get_username()}
+
+
+api.mount_mcp(mcp, oauth=BlogAuthorizationServer())
+```
+
+| Method | Bolt calls it | Override it to |
+| --- | --- | --- |
+| `get_extra_claims(user, *, scopes, client_id)` | When it makes a token | Add claims, for example a tenant or a role |
+| `async authenticate(username, password)` | When the user signs in | Use another user store, or add a second factor |
+| `async resolve_user(request)` | On each `/oauth/authorize` | Find the signed-in user in another way |
+| `async load_user(user_id)` | When it makes a token | Load the user in another way |
+| `render_login(params, *, error=None)` | When no user is signed in | Show your own sign-in page |
+| `render_consent(params, *, client_name, username)` | When a user is signed in | Show your own consent page |
+| `redirect_uri_allowed(registered, redirect_uri)` | On `/oauth/authorize` | Change how redirect URIs match |
+| `code_redirect_response(redirect_url)` | After consent | Change how the code goes to the client |
+
+A client that runs on a server, for example Claude.ai, cannot reach `localhost`.
+For a test, use a public HTTPS tunnel, and set `issuer` to its URL.
+
+## Deploy the server
+
+A client of the 2026-07-28 revision sends each request with all its state.
+Bolt serves it in each mode and in each process.
+An earlier client uses a session, and the `MCP()` options set how Bolt serves it:
+
+| Mode | Option | Sessions | Live `elicit()` and `sample()` | More than one process |
+| --- | --- | --- | --- | --- |
+| Stateful (default) | `MCP("blog")` | Yes | Yes | Only with sticky sessions |
+| JSON response | `MCP("blog", json_response=True)` | No | No | Yes |
+| Stateless | `MCP("blog", stateless=True)` | No | No | Yes |
+
+- **Stateful** keeps each session in the memory of one process. Run `runbolt --processes 1`, or a load balancer that sends a session to the same process.
+- **JSON response** answers a request with one `application/json` object. A tool that sends notifications still gets an event stream.
+- **Stateless** answers each request with an event stream, and has no `GET` stream.
+
+Set the public host names of the server with `allowed_hosts`.
+The check protects a local server from DNS rebinding:
+
+```python
+api.mount_mcp(mcp, allowed_hosts=["blog.example.com"])
+```
+
+A host without a port matches each port.
+Another `Host` gets `403` with `Forbidden: Host header is not allowed`.
+`allowed_hosts=[]` turns off the check. Use it only behind a proxy that checks the host.
+`allowed_origins=["https://app.example.com"]` also checks the `Origin` header of a browser request.
+
+`mount_mcp()` needs `SECRET_KEY`. `BOLT_MAX_UPLOAD_SIZE` limits the request body.
+
+`MCP()` takes these arguments:
+
+| Argument | Default | Effect |
+| --- | --- | --- |
+| `name` | `"django-bolt"` | The server name in `serverInfo`. |
+| `version` | `"0.1.0"` | The server version in `serverInfo`. |
+| `title`, `website_url`, `icons` | `None` | More data in `serverInfo`. |
+| `instructions` | `None` | Text that tells the model how to use the server. |
+| `stateless` | `False` | See the modes above. |
+| `json_response` | `False` | See the modes above. |
+| `list_ttl_ms` | `0` | The `ttlMs` cache hint on each list result. `0` asks for no cache. |
+| `list_cache_scope` | `"private"` | The `cacheScope` hint: `"private"` or `"public"`. |
+| `mask_error_details` | `True` | Hide the text of an exception from the client. |
+
+`api.mount_mcp(mcp, path="/mcp", *, auth=None, guards=None, oauth=None, expose=None, allowed_hosts=None, allowed_origins=None)` mounts the server.
+`bolt_mcp.mount_mcp(api, mcp, ...)` does the same.
+A second server at the same path raises `ValueError`.
+
+## Test the server
+
+`TestClient` sends requests through the MCP endpoint in the same process.
+It allows its own host, so the host check passes.
+Send requests of the 2026-07-28 revision. Each request is complete, so a test needs no session:
+
+```python title="blog/tests.py"
+import json
+
+from django_bolt.testing import TestClient
+
+from blog.api import api
+
+MCP_META = {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientInfo": {"name": "pytest", "version": "1.0"},
+    "io.modelcontextprotocol/clientCapabilities": {},
+}
+
+
+def call_tool(client: TestClient, name: str, arguments: dict) -> dict:
+    response = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments, "_meta": MCP_META},
+        },
+        headers={
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": "2026-07-28",
+            "Mcp-Method": "tools/call",
+            "Mcp-Name": name,
+        },
+    )
+    assert response.status_code == 200
+    events = [line[len("data: ") :] for line in response.text.splitlines() if line.startswith("data: ")]
+    return json.loads(events[-1])["result"]
+
+
+def test_get_article():
+    with TestClient(api) as client:
+        result = call_tool(client, "get_article", {"article_id": 1})
+    assert result["isError"] is False
+    assert result["structuredContent"] == {"id": 1, "title": "Hello Bolt", "published": True}
+```
+
+The `Mcp-Method` and `Mcp-Name` headers must match the body.
+For `resources/read`, `Mcp-Name` is the URI. For `prompts/get`, it is the prompt name.
+To test a guarded tool, add an `Authorization` header with a token.
 
 ## Supported MCP methods
 
-The protocol is implemented by the official MCP Rust SDK (rmcp) embedded in Django-Bolt. Served methods: `server/discover`, `tools/list`, `tools/call` (with MRTR `input_required` results), `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, `prompts/get`, `subscriptions/listen` — plus, for legacy-era clients, `initialize`, `ping`, and the session `GET`/`DELETE` endpoints. List results carry the SEP-2549 `ttlMs`/`cacheScope` caching hints (configure with `MCP(list_ttl_ms=..., list_cache_scope=...)`), and the SEP-2243 routing headers (`Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`) are validated against the body. With the built-in Authorization Server (Tier 3) it additionally serves `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, and `/oauth/{register,authorize,token,revoke}`, with RFC 9207 `iss` on authorization responses. The advertised `resource` (and token audience) is the full MCP endpoint URL — issuer + mount path.
+Bolt serves `server/discover`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, `prompts/get` and `subscriptions/listen`.
+For an earlier client, it also serves `initialize`, `ping`, and the `GET` and `DELETE` requests of a session.
+It speaks the 2026-07-28 revision, and each revision back to 2024-11-05.
 
-The server advertises protocol version **2026-07-28** and negotiates every earlier revision back to `2024-11-05` with legacy clients.
+Bolt does not serve `completion/complete`, the tasks extension or list-changed notifications.
+The lists of tools, resources and prompts do not change after the mount.
+
+## See also
+
+- [Authentication](authentication.md)
+- [Permissions](permissions.md)
+- [Server-Sent Events and streaming](sse.md)
+- [Deployment](deployment.md)
+- [Testing](testing.md)
+- [MCP specification](https://modelcontextprotocol.io/specification)
