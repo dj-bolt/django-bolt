@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from asyncio.events import _get_running_loop, _set_running_loop
+from asyncio.tasks import _swap_current_task
 from collections.abc import Callable, Coroutine
 from functools import partial
 
@@ -920,12 +921,22 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
         # The loop blocks on this read. Run it here: no hop, no second thread.
         # Nothing on this thread observes the running-loop flag during a
         # blocking call, so Django's async_unsafe guard lets the query through.
+        # Python 3.14 keeps the current task for each thread. The read also
+        # hides it, so that a loop which fn starts on this thread can run tasks.
+        # A callback of the loop has no task, and Python 3.12 refuses to swap
+        # out a task that is not there. Swap only while loop is the running
+        # loop of the thread: Python 3.14 swaps the task of that loop only.
+        task = asyncio.current_task(loop)
+        if task is not None:
+            _swap_current_task(loop, None)
         _set_running_loop(None)
         started = time.perf_counter()
         try:
             return contextvars.copy_context().run(_call_without_parent_loop, fn, *args)
         finally:
             _set_running_loop(loop)
+            if task is not None:
+                _swap_current_task(loop, task)
             waited = time.perf_counter() - started
             if waited >= _SLOW_LOOP_WAIT_SECONDS:
                 _report_slow_loop_wait(waited)
