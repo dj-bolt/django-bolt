@@ -188,7 +188,8 @@ fields, inherited fields, `write_only` exclusions, aliases, `source` mapping,
 and nested serializers.
 
 Plain `msgspec.Struct` response models still use the faster `QuerySet.values()`
-projection path for raw column output.
+projection path for raw column output. A nested `Struct` field of a foreign key or
+a one-to-one relation reads the related row in the same query.
 
 ### Request body errors
 

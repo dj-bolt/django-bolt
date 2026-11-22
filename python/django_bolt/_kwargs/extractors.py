@@ -1377,7 +1377,13 @@ def compile_struct_row_readers(
     def project(items: list[Any]) -> list[dict[str, Any]]:
         return [{wire: getattr(item, name, None) for name, wire in pairs} for item in items]
 
-    if any(is_msgspec_struct(unwrap_optional(field.type)) for field in msgspec.structs.fields(item_type)):
+    try:
+        fields = msgspec.structs.fields(item_type)
+    except NameError:
+        # A forward reference can resolve after the route registers. The
+        # nested reader resolves the fields on the first QuerySet.
+        return _compile_nested_row_loader(item_type), project
+    if any(is_msgspec_struct(unwrap_optional(field.type)) for field in fields):
         return _compile_nested_row_loader(item_type), project
 
     if names == wire_names:
@@ -1411,7 +1417,7 @@ def _compile_nested_row_loader(item_type: type) -> Callable[[QuerySet], list[dic
         plan = plans.get(model)
         if plan is None:
             # Benign race: two threads make the same plan.
-            plan = plans[model] = _row_plan(model, item_type, "")
+            plan = plans[model] = _row_plan(model, item_type, "", (item_type,))
         paths, build = plan
         return [build(row) for row in queryset.values(*paths)]
 
@@ -1429,11 +1435,12 @@ def _single_relation(model: type, name: str) -> Any:
     return None
 
 
-def _row_plan(model: type, struct_type: type, prefix: str) -> _RowPlan:
+def _row_plan(model: type, struct_type: type, prefix: str, outer: tuple[type, ...]) -> _RowPlan:
     """Return the ``.values()`` paths of ``struct_type`` and the function that nests a row.
 
     A nested Struct field of a relation reads the relation itself first. A
-    row with no related object gives None for the field.
+    row with no related object gives None for the field. ``outer`` holds
+    ``struct_type`` and the Structs that contain it.
     """
     paths: list[str] = []
     readers: list[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]] | None]] = []
@@ -1445,7 +1452,12 @@ def _row_plan(model: type, struct_type: type, prefix: str) -> _RowPlan:
         if relation is None:
             readers.append((field.encode_name, path, None))
             continue
-        nested_paths, nested_build = _row_plan(relation.related_model, nested_type, path + "__")
+        if nested_type in outer:
+            raise TypeError(
+                f"{nested_type.__name__} nests itself across the relation {struct_type.__name__}.{field.name}. "
+                "One .values() query cannot load it. Build the Structs in the handler and return them."
+            )
+        nested_paths, nested_build = _row_plan(relation.related_model, nested_type, path + "__", (*outer, nested_type))
         paths.extend(nested_paths)
         readers.append((field.encode_name, path, nested_build))
 

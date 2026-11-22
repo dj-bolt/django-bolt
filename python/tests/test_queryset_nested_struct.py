@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import msgspec
 import pytest
+from django.db.backends import utils as db_utils
+from django.db.models.functions import JSONObject
 
 from django_bolt import BoltAPI
 from django_bolt.testing import TestClient
@@ -64,6 +66,31 @@ class UserWithProfile(msgspec.Struct):
     profile: ProfileOut | None
 
 
+class TitleMeta(msgspec.Struct):
+    id: int
+    title: str
+
+
+class PostWithMeta(msgspec.Struct):
+    meta: TitleMeta
+    author: AuthorOut
+
+
+class PostOfLaterAuthor(msgspec.Struct):
+    title: str
+    author: LaterAuthor  # noqa: F821 - the test defines it after the route
+
+
+class ProfileOfUser(msgspec.Struct):
+    bio: str
+    user: UserOfProfile
+
+
+class UserOfProfile(msgspec.Struct):
+    username: str
+    profile: ProfileOfUser | None
+
+
 def _make_posts() -> None:
     ada = Author.objects.create(name="Ada", email="ada@example.com")
     bob = Author.objects.create(name="Bob", email="bob@example.com")
@@ -71,8 +98,22 @@ def _make_posts() -> None:
     BlogPost.objects.create(title="Second", content="y", author=bob)
 
 
+@pytest.fixture
+def sql_statements(monkeypatch):
+    """Collect the SQL statements of every thread. The ORM executor has its own connections."""
+    statements: list[str] = []
+    original = db_utils.CursorWrapper._execute
+
+    def collecting_execute(self, sql, params, *wrapper_args):
+        statements.append(sql)
+        return original(self, sql, params, *wrapper_args)
+
+    monkeypatch.setattr(db_utils.CursorWrapper, "_execute", collecting_execute)
+    return statements
+
+
 @pytest.mark.django_db(transaction=True)
-def test_nested_struct_of_a_foreign_key():
+def test_nested_struct_of_a_foreign_key(sql_statements):
     _make_posts()
     api = BoltAPI()
 
@@ -94,9 +135,12 @@ def test_nested_struct_of_a_foreign_key():
     ]
     with TestClient(api) as client:
         for path in ("/async", "/sync", "/unvalidated"):
+            sql_statements.clear()
             response = client.get(path)
             assert response.status_code == 200, (path, response.text)
             assert response.json() == expected
+            # One query with a join, not one query for each author.
+            assert len(sql_statements) == 1, sql_statements
 
 
 @pytest.mark.django_db(transaction=True)
@@ -163,3 +207,56 @@ def test_nested_struct_of_a_one_to_one_relation():
             {"username": "ada", "profile": {"bio": "Hi"}},
             {"username": "bob", "profile": None},
         ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_nested_struct_that_is_not_a_relation_is_read_whole():
+    _make_posts()
+    api = BoltAPI()
+
+    @api.get("/posts")
+    async def posts() -> list[PostWithMeta]:
+        return BlogPost.objects.annotate(meta=JSONObject(id="id", title="title")).order_by("id")
+
+    with TestClient(api) as client:
+        response = client.get("/posts")
+    assert response.status_code == 200, response.text
+    assert [(row["meta"]["title"], row["author"]["name"]) for row in response.json()] == [
+        ("First", "Ada"),
+        ("Second", "Bob"),
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_nested_struct_defined_after_the_route(monkeypatch):
+    """A forward reference can resolve after the route registers, as with no nested Struct."""
+    _make_posts()
+    api = BoltAPI()
+
+    @api.get("/posts")
+    async def posts() -> list[PostOfLaterAuthor]:
+        return BlogPost.objects.order_by("id")
+
+    monkeypatch.setitem(globals(), "LaterAuthor", RenamedAuthor)
+    with TestClient(api) as client:
+        response = client.get("/posts")
+    assert response.status_code == 200, response.text
+    assert response.json() == [
+        {"title": "First", "author": {"authorName": "Ada"}},
+        {"title": "Second", "author": {"authorName": "Bob"}},
+    ]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_struct_that_nests_itself_across_relations_gives_a_clear_error():
+    user = User.objects.create(username="ada", email="ada@example.com", password_hash="x")
+    UserProfile.objects.create(user=user, bio="Hi")
+    api = BoltAPI()
+
+    @api.get("/profiles")
+    async def profiles() -> list[ProfileOfUser]:
+        return UserProfile.objects.all()
+
+    message = "ProfileOfUser nests itself across the relation UserOfProfile.profile"
+    with TestClient(api) as client, pytest.raises(TypeError, match=message):
+        client.get("/profiles")
