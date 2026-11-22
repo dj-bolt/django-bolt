@@ -760,8 +760,8 @@ class Command(BaseCommand):
         recycles them on --max-rss / --workers-lifetime limits (spawn-first,
         graceful drain), respawns crashed workers when
         --respawn-failed-workers is set, and coordinates graceful shutdown
-        on SIGTERM/SIGINT. With --respawn-failed-workers, a worker that did
-        not start to serve stops runbolt with exit status 1.
+        on SIGTERM, SIGINT, SIGHUP and SIGQUIT. With --respawn-failed-workers,
+        a worker that did not start to serve stops runbolt with exit status 1.
         """
         if not hasattr(os, "fork"):
             raise CommandError(
@@ -770,6 +770,10 @@ class Command(BaseCommand):
 
         processes = options["processes"]
         kill_timeout = options["workers_kill_timeout"]
+        # Each of these signals stops the supervisor. It must stop its workers
+        # first, or they serve on the port with no parent. A terminal that
+        # closes sends SIGHUP. SIGHUP and SIGQUIT exist only where fork exists.
+        stop_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 
         # Run autodiscovery + banner once in the parent before forking so the
         # user sees a single clean banner instead of N copies.
@@ -789,9 +793,9 @@ class Command(BaseCommand):
                 return pid
             # Child: reset inherited handlers so only the supervising parent
             # reacts to terminal signals; the Rust server installs its own
-            # SIGTERM/SIGINT handling for graceful drain.
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            # SIGTERM/SIGINT/SIGQUIT handling for graceful drain.
+            for signum in stop_signals:
+                signal.signal(signum, signal.SIG_DFL)
             # Always enable SO_REUSEPORT: during recycling the replacement
             # worker binds the port while the old worker is still draining.
             os.environ["DJANGO_BOLT_REUSE_PORT"] = "1"
@@ -832,8 +836,8 @@ class Command(BaseCommand):
         def signal_handler(signum, frame):
             supervisor.request_shutdown()
 
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        for signum in stop_signals:
+            signal.signal(signum, signal_handler)
 
         exit_code = supervisor.run()
         if exit_code:
