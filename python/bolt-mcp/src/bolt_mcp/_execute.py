@@ -79,15 +79,9 @@ def to_call_tool_result(result: Any) -> dict[str, Any]:
         return _from_tool_result(result)
     if isinstance(result, str):
         return {"content": [_text_content(result)], "isError": False, "resultType": RESULT_TYPE_COMPLETE}
-    if isinstance(result, dict):
-        text = json_encode(result).decode()
-        return {
-            "content": [_text_content(text)],
-            "structuredContent": result,
-            "isError": False,
-            "resultType": RESULT_TYPE_COMPLETE,
-        }
-    payload = msgspec.to_builtins(result, enc_hook=default_serializer)
+    # Convert once for both outputs. A second pass gets a used-up map, zip or generator.
+    # A msgspec.Raw value is JSON already, so it stays as it is.
+    payload = msgspec.to_builtins(result, builtin_types=(msgspec.Raw,), enc_hook=default_serializer)
     structured = payload if isinstance(payload, dict) else {"result": payload}
     text = json_encode(payload).decode()
     return {
