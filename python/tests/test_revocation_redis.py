@@ -21,7 +21,7 @@ from django.test import override_settings
 
 from django_bolt import BoltAPI
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, JWTAuthViews, create_token_pair
-from django_bolt.auth.revocation import DjangoCacheRevocation
+from django_bolt.auth.revocation import DjangoCacheRevocation, ReservedJtiError
 from django_bolt.testing import TestClient
 
 from .thread_pools import shutdown_closing_connections
@@ -103,9 +103,9 @@ async def test_each_redis_entry_lives_until_the_backend_stops_accepting_its_toke
     await store.revoke("no-exp-jti")
 
     keys = redis_keys()
-    # ``exp`` plus the default leeway of 60 seconds. One second can pass in the test.
+    # ``exp`` plus the default leeway of 60 seconds, to the end of that second. One second can pass in the test.
     for name in ("revoked:revoked-jti", "revoked:used-jti", "revoked:fam:family-id"):
-        assert 159 <= keys.pop(name) <= 160, name
+        assert 160 <= keys.pop(name) <= 161, name
     assert 604799 <= keys.pop("revoked:no-exp-jti") <= 604800
     assert keys == {}
     assert await store.is_revoked("revoked-jti")
@@ -186,3 +186,32 @@ def test_a_redis_that_does_not_answer_refuses_each_request():
             }
 
     assert statuses == dict.fromkeys(statuses, 500)
+
+
+@pytest.mark.redis
+@pytest.mark.asyncio
+async def test_a_jti_cannot_write_the_key_of_a_family_or_of_a_user_version_on_redis(redis_keys):
+    """Reproduction of #887: ``revoke("ver:u2")`` made each token of ``u2`` invalid."""
+    store = DjangoCacheRevocation()
+    exp = int(time.time()) + 100
+
+    for jti in ("ver:u2", "fam:f1"):
+        with pytest.raises(ReservedJtiError, match="starts with a reserved prefix"):
+            await store.revoke(jti, exp=exp)
+
+    assert redis_keys() == {}
+    assert await store.get_user_version("u2") == 0
+    assert await store.bump_user_version("u2") == 1
+    assert await store.is_family_revoked("f1") is False
+
+
+@pytest.mark.redis
+@pytest.mark.asyncio
+async def test_a_consume_of_an_expired_token_is_refused_on_each_call_on_redis(redis_keys):
+    """Django deletes a Redis key with a timeout of 0."""
+    store = DjangoCacheRevocation()
+    exp = int(time.time()) - 3600
+
+    assert await store.consume("expired-jti", exp=exp) is False
+    assert await store.consume("expired-jti", exp=exp) is False
+    assert redis_keys() == {}

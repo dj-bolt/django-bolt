@@ -5,6 +5,8 @@ Provides flexible revocation strategies that users can choose based on their nee
 Revocation is OPTIONAL - only checked if user provides a handler.
 """
 
+from __future__ import annotations
+
 import time
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, timedelta
@@ -19,21 +21,42 @@ from django.db.models import F
 _DEFAULT_TTL_SECONDS = 86400 * 7  # 7 days — fallback when caller doesn't pass `exp`
 # A user version row must stay, so the cleanup task of expired rows must not find it.
 _NEVER_EXPIRES = datetime(9999, 1, 1, tzinfo=UTC)
+# The key of a family or of a user version starts with one of these prefixes.
+# A jti with such a prefix would read or write that key, so the stores refuse it.
+_CACHE_RESERVED_PREFIXES = ("fam:", "ver:")
+_ORM_RESERVED_PREFIXES = ("family:", "version:")
+
+
+class ReservedJtiError(ValueError):
+    """A store refuses a ``jti`` that starts with one of its reserved prefixes.
+
+    Authentication and ``JWTAuthViews`` count such a token as revoked.
+    """
+
+
+def _check_jti(jti: str, reserved: tuple[str, ...]) -> None:
+    """Raise ``ReservedJtiError`` when ``jti`` starts with a reserved prefix."""
+    if jti.startswith(reserved):
+        raise ReservedJtiError(
+            f"jti {jti!r} starts with a reserved prefix ({', '.join(reserved)}). "
+            "The store uses these prefixes for families and user versions."
+        )
 
 
 def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS, *, leeway: int) -> int:
     """
     Return the seconds that a revocation entry must live.
 
-    With ``exp``, the entry lives until ``exp + leeway``. ``JWTAuthentication``
-    accepts a token until that time, so the entry must not expire before it.
-    A result below 0 becomes 0, because ``timedelta`` subtracts a negative
-    duration from now. Without ``exp``, the result is ``default``, usually the
+    With ``exp``, the entry lives until the end of the second ``exp + leeway``.
+    ``JWTAuthentication`` accepts a token until the end of that second, so the
+    entry must not expire before it. A token after that second gets 0, not a
+    negative value, because ``timedelta`` subtracts a negative duration from
+    now. Without ``exp``, the result is ``default``, usually the
     ``default_ttl`` of the store. ``leeway`` does not change ``default``.
     """
     if exp is None:
         return default
-    return max(0, int(exp) + leeway - int(time.time()))
+    return max(0, int(exp) + leeway - int(time.time()) + 1)
 
 
 def _checked_leeway(store_name: str, leeway: int) -> int:
@@ -303,6 +326,7 @@ class DjangoCacheRevocation(RevocationStore):
         return self._cache
 
     async def is_revoked(self, jti: str) -> bool:
+        _check_jti(jti, _CACHE_RESERVED_PREFIXES)
         key = f"{self.key_prefix}{jti}"
         # Django cache get is sync, but fast
         return self.cache.get(key) is not None
@@ -319,7 +343,10 @@ class DjangoCacheRevocation(RevocationStore):
 
         If ``exp`` is omitted, the entry lives for ``self.default_ttl``
         seconds (set on the constructor).
+
+        A ``jti`` that starts with ``fam:`` or ``ver:`` raises ``ReservedJtiError``.
         """
+        _check_jti(jti, _CACHE_RESERVED_PREFIXES)
         key = f"{self.key_prefix}{jti}"
         self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
 
@@ -340,8 +367,13 @@ class DjangoCacheRevocation(RevocationStore):
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
         self._require_atomic_cache()
+        _check_jti(jti, _CACHE_RESERVED_PREFIXES)
         key = f"{self.key_prefix}{jti}"
-        return bool(self.cache.add(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway)))
+        ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
+        if ttl == 0:
+            # Django deletes an entry with a timeout of 0, so its marker cannot block a replay.
+            return False
+        return bool(self.cache.add(key, "1", timeout=ttl))
 
     async def get_user_version(self, user_id: str) -> int:
         return int(self.cache.get(f"{self.key_prefix}ver:{user_id}") or 0)
@@ -460,6 +492,7 @@ class DjangoORMRevocation(RevocationStore):
         return self._model
 
     async def is_revoked(self, jti: str) -> bool:
+        _check_jti(jti, _ORM_RESERVED_PREFIXES)
         return await self.model.objects.filter(jti=jti).aexists()
 
     async def revoke(self, jti: str, *, exp: int | None = None) -> None:
@@ -474,12 +507,26 @@ class DjangoORMRevocation(RevocationStore):
 
         If ``exp`` is omitted, ``expires_at`` is set to ``now +
         self.default_ttl`` (set on the constructor).
+
+        A ``jti`` that starts with ``family:`` or ``version:`` raises ``ReservedJtiError``.
         """
-        expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        _check_jti(jti, _ORM_RESERVED_PREFIXES)
+        await self._upsert(jti, exp)
+
+    async def _upsert(self, jti: str, exp: int | None) -> None:
+        # Read the TTL first: expires_at is then never before the end of exp + leeway.
+        ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
+        expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
         await self.model.objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
-        expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        _check_jti(jti, _ORM_RESERVED_PREFIXES)
+        ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
+        if ttl == 0:
+            # The cleanup task deletes an expired row, and a later consume would then
+            # succeed. The backend refuses this token, so refuse it here too.
+            return False
+        expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
         try:
             await self.model.objects.acreate(jti=jti, expires_at=expires_at)
         except IntegrityError:
@@ -487,10 +534,10 @@ class DjangoORMRevocation(RevocationStore):
         return True
 
     async def revoke_family(self, fam: str, *, exp: int | None = None) -> None:
-        await self.revoke(f"family:{fam}", exp=exp)
+        await self._upsert(f"family:{fam}", exp)
 
     async def is_family_revoked(self, fam: str) -> bool:
-        return await self.is_revoked(f"family:{fam}")
+        return await self.model.objects.filter(jti=f"family:{fam}").aexists()
 
     async def get_user_version(self, user_id: str) -> int:
         rows = self.model.objects.filter(jti=f"version:{user_id}")
@@ -518,7 +565,8 @@ def create_revocation_handler(store: RevocationStore):
         store: RevocationStore instance
 
     Returns:
-        Async callable that checks if token is revoked
+        Async callable that checks if token is revoked. A ``ReservedJtiError``
+        from ``store.is_revoked`` gives ``True``, so the backend refuses the token.
 
     Example:
         ```python
@@ -535,6 +583,11 @@ def create_revocation_handler(store: RevocationStore):
     """
 
     async def handler(jti: str) -> bool:
-        return await store.is_revoked(jti)
+        try:
+            return await store.is_revoked(jti)
+        except ReservedJtiError:
+            # The store refuses this jti, for example a jti with a reserved prefix.
+            # The store cannot check such a token, so the token counts as revoked.
+            return True
 
     return handler
