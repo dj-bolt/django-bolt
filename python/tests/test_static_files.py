@@ -17,7 +17,7 @@ import shutil
 import tempfile
 
 import pytest
-from django.contrib.staticfiles.finders import get_finder
+from django.contrib.staticfiles.finders import BaseFinder, get_finder
 from django.core.exceptions import ImproperlyConfigured, SuspiciousFileOperation
 from django.test import override_settings
 
@@ -934,3 +934,132 @@ class TestDebugModeFinders:
         assert response.status_code == 404, (
             f"Admin CSS should NOT be served in production mode (got {response.status_code})"
         )
+
+
+class TestFinderSymlinkContainment:
+    """With DEBUG, a file from the staticfiles finders stays inside its finder root (#933)."""
+
+    @pytest.fixture
+    def tree(self, tmp_path):
+        root = tmp_path / "static"
+        root.mkdir()
+        (root / "app.css").write_text("APP_CSS")
+        secret = tmp_path / "secret.txt"
+        secret.write_text("SECRET_CONTENT")
+        try:
+            (root / "leak.txt").symlink_to(secret)
+        except OSError:
+            pytest.skip("Symlink creation not supported on this system")
+        (root / "alias.css").symlink_to(root / "app.css")
+        return root
+
+    @staticmethod
+    def _get(settings, static_dirs, path, directories=()):
+        settings.DEBUG = True
+        settings.STATIC_ROOT = None
+        settings.STATIC_URL = "/static/"
+        settings.STATICFILES_DIRS = static_dirs
+        api = BoltAPI()
+        config = {"url_prefix": "/static", "directories": [str(d) for d in directories], "csp_header": None}
+        with TestClient(api, static_files_config=config) as client:
+            return client.get(path)
+
+    def test_symlink_out_of_a_staticfiles_dir_gives_404(self, settings, tree):
+        # The fast path refuses the link, so the finders must refuse it too.
+        response = self._get(settings, [str(tree)], "/static/leak.txt", directories=[tree])
+        assert response.status_code == 404
+        assert b"SECRET_CONTENT" not in response.content
+
+    def test_symlink_out_of_a_prefixed_staticfiles_dir_gives_404(self, settings, tree):
+        response = self._get(settings, [("vendor", str(tree))], "/static/vendor/leak.txt")
+        assert response.status_code == 404
+        assert b"SECRET_CONTENT" not in response.content
+
+    def test_prefixed_staticfiles_dir_serves_its_files(self, settings, tree):
+        response = self._get(settings, [("vendor", str(tree))], "/static/vendor/app.css")
+        assert response.status_code == 200
+        assert response.content == b"APP_CSS"
+
+    def test_symlink_inside_the_finder_root_is_served(self, settings, tree):
+        response = self._get(settings, [("vendor", str(tree))], "/static/vendor/alias.css")
+        assert response.status_code == 200
+        assert response.content == b"APP_CSS"
+
+    def test_staticfiles_dir_that_is_a_symlink_serves_its_files(self, settings, tree, tmp_path):
+        linked_root = tmp_path / "linked_static"
+        linked_root.symlink_to(tree, target_is_directory=True)
+        response = self._get(settings, [("vendor", str(linked_root))], "/static/vendor/app.css")
+        assert response.status_code == 200
+        assert response.content == b"APP_CSS"
+        leak = self._get(settings, [("vendor", str(linked_root))], "/static/vendor/leak.txt")
+        assert leak.status_code == 404
+
+    def test_staticfiles_dir_created_after_startup_is_served(self, settings, tmp_path):
+        # The directory does not exist when the server starts.
+        later = tmp_path / "later"
+        settings.DEBUG = True
+        settings.STATIC_ROOT = None
+        settings.STATIC_URL = "/static/"
+        settings.STATICFILES_DIRS = [("vendor", str(later))]
+        config = {"url_prefix": "/static", "directories": [], "csp_header": None}
+        with TestClient(BoltAPI(), static_files_config=config) as client:
+            later.mkdir()
+            (later / "app.css").write_text("LATER_CSS")
+            (tmp_path / "secret.txt").write_text("SECRET_CONTENT")
+            try:
+                (later / "leak.txt").symlink_to(tmp_path / "secret.txt")
+            except OSError:
+                pytest.skip("Symlink creation not supported on this system")
+            served = client.get("/static/vendor/app.css")
+            leak = client.get("/static/vendor/leak.txt")
+        assert served.status_code == 200
+        assert served.content == b"LATER_CSS"
+        assert leak.status_code == 404
+
+    def test_symlink_out_of_a_nested_location_gives_404(self, settings, tmp_path):
+        # The link leaves the inner location that found it, but stays in the outer one.
+        outer = tmp_path / "assets"
+        inner = outer / "vendor"
+        inner.mkdir(parents=True)
+        (outer / ".env").write_text("SECRET_CONTENT")
+        (inner / "app.css").write_text("APP_CSS")
+        try:
+            (inner / "leak.txt").symlink_to(outer / ".env")
+        except OSError:
+            pytest.skip("Symlink creation not supported on this system")
+        dirs = [("outer", str(outer)), ("vendor", str(inner))]
+        leak = self._get(settings, dirs, "/static/vendor/leak.txt")
+        assert leak.status_code == 404
+        assert b"SECRET_CONTENT" not in leak.content
+        served = self._get(settings, dirs, "/static/vendor/app.css")
+        assert served.status_code == 200
+
+    def test_symlink_keeps_the_content_type_of_the_requested_name(self, settings, tree):
+        (tree / "payload.txt").write_text("body{}")
+        (tree / "style.css").symlink_to(tree / "payload.txt")
+        response = self._get(settings, [("vendor", str(tree))], "/static/vendor/style.css")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/css")
+
+    def test_file_of_a_finder_without_a_storage_gives_404(self, settings, tree, capfd):
+        # Bolt cannot know the root of such a finder, so it refuses its files.
+        settings.STATICFILES_FINDERS = [f"{__name__}.PlainPathFinder"]
+        PlainPathFinder.root = str(tree)
+        response = self._get(settings, [], "/static/app.css")
+        assert response.status_code == 404
+        assert "PlainPathFinder" in capfd.readouterr().err
+
+
+class PlainPathFinder(BaseFinder):
+    """A finder that gives paths and keeps no storage."""
+
+    root = ""
+
+    def find(self, path, find_all=False, **kwargs):
+        found = os.path.join(self.root, path)
+        if not os.path.isfile(found):
+            return [] if find_all else None
+        return [found] if find_all else found
+
+    def list(self, ignore_patterns):
+        return []
