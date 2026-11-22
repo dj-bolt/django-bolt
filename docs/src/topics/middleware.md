@@ -625,19 +625,21 @@ Rust gives some responses before the handler runs:
 
 - a 404 for a path with no route, and a 405 for a method that the path does not have
 - a 401 or a 403 from authentication, a guard or the CSRF check of a cookie
-- a 429 from a rate limit
 
 Django runs each middleware for such a request. Bolt does the same. The Python middleware and the Django middleware get the response of Rust as the response of the handler. Thus a request-id middleware adds its header to a 404, and a tenant middleware sets the tenant for it. The handler does not run.
 
-- A request with no route runs the middleware of the API. It does not run router or route middleware, because it has no route. When `runbolt` serves more than one API, the request gets the middleware of the first API.
+- A request with no route runs the middleware of the API. It does not run router or route middleware, because it has no route. When `runbolt` serves more than one API, the request gets the middleware of the first API. A 405 also gets the middleware of the first API. Its access-log line uses the config of the API of its path.
 - A rejection of a route runs all the middleware of the route: the API, router and route middleware.
-- `process_view` runs for a rejection, because the route has a view. It does not run for a request with no route, as in Django.
+- `process_view` does not run for these requests, because no view runs. Thus `CsrfViewMiddleware` does not change a 401 or a 403 into a CSRF failure.
 - Bolt does not read the body of these requests. `request.body` is empty.
 - With an `error_formatter`, the middleware gets the formatted response.
+- A middleware cannot make the handler run. The response of Rust stays when a middleware removes values from `request.state`.
 
-Rust still does the check without the GIL. An API with no Python middleware and no Django middleware answers these requests in Rust, as before. A route with no Python middleware also answers its rejections in Rust. Thus a flood of 404 or 429 responses costs no Python time when no middleware must see it.
+A 429 from a rate limit does not go through the middleware. The rate limit stops a flood of requests before Python runs. Thus a request-id middleware or a tenant middleware does not see a 429.
 
-Other early responses of Rust do not go through the middleware. Examples are a 422 or a 400 from request validation and a 413 for a large body. The 308 redirect to the other slash form and the automatic `OPTIONS` answer also do not.
+An API with no Python middleware and no Django middleware answers a 404, a 405, a 401 and a 403 in Rust, with no Python call. A route with no Python middleware also answers its rejections in Rust. When the API has Python middleware or Django middleware, each 404 takes the GIL and runs the middleware. Thus a scanner that sends many requests to paths with no route costs Python time for each request.
+
+Other early responses of Rust do not go through the middleware. Examples are a 422 or a 400 from request validation and a 413 for a large body. The 308 redirect to the other slash form and the automatic `OPTIONS` answer also do not. The 204 answer of global CORS to a preflight for a path with no route also does not.
 
 ## Performance
 

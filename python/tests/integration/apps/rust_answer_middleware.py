@@ -1,6 +1,7 @@
 """App whose API has a Django middleware: it gets the requests that Rust answers.
 
-``/sync`` has a sync handler, so a request runs on a request lane.
+``/sync`` has a sync handler, so a request runs on a request lane. The 429
+of ``/limited`` stays in Rust, so the middleware does not get it.
 """
 
 from __future__ import annotations

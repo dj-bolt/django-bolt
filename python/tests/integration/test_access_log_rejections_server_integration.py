@@ -8,31 +8,14 @@ import time
 import pytest
 
 from .apps import app_module
-
-_LOGGING = """
-LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {"plain": {"format": "%(levelname)s %(message)s"}},
-    "handlers": {
-        "file": {
-            "class": "logging.FileHandler",
-            "filename": str(BASE_DIR / "access.log"),
-            "formatter": "plain",
-        }
-    },
-    "loggers": {
-        "django.server": {"handlers": ["file"], "level": "INFO", "propagate": False}
-    },
-}
-"""
+from .helpers import access_log_settings
 
 
 @pytest.mark.server_integration
 def test_access_log_writes_one_429_line_for_each_second_of_a_flood(make_server_project):
     project = make_server_project(
         api_module=app_module("access_log_rejections"),
-        settings_extra=_LOGGING,
+        settings_extra=access_log_settings(),
     )
     with project.start(startup_path="/health") as server:
         # The route takes one request for each second. The server has one worker.
@@ -56,7 +39,7 @@ def test_access_log_writes_one_429_line_for_each_second_of_a_flood(make_server_p
 def test_access_log_has_a_line_for_each_response_of_a_route(make_server_project):
     project = make_server_project(
         api_module=app_module("access_log_rejections"),
-        settings_extra=_LOGGING,
+        settings_extra=access_log_settings(),
     )
     with project.start(startup_path="/health") as server:
         assert server.request("GET", "/open").status_code == 200

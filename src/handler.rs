@@ -909,6 +909,32 @@ fn without_error_info(mut response: HttpResponse, state: &AppState) -> HttpRespo
     response
 }
 
+/// The content type and the other headers of an answer of Rust, as text for
+/// the middleware. The middleware chain sends a header again from its text.
+/// A value that is not visible ASCII cannot go back into a response, so this
+/// logs it and leaves it out, as the response builder does.
+fn answer_headers(map: &actix_web::http::header::HeaderMap) -> (String, Vec<(String, String)>) {
+    let mut content_type = String::new();
+    let mut headers = Vec::with_capacity(map.len());
+    for (name, value) in map {
+        if *name == actix_web::http::header::CONTENT_LENGTH || *name == SKIP_CORS_HEADER_NAME {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            log::warn!(
+                "The response header '{name}' is not ASCII text. The middleware does not get it, and Bolt does not send it."
+            );
+            continue;
+        };
+        if *name == actix_web::http::header::CONTENT_TYPE {
+            content_type = value.to_owned();
+        } else {
+            headers.push((name.as_str().to_owned(), value.to_owned()));
+        }
+    }
+    (content_type, headers)
+}
+
 /// A response that Rust gave before the handler, read for the Python middleware.
 struct RustAnswer {
     status: u16,
@@ -935,22 +961,7 @@ impl RustAnswer {
             answer
         };
         let status = answer.status().as_u16();
-        let mut content_type = String::new();
-        let mut headers = Vec::with_capacity(answer.headers().len());
-        for (name, value) in answer.headers() {
-            if *name == actix_web::http::header::CONTENT_LENGTH || *name == SKIP_CORS_HEADER_NAME {
-                continue;
-            }
-            // Rust builds each header of these responses from ASCII text.
-            let Ok(value) = value.to_str() else {
-                return Err(answer);
-            };
-            if *name == actix_web::http::header::CONTENT_TYPE {
-                content_type = value.to_owned();
-            } else {
-                headers.push((name.as_str().to_owned(), value.to_owned()));
-            }
-        }
+        let (content_type, headers) = answer_headers(answer.headers());
         // The body of a response that Rust builds is in memory.
         let body = match actix_web::body::MessageBody::try_into_bytes(answer.into_body()) {
             Ok(body) => body,
@@ -994,9 +1005,10 @@ impl RustAnswer {
 /// when the response is for a Bolt route: each response after the route match,
 /// the redirect to the other slash form of a route path, the automatic OPTIONS
 /// answer, and the 405 for a method that the route path does not have.
+/// A 404 of a path with no route gets the no-route route of the app.
 /// `handle_request` writes the access-log line for these, if
-/// the filter of that route keeps it. A native route, a mount and a path with
-/// no route leave it `None`.
+/// the filter of that route keeps it. A native route, a mount and the
+/// preflight answer of global CORS leave it `None`.
 async fn route_request(
     req: HttpRequest,
     mut payload: web::Payload,
@@ -1020,7 +1032,7 @@ async fn route_request(
     // Python::attach per request just to clone the callable.
     //
     // `rust_answer` holds a response that Rust gives before the handler: a
-    // 404 or a 405 for a request with no route, and a 401, 403 or 429 of the
+    // 404 or a 405 for a request with no route, and a 401 or a 403 of the
     // route. When the route runs Python middleware, the response goes through
     // that middleware as the response of the handler (see `RustAnswer`).
     let (route, path_params, handler_id, mut rust_answer) = {
@@ -1144,6 +1156,8 @@ async fn route_request(
 
             // The no-route route of the app has the access-log filter of the
             // API. When the API has Python middleware, the answer goes through it.
+            // A 405 keeps the filter of the route of its path. With merged APIs,
+            // that route can be of another API than the no-route route.
             let Some(no_route) = router.no_route() else {
                 return answer;
             };
@@ -1286,11 +1300,9 @@ async fn route_request(
                 method,
                 path,
             ) {
-                // CORS headers will be added by CorsMiddleware
-                if !runs_python_middleware {
-                    return response;
-                }
-                rust_answer = Some(response);
+                // A 429 stays in Rust: the limit sheds load before Python
+                // runs. CORS headers will be added by CorsMiddleware.
+                return response;
             }
         } else {
             debug_assert!(false, "rate-limited route missing extracted headers");
@@ -1298,15 +1310,10 @@ async fn route_request(
     }
 
     // Execute authentication and guards using shared validation logic.
-    // A request that the rate limit rejected does not authenticate.
     let mut auth_ctx = None;
-    if has_route_auth_or_guards
-        && rust_answer.is_none()
-        && let Some(route_meta) = route_metadata
-    {
+    if has_route_auth_or_guards && let Some(route_meta) = route_metadata {
         let empty_headers = AHashMap::new();
         let headers_map = headers.as_ref().unwrap_or(&empty_headers);
-        // CORS headers will be added by CorsMiddleware
         let mut rejection = match validate_auth_and_guards(
             headers_map,
             &route_meta.auth_backends,
@@ -1343,6 +1350,7 @@ async fn route_request(
             rejection = Some(responses::error_403());
         }
         if let Some(response) = rejection {
+            // CORS headers will be added by CorsMiddleware.
             if !runs_python_middleware {
                 return response;
             }
@@ -1351,6 +1359,7 @@ async fn route_request(
         }
     }
 
+    // A rejected request does not count against an identity limit.
     if rust_answer.is_none()
         && let Some(config) = rate_config
         && let Some(headers_map) = headers.as_ref()
@@ -1366,10 +1375,7 @@ async fn route_request(
         )
     {
         // CORS headers will be added by CorsMiddleware
-        if !runs_python_middleware {
-            return response;
-        }
-        rust_answer = Some(response);
+        return response;
     }
 
     // Optimization: Only parse cookies if handler needs them
@@ -1599,18 +1605,15 @@ async fn route_request(
         // then needs no Python source dicts.
         let state_lock = std::sync::OnceLock::new();
         let mut skip_dicts = false;
-        if let Some(answer) = rust_answer {
-            // The innermost layer of the middleware chain returns this wire,
-            // and the handler does not run. A route that runs Python
-            // middleware has no sync dispatch, so the wire goes to that chain.
-            debug_assert!(!can_sync_dispatch);
-            let state_dict = PyDict::new(py);
-            state_dict.set_item(
-                pyo3::intern!(py, "_bolt_rust_answer"),
-                answer.into_wire(py)?,
-            )?;
-            let _ = state_lock.set(state_dict.unbind());
-        } else if let Some(bindings) = route_metadata.and_then(|m| m.rust_arg_bindings.as_deref()) {
+        // The innermost layer of the middleware chain returns the wire of an
+        // answer. A route that runs Python middleware has no sync dispatch,
+        // so the wire goes to that chain.
+        debug_assert!(rust_answer.is_none() || !can_sync_dispatch);
+        let rust_answer = rust_answer.map(|answer| answer.into_wire(py)).transpose()?;
+        // The handler does not run for an answer, so it gets no arguments.
+        if rust_answer.is_none()
+            && let Some(bindings) = route_metadata.and_then(|m| m.rust_arg_bindings.as_deref())
+        {
             let prebound = build_prebound_from_values(
                 py,
                 bindings,
@@ -1727,6 +1730,7 @@ async fn route_request(
             conn_host,
             conn_scheme,
             conn_remote_addr,
+            rust_answer,
         };
         let request_obj = Py::new(py, request)?;
 
@@ -1895,7 +1899,32 @@ async fn route_request(
 
 #[cfg(test)]
 mod tests {
-    use super::access_log_level;
+    use super::{SKIP_CORS_HEADER_NAME, access_log_level, answer_headers};
+    use actix_web::http::header::{
+        CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
+    };
+
+    #[test]
+    fn the_middleware_gets_each_text_header_of_an_answer() {
+        let mut map = HeaderMap::new();
+        map.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        map.insert(CONTENT_LENGTH, HeaderValue::from_static("2"));
+        map.insert(SKIP_CORS_HEADER_NAME, HeaderValue::from_static("1"));
+        map.insert(
+            HeaderName::from_static("allow"),
+            HeaderValue::from_static("GET, POST"),
+        );
+        // A value with a byte that is not ASCII cannot go back into a response.
+        map.insert(
+            HeaderName::from_static("x-name"),
+            HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
+
+        let (content_type, headers) = answer_headers(&map);
+
+        assert_eq!(content_type, "application/json");
+        assert_eq!(headers, [("allow".to_owned(), "GET, POST".to_owned())]);
+    }
 
     #[test]
     fn the_access_log_level_follows_the_status_class() {

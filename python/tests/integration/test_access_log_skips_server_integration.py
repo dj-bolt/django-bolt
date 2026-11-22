@@ -5,31 +5,14 @@ from __future__ import annotations
 import pytest
 
 from .apps import app_module
-
-_LOGGING = """
-LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {"plain": {"format": "%(levelname)s %(message)s"}},
-    "handlers": {
-        "file": {
-            "class": "logging.FileHandler",
-            "filename": str(BASE_DIR / "access.log"),
-            "formatter": "plain",
-        }
-    },
-    "loggers": {
-        "django.server": {"handlers": ["file"], "level": "INFO", "propagate": False}
-    },
-}
-"""
+from .helpers import access_log_settings
 
 
 @pytest.mark.server_integration
 def test_access_log_skips_the_paths_and_the_status_codes_of_a_logging_config(make_server_project):
     project = make_server_project(
         api_module=app_module("access_log_skips"),
-        settings_extra=_LOGGING,
+        settings_extra=access_log_settings(),
     )
     with project.start(startup_path="/health") as server:
         # The default config skips /health and /ready, also for an error.

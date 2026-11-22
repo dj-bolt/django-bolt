@@ -591,16 +591,19 @@ def _error_response(request: Request, exception: Exception) -> MiddlewareRespons
     return request.state["_route_meta"]["_chain_error_response"](exception, request)
 
 
-def _view_callback(request: Request) -> Callable:
+def _view_callback(request: Request) -> Callable | None:
     """Return the view that ``process_view`` gets: the route handler, as Django gives the view.
 
-    A request that matches no route has no view (None). Django calls no
-    ``process_view`` for it, so Bolt does not either.
+    A request that Rust answers has no view (None), because no view runs for it.
+    Thus no ``process_view`` runs, and ``CsrfViewMiddleware`` does not read its empty body.
 
     Django middleware reads the flags of view decorators on it, for example
     ``csrf_exempt`` (CsrfViewMiddleware) and ``login_required`` (LoginRequiredMiddleware).
     """
-    return request.state["_route_meta"]["view_func"]
+    meta = request.state["_route_meta"]
+    if meta["_takes_rust_answer"] and request._rust_answer is not None:
+        return None
+    return meta["view_func"]
 
 
 # Module-level constants to avoid allocation on hot path
@@ -859,13 +862,14 @@ class DjangoMiddlewareStack:
         _sync_request_attributes(django_request, request)
         view_func = _view_callback(request)
         ran_view_hook = False
-        for entry in entries if view_func is not None else ():
-            hook = entry["raw_process_view"]
-            if hook is not None:
-                ran_view_hook = True
-                response = hook(django_request, view_func, _EMPTY_TUPLE, _EMPTY_DICT)
-                if response is not None:
-                    return response, entered
+        if view_func is not None:
+            for entry in entries:
+                hook = entry["raw_process_view"]
+                if hook is not None:
+                    ran_view_hook = True
+                    response = hook(django_request, view_func, _EMPTY_TUPLE, _EMPTY_DICT)
+                    if response is not None:
+                        return response, entered
         if ran_view_hook:
             # process_view can set request attributes for the handler.
             _sync_request_attributes(django_request, request)
@@ -926,20 +930,21 @@ class DjangoMiddlewareStack:
             view_func = _view_callback(bolt_request)
             ran_view_hook = False
 
-            for entry in entered_hook_entries if view_func is not None else ():
-                if entry["process_view"] is None:
-                    continue
-                ran_view_hook = True
-                response = await self._invoke_hook(
-                    entry["raw_process_view"],
-                    entry["process_view"],
-                    django_request,
-                    view_func,
-                    _EMPTY_TUPLE,
-                    _EMPTY_DICT,
-                )
-                if response is not None:
-                    return response
+            if view_func is not None:
+                for entry in entered_hook_entries:
+                    if entry["process_view"] is None:
+                        continue
+                    ran_view_hook = True
+                    response = await self._invoke_hook(
+                        entry["raw_process_view"],
+                        entry["process_view"],
+                        django_request,
+                        view_func,
+                        _EMPTY_TUPLE,
+                        _EMPTY_DICT,
+                    )
+                    if response is not None:
+                        return response
             if ran_view_hook:
                 # process_view can set request attributes for the handler.
                 _sync_request_attributes(django_request, bolt_request)

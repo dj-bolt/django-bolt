@@ -401,6 +401,9 @@ With an `error_formatter`, the line has the status of the formatted response.
 Bolt also writes a line for the 404 of a path with no route.
 The line uses the `skip_paths`, `skip_status_codes` and `sample_rate` of the API.
 When `runbolt` serves more than one API, it uses the config of the first API.
+Bolt takes the GIL to write each 404 line, and the limit of 429 lines below does not apply to it.
+Thus a scanner that sends many requests to paths with no route costs a GIL call for each request.
+To write no 404 line, add 404 to `skip_status_codes`. The filter runs in Rust, before the GIL.
 
 Bolt writes no line for a mounted ASGI app or MCP server, for a static or media file, and for a [native route](native-routes.md).
 

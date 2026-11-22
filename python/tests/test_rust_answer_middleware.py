@@ -1,9 +1,9 @@
 """The middleware of the API runs for a request that Rust answers (issue #865).
 
 Rust answers a request with no route (404, 405) and rejects a request in
-authentication, a guard or a rate limit (401, 403, 429). Django runs each
-middleware for such a request. Bolt now gives the answer of Rust to the
-Python and Django middleware, as the response of the handler.
+authentication or a guard (401, 403). Django runs each middleware for such a
+request. Bolt now gives the answer of Rust to the Python and Django
+middleware, as the response of the handler. A 429 stays in Rust.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import time
 
 import jwt
 import pytest
+from django.middleware.csrf import CsrfViewMiddleware
 from django.utils.deprecation import MiddlewareMixin
 
 from django_bolt import BoltAPI, Request
@@ -74,6 +75,14 @@ class BoltRequestIdMiddleware(Middleware):
         response = await self.get_response(request)
         response.headers["X-Bolt-Request-Id"] = "bolt-rid"
         return response
+
+
+class ClearStateMiddleware(Middleware):
+    """A Bolt middleware that removes each value of request.state."""
+
+    async def process_request(self, request):
+        request.state.clear()
+        return await self.get_response(request)
 
 
 class MaintenanceMiddleware(Middleware):
@@ -144,15 +153,21 @@ def _api(middleware_specs, kind: str = "async", **api_kwargs) -> BoltAPI:
 
 
 def _rust_answers(client: TestClient) -> list:
-    """Send one request for each kind of answer of Rust."""
-    client.get("/limited")  # The first request takes the one token of the bucket.
+    """Send one request for each kind of answer of Rust that the middleware gets."""
     return [
         client.get("/no-route"),
         client.post("/open"),
         client.get("/private"),
         client.get("/admin", headers={"Authorization": f"Bearer {_token(role='user')}"}),
-        client.get("/limited"),
     ]
+
+
+def _until_rate_limited(client: TestClient) -> list:
+    """Send requests to /limited until one gets a 429. The bucket has one token."""
+    responses = [client.get("/limited")]
+    while responses[-1].status_code != 429 and len(responses) < 20:
+        responses.append(client.get("/limited"))
+    return responses
 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
@@ -164,7 +179,7 @@ def test_the_middleware_of_the_api_gets_each_answer_of_rust(layout, kind):
     with TestClient(_api(_LAYOUTS[layout](), kind)) as client:
         answers = _rust_answers(client)
 
-    assert [response.status_code for response in answers] == [404, 405, 401, 403, 429]
+    assert [response.status_code for response in answers] == [404, 405, 401, 403]
     header = _HEADER[layout]
     for with_middleware, without_middleware in zip(answers, plain, strict=True):
         assert with_middleware.headers[header] == ("bolt-rid" if layout == "bolt" else "rid")
@@ -195,10 +210,11 @@ def test_the_answer_of_a_path_with_no_route_runs_no_process_view():
 
 
 @pytest.mark.parametrize("kind", ["sync", "async"])
-def test_a_rejection_of_a_route_runs_process_view(kind):
-    """Django calls process_view before the view checks the request, so it runs for a rejection."""
+@pytest.mark.parametrize("wrap", [DjangoMiddleware, lambda cls: DjangoMiddlewareStack([cls])], ids=["wrapper", "stack"])
+def test_a_rejection_of_a_route_runs_no_process_view(kind, wrap):
+    """No view runs for a rejection, and Bolt does not read its body."""
     _hooks.clear()
-    with TestClient(_api([DjangoMiddlewareStack([HookRecorder])], kind)) as client:
+    with TestClient(_api([wrap(HookRecorder)], kind)) as client:
         response = client.get("/private")
 
     assert response.status_code == 401
@@ -206,9 +222,61 @@ def test_a_rejection_of_a_route_runs_process_view(kind):
     assert response.headers["www-authenticate"]
     assert _hooks == [
         ("process_request", "/private"),
-        ("process_view", "/private"),
         ("process_response", "/private", 401),
     ]
+
+
+def test_the_csrf_middleware_does_not_replace_a_rejection_of_a_form_post():
+    """CsrfViewMiddleware checks in process_view. A 401 must not become a CSRF 403."""
+    api = BoltAPI(middleware=[DjangoMiddlewareStack([CsrfViewMiddleware])])
+
+    @api.post(
+        "/private", auth=[APIKeyAuthentication(api_keys={"secret"}, header="x-api-key")], guards=[IsAuthenticated()]
+    )
+    async def private():
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        response = client.post("/private", data={"name": "value"})
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"]
+
+
+def test_a_middleware_that_clears_the_state_does_not_run_the_handler():
+    """The answer of Rust is not in request.state, so middleware cannot remove it."""
+    calls = []
+    api = BoltAPI()
+
+    @api.get(
+        "/private", auth=[APIKeyAuthentication(api_keys={"secret"}, header="x-api-key")], guards=[IsAuthenticated()]
+    )
+    @middleware(ClearStateMiddleware)
+    async def private():
+        calls.append("handler")
+        return {"ok": True}
+
+    with TestClient(api) as client:
+        response = client.get("/private")
+
+    assert response.status_code == 401
+    assert calls == []
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("layout", list(_LAYOUTS))
+def test_a_429_does_not_reach_the_python_middleware(layout, kind):
+    """The rate limit sheds load in Rust, before Python runs."""
+    with TestClient(_api(_LAYOUTS[layout](), kind)) as client:
+        responses = _until_rate_limited(client)
+
+    header = _HEADER[layout]
+    *allowed, limited = responses
+    assert limited.status_code == 429
+    assert header not in limited.headers
+    assert [response.headers[header] for response in allowed] == ["bolt-rid" if layout == "bolt" else "rid"] * len(
+        allowed
+    )
 
 
 def test_a_middleware_can_answer_a_request_with_no_route():
@@ -230,7 +298,7 @@ def test_a_thread_local_middleware_keeps_its_thread_for_an_answer_of_rust(layout
     with TestClient(_api(specs, "sync")) as client:
         answers = _rust_answers(client)
 
-    assert [response.headers["x-tenant"] for response in answers] == ["acme"] * 5
+    assert [response.headers["x-tenant"] for response in answers] == ["acme"] * 4
 
 
 def _formatted(error, request):
@@ -271,11 +339,3 @@ def test_the_route_middleware_gets_a_rejection_of_its_route():
     # The route middleware does not belong to the API, so a path with no route does not run it.
     assert no_route.status_code == 404
     assert "x-bolt-request-id" not in no_route.headers
-
-
-def test_an_api_with_no_middleware_answers_in_rust_as_before():
-    with TestClient(_api([])) as client:
-        response = client.get("/no-route")
-
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Not Found"}
