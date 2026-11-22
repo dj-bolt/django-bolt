@@ -84,6 +84,9 @@ pub struct PyRequest {
     pub conn_scheme: &'static str,
     /// Resolved client address. Formatted only when `META` is read.
     pub conn_remote_addr: Option<IpAddr>,
+    /// The ResponseWireV1 of a response that Rust gave before the handler.
+    /// The middleware chain returns it, and the handler does not run.
+    pub rust_answer: Option<Py<PyAny>>,
 }
 
 impl PyRequest {
@@ -220,6 +223,14 @@ impl PyRequest {
     #[inline]
     fn params<'py>(&self, py: Python<'py>) -> Py<PyDict> {
         Self::dict_or_empty(&self.path_params, py)
+    }
+
+    /// The answer of Rust for this request, or None. It has no setter, so
+    /// middleware cannot remove it and make the handler run.
+    #[getter(_rust_answer)]
+    #[inline]
+    fn rust_answer(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.rust_answer.as_ref().map(|answer| answer.clone_ref(py))
     }
 
     /// Get the state dict for middleware to store arbitrary data.
