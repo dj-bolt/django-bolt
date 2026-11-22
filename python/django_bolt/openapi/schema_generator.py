@@ -197,6 +197,11 @@ _PARAMETER_SOURCES = frozenset({"path", "query", "header", "cookie"})
 _FORM_SOURCES = frozenset({"form", "file"})
 
 
+def _is_empty_sequence(value: Any) -> bool:
+    """Return True for a default that is an empty JSON array, such as ``()`` or ``frozenset()``."""
+    return isinstance(value, (list, tuple, set, frozenset)) and not value
+
+
 def _extract_path_param_names(path: str) -> list[str]:
     """Return path parameter names declared in a route path (e.g. {pk} → "pk")."""
     return _PATH_PARAM_RE.findall(path)
@@ -1078,7 +1083,7 @@ class SchemaGenerator:
                     if source != "query" and isinstance(field_schema, Schema) and field_schema.type == "array":
                         # A header or a cookie gives one value, so its array holds exactly one item.
                         # An empty default must stay valid for the schema, so it sets no minimum.
-                        min_items = None if field_schema.default == [] else 1
+                        min_items = None if _is_empty_sequence(field_schema.default) else 1
                         field_schema = replace(field_schema, min_items=min_items, max_items=1)
                     parameters.append(
                         Parameter(
@@ -1096,7 +1101,7 @@ class SchemaGenerator:
             # A path, a header or a cookie gives one value, so its array holds exactly one item.
             if param_in != "query" and isinstance(schema, Schema) and schema.type == "array":
                 # An empty default must stay valid for the schema, so it sets no minimum.
-                schema = replace(schema, min_items=None if default == [] else 1, max_items=1)
+                schema = replace(schema, min_items=None if _is_empty_sequence(default) else 1, max_items=1)
             if default not in (inspect.Parameter.empty, None):
                 schema = replace(schema, default=default)
 
