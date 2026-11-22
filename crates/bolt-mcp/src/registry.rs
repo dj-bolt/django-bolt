@@ -18,8 +18,44 @@ use rmcp::model::{
 };
 use serde::Deserialize;
 
-use bolt_core::metadata::parse_guard;
+use bolt_core::metadata::{parse_auth_backend, parse_guard};
+use bolt_core::middleware::auth::{AuthBackend, AuthContext};
 use bolt_core::permissions::{Guard, GuardSet};
+use bolt_core::validation::{AuthGuardResult, cookie_csrf_blocks, validate_auth_and_guards};
+
+use crate::McpRouteRequest;
+
+/// The auth and the guards of an exposed route. Each call of its tool runs
+/// them on the MCP request, as an HTTP request to the route runs them.
+pub struct RouteGate {
+    pub auth_backends: Vec<AuthBackend>,
+    pub guards: GuardSet,
+}
+
+impl RouteGate {
+    /// The principal that the auth of the route gives for this request.
+    /// Returns None when the route refuses the request.
+    pub fn check(&self, request: Option<&McpRouteRequest>) -> Option<Option<AuthContext>> {
+        // The bridge adds the request for each mount with a gate. Fail closed without it.
+        let request = request?;
+        match validate_auth_and_guards(&request.headers, &self.auth_backends, &self.guards) {
+            AuthGuardResult::Allow(auth) => {
+                let csrf = auth.as_ref().is_some_and(|auth| auth.cookie_csrf);
+                if csrf
+                    && cookie_csrf_blocks(&request.method, &request.headers, true, &request.scheme)
+                {
+                    return None;
+                }
+                Some(auth)
+            }
+            // Django middleware does not run for a tool call, so no code can
+            // check the guards of a session request.
+            AuthGuardResult::Deferred(_)
+            | AuthGuardResult::Unauthorized
+            | AuthGuardResult::Forbidden(_) => None,
+        }
+    }
+}
 
 /// One tool entry: prebuilt wire model + Rust-evaluated guards + the Python
 /// callable that executes it.
@@ -30,6 +66,8 @@ pub struct McpToolEntry {
     pub dispatch: Py<PyAny>,
     /// Whether the tool declared a `Context` parameter (progress/log/elicit).
     pub needs_context: bool,
+    /// The auth and the guards of the route, for a tool that exposes a route.
+    pub route_gate: Option<RouteGate>,
 }
 
 pub struct McpRegistry {
@@ -56,6 +94,8 @@ pub struct McpRegistry {
     /// Freshness hint applied to all list results (SEP-2549).
     pub list_ttl_ms: u64,
     pub list_cache_scope: CacheScope,
+    /// Whether a tool has a `route_gate`.
+    pub route_gates: bool,
 }
 
 /// Serde model of the wire-format catalog JSON produced by
@@ -93,6 +133,37 @@ fn parse_guard_list(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<GuardSet> {
         guards.push(parse_guard(dict, py)?);
     }
     Ok(GuardSet::from_guards(guards))
+}
+
+/// Parse the `route_auth` of a tool: None, or the auth and the guards of its route.
+fn parse_route_gate(
+    py: Python<'_>,
+    name: &str,
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Option<RouteGate>> {
+    if obj.is_none() {
+        return Ok(None);
+    }
+    let invalid = |e: &dyn std::fmt::Display| {
+        PyValueError::new_err(format!("Invalid 'route_auth' of MCP tool '{name}': {e}"))
+    };
+    let dict = obj.cast::<PyDict>().map_err(|e| invalid(&e))?;
+    let backends_obj = dict
+        .get_item("auth_backends")?
+        .ok_or_else(|| invalid(&"missing 'auth_backends'"))?;
+    let dicts: Vec<HashMap<String, Py<PyAny>>> = backends_obj.extract().map_err(|e| invalid(&e))?;
+    let auth_backends = dicts
+        .iter()
+        .map(|backend| parse_auth_backend(backend, py))
+        .collect::<PyResult<Vec<_>>>()?;
+    let guards_obj = dict
+        .get_item("guards")?
+        .ok_or_else(|| invalid(&"missing 'guards'"))?;
+    let guards = parse_guard_list(py, &guards_obj)?;
+    Ok(Some(RouteGate {
+        auth_backends,
+        guards,
+    }))
 }
 
 impl McpRegistry {
@@ -148,6 +219,10 @@ impl McpRegistry {
                 PyValueError::new_err(format!("MCP tool '{name}' config missing 'guards'"))
             })?;
             let guards = parse_guard_list(py, &guards_obj)?;
+            let route_obj = cfg.get_item("route_auth")?.ok_or_else(|| {
+                PyValueError::new_err(format!("MCP tool '{name}' config missing 'route_auth'"))
+            })?;
+            let route_gate = parse_route_gate(py, &name, &route_obj)?;
             tool_order.push(name.clone());
             tools.insert(
                 name,
@@ -156,6 +231,7 @@ impl McpRegistry {
                     guards,
                     dispatch,
                     needs_context,
+                    route_gate,
                 },
             );
         }
@@ -209,6 +285,7 @@ impl McpRegistry {
         server_info.server_info = catalog.server_info;
         server_info.instructions = catalog.instructions;
 
+        let route_gates = tools.values().any(|entry| entry.route_gate.is_some());
         Ok(Self {
             server_info,
             tool_order,
@@ -223,13 +300,16 @@ impl McpRegistry {
             codec,
             list_ttl_ms: catalog.list_ttl_ms.unwrap_or(0),
             list_cache_scope,
+            route_gates,
         })
     }
 
     /// Tools visible to this request's principal, in registration order.
+    /// A tool that exposes a route is visible when the route accepts the request.
     pub fn visible_tools(
         &self,
-        auth_ctx: Option<&bolt_core::middleware::auth::AuthContext>,
+        auth_ctx: Option<&AuthContext>,
+        route_request: Option<&McpRouteRequest>,
     ) -> Vec<Tool> {
         self.tool_order
             .iter()
@@ -241,7 +321,56 @@ impl McpRegistry {
                         bolt_core::permissions::GuardResult::Allow
                     )
             })
+            .filter(|entry| {
+                entry
+                    .route_gate
+                    .as_ref()
+                    .is_none_or(|gate| gate.check(route_request).is_some())
+            })
             .map(|entry| entry.tool.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bolt_core::permissions::Guard;
+
+    fn gate(guards: Vec<Guard>) -> RouteGate {
+        RouteGate {
+            auth_backends: Vec::new(),
+            guards: GuardSet::from_guards(guards),
+        }
+    }
+
+    fn request() -> McpRouteRequest {
+        McpRouteRequest {
+            headers: AHashMap::new(),
+            method: "POST".to_owned(),
+            scheme: "http".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_gate_with_no_request_refuses() {
+        assert!(gate(vec![Guard::AllowAny]).check(None).is_none());
+    }
+
+    #[test]
+    fn a_gate_refuses_a_request_that_its_guards_refuse() {
+        assert!(
+            gate(vec![Guard::IsAuthenticated])
+                .check(Some(&request()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_gate_allows_a_request_that_its_guards_allow() {
+        assert!(matches!(
+            gate(vec![Guard::AllowAny]).check(Some(&request())),
+            Some(None)
+        ));
     }
 }

@@ -108,6 +108,12 @@ only to override those. A handler that isn't a route on `api`, that takes file/f
 parameters, or whose name collides with another tool raises `ValueError` rather than being
 silently dropped or shadowed.
 
+An exposed route keeps its `auth` and its guards, including the settings defaults. Each tool
+call runs them in Rust on the headers of the MCP request, after the auth of the mount. A call
+that the route refuses gets `Permission denied for tool '<name>'`, and `tools/list` hides the
+tool from that caller. A tool call cannot run middleware, so a route with `@rate_limit`,
+Python middleware or Django middleware raises `ValueError`.
+
 Exposure is **per-handler by design**: there is no "expose everything" switch, because a
 marker scattered across the codebase must never silently turn a route into an AI-callable
 tool. For deliberate bulk selection, call `expose_routes(mcp, api, include=[...], methods=(...))`

@@ -27,10 +27,10 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use serde_json::Value;
 
-use crate::McpAuthExt;
 use crate::context::{CtxEvent, McpPyContext, ProtocolMode};
 use crate::registry::{McpRegistry, McpToolEntry};
 use crate::state_codec;
+use crate::{McpAuthExt, McpRouteRequest, McpRouteRequestExt};
 use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
 use bolt_core::permissions::{GuardResult, evaluate_guards};
 use bolt_loop as worker_loop;
@@ -48,6 +48,22 @@ fn auth_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<Arc<AuthContext>> {
         .get::<http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<McpAuthExt>())
         .and_then(|ext| ext.0.clone())
+}
+
+/// The request that the gate of an exposed route reads. The bridge adds it
+/// only for a mount with a gate.
+fn route_request_from_ctx(ctx: &RequestContext<RoleServer>) -> Option<&McpRouteRequest> {
+    ctx.extensions
+        .get::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<McpRouteRequestExt>())
+        .map(|ext| ext.0.as_ref())
+}
+
+fn permission_denied(name: &str) -> CallToolResponse {
+    CallToolResult::error(vec![ContentBlock::text(format!(
+        "Permission denied for tool '{name}'"
+    ))])
+    .into()
 }
 
 fn protocol_mode(ctx: &RequestContext<RoleServer>) -> ProtocolMode {
@@ -532,7 +548,9 @@ impl rmcp::ServerHandler for McpHandler {
             next_cursor: None,
             ttl_ms: Some(self.registry.list_ttl_ms),
             cache_scope: Some(self.registry.list_cache_scope),
-            tools: self.registry.visible_tools(auth.as_deref()),
+            tools: self
+                .registry
+                .visible_tools(auth.as_deref(), route_request_from_ctx(&context)),
         })
     }
 
@@ -550,17 +568,21 @@ impl rmcp::ServerHandler for McpHandler {
             ))])
             .into());
         };
-        let auth = auth_from_ctx(&context);
+        let mut auth = auth_from_ctx(&context);
         if !entry.guards.is_empty() {
             match evaluate_guards(&entry.guards, auth.as_deref()) {
                 GuardResult::Allow => {}
                 GuardResult::Unauthorized | GuardResult::Forbidden(_) => {
-                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                        "Permission denied for tool '{}'",
-                        request.name
-                    ))])
-                    .into());
+                    return Ok(permission_denied(&request.name));
                 }
+            }
+        }
+        // An exposed route keeps its own auth and guards. The handler gets
+        // the principal of the route, as over HTTP.
+        if let Some(gate) = &entry.route_gate {
+            match gate.check(route_request_from_ctx(&context)) {
+                Some(route_auth) => auth = route_auth.map(Arc::new),
+                None => return Ok(permission_denied(&request.name)),
             }
         }
         self.run_tool(entry, &request, &context, auth).await
