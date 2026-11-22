@@ -14,6 +14,7 @@ from collections.abc import Callable
 from typing import Annotated, Any, Literal, get_args, get_origin
 
 import msgspec
+from django.core.exceptions import FieldDoesNotExist
 from django.db.models import QuerySet
 
 from .._field_marker import _FieldMarker
@@ -1373,6 +1374,12 @@ def compile_struct_row_readers(
     wire_names = item_type.__struct_encode_fields__
     pairs = tuple(zip(names, wire_names, strict=True))
 
+    def project(items: list[Any]) -> list[dict[str, Any]]:
+        return [{wire: getattr(item, name, None) for name, wire in pairs} for item in items]
+
+    if any(is_msgspec_struct(unwrap_optional(field.type)) for field in msgspec.structs.fields(item_type)):
+        return _compile_nested_row_loader(item_type), project
+
     if names == wire_names:
 
         def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
@@ -1383,10 +1390,71 @@ def compile_struct_row_readers(
         def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
             return [{wire: row[name] for name, wire in pairs} for row in queryset.values(*names)]
 
-    def project(items: list[Any]) -> list[dict[str, Any]]:
-        return [{wire: getattr(item, name, None) for name, wire in pairs} for item in items]
-
     return load_rows, project
+
+
+_RowPlan = tuple[tuple[str, ...], Callable[[dict[str, Any]], dict[str, Any]]]
+
+
+def _compile_nested_row_loader(item_type: type) -> Callable[[QuerySet], list[dict[str, Any]]]:
+    """Build the row reader of a Struct with a nested Struct field, once per route.
+
+    A nested Struct names a foreign key or a one-to-one relation. ``.values()``
+    reads its fields across the relation, so one query loads all rows. The
+    relations depend on the model of the QuerySet. Thus the reader makes the
+    plan of a model on its first QuerySet and keeps it.
+    """
+    plans: dict[type, _RowPlan] = {}
+
+    def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
+        model = queryset.model
+        plan = plans.get(model)
+        if plan is None:
+            # Benign race: two threads make the same plan.
+            plan = plans[model] = _row_plan(model, item_type, "")
+        paths, build = plan
+        return [build(row) for row in queryset.values(*paths)]
+
+    return load_rows
+
+
+def _single_relation(model: type, name: str) -> Any:
+    """Return the model field of a foreign key or one-to-one relation ``name``, or None."""
+    try:
+        field = model._meta.get_field(name)
+    except FieldDoesNotExist:
+        return None
+    if (field.many_to_one or field.one_to_one) and field.related_model is not None:
+        return field
+    return None
+
+
+def _row_plan(model: type, struct_type: type, prefix: str) -> _RowPlan:
+    """Return the ``.values()`` paths of ``struct_type`` and the function that nests a row.
+
+    A nested Struct field of a relation reads the relation itself first. A
+    row with no related object gives None for the field.
+    """
+    paths: list[str] = []
+    readers: list[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]] | None]] = []
+    for field in msgspec.structs.fields(struct_type):
+        path = prefix + field.name
+        paths.append(path)
+        nested_type = unwrap_optional(field.type)
+        relation = _single_relation(model, field.name) if is_msgspec_struct(nested_type) else None
+        if relation is None:
+            readers.append((field.encode_name, path, None))
+            continue
+        nested_paths, nested_build = _row_plan(relation.related_model, nested_type, path + "__")
+        paths.extend(nested_paths)
+        readers.append((field.encode_name, path, nested_build))
+
+    def build(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            wire: row[path] if nested is None or row[path] is None else nested(row) for wire, path, nested in readers
+        }
+
+    return tuple(paths), build
 
 
 def _compile_struct_coercer(annotation: type) -> Callable[[Any], Any]:
