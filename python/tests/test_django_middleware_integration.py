@@ -2084,7 +2084,9 @@ def test_process_response_runs_for_an_error_response_of_the_handler(layout, kind
     """
     with TestClient(_error_routes_api([], kind, **api_kwargs), raise_server_exceptions=False) as client:
         plain = _error_requests(client)
-    with TestClient(_error_routes_api(_STAMP_LAYOUTS[layout](), kind, **api_kwargs)) as client:
+    with TestClient(
+        _error_routes_api(_STAMP_LAYOUTS[layout](), kind, **api_kwargs), raise_server_exceptions=False
+    ) as client:
         stamped = _error_requests(client)
 
     assert [response.status_code for response in stamped] == [404, 422, 500]
@@ -2413,7 +2415,7 @@ def test_hook_that_calls_get_response_gets_a_clear_error(caplog):
     async def hook_route():
         return {}
 
-    with caplog.at_level(logging.ERROR), TestClient(api) as client:
+    with caplog.at_level(logging.ERROR), TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/hook")
 
     assert response.status_code == 500

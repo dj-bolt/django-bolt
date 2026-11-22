@@ -123,7 +123,7 @@ def test_plain_iterator_is_not_streamed_without_a_stream_annotation():
     def struct() -> Item:
         return iter([b"a"])
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/untyped")
         assert response.status_code == 500, response.text
         assert response.json()["exception"].startswith("Handler returned unsupported type 'list_iterator'.")
@@ -143,7 +143,7 @@ def test_tuple_is_not_streamed_under_a_stream_annotation(settings):
     def chunks_tuple() -> Iterator[bytes]:
         return (b"a", b"b")
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/tuple")
 
     assert response.status_code == 500, response.text
@@ -325,7 +325,7 @@ def raw_client():
     def object_sync():
         return object()
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         yield client
 
 
@@ -402,7 +402,7 @@ def test_stream_route_that_returns_a_serializer_fails_response_validation():
     def sync_route() -> Iterator[dict]:
         return PublicUser(id=2)
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         for path in ("/awaits", "/sync"):
             response = client.get(path)
             assert response.status_code == 500, (path, response.text)
