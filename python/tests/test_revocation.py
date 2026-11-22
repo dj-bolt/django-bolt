@@ -15,6 +15,7 @@ from django.db import IntegrityError
 
 from django_bolt import BoltAPI
 from django_bolt.auth import JWTAuthentication, JWTAuthViews, TokenRotationError, rotate_refresh_token
+from django_bolt.auth import revocation as revocation_module
 from django_bolt.auth.revocation import (
     _DEFAULT_TTL_SECONDS,
     DjangoCacheRevocation,
@@ -886,3 +887,39 @@ def test_reusable_refresh_of_a_token_whose_jti_has_a_reserved_prefix_raises_toke
 
     with pytest.raises(TokenRotationError):
         asyncio.run(rotate_refresh_token(claims, store=cache_store(), secret=_SECRET, rotate=False))
+
+
+class _SteppingClock:
+    """A clock that moves a little at each read, so a read order is visible.
+
+    The first read is just before the second 101 and the next reads are in it.
+    """
+
+    def __init__(self) -> None:
+        self.reads = iter([100.999, 101.0, 101.0, 101.0])
+
+    def time(self) -> float:
+        return next(self.reads)
+
+    def now(self, tz=None) -> datetime:
+        return datetime.fromtimestamp(self.time(), tz)
+
+
+@pytest.mark.parametrize("method", ["revoke", "revoke_family", "consume"])
+def test_orm_entry_lives_to_the_end_of_exp_plus_leeway_at_a_second_boundary(orm_store, monkeypatch, method):
+    """The TTL and the base time come from two reads of the clock.
+
+    When the second changes between the reads, ``expires_at`` must still not
+    be before the end of the second ``exp + leeway``. The backend accepts the token
+    until then, so the cleanup task must keep the row until then.
+    """
+    clock = _SteppingClock()
+    monkeypatch.setattr(revocation_module, "time", clock)
+    monkeypatch.setattr(revocation_module, "datetime", clock)
+    store = orm_store()
+    exp = 200
+
+    asyncio.run(getattr(store, method)("jti-1", exp=exp))
+
+    row = RevokedToken.objects.get(jti="family:jti-1" if method == "revoke_family" else "jti-1")
+    assert row.expires_at.timestamp() >= exp + store.leeway + 1

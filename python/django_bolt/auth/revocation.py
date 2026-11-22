@@ -514,7 +514,9 @@ class DjangoORMRevocation(RevocationStore):
         await self._upsert(jti, exp)
 
     async def _upsert(self, jti: str, exp: int | None) -> None:
-        expires_at = datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+        # Read the TTL first: expires_at is then never before the end of exp + leeway.
+        ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
+        expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
         await self.model.objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
