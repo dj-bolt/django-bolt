@@ -304,8 +304,7 @@ mod tests {
                 extensions: http::Extensions::new(),
                 static_files_config: None,
                 media_files_config: None,
-                access_log_levels: 0,
-                access_logger: None,
+                access_loggers: Vec::new(),
                 error_renderer: None,
             })
         })

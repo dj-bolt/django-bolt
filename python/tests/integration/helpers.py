@@ -736,6 +736,30 @@ def postgres_settings(params: dict[str, Any], *, engine: str = "django.db.backen
     return f'DATABASES["default"] = {database!r}'
 
 
+def access_log_settings(level: str = "INFO") -> str:
+    """Django ``LOGGING`` that writes the ``django.server`` logger at ``level`` to ``access.log``.
+
+    The file is in the project directory. Each line is the level and the message.
+    """
+    return f"""
+LOGGING = {{
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {{"plain": {{"format": "%(levelname)s %(message)s"}}}},
+    "handlers": {{
+        "file": {{
+            "class": "logging.FileHandler",
+            "filename": str(BASE_DIR / "access.log"),
+            "formatter": "plain",
+        }}
+    }},
+    "loggers": {{
+        "django.server": {{"handlers": ["file"], "level": "{level}", "propagate": False}}
+    }},
+}}
+"""
+
+
 def create_server_project(
     root: Path,
     *,

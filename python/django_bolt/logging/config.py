@@ -13,6 +13,7 @@ import atexit
 import contextlib
 import importlib
 import logging
+import os
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -34,52 +35,16 @@ _QUEUE: Queue | None = None
 
 @dataclass
 class LoggingConfig:
-    """Configuration for request/response logging.
+    """Configuration of the access log of ``runbolt`` and of exception logging.
 
-    Integrates with Django's logging system and uses the configured logger.
+    The Rust access log applies ``logger_name``, ``skip_paths``,
+    ``skip_status_codes``, ``sample_rate`` and ``min_duration_ms``.
+    ``LoggingMiddleware.log_exception()`` applies ``logger_name``,
+    ``error_log_level`` and ``exception_logging_handler``.
     """
 
-    # Logger name - defaults to Django's logger
+    # The access log of runbolt and log_exception() write to this logger.
     logger_name: str = "django.server"
-
-    # Request logging fields
-    request_log_fields: set[str] = field(default_factory=lambda: {"method", "path", "status_code"})
-
-    # Response logging fields
-    response_log_fields: set[str] = field(default_factory=lambda: {"status_code"})
-
-    # Headers to obfuscate in logs (for security)
-    obfuscate_headers: set[str] = field(
-        default_factory=lambda: {"authorization", "cookie", "x-api-key", "x-auth-token"}
-    )
-
-    # Cookies to obfuscate in logs
-    obfuscate_cookies: set[str] = field(default_factory=lambda: {"sessionid", "csrftoken"})
-
-    # Log request body (be careful with sensitive data)
-    log_request_body: bool = False
-
-    # Log response body (be careful with large responses)
-    log_response_body: bool = False
-
-    # Maximum body size to log (in bytes)
-    max_body_log_size: int = 1024
-
-    # Note: Individual log levels are determined automatically:
-    # - Requests: DEBUG
-    # - Successful responses (2xx/3xx): INFO
-    # - Client errors (4xx): WARNING
-    # - Server errors (5xx): ERROR
-    #
-    # To control which logs appear, configure Django's LOGGING in settings.py:
-    # LOGGING = {
-    #     "loggers": {
-    #         "django_bolt": {"level": "INFO"},  # Show INFO and above
-    #     }
-    # }
-
-    # Deprecated: log_level is no longer used (kept for backward compatibility)
-    log_level: str = "INFO"
 
     # Log level for exceptions (used by log_exception method)
     error_log_level: str = "ERROR"
@@ -106,9 +71,10 @@ class LoggingConfig:
     def get_logger(self) -> logging.Logger:
         """Get the configured logger.
 
-        Uses Django's logging configuration if available.
+        Uses Django's logging configuration if available. A ``logger_name``
+        that is not a name raises ``ValueError``.
         """
-        return logging.getLogger(self.logger_name)
+        return logging.getLogger(_checked_logger_name(self.logger_name))
 
     def should_log_request(self, path: str, status_code: int | None = None) -> bool:
         """Check if a request should be logged.
@@ -124,6 +90,13 @@ class LoggingConfig:
             return False
 
         return not (status_code and status_code in self.skip_status_codes)
+
+
+def _checked_logger_name(value: object) -> str:
+    """Return ``value`` as the name of the access-log logger, a str that is not empty."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"LoggingConfig.logger_name must be a logger name, got {value!r}")
+    return value
 
 
 def _checked_sample_rate(value: object, name: str) -> float:
@@ -164,13 +137,19 @@ def _checked_skip_status_codes(value: object) -> tuple[int, ...]:
     return tuple(sorted(codes))
 
 
-def access_log_filter_meta(config: LoggingConfig) -> dict[str, float | tuple[str, ...] | tuple[int, ...]]:
-    """Return the route metadata keys for the access-log filter of ``config``.
+def access_log_filter_meta(config: LoggingConfig) -> dict[str, str | float | tuple[str, ...] | tuple[int, ...]]:
+    """Return the route metadata keys for the access log of ``config``.
 
     Rust reads the keys one time, at startup. A key is absent when its option
-    sets no limit. A value out of range raises ``ValueError``.
+    has no effect: ``logger_name`` is ``django.server``, ``skip_paths`` or
+    ``skip_status_codes`` is empty, ``sample_rate`` is 1.0 or None, or
+    ``min_duration_ms`` is 0.0 or None. The default ``skip_paths`` are not
+    empty, so their key is present. A value out of range raises ``ValueError``.
     """
-    meta: dict[str, float | tuple[str, ...] | tuple[int, ...]] = {}
+    meta: dict[str, str | float | tuple[str, ...] | tuple[int, ...]] = {}
+    logger_name = _checked_logger_name(config.logger_name)
+    if logger_name != "django.server":
+        meta["access_log_logger_name"] = logger_name
     skip_paths = _checked_skip_paths(config.skip_paths)
     if skip_paths:
         meta["access_log_skip_paths"] = skip_paths
@@ -195,13 +174,11 @@ def get_default_logging_config() -> LoggingConfig:
     ``sample_rate`` and ``min_duration_ms``. A value out of range raises
     ``ImproperlyConfigured``.
     """
-    log_level = "INFO"
     settings_sample = None
     settings_slow_ms = None
     if settings is not None and settings.configured:
         settings_sample = getattr(settings, "DJANGO_BOLT_LOG_SAMPLE", None)
         settings_slow_ms = getattr(settings, "DJANGO_BOLT_LOG_SLOW_MS", None)
-        log_level = "DEBUG" if settings.DEBUG else "WARNING"
 
     try:
         sample_rate = (
@@ -214,7 +191,6 @@ def get_default_logging_config() -> LoggingConfig:
         raise ImproperlyConfigured(str(error)) from error
 
     return LoggingConfig(
-        log_level=log_level,
         sample_rate=sample_rate,
         min_duration_ms=min_duration_ms,
     )
@@ -341,6 +317,77 @@ def _ensure_queue_logging(base_level: str) -> QueueHandler:
         _QUEUE_LISTENER = listener
 
     return queue_handler
+
+
+def _hold_listener_handlers() -> None:
+    """Take the lock of each listener handler before a fork.
+
+    A fork does not reset the lock of a stream. If the fork occurs during a
+    write of the listener, the child gets the lock of the stream in the held
+    state. Then the listener of the child waits for the lock with no end.
+    The handler lock is held during each write, so the fork waits for the write.
+    Take the module lock of ``logging`` first. ``dictConfig()`` takes the locks
+    in this order, so the two threads cannot wait for each other.
+    """
+    if _QUEUE_LISTENER is not None:
+        logging._lock.acquire()
+        for handler in _QUEUE_LISTENER.handlers:
+            handler.acquire()
+
+
+def _release_listener_handlers() -> None:
+    """Release the handler locks and the module lock in the parent after a fork.
+
+    The ``logging`` module makes new locks in the child.
+    """
+    if _QUEUE_LISTENER is not None:
+        for handler in reversed(_QUEUE_LISTENER.handlers):
+            handler.release()
+        logging._lock.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_hold_listener_handlers, after_in_parent=_release_listener_handlers)
+
+
+def restart_queue_listener_after_fork() -> None:
+    """Start a new queue listener in a forked child process.
+
+    A fork copies the queue, but not the listener thread. Without a new
+    listener, the records of the child stay in the queue, and nothing writes
+    them. Call this function in the child, immediately after the fork.
+    The function does nothing when no listener runs.
+    """
+    global _QUEUE_LISTENER  # noqa: PLW0603
+
+    if _QUEUE_LISTENER is None or _QUEUE is None:
+        return
+    # Initialize the queue again. This clears the copied records, which the
+    # listener of the parent writes. It also makes new locks, because a thread
+    # of the parent can hold a lock at the time of the fork.
+    _QUEUE.__init__(_QUEUE.maxsize)
+    listener = _BoundedQueueListener(
+        _QUEUE,
+        *_QUEUE_LISTENER.handlers,
+        respect_handler_level=_QUEUE_LISTENER.respect_handler_level,
+    )
+    listener.start()
+    _QUEUE_LISTENER = listener
+
+
+def stop_queue_listener() -> None:
+    """Write the records in the queue, then stop the queue listener.
+
+    ``os._exit()`` does not run the ``atexit`` functions. Call this function
+    before ``os._exit()``, or the records in the queue are lost.
+    The function does nothing when no listener runs.
+    """
+    global _QUEUE_LISTENER  # noqa: PLW0603
+
+    if _QUEUE_LISTENER is None:
+        return
+    _QUEUE_LISTENER.stop()
+    _QUEUE_LISTENER = None
 
 
 def setup_django_logging(force: bool = False) -> None:

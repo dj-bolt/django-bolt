@@ -184,6 +184,47 @@ assert response.status_code == 307
 assert response.headers["location"] == "/new-path"
 ```
 
+## Exceptions in handlers
+
+By default, the test client raises the exception of a handler in the test.
+The traceback then shows the place of the fault. Starlette's test client does the same:
+
+```python title="tests/test_errors.py"
+import pytest
+
+from django_bolt import BoltAPI
+from django_bolt.testing import TestClient
+
+api = BoltAPI()
+
+
+@api.get("/boom")
+async def boom() -> dict:
+    raise RuntimeError("boom")
+
+
+def test_boom_raises():
+    with TestClient(api) as client:
+        with pytest.raises(RuntimeError, match="boom"):
+            client.get("/boom")
+
+
+def test_boom_gives_500():
+    with TestClient(api, raise_server_exceptions=False) as client:
+        assert client.get("/boom").status_code == 500
+```
+
+The client raises each exception that the server answers with a 5xx.
+This includes an exception in the body of a streaming response, and a `ResponseValidationError`.
+It applies to sync and async handlers, and to routes with Django middleware.
+
+The client does not raise an exception that the API answers with a response.
+Thus you get the response for an `HTTPException`, also with status 500.
+You also get the 4xx of a validation error, a `PermissionDenied` or an `Http404`.
+An `error_formatter` that answers with a 4xx also gives you the response.
+
+To get the 500 response that `runbolt` sends, set `raise_server_exceptions=False`. `AsyncTestClient` takes the same option.
+
 ## Test validation errors
 
 Bolt validates the path, query, headers and body before the handler runs. Test the request that the handler gets, and also the request that it must not get:

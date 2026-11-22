@@ -9,7 +9,7 @@ Bolt writes to these loggers:
 
 | Logger | Records |
 | --- | --- |
-| `django.server` | One access-log line for each response of a route. The traceback of each server error. |
+| `django.server`, or the `logger_name` of the API | One access-log line for each response of a route. The traceback of each server error. |
 | `django_bolt` and its children | Warnings and errors of Bolt, for example `django_bolt.error_handlers` for each server error. |
 | `django_bolt` (level only) | The level of this logger also sets the records of the Rust core. See [Logs of the Rust core](#logs-of-the-rust-core). |
 
@@ -45,12 +45,9 @@ INFO 2026-11-21 20:13:44,171 django.server GET /articles/2 200 0.3ms
 
 The `blog.api` line comes from `logging.getLogger(__name__).warning(...)` in a handler of `blog/api.py`.
 
-!!! warning "Define LOGGING when you run more than one process"
-    Without `LOGGING`, Bolt sends records to a queue that a thread of the `runbolt` supervisor reads. A forked worker has no such thread. With `--processes` above 1, the warnings and errors of your code and of `django_bolt` do not appear.
-
 ## Read the access log
 
-The server writes one line to `django.server` for each response of a route:
+The server writes one line for each response of a route. The line goes to the logger of the API: `django.server` by default.
 
 ```text
 GET /articles 200 0.3ms
@@ -68,9 +65,11 @@ The level follows the status, as in `runserver`:
 The access log includes the responses that Bolt sends before the handler runs. Examples are a `401` from authentication, a `429` from a rate limit and a `422` from validation.
 It also includes the redirect to the other slash form of a path, the automatic `OPTIONS` response, and a `405`.
 
+A request that matches no route writes a `404` line to the logger of the API. When `runbolt` serves more than one API, the line uses the logger and the options of the first API.
+Bolt takes the GIL to write each `404` line. To write no `404` line, add `404` to `skip_status_codes`. This filter runs in Rust, before the GIL.
+
 The access log has no line for:
 
-- a request that matches no route (`404`),
 - a static or a media file,
 - a mounted ASGI app or an MCP server,
 - a [native route](native-routes.md),
@@ -86,11 +85,38 @@ GET /articles 429 0.1ms | suppressed: 41
 
 ### Change the level
 
-The server reads the level of `django.server` one time, at startup.
+The server reads the level of the logger of each API one time, at startup.
 
 - Set `"level": "WARNING"` to keep only the 4xx and 5xx lines.
 - Set `"level": "ERROR"` to keep only the 5xx lines.
-- Set `"level": "CRITICAL"` to turn the access log off. The server then does no logging work for a request.
+- Set `"level": "CRITICAL"` to turn the access log off. When no API writes to a logger at `ERROR` or a lower level, the server does no logging work for a request.
+
+### Use a logger for each API
+
+`logger_name` sends the lines of an API to its own logger:
+
+```python title="blog/api.py"
+from django_bolt import BoltAPI
+from django_bolt.logging import LoggingConfig
+
+api = BoltAPI(logging_config=LoggingConfig(logger_name="blog.access"))
+```
+
+Each API keeps its logger after `mount()`. Give the logger its level and handlers in `LOGGING`, as for `django.server`:
+
+```python title="blog/settings.py"
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {
+        "blog.access": {"handlers": ["console"], "level": "INFO", "propagate": False},
+    },
+}
+```
+
+An empty `logger_name`, or a value that is not a `str`, raises `ValueError` in `BoltAPI()`.
+
 
 ### Skip paths and status codes
 
@@ -265,7 +291,7 @@ Some startup warnings, for example about a missing static directory, go to stder
 
 When your settings module has no `LOGGING`, `runbolt` configures logging at startup:
 
-- The root logger, `django`, `django.server` and `django_bolt` write to a queue. A background thread writes the queue to stderr.
+- The root logger, `django`, `django.server` and `django_bolt` write to a queue. A background thread writes the queue to stderr. With `--processes` above 1, each worker process starts its own thread.
 - The format is `INFO - 2026-11-21 20:00:28 - django.server - GET /articles 200 0.2ms`.
 - The level is `DEBUG` with `DEBUG = True`, and `WARNING` with `DEBUG = False`. `django.server` keeps the `INFO` level of Django, so the access log stays on.
 - When the queue holds `BOLT_LOG_QUEUE_SIZE` records (10000 by default), Bolt drops new records and prints `django-bolt: log queue saturated, dropped N record(s)`.
@@ -284,15 +310,11 @@ When `runbolt` serves the Django admin, Django sets up its own logging again. Th
 | `min_duration_ms` | `None` | Keep a 1xx to 3xx line only when the response took this time or more. |
 | `exception_logging_handler` | `None` | Callable `(logger, request, exc, exc_info)` for each server error. |
 | `error_log_level` | `"ERROR"` | Level of the server-error record when there is no handler. |
-| `logger_name` | `"django.server"` | Logger of the server-error record. The access log always uses `django.server`. |
-| `request_log_fields` | `{"method", "path", "status_code"}` | Fields of `LoggingMiddleware.log_request()`. |
-| `response_log_fields` | `{"status_code"}` | Fields of `LoggingMiddleware.log_response()`. |
-| `obfuscate_headers` | `{"authorization", "cookie", "x-api-key", "x-auth-token"}` | Headers that `log_request()` writes as `***`. |
-| `obfuscate_cookies` | `{"sessionid", "csrftoken"}` | Cookies that `obfuscate_cookies()` writes as `***`. |
-| `log_request_body` | `False` | Let `log_request()` write the body when `request_log_fields` has `"body"`. |
-| `max_body_log_size` | `1024` | Largest body in bytes that `log_request()` writes. |
+| `logger_name` | `"django.server"` | Logger of the access-log lines and of the server-error record of the API. |
 
-Bolt calls only the exception log of `LoggingMiddleware`. The field and body options apply when your own code calls `log_request()` or `log_response()`. They do not change the access log.
+`LoggingConfig` raises `TypeError` for another option.
+The access-log line has a fixed format: the method, the path, the status and the duration.
+To log more fields of a request, write a [middleware](middleware.md).
 
 ## See also
 

@@ -176,8 +176,32 @@ The middleware of a request runs in this order:
 The response goes back in the reverse order.
 
 Rust runs authentication, guards and rate limits before all Python middleware.
-A request that Rust rejects, for example with a 401 or a 429, does not reach Python middleware. A request that matches no route does not reach it either.
-Thus a logging middleware does not see a 404 for an unknown path. Record such requests at your proxy.
+The middleware still sees most responses that Rust gives before the handler. See [Responses from Rust](#responses-from-rust).
+
+### Responses from Rust
+
+Rust gives some responses before the handler runs:
+
+- a 404 for a path with no route, and a 405 for a method that the path does not have,
+- a 401 or a 403 from authentication, a guard or the CSRF check of a cookie.
+
+Django runs each middleware for such a request, and Bolt does the same. The Python middleware and the Django middleware get the response of Rust as the response of the handler. Thus a request-id middleware adds its header to a 404. The handler does not run.
+
+- A request with no route runs the middleware of the API. It runs no router or route middleware. When `runbolt` serves more than one API, a 404 or a 405 gets the middleware of the first API.
+- A rejection of a route runs all the middleware of the route: the API, router and route middleware.
+- `process_view` does not run, because no view runs. Thus `CsrfViewMiddleware` does not change a 401 or a 403 into a CSRF failure.
+- Bolt does not read the body. `request.body` is empty.
+- A middleware cannot make the handler run.
+
+These responses do not go through the middleware:
+
+- a 429 from a rate limit. The rate limit stops a flood of requests before Python runs.
+- a 422 or a 400 from request validation, and a 413 for a large body,
+- the 308 redirect to the other slash form, and the automatic `OPTIONS` response,
+- the 204 of global CORS to a preflight for a path with no route.
+
+An API with no Python middleware and no Django middleware answers a 404, 405, 401 and 403 in Rust, with no middleware call.
+When the API has middleware, each 404 takes the GIL. Thus a scanner that sends many requests to unknown paths costs Python time.
 
 The config decorators `@middleware`, `@skip_middleware`, `@no_compress`, `@cors` and `@rate_limit` go below the route decorator.
 A config decorator above the route decorator has no effect, so Bolt raises `TypeError` at startup.

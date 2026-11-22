@@ -149,7 +149,7 @@ curl localhost:8000/authors
 The conversion does three things:
 
 - It reads model instances and QuerySets. A `QuerySet` loads only the fields of the type. Return the `QuerySet` and do not iterate it in an async handler.
-- It removes fields that the type does not declare. Thus a handler cannot leak a field by accident.
+- It removes fields that the type does not declare. Thus a handler cannot leak a field by accident. A response object that Bolt does not validate, for example `JSON(...)` with another status, keeps all its fields.
 - It validates the value. A value that does not match gets a 500 response.
 
 `response_model=` on the decorator sets the response type in place of the annotation:
@@ -381,6 +381,20 @@ async def cached_article(article_id: int):
 ```
 
 Each header value must be a `str`. A value of another type gets a 500 response.
+
+Each response copies its `headers` dict. A change to `response.headers` does not change the dict that you give.
+Thus many responses can share one module-level dict:
+
+```python
+COMMON_HEADERS = {"X-Service": "blog"}
+
+
+@api.get("/articles/{article_id}/counted")
+async def counted_article(article_id: int):
+    response = JSON({"id": article_id}, headers=COMMON_HEADERS)
+    response.headers["X-Count"] = "1"  # COMMON_HEADERS does not change
+    return response
+```
 
 ## Set and delete cookies
 

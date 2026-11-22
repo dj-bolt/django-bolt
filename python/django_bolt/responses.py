@@ -193,7 +193,7 @@ class Response(CookieMixin):
     ):
         self.content = content if content is not None else {}
         self.status_code = status_code
-        self.headers = headers or {}
+        self.headers = dict(headers) if headers else {}
         self.media_type = media_type
 
     def to_bytes(self) -> bytes:
@@ -216,7 +216,7 @@ class JSON(CookieMixin):
     def __init__(self, data: Any, status_code: int = 200, headers: dict[str, str] | None = None):
         self.data = data
         self.status_code = status_code
-        self.headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
     def to_bytes(self) -> bytes:
         return _json.encode(self.data)
@@ -226,7 +226,7 @@ class PlainText(CookieMixin):
     def __init__(self, text: str, status_code: int = 200, headers: dict[str, str] | None = None):
         self.text = text
         self.status_code = status_code
-        self.headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
     def to_bytes(self) -> bytes:
         return self.text.encode()
@@ -236,7 +236,7 @@ class HTML(CookieMixin):
     def __init__(self, html: str, status_code: int = 200, headers: dict[str, str] | None = None):
         self.html = html
         self.status_code = status_code
-        self.headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
     def to_bytes(self) -> bytes:
         return self.html.encode()
@@ -246,7 +246,7 @@ class Redirect(CookieMixin):
     def __init__(self, url: str, status_code: int = 307, headers: dict[str, str] | None = None):
         self.url = url
         self.status_code = status_code
-        self.headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
 
 class File(CookieMixin):
@@ -263,7 +263,7 @@ class File(CookieMixin):
         self.media_type = media_type
         self.filename = filename
         self.status_code = status_code
-        self.headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
     def read_bytes(self) -> bytes:
         # The lookup of FileResponse, so a path that names no regular file is a 404.
@@ -287,7 +287,7 @@ class FileResponse(CookieMixin):
         self.media_type = media_type
         self.filename = filename
         self.status_code = status_code
-        self.headers = headers or {}
+        self.headers = dict(headers) if headers else {}
 
 
 class StreamingResponse(CookieMixin):

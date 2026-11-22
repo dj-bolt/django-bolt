@@ -17,6 +17,7 @@ from django.conf import settings as django_settings
 
 from .._serializer_input import any_serializer
 from ..datastructures import UploadFile
+from ..pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, PaginationBase
 from ..responses import (
     HTML,
     EventSourceResponse,
@@ -863,6 +864,15 @@ class SchemaGenerator:
 
         # Extract parameters
         parameters = self._extract_parameters(meta, path)
+        pagination_class = getattr(handler, "__pagination_class__", None)
+        if pagination_class is not None:
+            # A parameter of the handler with the same name stays. A query name is documented one time.
+            documented = {(parameter.param_in, parameter.name) for parameter in parameters}
+            parameters.extend(
+                parameter
+                for parameter in self._pagination_parameters(pagination_class)
+                if (parameter.param_in, parameter.name) not in documented
+            )
 
         # Extract request body
         request_body = self._extract_request_body(meta)
@@ -1010,6 +1020,42 @@ class SchemaGenerator:
         )
 
         return operation
+
+    @staticmethod
+    def _pagination_parameters(pagination_class: type[PaginationBase]) -> list[Parameter]:
+        """Return the query parameters that ``pagination_class`` reads.
+
+        The schemas use the attributes of the class. A value out of range does not
+        give an error. The pagination uses its default or its limit in place of it.
+        """
+        max_page_size = pagination_class.max_page_size
+        page_size = Schema(
+            type="integer",
+            minimum=1,
+            maximum=max_page_size,
+            default=min(pagination_class.page_size, max_page_size),
+        )
+
+        def query(name: str, schema: Schema, description: str) -> Parameter:
+            return Parameter(name=name, param_in="query", required=False, schema=schema, description=description)
+
+        if issubclass(pagination_class, LimitOffsetPagination):
+            return [
+                query("limit", page_size, "Maximum number of items to return."),
+                query("offset", Schema(type="integer", minimum=0, default=0), "Number of items to skip."),
+            ]
+        parameters = []
+        if issubclass(pagination_class, PageNumberPagination):
+            parameters.append(query("page", Schema(type="integer", minimum=1, default=1), "Page number."))
+        elif issubclass(pagination_class, CursorPagination):
+            parameters.append(
+                query(
+                    "cursor", Schema(type="string"), "The next_cursor of the previous page. Omit it for the first page."
+                )
+            )
+        if pagination_class.page_size_query_param:
+            parameters.append(query(pagination_class.page_size_query_param, page_size, "Number of items on a page."))
+        return parameters
 
     @staticmethod
     def _route_fields(meta: dict[str, Any]) -> list[Any]:
