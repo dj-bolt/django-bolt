@@ -79,7 +79,7 @@ def _gil_stays_disabled():
 
 
 @pytest.fixture
-def bolt_logging_state():
+def bolt_logging_state(capsys):
     """Restore the logging state of Django-Bolt after the test.
 
     ``setup_django_logging()`` puts a queue handler on the root logger and on
@@ -90,6 +90,11 @@ def bolt_logging_state():
     stream, and ``logging`` writes "--- Logging error ---" to the stderr of that
     later test. Use this fixture in each test that calls ``setup_django_logging()``,
     for example through ``call_command("runbolt")``.
+
+    The fixture requests ``capsys``, so the listener writes to the stream of
+    ``capsys``. pytest closes ``capsys`` after this fixture. Thus the teardown
+    stops the listener while its stream is open, and the listener can write
+    the records that stay in the queue.
     """
     saved_loggers = [
         (logger, logger.handlers[:], logger.level, logger.propagate)
