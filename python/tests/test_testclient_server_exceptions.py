@@ -298,8 +298,51 @@ async def async_chunks():
     raise Boom("async stream")
 
 
+class NextOnlyChunks:
+    """A stream with ``__next__`` and no ``__iter__``. Bolt reads such an object directly."""
+
+    def __init__(self) -> None:
+        self.sent = False
+
+    def __next__(self) -> bytes:
+        if self.sent:
+            raise Boom("next-only stream")
+        self.sent = True
+        return b"first,"
+
+
+class FailingAsyncIterable:
+    def __aiter__(self):
+        raise Boom("aiter stream")
+
+
+class ClosableChunks:
+    """A stream that frees a resource in ``close()``."""
+
+    def __init__(self) -> None:
+        self.items = iter([b"a,", b"b"])
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> bytes:
+        return next(self.items)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def make_stream_api() -> BoltAPI:
     api = BoltAPI()
+
+    @api.get("/next-only-stream")
+    def next_only_stream():
+        return StreamingResponse(NextOnlyChunks(), media_type="text/plain")
+
+    @api.get("/aiter-stream")
+    async def aiter_stream():
+        return StreamingResponse(FailingAsyncIterable(), media_type="text/plain")
 
     @api.get("/sync-stream")
     def sync_stream():
@@ -320,10 +363,14 @@ def make_stream_api() -> BoltAPI:
     return api
 
 
-STREAMS = [("/sync-stream", "sync stream"), ("/async-stream", "async stream")]
+STREAMS = [
+    ("/sync-stream", "sync stream"),
+    ("/async-stream", "async stream"),
+    ("/next-only-stream", "next-only stream"),
+]
 
 
-@pytest.mark.parametrize(("path", "message"), STREAMS)
+@pytest.mark.parametrize(("path", "message"), [*STREAMS, ("/aiter-stream", "aiter stream")])
 def test_an_exception_of_a_streaming_body_is_raised(path, message, caplog):
     with TestClient(make_stream_api()) as client, pytest.raises(Boom, match=f"^{message}$"):
         client.get(path)
@@ -345,3 +392,19 @@ def test_a_good_stream_has_its_body_and_headers_only():
     assert response.content == b"a,b"
     assert response.headers["x-kept"] == "yes"
     assert not [name for name in response.headers if name.startswith("x-django-bolt")]
+
+
+def test_the_client_closes_the_stream_after_its_last_chunk():
+    """The wrapper of the client closes the stream, as Bolt does without it."""
+    api = BoltAPI()
+    chunks = ClosableChunks()
+
+    @api.get("/closable-stream")
+    def closable_stream():
+        return StreamingResponse(chunks, media_type="text/plain")
+
+    with TestClient(api) as client:
+        response = client.get("/closable-stream")
+
+    assert response.content == b"a,b"
+    assert chunks.closed

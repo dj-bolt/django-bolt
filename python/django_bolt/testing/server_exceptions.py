@@ -72,25 +72,41 @@ class ServerExceptions:
         token = str(next(self._tokens))
         if stream.is_async_generator:
             stream.content = _record_async(content, self._held, token)
-        elif hasattr(content, "__iter__"):
+        elif hasattr(content, "__next__") or hasattr(content, "__iter__"):
             stream.content = _record_sync(content, self._held, token)
         headers = [*(headers or ()), (TOKEN_HEADER, token)]
         return status, (response_type, content_type, headers, cookies), body_kind, stream
 
 
 def _record_sync(content: Any, held: dict[str, BaseException], token: str) -> Iterator[Any]:
-    """Yield the chunks of ``content``, and record the exception that ends it."""
+    """Yield the chunks of ``content``, and record the exception that ends it.
+
+    It takes and closes the iterator as the Rust stream does: ``content`` itself
+    when it has ``__next__``, else ``iter(content)``.
+    """
+    iterator = None
     try:
-        yield from content
+        iterator = content if hasattr(content, "__next__") else iter(content)
+        while True:
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            yield item
     except Exception as error:
         held[token] = error
         raise
+    finally:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            close()
 
 
 async def _record_async(content: Any, held: dict[str, BaseException], token: str) -> AsyncIterator[Any]:
     """Yield the chunks of ``content``, and record the exception that ends it."""
-    iterator = content.__aiter__() if hasattr(content, "__aiter__") else content
+    iterator = None
     try:
+        iterator = content.__aiter__() if hasattr(content, "__aiter__") else content
         while True:
             try:
                 item = await iterator.__anext__()
