@@ -135,6 +135,7 @@ def bound_dispatches(
     if exceptions is None:
         return dispatch, dispatch_sync
 
+    # A middleware can clear request.state, so each pop has a default.
     async def checked_dispatch(request: Any) -> Any:
         state = request.state
         state[SERVER_EXCEPTION_STATE_KEY] = None
@@ -144,7 +145,7 @@ def bound_dispatches(
             return exceptions.error_wire(error)
         finally:
             # The exception holds the request in its traceback. The state must not hold it.
-            kept = state.pop(SERVER_EXCEPTION_STATE_KEY)
+            kept = state.pop(SERVER_EXCEPTION_STATE_KEY, None)
         return exceptions.check(wire, kept)
 
     def checked_dispatch_sync(request: Any) -> Any:
@@ -153,7 +154,7 @@ def bound_dispatches(
         try:
             result = dispatch_sync(request)
         except Exception as error:
-            state.pop(SERVER_EXCEPTION_STATE_KEY)
+            state.pop(SERVER_EXCEPTION_STATE_KEY, None)
             return exceptions.error_wire(error)
         if callable(result):
             # Rust awaits the call on the worker loop, for example to load a QuerySet.
@@ -163,10 +164,10 @@ def bound_dispatches(
                 except Exception as error:
                     return exceptions.error_wire(error)
                 finally:
-                    kept = state.pop(SERVER_EXCEPTION_STATE_KEY)
+                    kept = state.pop(SERVER_EXCEPTION_STATE_KEY, None)
                 return exceptions.check(wire, kept)
 
             return checked_result
-        return exceptions.check(result, state.pop(SERVER_EXCEPTION_STATE_KEY))
+        return exceptions.check(result, state.pop(SERVER_EXCEPTION_STATE_KEY, None))
 
     return checked_dispatch, checked_dispatch_sync

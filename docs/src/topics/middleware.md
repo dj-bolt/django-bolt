@@ -448,7 +448,7 @@ Bolt makes the error response inside the middleware chain, as Django does. Thus 
 
 `get_response(request)` does not raise the exception of the handler. It returns the error response. To handle the exception in a middleware, use `process_exception`. A Bolt middleware around a Django middleware gets the error response from `call_next` too.
 
-A request with no route, or a request that Rust rejects before the handler (authentication, guards, rate limit), does not run the Django middleware.
+The Django middleware also gets a response that Rust gives before the handler. See [Responses from Rust](#responses-from-rust).
 
 A list of wrappers runs the hooks in a different order from Django. Each wrapper runs its `process_request` and then its `process_view`, before the next wrapper starts. Django runs all `process_request` hooks first, and then all `process_view` hooks. If the order of the hooks is important, use `django_middleware=[...]` or `DjangoMiddlewareStack`. They use the order of Django.
 
@@ -621,7 +621,27 @@ A Python middleware before the Django middleware runs before any Django hook, as
 
 Rust-handled middleware configs (for example `@cors` and `@rate_limit`) are still compiled from metadata and executed in Rust.
 
-Python middleware and Django middleware run only for a request that matches a route. Rust answers a request that matches no route, for example with a 404, and no middleware sees it. This is different from Django, where each middleware in `MIDDLEWARE` also sees a request that gets a 404. Thus a logging middleware does not record these requests, and a tenant middleware does not set a tenant for them. The access log of Bolt also has no line for them, so record them at the proxy in front of Bolt.
+### Responses from Rust
+
+Rust gives some responses before the handler runs:
+
+- a 404 for a path with no route, and a 405 for a method that the path does not have
+- a 401 or a 403 from authentication, a guard or the CSRF check of a cookie
+
+Django runs each middleware for such a request. Bolt does the same. The Python middleware and the Django middleware get the response of Rust as the response of the handler. Thus a request-id middleware adds its header to a 404, and a tenant middleware sets the tenant for it. The handler does not run.
+
+- A request with no route runs the middleware of the API. It does not run router or route middleware, because it has no route. When `runbolt` serves more than one API, the request gets the middleware of the first API. A 405 also gets the middleware of the first API. Its access-log line uses the config of the API of its path.
+- A rejection of a route runs all the middleware of the route: the API, router and route middleware.
+- `process_view` does not run for these requests, because no view runs. Thus `CsrfViewMiddleware` does not change a 401 or a 403 into a CSRF failure.
+- Bolt does not read the body of these requests. `request.body` is empty.
+- With an `error_formatter`, the middleware gets the formatted response.
+- A middleware cannot make the handler run. The response of Rust stays when a middleware removes values from `request.state`.
+
+A 429 from a rate limit does not go through the middleware. The rate limit stops a flood of requests before Python runs. Thus a request-id middleware or a tenant middleware does not see a 429.
+
+An API with no Python middleware and no Django middleware answers a 404, a 405, a 401 and a 403 in Rust, with no middleware call. The access log and an `error_formatter` can still call Python for such a response. A route with no Python middleware also answers its rejections in Rust. When the API has Python middleware or Django middleware, each 404 takes the GIL and runs the middleware. Thus a scanner that sends many requests to paths with no route costs Python time for each request.
+
+Other early responses of Rust do not go through the middleware. Examples are a 422 or a 400 from request validation and a 413 for a large body. The 308 redirect to the other slash form and the automatic `OPTIONS` answer also do not. The 204 answer of global CORS to a preflight for a path with no route also does not.
 
 ## Performance
 

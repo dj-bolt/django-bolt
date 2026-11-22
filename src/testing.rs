@@ -428,6 +428,7 @@ pub fn destroy_test_app(app_id: u64) -> PyResult<()> {
 
 /// Register HTTP routes for a test app
 #[pyfunction]
+#[pyo3(signature = (app_id, routes, native_routes, no_route=None))]
 #[expect(
     clippy::type_complexity,
     reason = "PyO3 wire format: Python passes each route as one tuple"
@@ -437,8 +438,9 @@ pub fn register_test_routes(
     app_id: u64,
     routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
     native_routes: Vec<crate::native::NativeRouteSpec>,
+    no_route: Option<crate::native::NoRouteSpec>,
 ) -> PyResult<()> {
-    let router = crate::native::build_router(py, routes, native_routes)?;
+    let router = crate::native::build_router(py, routes, native_routes, no_route)?;
     let entry = test_app(app_id)?;
     entry.write().router = Arc::new(router);
     Ok(())

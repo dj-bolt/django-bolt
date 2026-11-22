@@ -590,6 +590,20 @@ def _validate_option_ranges(options) -> None:
             raise CommandError(f"{flag} must be at most {highest}, got {value}")
 
 
+def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int, handler) -> None:
+    """Copy one handler of ``api`` into ``merged`` with a new handler id.
+
+    The handler keeps the API that owns it, so it keeps the logging, auth and
+    middleware of that API. A route that ``api`` mounted keeps its sub-app.
+    """
+    merged._handlers[new_handler_id] = handler
+    merged._handler_api_map[new_handler_id] = api._handler_api_map.get(old_handler_id, api)
+    if old_handler_id in api._handler_meta:
+        merged._handler_meta[new_handler_id] = api._handler_meta[old_handler_id]
+    if old_handler_id in api._handler_middleware:
+        merged._handler_middleware[new_handler_id] = api._handler_middleware[old_handler_id]
+
+
 class Command(BaseCommand):
     help = "Run Django-Bolt server with autodiscovered APIs"
 
@@ -1007,7 +1021,7 @@ class Command(BaseCommand):
             )
 
         try:
-            _core.register_routes(rust_routes, list(merged_api._native_routes))
+            _core.register_routes(rust_routes, list(merged_api._native_routes), merged_api._rust_no_route())
         except ValueError as e:
             raise CommandError(str(e)) from e
 
@@ -1424,25 +1438,7 @@ class Command(BaseCommand):
 
                 route_map[route_key] = api_path
                 merged._routes.append((method, path, new_handler_id, handler))
-                merged._handlers[new_handler_id] = handler
-
-                # CRITICAL: Store reference to original API for this handler
-                # For mounted sub-apps, preserve the sub-app reference (has its own middleware)
-                # Otherwise use the API that owns this route
-                if hasattr(api, "_handler_api_map") and old_handler_id in api._handler_api_map:
-                    # This route was mounted from a sub-app - preserve that reference
-                    merged._handler_api_map[new_handler_id] = api._handler_api_map[old_handler_id]
-                else:
-                    # Route belongs directly to this API
-                    merged._handler_api_map[new_handler_id] = api
-
-                # Merge handler metadata (use handler_id as key, old_handler_id is already in the tuple)
-                if old_handler_id in api._handler_meta:
-                    merged._handler_meta[new_handler_id] = api._handler_meta[old_handler_id]
-
-                # Merge middleware metadata (use NEW handler_id)
-                if old_handler_id in api._handler_middleware:
-                    merged._handler_middleware[new_handler_id] = api._handler_middleware[old_handler_id]
+                _merge_handler(merged, api, old_handler_id, new_handler_id, handler)
 
             # Merge WebSocket routes from this API
             for path, old_ws_handler_id, ws_handler in api._websocket_routes:
@@ -1461,21 +1457,7 @@ class Command(BaseCommand):
 
                 route_map[ws_route_key] = api_path
                 merged._websocket_routes.append((path, new_ws_handler_id, ws_handler))
-                merged._handlers[new_ws_handler_id] = ws_handler
-
-                # Store reference to original API (or sub-app for mounted routes)
-                if hasattr(api, "_handler_api_map") and old_ws_handler_id in api._handler_api_map:
-                    merged._handler_api_map[new_ws_handler_id] = api._handler_api_map[old_ws_handler_id]
-                else:
-                    merged._handler_api_map[new_ws_handler_id] = api
-
-                # Merge handler metadata for WebSocket (use handler_id as key, old_ws_handler_id is already in the tuple)
-                if old_ws_handler_id in api._handler_meta:
-                    merged._handler_meta[new_ws_handler_id] = api._handler_meta[old_ws_handler_id]
-
-                # Merge middleware metadata for WebSocket
-                if old_ws_handler_id in api._handler_middleware:
-                    merged._handler_middleware[new_ws_handler_id] = api._handler_middleware[old_ws_handler_id]
+                _merge_handler(merged, api, old_ws_handler_id, new_ws_handler_id, ws_handler)
 
             # Merge HTTP ASGI mounts from this API
             for asgi_prefix, asgi_app in getattr(api, "_asgi_mounts", []):
@@ -1526,6 +1508,15 @@ class Command(BaseCommand):
                 "The APIs set different error_formatter values. Set the same error_formatter on each API, or on one."
             )
         merged._error_formatter = formatters[0] if formatters else None
+
+        # A request that matches no route belongs to no API. It gets the route
+        # of the first API: its middleware and its access-log filter, as the
+        # docs routes get the middleware of the first API.
+        first_api = apis[0][1]
+        no_route_id, no_route_handler = first_api._no_route_handler()
+        merged._no_route = (next_handler_id, no_route_handler)
+        _merge_handler(merged, first_api, no_route_id, next_handler_id, no_route_handler)
+        next_handler_id += 1
 
         # Update next handler ID
         merged._next_handler_id = next_handler_id
