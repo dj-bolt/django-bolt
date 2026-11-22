@@ -183,5 +183,6 @@ fn error_request(py: Python<'_>, req: &HttpRequest, state: &AppState) -> PyResul
         conn_host,
         conn_scheme,
         conn_remote_addr,
+        rust_answer: None,
     })
 }

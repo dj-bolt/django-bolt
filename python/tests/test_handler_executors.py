@@ -455,7 +455,7 @@ def test_a_queryset_from_a_sync_handler_with_a_response_type(middleware):
 
     Article.objects.create(title="One", content="First", author="A")
     # With DEBUG off, the body of a response validation error hides the errors.
-    with override_settings(DEBUG=True), TestClient(api) as client:
+    with override_settings(DEBUG=True), TestClient(api, raise_server_exceptions=False) as client:
         lists = [client.get(path, params={"q": "bolt"}) for path in ("/rows", "/rows/O")]
         singles = [client.get(path, params={"q": "bolt"}) for path in ("/row", "/row/O")]
 

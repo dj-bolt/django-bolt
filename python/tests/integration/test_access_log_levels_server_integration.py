@@ -5,30 +5,13 @@ from __future__ import annotations
 import pytest
 
 from .apps import app_module
-
-_LOGGING = """
-LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {"plain": {"format": "%(levelname)s %(message)s"}},
-    "handlers": {
-        "file": {
-            "class": "logging.FileHandler",
-            "filename": str(BASE_DIR / "access.log"),
-            "formatter": "plain",
-        }
-    },
-    "loggers": {
-        "django.server": {"handlers": ["file"], "level": "{level}", "propagate": False}
-    },
-}
-"""
+from .helpers import access_log_settings
 
 
 def _run(make_server_project, level: str) -> list[str]:
     project = make_server_project(
         api_module=app_module("access_log_levels"),
-        settings_extra=_LOGGING.replace("{level}", level),
+        settings_extra=access_log_settings(level),
     )
     with project.start(startup_path="/health") as server:
         for path in ("/ok", "/gone", "/down", "/teapot"):

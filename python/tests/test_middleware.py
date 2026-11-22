@@ -2071,6 +2071,40 @@ def test_python_middleware_response_headers_behave_as_a_case_insensitive_mapping
     assert response.headers["x-ior-pair"] == "5"
 
 
+def test_a_middleware_header_does_not_go_into_the_headers_dict_of_a_response_object():
+    """A header that a middleware writes stays on its response (#867)."""
+    shared = {"X-Service": "api"}
+    count = 0
+
+    class AnswerWithSharedHeaders(Middleware):
+        async def process_request(self, request):
+            return JSON({"cached": True}, headers=shared)
+
+    class StampRequestNumber(Middleware):
+        async def process_request(self, request):
+            nonlocal count
+            response = await self.get_response(request)
+            count += 1
+            response.headers[f"X-Request-{count}"] = "yes"
+            return response
+
+    api = BoltAPI(middleware=[StampRequestNumber, AnswerWithSharedHeaders])
+
+    @api.get("/tea")
+    async def tea():
+        return {"handler": True}
+
+    with TestClient(api) as client:
+        first = client.get("/tea")
+        second = client.get("/tea")
+
+    assert shared == {"X-Service": "api"}
+    assert first.headers["x-service"] == second.headers["x-service"] == "api"
+    assert first.headers["x-request-1"] == "yes"
+    assert second.headers["x-request-2"] == "yes"
+    assert "x-request-1" not in second.headers
+
+
 if __name__ == "__main__":
     # Run basic tests
     print("Testing middleware decorators...")

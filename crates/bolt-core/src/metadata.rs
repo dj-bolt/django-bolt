@@ -428,6 +428,7 @@ impl RouteExecutionPlan {
     const CAN_SYNC_DISPATCH: u16 = 1 << 9;
     const IS_ASYNC: u16 = 1 << 10;
     const CAN_LANE_DISPATCH: u16 = 1 << 11;
+    const RUNS_PYTHON_MIDDLEWARE: u16 = 1 << 12;
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
@@ -443,6 +444,7 @@ impl RouteExecutionPlan {
         can_sync_dispatch: bool,
         is_async: bool,
         can_lane_dispatch: bool,
+        runs_python_middleware: bool,
     ) -> Self {
         let mut bits = 0u16;
         if needs_body {
@@ -480,6 +482,9 @@ impl RouteExecutionPlan {
         }
         if can_lane_dispatch {
             bits |= Self::CAN_LANE_DISPATCH;
+        }
+        if runs_python_middleware {
+            bits |= Self::RUNS_PYTHON_MIDDLEWARE;
         }
         Self { bits }
     }
@@ -542,6 +547,13 @@ impl RouteExecutionPlan {
     #[inline]
     pub const fn is_async(self) -> bool {
         (self.bits & Self::IS_ASYNC) != 0
+    }
+
+    /// The route runs Python or Django middleware. A response that Rust gives
+    /// before the handler then goes through that middleware.
+    #[inline]
+    pub const fn runs_python_middleware(self) -> bool {
+        (self.bits & Self::RUNS_PYTHON_MIDDLEWARE) != 0
     }
 }
 
@@ -630,8 +642,8 @@ pub struct RouteMetadata {
     /// callable that takes the auth context and returns True for a revoked
     /// token. The handshake awaits it before the upgrade.
     pub websocket_revocation_check: Option<Arc<Py<PyAny>>>,
-    /// Sampling and the slow-request threshold of the access log, from the
-    /// `LoggingConfig` of the API of the route.
+    /// The logger, the sampling, the skips and the slow-request threshold of
+    /// the access log, from the `LoggingConfig` of the API of the route.
     pub access_log_filter: AccessLogFilter,
 }
 
@@ -887,6 +899,12 @@ impl RouteMetadata {
             .flatten()
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false);
+        let runs_python_middleware = py_meta
+            .get_item("runs_python_middleware")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false);
         let plan = RouteExecutionPlan::from_parts(
             needs_body,
             needs_query,
@@ -900,6 +918,7 @@ impl RouteMetadata {
             can_sync_dispatch,
             is_async,
             can_lane_dispatch,
+            runs_python_middleware,
         );
 
         // Form field type hints (same format as path_types)
@@ -1735,7 +1754,7 @@ mod tests {
     // ---- RouteExecutionPlan ----
 
     /// The plan in the order of the arguments of `from_parts`.
-    fn readings(plan: RouteExecutionPlan) -> [bool; 12] {
+    fn readings(plan: RouteExecutionPlan) -> [bool; 13] {
         [
             plan.needs_body(),
             plan.needs_query(),
@@ -1749,37 +1768,38 @@ mod tests {
             plan.can_sync_dispatch(),
             plan.is_async(),
             plan.can_lane_dispatch(),
+            plan.runs_python_middleware(),
         ]
     }
 
-    fn only(index: usize) -> [bool; 12] {
-        let mut flags = [false; 12];
+    fn only(index: usize) -> [bool; 13] {
+        let mut flags = [false; 13];
         flags[index] = true;
         flags
     }
 
-    fn plan_of(f: [bool; 12]) -> RouteExecutionPlan {
+    fn plan_of(f: [bool; 13]) -> RouteExecutionPlan {
         RouteExecutionPlan::from_parts(
-            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11],
+            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12],
         )
     }
 
     #[test]
     fn an_empty_plan_has_no_flag() {
-        assert_eq!(readings(plan_of([false; 12])), [false; 12]);
-        assert_eq!(readings(RouteExecutionPlan::default()), [false; 12]);
+        assert_eq!(readings(plan_of([false; 13])), [false; 13]);
+        assert_eq!(readings(RouteExecutionPlan::default()), [false; 13]);
     }
 
     #[test]
     fn each_plan_argument_sets_only_its_own_flag() {
-        for index in 0..12 {
+        for index in 0..13 {
             assert_eq!(readings(plan_of(only(index))), only(index), "flag {index}");
         }
     }
 
     #[test]
     fn a_plan_keeps_all_flags_when_all_are_set() {
-        assert_eq!(readings(plan_of([true; 12])), [true; 12]);
+        assert_eq!(readings(plan_of([true; 13])), [true; 13]);
     }
 
     // ---- RateLimitKey and the config defaults ----
@@ -2376,7 +2396,7 @@ mod tests {
     #[test]
     fn a_route_with_every_flag_off_has_an_empty_plan() {
         let meta = route("");
-        assert_eq!(readings(meta.plan), [false; 12]);
+        assert_eq!(readings(meta.plan), [false; 13]);
         assert!(!meta.needs_path_params && !meta.is_static_route);
         assert_eq!(meta.default_status_code, 200);
         assert!(meta.auth_backends.is_empty() && meta.guards.is_empty());
@@ -2522,7 +2542,7 @@ mod tests {
 
         assert_eq!(readings(route("'skip': ['cors']").plan), only(5));
         assert_eq!(readings(route("'skip': ['compression']").plan), only(6));
-        assert_eq!(readings(route("'skip': ['other']").plan), [false; 12]);
+        assert_eq!(readings(route("'skip': ['other']").plan), [false; 13]);
         // A skip value that is not a list of str is ignored.
         assert!(route("'skip': 'cors'").skip.is_empty());
         assert!(route("'skip': None").skip.is_empty());
@@ -2534,9 +2554,17 @@ mod tests {
         assert_eq!(readings(route("'is_async': True").plan), only(10));
         assert_eq!(readings(route("'can_lane_dispatch': True").plan), only(11));
         let off = route("'can_sync_dispatch': 'yes', 'is_async': 1, 'can_lane_dispatch': None");
-        assert_eq!(readings(off.plan), [false; 12]);
+        assert_eq!(readings(off.plan), [false; 13]);
         let all = route("'can_sync_dispatch': True, 'is_async': True, 'can_lane_dispatch': True");
-        assert_eq!(readings(all.plan)[9..], [true, true, true]);
+        assert_eq!(readings(all.plan)[9..12], [true, true, true]);
+        assert_eq!(
+            readings(route("'runs_python_middleware': True").plan),
+            only(12)
+        );
+        assert_eq!(
+            readings(route("'runs_python_middleware': 1").plan),
+            [false; 13]
+        );
     }
 
     #[test]
@@ -2705,11 +2733,11 @@ mod tests {
 
         let meta = route("'guards': [{'type': 'allow_any'}]");
         assert!(!meta.guards.is_empty() && !meta.guards.is_enforcing());
-        assert_eq!(readings(meta.plan), [false; 12]);
+        assert_eq!(readings(meta.plan), [false; 13]);
 
         let meta = route("'guards': None");
         assert!(meta.guards.is_empty());
-        assert_eq!(readings(meta.plan), [false; 12]);
+        assert_eq!(readings(meta.plan), [false; 13]);
     }
 
     #[test]
