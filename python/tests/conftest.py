@@ -17,6 +17,8 @@ import pytest
 from hypothesis import settings as hypothesis_settings
 from hypothesis.database import DirectoryBasedExampleDatabase
 
+import django_bolt.logging.config as logging_config
+
 # Suppress httpx INFO logs during tests
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -74,6 +76,50 @@ def _gil_stays_disabled():
             "An imported C extension enabled the GIL. A RuntimeWarning names the module. "
             "Find it in stderr at startup, or in the error of the test that imported it."
         )
+
+
+@pytest.fixture
+def bolt_logging_state(capsys):
+    """Restore the logging state of Django-Bolt after the test.
+
+    ``setup_django_logging()`` puts a queue handler on the root logger and on
+    the ``django``, ``django.server`` and ``django_bolt`` loggers. Its queue
+    listener thread writes to the ``sys.stderr`` of the test, a stream that
+    pytest closes at the end of the test. Without this fixture, the listener
+    continues in the process. A record of a later test then fails on the closed
+    stream, and ``logging`` writes "--- Logging error ---" to the stderr of that
+    later test. Use this fixture in each test that calls ``setup_django_logging()``,
+    for example through ``call_command("runbolt")``.
+
+    The fixture requests ``capsys``, so the listener writes to the stream of
+    ``capsys``. pytest closes ``capsys`` after this fixture. Thus the teardown
+    stops the listener while its stream is open, and the listener can write
+    the records that stay in the queue.
+    """
+    saved_loggers = [
+        (logger, logger.handlers[:], logger.level, logger.propagate)
+        for logger in map(logging.getLogger, ("", "django", "django.server", "django_bolt"))
+    ]
+    configured = logging_config._LOGGING_CONFIGURED
+    listener = logging_config._QUEUE_LISTENER
+    queue = logging_config._QUEUE
+    listener_running = listener is not None and listener._thread is not None
+
+    yield
+
+    current = logging_config._QUEUE_LISTENER
+    if current is not None and current is not listener and current._thread is not None:
+        current.stop()
+    # setup_django_logging(force=True) stops the listener that was running before the test.
+    if listener_running and listener._thread is None:
+        listener.start()
+    logging_config._LOGGING_CONFIGURED = configured
+    logging_config._QUEUE_LISTENER = listener
+    logging_config._QUEUE = queue
+    for logger, handlers, level, propagate in saved_loggers:
+        logger.handlers[:] = handlers
+        logger.setLevel(level)
+        logger.propagate = propagate
 
 
 def pytest_configure(config):
