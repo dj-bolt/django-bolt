@@ -16,7 +16,7 @@ Example:
 """
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from functools import cache
 from typing import TYPE_CHECKING, Any
@@ -31,7 +31,7 @@ from ._view_context import _current_action, _current_request
 from .exceptions import HTTPException
 from .pagination import PaginationBase
 from .request import Request
-from .serializers.base import Serializer
+from .serializers.base import _RELATION_ATTNAMES, Serializer, _relation_attnames
 
 
 def _layer(value: bool | None, outer: bool | None) -> bool | None:
@@ -119,6 +119,33 @@ def _has_database_primary_key(model: type[Model]) -> bool:
     while pk.remote_field is not None and pk.remote_field.parent_link:
         pk = pk.remote_field.model._meta.pk
     return isinstance(pk, AutoField)
+
+
+def _column_values(model: type[Model], values: Iterable[tuple[str, Any]], skip: frozenset[str]) -> dict[str, Any]:
+    """Return the attribute values for a ``model`` instance, without the ``skip`` fields.
+
+    A ForeignKey or OneToOneField field can hold the primary key of the related row
+    (``author: int``). This value goes to the column attribute (``author_id``), as in
+    ``Serializer.to_model()``. A model instance and the dict of a nested serializer
+    stay on the relation. The map of the relations is made one time for each model.
+    A relation is also left out when ``skip`` names its column attribute.
+    """
+    relation_attnames = _RELATION_ATTNAMES.get(model)
+    if relation_attnames is None:
+        relation_attnames = _relation_attnames(model)
+    result = {}
+    for name, value in values:
+        if name in skip:
+            continue
+        attname = relation_attnames.get(name)
+        if attname is not None:
+            # A value on the relation also writes its column, for example a lookup field.
+            if attname in skip:
+                continue
+            if not isinstance(value, (Model, dict)):
+                name = attname
+        result[name] = value
+    return result
 
 
 class APIView:
@@ -707,7 +734,7 @@ class CreateMixin(_ViewSet):
         skip = serializer_class.__read_only_fields__
         if _has_database_primary_key(model):
             skip = skip | _primary_key_names(model)
-        obj = model(**{name: value for name, value in validated_obj.to_dict().items() if name not in skip})
+        obj = model(**_column_values(model, validated_obj.to_dict().items(), skip))
         try:
             await self.perform_create(obj)
         except IntegrityError as e:
@@ -738,9 +765,8 @@ class UpdateMixin(_ViewSet):
 
         # Update object fields
         skip = self._unwritable_fields(serializer_class, obj)
-        for key, value in validated_obj.to_dict().items():
-            if key not in skip:
-                setattr(obj, key, value)
+        for key, value in _column_values(type(obj), validated_obj.to_dict().items(), skip).items():
+            setattr(obj, key, value)
 
         # Save object
         await self.perform_update(obj)
@@ -790,8 +816,9 @@ class PartialUpdateMixin(_ViewSet):
         validated_obj = msgspec.convert(merged_data, type=serializer_class)
 
         # Apply only the patched fields, but use the validated values.
-        for field_name in patch_data:
-            setattr(obj, field_name, getattr(validated_obj, field_name))
+        patched = ((field_name, getattr(validated_obj, field_name)) for field_name in patch_data)
+        for key, value in _column_values(type(obj), patched, skip).items():
+            setattr(obj, key, value)
 
         # Save object
         await self.perform_update(obj)
