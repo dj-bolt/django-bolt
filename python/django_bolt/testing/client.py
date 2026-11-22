@@ -385,7 +385,7 @@ class TestClient(httpx.Client):
             (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
             for method, path, handler_id, handler in api._routes
         ]
-        _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes))
+        _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes), api._rust_no_route())
 
         # Register WebSocket routes with pre-compiled injectors (same as production)
         ws_routes = []
@@ -714,7 +714,7 @@ class AsyncTestClient(httpx.AsyncClient):
             (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
             for method, path, handler_id, handler in api._routes
         ]
-        _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes))
+        _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes), api._rust_no_route())
 
         # Register WebSocket routes
         ws_routes = []

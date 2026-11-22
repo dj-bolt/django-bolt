@@ -45,6 +45,8 @@ def _run(make_server_project, server_level):
     with project.start(startup_path="/health") as server:
         assert server.request("GET", "/open").status_code == 200
         assert server.request("GET", "/broken").status_code == 404
+        # A path with no route writes its 404 line to the logger of the first API.
+        assert server.request("GET", "/nowhere").status_code == 404
         assert server.request("GET", "/named/ping").status_code == 200
         assert server.request("GET", "/named/ping/", follow_redirects=False).status_code == 308
         assert server.request("OPTIONS", "/named/ping").status_code == 204
@@ -65,7 +67,7 @@ _NAMED_LINES = [
 def test_access_log_writes_to_the_logger_of_the_logging_config(make_server_project):
     server_lines, named_lines = _run(make_server_project, "WARNING")
     # Each line goes to the logger of the API of its route, at the level of that logger.
-    assert server_lines == ["django.server WARNING GET /broken 404"]
+    assert server_lines == ["django.server WARNING GET /broken 404", "django.server WARNING GET /nowhere 404"]
     assert named_lines == _NAMED_LINES
 
 
