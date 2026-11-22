@@ -418,6 +418,9 @@ async def _user_version(store: Any, user_id: str | None) -> int:
         return await store.get_user_version(user_id)
     except NotImplementedError:
         return 0
+    except ReservedJtiError as exc:
+        # The store cannot keep the version of this user, so it cannot end the sessions of the user.
+        raise TokenRotationError("Refresh token has invalid subject") from exc
 
 
 async def _is_revoked(store: Any, jti: str) -> bool:
@@ -432,6 +435,9 @@ async def _is_family_revoked(store: Any, fam: str) -> bool:
         return await store.is_family_revoked(fam)
     except (AttributeError, NotImplementedError) as exc:
         raise TokenRotationError("Revocation store does not support refresh-token families") from exc
+    except ReservedJtiError as exc:
+        # The store cannot keep this family, so it cannot revoke the family on reuse.
+        raise TokenRotationError("Refresh token has invalid family id") from exc
 
 
 async def _consume(store: Any, jti: str, *, exp: int | None) -> bool:
