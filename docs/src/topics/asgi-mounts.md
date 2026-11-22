@@ -141,11 +141,11 @@ Use `clear_root_path=True` when the mounted Django app's URL patterns already in
 
 An admin site in `i18n_patterns()` has one prefix for each language of `settings.LANGUAGES`, for example `/en/admin` and `/fr/admin`. `runbolt` mounts each of them. It also mounts the path with no language, `/admin`. Django's `LocaleMiddleware` redirects that path to the prefix of a language. With `prefix_default_language=False`, the default language has no prefix. The default language is the variant of `LANGUAGE_CODE` that `LANGUAGES` has: for `"en-us"` with only `"en"` in `LANGUAGES`, the prefix is `/en/admin`, as in Django. Set `LANGUAGES` to the languages that you use: the default of Django has about 100 languages, and each gets a mount.
 
-A prefix with a path parameter, such as `path("<tenant>/admin/", admin.site.urls)`, is not a static path. `runbolt` cannot mount the admin there and prints a warning. To serve it, give Django each path that has no Bolt route:
+A prefix with a path parameter, such as `path("<tenant>/admin/", site.urls)`, is not a static path. A mount path must be static, so `runbolt` mounts Django at the root path for it. Bolt routes answer first. Django answers each path that has no Bolt route, so `/acme/admin/` goes to the admin. `runbolt` prints a warning about this wider mount. An admin site at the root path, `path("", admin.site.urls)`, gets the same mount and a warning.
 
-```python
-api.mount_django("/", clear_root_path=True)
-```
+The mount at the root path costs nothing for a request to a Bolt route. Bolt reads the mounts only when no Bolt route matches. A path that has no Bolt route gets the answer of Django, for example a Django 404 page, not the 404 of Bolt. A path of a Bolt route with another method gets 405 from Bolt, not the mount.
+
+If you call `api.mount_django("/", ...)` yourself, `runbolt` keeps your mount and does not add one.
 
 ## Rules and constraints
 
@@ -153,6 +153,7 @@ api.mount_django("/", clear_root_path=True)
 - Prefixes are normalized (leading slash, no trailing slash except `/`).
 - Duplicate exact mount prefixes are rejected.
 - Exact collisions between Bolt route paths and mount prefixes are rejected.
+- A mount at `/` and a Bolt route at `/` can exist together. The route answers `/`, and the mount gets each request that no route matches.
 - Non-exact prefix overlap is allowed.
 - Longest prefix wins when multiple mounts match.
 

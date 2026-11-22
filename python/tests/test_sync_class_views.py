@@ -442,7 +442,7 @@ def test_sync_view_generic_exception(api):
         def get(self, request) -> dict:
             raise ValueError("Something went wrong")
 
-    with TestClient(api) as client:
+    with TestClient(api, raise_server_exceptions=False) as client:
         response = client.get("/crash")
         assert response.status_code == 500
 

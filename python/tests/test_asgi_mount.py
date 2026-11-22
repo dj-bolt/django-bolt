@@ -622,6 +622,46 @@ def test_runbolt_allows_prefix_overlap_without_exact_collision():
     command.validate_asgi_mount_conflicts(routes, asgi_mounts)
 
 
+def test_runbolt_allows_a_root_mount_with_a_route_at_the_root_path():
+    """A mount at "/" gets only the paths with no route, so a route at "/" does not collide with it."""
+    command = Command()
+
+    routes = [("GET", "/", 1, lambda: None)]
+    asgi_mounts = [("/", lambda _scope, _receive, _send: None)]
+
+    command.validate_asgi_mount_conflicts(routes, asgi_mounts)
+
+
+def test_testclient_serves_a_route_at_the_root_path_and_a_root_mount():
+    """The route answers "/", and the root mount answers each path with no route.
+
+    A path of a route with another method gets 405, not the mount.
+    """
+    api = BoltAPI()
+
+    @api.get("/")
+    async def home():
+        return {"home": True}
+
+    async def asgi_app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": scope["path"].encode(), "more_body": False})
+
+    api.mount_asgi("/", asgi_app)
+
+    with TestClient(api, use_http_layer=True) as client:
+        home_response = client.get("/")
+        wrong_method = client.post("/")
+        mounted = client.get("/other/path")
+
+    assert home_response.json() == {"home": True}
+    assert wrong_method.status_code == 405
+    assert wrong_method.headers["allow"] == "GET, OPTIONS"
+    assert mounted.status_code == 200
+    assert mounted.text.endswith("/other/path")
+
+
 def test_runbolt_rejects_mcp_http_route_collision():
     command = Command()
     routes = [("POST", "/mcp", 1, lambda: None)]

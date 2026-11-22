@@ -1,5 +1,5 @@
-//! The access-log filter of a route: sampling, the slow-request threshold, and
-//! the paths and status codes that write no line.
+//! The access-log filter of a route: its logger, sampling, the slow-request
+//! threshold, and the paths and status codes that write no line.
 //!
 //! Python gives the values of `LoggingConfig` at route registration. The
 //! request path reads them from the route metadata, with no Python call.
@@ -21,6 +21,74 @@ const MIN_DURATION_KEY: &str = "access_log_min_duration_ms";
 const SKIP_PATHS_KEY: &str = "access_log_skip_paths";
 /// Route metadata key of `LoggingConfig.skip_status_codes`.
 const SKIP_STATUS_CODES_KEY: &str = "access_log_skip_status_codes";
+/// Route metadata key of `LoggingConfig.logger_name`.
+const LOGGER_NAME_KEY: &str = "access_log_logger_name";
+/// The logger of a route with no `logger_name`.
+pub const DEFAULT_LOGGER_NAME: &str = "django.server";
+
+/// A Python logger of the access log and its levels, read once at startup.
+#[derive(Debug)]
+pub struct AccessLogger {
+    /// The INFO, WARNING and ERROR bits that the logger writes. 0 writes no line.
+    pub levels: u8,
+    pub logger: Py<PyAny>,
+}
+
+impl AccessLogger {
+    /// Get the logger `name` and read the levels that it writes.
+    pub fn read(py: Python<'_>, name: &str) -> PyResult<Self> {
+        let logger = py.import("logging")?.call_method1("getLogger", (name,))?;
+        let mut levels = 0;
+        for (bit, level) in [(1, 20), (2, 30), (4, 40)] {
+            if logger
+                .call_method1("isEnabledFor", (level,))?
+                .extract::<bool>()?
+            {
+                levels |= bit;
+            }
+        }
+        Ok(Self {
+            levels,
+            logger: logger.unbind(),
+        })
+    }
+}
+
+/// Read the logger of each filter once. Each filter gets the index of its
+/// logger in the result. Index 0 is `django.server`, the logger of a route
+/// with no `logger_name` and of a route with no metadata.
+pub fn read_access_loggers<'a>(
+    py: Python<'_>,
+    filters: impl IntoIterator<Item = &'a mut AccessLogFilter>,
+) -> PyResult<Vec<AccessLogger>> {
+    let mut names = vec![DEFAULT_LOGGER_NAME.to_string()];
+    let mut loggers = vec![AccessLogger::read(py, DEFAULT_LOGGER_NAME)?];
+    for filter in filters {
+        let Some(name) = filter.logger_name.as_deref() else {
+            continue;
+        };
+        filter.logger = match names.iter().position(|known| known == name) {
+            Some(index) => index,
+            None => {
+                loggers.push(AccessLogger::read(py, name)?);
+                names.push(name.to_string());
+                names.len() - 1
+            }
+        };
+    }
+    Ok(loggers)
+}
+
+/// `true` when a route writes to a logger that writes a line. `route_loggers`
+/// gives the logger index of each route.
+pub fn access_log_on(
+    loggers: &[AccessLogger],
+    route_loggers: impl IntoIterator<Item = usize>,
+) -> bool {
+    route_loggers
+        .into_iter()
+        .any(|index| loggers.get(index).is_some_and(|logger| logger.levels != 0))
+}
 
 /// Which responses of a route write an access-log line.
 /// The sample rate and the threshold apply to a 1xx to 3xx response only.
@@ -37,6 +105,10 @@ pub struct AccessLogFilter {
     skip_paths: AHashSet<String>,
     /// A response with one of these status codes writes no line.
     skip_status_codes: Vec<u16>,
+    /// `LoggingConfig.logger_name`. `None` is `django.server`.
+    logger_name: Option<String>,
+    /// The index of the logger in `AppState::access_loggers`. Startup sets it.
+    pub logger: usize,
 }
 
 impl AccessLogFilter {
@@ -47,7 +119,15 @@ impl AccessLogFilter {
             has_limit: sample_rate.is_some() || min_duration_ms.is_some(),
             skip_paths: AHashSet::new(),
             skip_status_codes: Vec::new(),
+            logger_name: None,
+            logger: 0,
         }
+    }
+
+    /// Write the lines to the logger `name` in place of `django.server`.
+    pub fn with_logger_name(mut self, name: impl Into<String>) -> Self {
+        self.logger_name = Some(name.into());
+        self
     }
 
     /// Add the request paths and the status codes that write no line.
@@ -90,7 +170,14 @@ impl AccessLogFilter {
             Some(value) if !value.is_none() => value.extract::<Vec<u16>>()?,
             _ => Vec::new(),
         };
-        Ok(Self::new(sample_rate, min_duration_ms).with_skips(skip_paths, skip_status_codes))
+        let filter =
+            Self::new(sample_rate, min_duration_ms).with_skips(skip_paths, skip_status_codes);
+        match py_meta.get_item(LOGGER_NAME_KEY)? {
+            Some(value) if !value.is_none() => {
+                Ok(filter.with_logger_name(value.extract::<String>()?))
+            }
+            _ => Ok(filter),
+        }
     }
 
     /// `true` when the config of the route skips this request path or this
@@ -175,23 +262,31 @@ impl RejectionLineLimit {
 }
 
 thread_local! {
-    /// The 429 line limit of this worker thread, and the time of its first 429 response.
-    static REJECTION_LINES: RefCell<Option<(Instant, RejectionLineLimit)>> =
-        const { RefCell::new(None) };
+    /// The 429 line limit of each logger on this worker thread, by logger
+    /// index, and the time of its first 429 response.
+    static REJECTION_LINES: RefCell<Vec<Option<(Instant, RejectionLineLimit)>>> =
+        const { RefCell::new(Vec::new()) };
 }
 
-/// Decide if a 429 response at `now` writes its access-log line on this
-/// worker thread. See `RejectionLineLimit::line_in` for the result.
-pub fn rejection_line_at(now: Instant) -> Option<u64> {
-    REJECTION_LINES.with_borrow_mut(|state| {
-        let (first, limit) = state.get_or_insert_with(|| (now, RejectionLineLimit::default()));
+/// Decide if a 429 response at `now` writes its line to the logger `logger`
+/// on this worker thread. See `RejectionLineLimit::line_in` for the result.
+pub fn rejection_line_at(logger: usize, now: Instant) -> Option<u64> {
+    REJECTION_LINES.with_borrow_mut(|limits| {
+        if limits.len() <= logger {
+            limits.resize_with(logger + 1, || None);
+        }
+        let (first, limit) =
+            limits[logger].get_or_insert_with(|| (now, RejectionLineLimit::default()));
         limit.line_in(now.saturating_duration_since(*first).as_secs())
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AccessLogFilter, RejectionLineLimit, random_unit, rejection_line_at};
+    use super::{
+        AccessLogFilter, AccessLogger, RejectionLineLimit, access_log_on, random_unit,
+        read_access_loggers, rejection_line_at,
+    };
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
     use std::time::{Duration, Instant};
@@ -294,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn from_python_reads_the_two_keys_and_refuses_a_value_out_of_range() {
+    fn from_python_reads_the_keys_and_refuses_a_value_out_of_range() {
         Python::initialize();
         Python::attach(|py| {
             let meta = PyDict::new(py);
@@ -325,11 +420,76 @@ mod tests {
             assert!(AccessLogFilter::from_python(&meta).is_err());
             meta.del_item("access_log_skip_status_codes").unwrap();
 
+            meta.set_item("access_log_logger_name", "myapp.api")
+                .unwrap();
+            assert_eq!(
+                AccessLogFilter::from_python(&meta).unwrap(),
+                AccessLogFilter::new(Some(0.05), Some(250.0))
+                    .with_skips(["/ready".to_string(), "/health".to_string()], [])
+                    .with_logger_name("myapp.api")
+            );
+            meta.set_item("access_log_logger_name", 7).unwrap();
+            assert!(AccessLogFilter::from_python(&meta).is_err());
+            meta.del_item("access_log_logger_name").unwrap();
+
             meta.set_item("access_log_sample_rate", 1.5).unwrap();
             assert!(AccessLogFilter::from_python(&meta).is_err());
             meta.set_item("access_log_sample_rate", py.None()).unwrap();
             meta.set_item("access_log_min_duration_ms", -1).unwrap();
             assert!(AccessLogFilter::from_python(&meta).is_err());
+        });
+    }
+
+    #[test]
+    fn each_logger_name_is_read_once_and_index_0_is_django_server() {
+        Python::initialize();
+        Python::attach(|py| {
+            let logging = py.import("logging").unwrap();
+            logging
+                .call_method1("getLogger", ("access_log_test.quiet",))
+                .unwrap()
+                .call_method1("setLevel", (30,))
+                .unwrap();
+            let mut filters = [
+                AccessLogFilter::default().with_logger_name("access_log_test.quiet"),
+                AccessLogFilter::default(),
+                AccessLogFilter::default().with_logger_name("access_log_test.other"),
+                AccessLogFilter::default().with_logger_name("access_log_test.quiet"),
+                AccessLogFilter::default().with_logger_name("django.server"),
+            ];
+            let loggers = read_access_loggers(py, filters.iter_mut()).unwrap();
+            let indexes: Vec<usize> = filters.iter().map(|filter| filter.logger).collect();
+            assert_eq!(indexes, [1, 0, 2, 1, 0]);
+            assert_eq!(loggers.len(), 3);
+            let name = |index: usize| -> String {
+                loggers[index]
+                    .logger
+                    .bind(py)
+                    .getattr("name")
+                    .unwrap()
+                    .extract()
+                    .unwrap()
+            };
+            assert_eq!(name(0), "django.server");
+            assert_eq!(name(1), "access_log_test.quiet");
+            // A logger at WARNING writes the WARNING and the ERROR lines only.
+            assert_eq!(loggers[1].levels, 2 | 4);
+        });
+    }
+
+    #[test]
+    fn the_log_is_on_only_when_a_route_uses_a_logger_that_writes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let logger = |levels| AccessLogger {
+                levels,
+                logger: py.None(),
+            };
+            // django.server writes INFO. The custom logger writes nothing.
+            let loggers = [logger(1 | 2 | 4), logger(0)];
+            assert!(!access_log_on(&loggers, [1, 1]));
+            assert!(access_log_on(&loggers, [1, 0]));
+            assert!(!access_log_on(&loggers, []));
         });
     }
 
@@ -352,21 +512,45 @@ mod tests {
     fn each_thread_counts_its_seconds_from_its_first_429() {
         std::thread::spawn(|| {
             let start = Instant::now();
-            assert_eq!(rejection_line_at(start), Some(0));
-            assert_eq!(rejection_line_at(start + Duration::from_millis(999)), None);
+            assert_eq!(rejection_line_at(0, start), Some(0));
             assert_eq!(
-                rejection_line_at(start + Duration::from_millis(1000)),
+                rejection_line_at(0, start + Duration::from_millis(999)),
+                None
+            );
+            assert_eq!(
+                rejection_line_at(0, start + Duration::from_millis(1000)),
                 Some(1)
             );
             // A time before the first response is in second 0.
-            assert_eq!(rejection_line_at(start - Duration::from_secs(9)), None);
-            assert_eq!(rejection_line_at(start + Duration::from_secs(2)), Some(1));
+            assert_eq!(rejection_line_at(0, start - Duration::from_secs(9)), None);
+            assert_eq!(
+                rejection_line_at(0, start + Duration::from_secs(2)),
+                Some(1)
+            );
         })
         .join()
         .unwrap();
         // The state of the other thread is not here.
-        std::thread::spawn(|| assert_eq!(rejection_line_at(Instant::now()), Some(0)))
+        std::thread::spawn(|| assert_eq!(rejection_line_at(0, Instant::now()), Some(0)))
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn each_logger_has_its_own_429_line_limit() {
+        std::thread::spawn(|| {
+            let start = Instant::now();
+            assert_eq!(rejection_line_at(2, start), Some(0));
+            // The 429 of logger 2 does not take the line of logger 0.
+            assert_eq!(rejection_line_at(0, start), Some(0));
+            assert_eq!(rejection_line_at(2, start), None);
+            assert_eq!(rejection_line_at(2, start), None);
+            // The count of logger 2 is not in the line of logger 0.
+            let next = start + Duration::from_secs(1);
+            assert_eq!(rejection_line_at(0, next), Some(0));
+            assert_eq!(rejection_line_at(2, next), Some(2));
+        })
+        .join()
+        .unwrap();
     }
 }

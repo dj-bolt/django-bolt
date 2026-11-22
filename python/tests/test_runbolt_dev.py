@@ -14,6 +14,7 @@ from django.core.management.base import CommandError
 from django_bolt import BoltAPI, WebSocket
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
 from django_bolt.management.commands import runbolt as runbolt_module
+from django_bolt.middleware import Middleware
 from django_bolt.testing import TestClient, WebSocketTestClient
 
 
@@ -352,7 +353,9 @@ def test_runbolt_passes_its_options_to_the_server(
         runbolt_module,
         "_core",
         SimpleNamespace(
-            register_routes=lambda routes, _native_routes: started.update(paths=[route[1] for route in routes]),
+            register_routes=lambda routes, _native_routes, _no_route: started.update(
+                paths=[route[1] for route in routes]
+            ),
             register_asgi_mounts=lambda asgi_mounts: started.update(mounts=[prefix for prefix, _ in asgi_mounts]),
             register_middleware_metadata=lambda _metadata: None,
             start_server=fake_start_server,
@@ -644,6 +647,44 @@ def test_merge_apis_keeps_the_guards_of_a_websocket_route_and_the_handler_of_eac
         assert client.get("/first").json() == {"api": "first"}
         assert client.get("/second").json() == {"api": "second"}
         assert client.get("/third").json() == {"api": "third"}
+
+
+class _FirstApiMiddleware(Middleware):
+    """Add the header ``x-api`` with the name of its API."""
+
+    api_name = "first"
+
+    async def process_request(self, request):
+        response = await self.get_response(request)
+        response.headers["x-api"] = self.api_name
+        return response
+
+
+class _SecondApiMiddleware(_FirstApiMiddleware):
+    api_name = "second"
+
+
+def test_merge_apis_runs_the_middleware_of_the_first_api_for_a_path_with_no_route():
+    first = BoltAPI(middleware=[_FirstApiMiddleware])
+    second = BoltAPI(middleware=[_SecondApiMiddleware])
+
+    @first.get("/first")
+    async def first_route():
+        return {"api": "first"}
+
+    @second.get("/second")
+    async def second_route():
+        return {"api": "second"}
+
+    merged = runbolt_module.Command().merge_apis([("first.api", first), ("second.api", second)])
+
+    with TestClient(merged) as client:
+        missing = client.get("/no-route")
+        second_response = client.get("/second")
+
+    assert missing.status_code == 404
+    assert missing.headers["x-api"] == "first"
+    assert second_response.headers["x-api"] == "second"
 
 
 def _api_with_mcp(server_name: str, path: str) -> BoltAPI:

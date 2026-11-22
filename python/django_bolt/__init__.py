@@ -13,15 +13,13 @@ Quick Start:
     async def hello(request: Request) -> dict:
         return {"message": "Hello, World!"}
 
-Type-Safe Requests:
-    from django_bolt import BoltAPI, Request
-    from django_bolt.types import JWTClaims
-    from myapp.models import User
+Authentication:
+    from django_bolt import BoltAPI, IsAuthenticated, JWTAuthentication, Request
 
     api = BoltAPI()
 
-    @api.get("/profile", guards=[IsAuthenticated()])
-    async def profile(request: Request[User, JWTClaims, dict]) -> dict:
+    @api.get("/profile", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+    async def profile(request: Request) -> dict:
         user = await request.auser()
         return {"email": user.email}
 

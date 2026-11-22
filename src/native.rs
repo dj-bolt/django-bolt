@@ -19,6 +19,10 @@ use tokio::sync::oneshot;
 /// `(method, path, capsule)` as Python passes a native route.
 pub type NativeRouteSpec = (String, String, Py<PyAny>);
 
+/// `(handler_id, handler, dispatch, dispatch_sync)` of the route of a request
+/// that matches no route, as Python passes it.
+pub type NoRouteSpec = (usize, Py<PyAny>, Py<PyAny>, Py<PyAny>);
+
 /// Build the router of an app: the Python routes, then the native routes.
 #[expect(
     clippy::type_complexity,
@@ -28,10 +32,14 @@ pub fn build_router(
     py: Python<'_>,
     routes: Vec<(String, String, usize, Py<PyAny>, Py<PyAny>, Py<PyAny>)>,
     native_routes: Vec<NativeRouteSpec>,
+    no_route: Option<NoRouteSpec>,
 ) -> PyResult<Router> {
     let mut router = Router::new();
     for (method, path, handler_id, handler, dispatch, dispatch_sync) in routes {
         router.register(&method, &path, handler_id, handler, dispatch, dispatch_sync)?;
+    }
+    if let Some((handler_id, handler, dispatch, dispatch_sync)) = no_route {
+        router.set_no_route(handler_id, handler, dispatch, dispatch_sync);
     }
     for (method, path, capsule) in native_routes {
         let native = handler_from_capsule(py, &capsule)?;

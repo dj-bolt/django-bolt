@@ -36,15 +36,22 @@ from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.workers import MIB, WORKER_BOOT_ERROR, WorkerSupervisor
 
 try:
-    from django_bolt.logging.config import setup_django_logging
+    from django_bolt.logging.config import (
+        restart_queue_listener_after_fork,
+        setup_django_logging,
+        stop_queue_listener,
+    )
     from django_bolt.responses import initialize_file_response_settings
 except ImportError:
+    restart_queue_listener_after_fork = None
     setup_django_logging = None
+    stop_queue_listener = None
     initialize_file_response_settings = None
 
 try:
-    from django_bolt.admin.admin_detection import detect_admin_url_prefix
+    from django_bolt.admin.admin_detection import admin_url_needs_path_parameter, detect_admin_url_prefix
 except ImportError:
+    admin_url_needs_path_parameter = None
     detect_admin_url_prefix = None
 
 
@@ -589,6 +596,20 @@ def _validate_option_ranges(options) -> None:
             raise CommandError(f"{flag} must be at most {highest}, got {value}")
 
 
+def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int, handler) -> None:
+    """Copy one handler of ``api`` into ``merged`` with a new handler id.
+
+    The handler keeps the API that owns it, so it keeps the logging, auth and
+    middleware of that API. A route that ``api`` mounted keeps its sub-app.
+    """
+    merged._handlers[new_handler_id] = handler
+    merged._handler_api_map[new_handler_id] = api._handler_api_map.get(old_handler_id, api)
+    if old_handler_id in api._handler_meta:
+        merged._handler_meta[new_handler_id] = api._handler_meta[old_handler_id]
+    if old_handler_id in api._handler_middleware:
+        merged._handler_middleware[new_handler_id] = api._handler_middleware[old_handler_id]
+
+
 class Command(BaseCommand):
     help = "Run Django-Bolt server with autodiscovered APIs"
 
@@ -753,8 +774,8 @@ class Command(BaseCommand):
         recycles them on --max-rss / --workers-lifetime limits (spawn-first,
         graceful drain), respawns crashed workers when
         --respawn-failed-workers is set, and coordinates graceful shutdown
-        on SIGTERM/SIGINT. With --respawn-failed-workers, a worker that did
-        not start to serve stops runbolt with exit status 1.
+        on SIGTERM, SIGINT, SIGHUP and SIGQUIT. With --respawn-failed-workers,
+        a worker that did not start to serve stops runbolt with exit status 1.
         """
         if not hasattr(os, "fork"):
             raise CommandError(
@@ -763,6 +784,10 @@ class Command(BaseCommand):
 
         processes = options["processes"]
         kill_timeout = options["workers_kill_timeout"]
+        # Each of these signals stops the supervisor. It must stop its workers
+        # first, or they serve on the port with no parent. A terminal that
+        # closes sends SIGHUP. SIGHUP and SIGQUIT exist only where fork exists.
+        stop_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 
         # Run autodiscovery + banner once in the parent before forking so the
         # user sees a single clean banner instead of N copies.
@@ -782,15 +807,19 @@ class Command(BaseCommand):
                 return pid
             # Child: reset inherited handlers so only the supervising parent
             # reacts to terminal signals; the Rust server installs its own
-            # SIGTERM/SIGINT handling for graceful drain.
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            # SIGTERM/SIGINT/SIGQUIT handling for graceful drain.
+            for signum in stop_signals:
+                signal.signal(signum, signal.SIG_DFL)
             # Always enable SO_REUSEPORT: during recycling the replacement
             # worker binds the port while the old worker is still draining.
             os.environ["DJANGO_BOLT_REUSE_PORT"] = "1"
             os.environ["DJANGO_BOLT_PROCESS_ID"] = str(slot)
             exit_code = 0
             try:
+                # The fork does not copy the thread that writes the queued log
+                # records. Without a new one, the records of this worker are lost.
+                if restart_queue_listener_after_fork is not None:
+                    restart_queue_listener_after_fork()
                 self.start_single_process(options, process_id=slot)
             except BaseException:
                 traceback.print_exc()
@@ -799,6 +828,12 @@ class Command(BaseCommand):
                 # that did not start.
                 exit_code = 1 if _core.server_listening() else WORKER_BOOT_ERROR
             finally:
+                # os._exit() does not run atexit, so write the queued records first.
+                if stop_queue_listener is not None:
+                    try:
+                        stop_queue_listener()
+                    except BaseException:
+                        traceback.print_exc()
                 os._exit(exit_code)
             return 0  # unreachable: os._exit never returns
 
@@ -815,8 +850,8 @@ class Command(BaseCommand):
         def signal_handler(signum, frame):
             supervisor.request_shutdown()
 
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        for signum in stop_signals:
+            signal.signal(signum, signal_handler)
 
         exit_code = supervisor.run()
         if exit_code:
@@ -857,7 +892,8 @@ class Command(BaseCommand):
         admin_enabled = not options.get("no_admin", False)
         if admin_enabled and detect_admin_url_prefix is not None:
             merged_api._register_admin_routes(options["host"], options["port"])
-            if merged_api._admin_routes_registered:
+            # The root mount for an admin site behind a path parameter has no admin URL to print.
+            if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():
                 admin_prefix = detect_admin_url_prefix()
                 admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
                 features.append(("Admin", f"{banner_base_url}{admin_path}"))
@@ -963,7 +999,8 @@ class Command(BaseCommand):
             # Register admin routes
             merged_api._register_admin_routes(options["host"], options["port"])
 
-            if merged_api._admin_routes_registered:
+            # The root mount for an admin site behind a path parameter has no admin URL to print.
+            if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():
                 admin_prefix = detect_admin_url_prefix()
                 admin_path = f"/{admin_prefix}/" if admin_prefix else "/"
                 features.append(("Admin", f"{banner_base_url}{admin_path}"))
@@ -1000,7 +1037,7 @@ class Command(BaseCommand):
             )
 
         try:
-            _core.register_routes(rust_routes, list(merged_api._native_routes))
+            _core.register_routes(rust_routes, list(merged_api._native_routes), merged_api._rust_no_route())
         except ValueError as e:
             raise CommandError(str(e)) from e
 
@@ -1417,25 +1454,7 @@ class Command(BaseCommand):
 
                 route_map[route_key] = api_path
                 merged._routes.append((method, path, new_handler_id, handler))
-                merged._handlers[new_handler_id] = handler
-
-                # CRITICAL: Store reference to original API for this handler
-                # For mounted sub-apps, preserve the sub-app reference (has its own middleware)
-                # Otherwise use the API that owns this route
-                if hasattr(api, "_handler_api_map") and old_handler_id in api._handler_api_map:
-                    # This route was mounted from a sub-app - preserve that reference
-                    merged._handler_api_map[new_handler_id] = api._handler_api_map[old_handler_id]
-                else:
-                    # Route belongs directly to this API
-                    merged._handler_api_map[new_handler_id] = api
-
-                # Merge handler metadata (use handler_id as key, old_handler_id is already in the tuple)
-                if old_handler_id in api._handler_meta:
-                    merged._handler_meta[new_handler_id] = api._handler_meta[old_handler_id]
-
-                # Merge middleware metadata (use NEW handler_id)
-                if old_handler_id in api._handler_middleware:
-                    merged._handler_middleware[new_handler_id] = api._handler_middleware[old_handler_id]
+                _merge_handler(merged, api, old_handler_id, new_handler_id, handler)
 
             # Merge WebSocket routes from this API
             for path, old_ws_handler_id, ws_handler in api._websocket_routes:
@@ -1454,21 +1473,7 @@ class Command(BaseCommand):
 
                 route_map[ws_route_key] = api_path
                 merged._websocket_routes.append((path, new_ws_handler_id, ws_handler))
-                merged._handlers[new_ws_handler_id] = ws_handler
-
-                # Store reference to original API (or sub-app for mounted routes)
-                if hasattr(api, "_handler_api_map") and old_ws_handler_id in api._handler_api_map:
-                    merged._handler_api_map[new_ws_handler_id] = api._handler_api_map[old_ws_handler_id]
-                else:
-                    merged._handler_api_map[new_ws_handler_id] = api
-
-                # Merge handler metadata for WebSocket (use handler_id as key, old_ws_handler_id is already in the tuple)
-                if old_ws_handler_id in api._handler_meta:
-                    merged._handler_meta[new_ws_handler_id] = api._handler_meta[old_ws_handler_id]
-
-                # Merge middleware metadata for WebSocket
-                if old_ws_handler_id in api._handler_middleware:
-                    merged._handler_middleware[new_ws_handler_id] = api._handler_middleware[old_ws_handler_id]
+                _merge_handler(merged, api, old_ws_handler_id, new_ws_handler_id, ws_handler)
 
             # Merge HTTP ASGI mounts from this API
             for asgi_prefix, asgi_app in getattr(api, "_asgi_mounts", []):
@@ -1480,6 +1485,7 @@ class Command(BaseCommand):
 
                 route_map[asgi_key] = api_path
                 merged._asgi_mounts.append((asgi_prefix, asgi_app))
+                merged._asgi_mount_prefixes.add(asgi_prefix)
 
             # Same key as a Python route, so a clash fails here, before
             # runbolt starts its worker processes.
@@ -1518,6 +1524,15 @@ class Command(BaseCommand):
                 "The APIs set different error_formatter values. Set the same error_formatter on each API, or on one."
             )
         merged._error_formatter = formatters[0] if formatters else None
+
+        # A request that matches no route belongs to no API. It gets the route
+        # of the first API: its middleware and its access-log filter, as the
+        # docs routes get the middleware of the first API.
+        first_api = apis[0][1]
+        no_route_id, no_route_handler = first_api._no_route_handler()
+        merged._no_route = (next_handler_id, no_route_handler)
+        _merge_handler(merged, first_api, no_route_id, next_handler_id, no_route_handler)
+        next_handler_id += 1
 
         # Update next handler ID
         merged._next_handler_id = next_handler_id

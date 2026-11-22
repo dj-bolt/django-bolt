@@ -244,6 +244,30 @@ def test_a_sequence_field_of_a_header_model_gives_one_item():
         assert bad.json()["detail"][0]["input"] == ["x"]
 
 
+class _LimitedTags(msgspec.Struct):
+    tags: Annotated[list[str], msgspec.Meta(max_length=1)] = []
+    ids: Annotated[set[int], msgspec.Meta(max_length=1)] | None = None
+
+
+@pytest.mark.parametrize(
+    ("marker", "headers"),
+    [(Header, {"Tags": "a", "Ids": "4"}), (Cookie, {"Cookie": "tags=a; ids=4"})],
+    ids=["header", "cookie"],
+)
+def test_a_constrained_sequence_field_of_a_header_or_cookie_model_gives_one_item(marker, headers):
+    """A ``msgspec.Meta`` constraint keeps ``Annotated`` on the field type. The field still gets one item."""
+    api = BoltAPI()
+
+    @api.get("/model")
+    async def model(values: Annotated[_LimitedTags, marker()]):
+        return {"tags": values.tags, "ids": _show(values.ids)}
+
+    with TestClient(api) as client:
+        response = client.get("/model", headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json() == {"tags": ["a"], "ids": {"value": [4], "type": "set"}}
+
+
 @pytest.mark.parametrize(
     ("route", "annotation"),
     [
