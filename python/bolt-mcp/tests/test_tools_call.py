@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import msgspec
 from _helpers import initialize, make_server, parse_rpc, post_rpc
 from bolt_mcp import MCP, mount_mcp
 
@@ -52,6 +53,26 @@ def test_dict_result_with_iterators_has_the_same_values_in_text_and_structured_c
     assert result["isError"] is False
     assert json.loads(result["content"][0]["text"]) == expected
     assert result["structuredContent"] == expected
+
+
+def test_dict_result_with_raw_json_keeps_the_raw_value():
+    """A msgspec.Raw value is JSON already. The result embeds it as it is."""
+    api = BoltAPI()
+    mcp = MCP("raw-test")
+
+    @mcp.tool
+    async def cached() -> dict:
+        return {"value": msgspec.Raw(b'{"a":1}')}
+
+    mount_mcp(api, mcp)
+
+    with TestClient(api) as client:
+        _, session_id = initialize(client)
+        result = parse_rpc(_call(client, session_id, "cached", {}))["result"]
+
+    assert result["isError"] is False
+    assert json.loads(result["content"][0]["text"]) == {"value": {"a": 1}}
+    assert result["structuredContent"] == {"value": {"a": 1}}
 
 
 def test_string_result_maps_to_text_content():
