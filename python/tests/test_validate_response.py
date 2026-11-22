@@ -164,3 +164,61 @@ def test_return_annotation_validates_only_the_default_status():
         assert sync_bad.status_code == 400
         assert sync_bad.json() == {"price": ["Must be positive."]}
         assert client.get("/sync-items").status_code == 200
+
+
+def test_response_class_return_annotation_sends_the_body_as_it_is():
+    """``-> JSON`` and ``-> Response`` name the response class, not the body (#912).
+
+    Bolt does not validate the body against the class, at the default
+    status code or at another one.
+    """
+    api = BoltAPI()
+
+    @api.get("/json")
+    async def json_default() -> JSON:
+        return JSON({"a": 1})
+
+    @api.post("/json-created", status_code=201)
+    async def json_created() -> JSON:
+        return JSON({"a": 1}, status_code=201)
+
+    @api.get("/json-sync")
+    def json_sync() -> JSON:
+        return JSON([1, 2])
+
+    @api.get("/response")
+    async def response_default() -> Response:
+        return Response({"b": 2})
+
+    @api.post("/response-created", status_code=201)
+    def response_created() -> Response:
+        return Response({"b": 2}, status_code=201)
+
+    @api.get("/optional")
+    async def optional_json() -> JSON | None:
+        return JSON({"c": 3})
+
+    with TestClient(api) as client:
+        default = client.get("/json")
+        assert default.status_code == 200
+        assert default.json() == {"a": 1}
+
+        created = client.post("/json-created")
+        assert created.status_code == 201
+        assert created.json() == {"a": 1}
+
+        sync = client.get("/json-sync")
+        assert sync.status_code == 200
+        assert sync.json() == [1, 2]
+
+        response = client.get("/response")
+        assert response.status_code == 200
+        assert response.json() == {"b": 2}
+
+        response_created = client.post("/response-created")
+        assert response_created.status_code == 201
+        assert response_created.json() == {"b": 2}
+
+        optional = client.get("/optional")
+        assert optional.status_code == 200
+        assert optional.json() == {"c": 3}

@@ -433,9 +433,12 @@ def _response_class_wire_meta(
 
 
 def _response_validation_is_required(annotation: Any) -> bool:
-    if annotation is None:
+    if annotation is None or annotation in _VALIDATION_NOOP_TYPES:
         return False
-    return annotation not in _VALIDATION_NOOP_TYPES
+    # A response class, such as -> JSON or -> Response, names the class of the
+    # result and not the type of its body. Thus Bolt sends the body as it is.
+    response_type = _strip_optional(annotation)
+    return not (isinstance(response_type, type) and is_response_class(response_type))
 
 
 def _allows_none(annotation: Any) -> bool:
