@@ -16,6 +16,7 @@ from django.db.models.functions import JSONObject
 
 from django_bolt import BoltAPI, ViewSet
 from django_bolt.pagination import CursorPagination, PageNumberPagination, paginate
+from django_bolt.responses import JSON
 from django_bolt.testing import TestClient
 from django_bolt.views import RetrieveMixin
 
@@ -575,3 +576,48 @@ def test_list_of_instances_from_a_helper_without_validation(sql_statements):
         response = client.get("/flat")
         assert response.status_code == 200, response.text
         assert response.json() == [{"id": post["id"], "title": post["title"]} for post in expected]
+
+
+type PostAlias = PostOut
+type PostListAlias = list[PostOut]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_model_instance_with_a_written_out_response_type(sql_statements):
+    """``Annotated``, a ``type`` alias and ``-> Item | JSON`` validate against the Struct, so they load its relations too."""
+    _make_posts()
+    post = BlogPost.objects.order_by("id").first()
+    api = BoltAPI()
+
+    @api.get("/annotated/{pk}")
+    async def annotated(pk: int) -> Annotated[PostOut, msgspec.Meta(description="A post")]:
+        return await BlogPost.objects.aget(pk=pk)
+
+    @api.get("/union/{pk}")
+    async def union(pk: int) -> PostOut | JSON:
+        return await BlogPost.objects.aget(pk=pk)
+
+    @api.get("/alias/{pk}")
+    async def alias(pk: int) -> PostAlias:
+        return await BlogPost.objects.aget(pk=pk)
+
+    @api.get("/list-alias")
+    async def list_alias() -> PostListAlias:
+        return [item async for item in BlogPost.objects.order_by("id")]
+
+    expected = {"id": post.id, "title": post.title, "author": {"id": post.author_id, "name": "Ada"}}
+    expected_list = _expected_posts()
+    with TestClient(api) as client:
+        for path in (f"/annotated/{post.id}", f"/union/{post.id}", f"/alias/{post.id}"):
+            sql_statements.clear()
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json() == expected, path
+            assert len(sql_statements) == 2, (path, sql_statements)
+
+        sql_statements.clear()
+        response = client.get("/list-alias")
+        assert response.status_code == 200, response.text
+        assert response.json() == expected_list
+        # The query of the handler, and one query for the authors.
+        assert len(sql_statements) == 2, sql_statements

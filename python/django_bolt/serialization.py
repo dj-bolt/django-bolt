@@ -803,15 +803,28 @@ def _compile_model_projector(meta: HandlerMetadata | dict[str, Any]) -> Any:
     return None if readers is None else readers[1]
 
 
+def _plain_body_type(annotation: Any) -> Any:
+    """Return ``annotation`` without a ``type`` alias, ``Annotated`` metadata and ``| None``."""
+    while True:
+        resolved = unwrap_optional(resolve_type_alias(annotation))
+        if get_origin(resolved) is Annotated:
+            resolved = resolved.__origin__
+        if resolved == annotation:
+            return resolved
+        annotation = resolved
+
+
 def _compile_relation_loader(meta: HandlerMetadata | dict[str, Any]) -> Any:
     """The relation loader of a ``Struct`` or ``list[Struct]`` response type with a nested Struct, or None.
 
-    A Bolt Serializer loads its own relations.
+    The Struct is the one that validates the body (see split_response_annotation),
+    so ``Annotated``, a ``type`` alias and ``-> Item | JSON`` name it too. A Bolt
+    Serializer loads its own relations.
     """
-    response_type = unwrap_optional(meta.get("response_type"))
+    response_type = _plain_body_type(_validated_body_type(meta.get("response_type")))
     if get_origin(response_type) is list:
         args = get_args(response_type)
-        response_type = args[0] if args else None
+        response_type = _plain_body_type(args[0]) if args else None
     if not _is_plain_struct(response_type):
         return None
     return compile_struct_relation_loader(response_type)
