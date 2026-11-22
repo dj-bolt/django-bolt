@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
-import copy
+import dataclasses
 import logging
 import threading
 import warnings
@@ -49,6 +49,24 @@ except ImportError:
 _docs_routes_lock = threading.Lock()
 
 
+def _frozen(value: Any) -> Any:
+    """Return a copy of ``value`` that a later change of a list or a dict in it does not change."""
+    if isinstance(value, list | tuple):
+        return tuple(_frozen(item) for item in value)
+    if isinstance(value, dict):
+        return tuple((key, _frozen(item)) for key, item in value.items())
+    if isinstance(value, set | frozenset):
+        return frozenset(value)
+    return value
+
+
+def _config_key(config: Any) -> tuple[Any, ...] | None:
+    """Return the values of an ``OpenAPIConfig``, to compare with the values of an earlier client."""
+    if config is None:
+        return None
+    return tuple(_frozen(getattr(config, field.name)) for field in dataclasses.fields(config))
+
+
 def _docs_routes(api: BoltAPI) -> list[tuple[Any, ...]]:
     """Return the docs routes of a test client of ``api``.
 
@@ -64,15 +82,16 @@ def _docs_routes(api: BoltAPI) -> list[tuple[Any, ...]]:
             # runbolt, or the test, added the docs routes to api._routes.
             return []
         cached = api._client_docs_routes
-        # A copy of the config is the key, so a changed field registers again.
-        if cached is None or cached[0] != api._openapi_config:
+        # The values of the config are the key, so a changed value registers again.
+        key = _config_key(api._openapi_config)
+        if cached is None or cached[0] != key:
             start = len(api._routes)
             # The code of runbolt. A disabled config adds no route.
             api._register_openapi_routes()
             routes = api._routes[start:]
             del api._routes[start:]
             api._openapi_routes_registered = False
-            cached = api._client_docs_routes = (copy.copy(api._openapi_config), routes)
+            cached = api._client_docs_routes = (key, routes)
         # A new client generates the schema again, so it has the routes added before it.
         api._openapi_schema = None
         return cached[1]

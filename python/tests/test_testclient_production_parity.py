@@ -17,7 +17,7 @@ from django.test import override_settings
 from django_bolt import BoltAPI, Request, WebSocket
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
 from django_bolt.middleware import rate_limit
-from django_bolt.openapi import OpenAPIConfig
+from django_bolt.openapi import OpenAPIConfig, RedocRenderPlugin, SwaggerRenderPlugin
 from django_bolt.responses import Redirect
 from django_bolt.testing import AsyncTestClient, TestClient, WebSocketTestClient
 from tests.integration.apps.testclient_parity import api
@@ -335,6 +335,17 @@ def test_a_change_of_the_docs_config_applies_to_the_next_client(enabled_first):
 
     with TestClient(local_api) as client:
         assert client.get("/docs/openapi.json").status_code == expected[not enabled_first]
+
+
+def test_a_plugin_added_to_the_docs_config_applies_to_the_next_client():
+    local_api = _docs_api(openapi_config=OpenAPIConfig(title="T", version="1", render_plugins=[SwaggerRenderPlugin()]))
+    with TestClient(local_api) as client:
+        assert client.get("/docs/extra").status_code == 404
+
+    local_api._openapi_config.render_plugins.append(RedocRenderPlugin(path="/extra"))
+
+    with TestClient(local_api) as client:
+        assert client.get("/docs/extra").status_code == 200
 
 
 def _get_docs_after(barrier: threading.Barrier, local_api: BoltAPI, results: list[object]) -> None:
