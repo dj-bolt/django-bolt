@@ -89,7 +89,8 @@ def _record_sync(content: Any, held: dict[str, BaseException], token: str) -> It
         iterator = content if hasattr(content, "__next__") else iter(content)
         while True:
             try:
-                item = next(iterator)
+                # As Bolt does: an instance can hold __next__, and next() looks only on the class.
+                item = iterator.__next__()
             except StopIteration:
                 return
             yield item

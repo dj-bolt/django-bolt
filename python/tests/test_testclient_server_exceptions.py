@@ -11,6 +11,7 @@ import asyncio
 import gc
 import logging
 import weakref
+from types import SimpleNamespace
 
 import msgspec
 import pytest
@@ -408,3 +409,17 @@ def test_the_client_closes_the_stream_after_its_last_chunk():
 
     assert response.content == b"a,b"
     assert chunks.closed
+
+
+def test_the_client_reads_a_stream_with_an_instance_next_as_bolt_does():
+    """Bolt calls ``__next__`` of the object. ``next()`` would look only on the class."""
+    api = BoltAPI()
+
+    @api.get("/instance-next-stream")
+    def instance_next_stream():
+        return StreamingResponse(SimpleNamespace(__next__=iter([b"o", b"k"]).__next__), media_type="text/plain")
+
+    with TestClient(api) as client:
+        response = client.get("/instance-next-stream")
+
+    assert response.content == b"ok"
