@@ -78,7 +78,7 @@ def test_the_error_is_a_runtime_error():
 
 def test_the_error_names_the_route_and_the_handler(caplog):
     caplog.set_level(logging.ERROR)
-    with TestClient(_api()) as client:
+    with TestClient(_api(), raise_server_exceptions=False) as client:
         response = client.get("/profile/ann", headers=_headers())
 
     assert response.status_code == 500
@@ -93,7 +93,7 @@ def test_the_error_names_the_route_and_the_handler(caplog):
 
 def test_dev_mode_logs_the_fix_one_time_for_each_route(caplog):
     caplog.set_level(logging.WARNING, logger="django_bolt")
-    with override_settings(DEBUG=True), TestClient(_api()) as client:
+    with override_settings(DEBUG=True), TestClient(_api(), raise_server_exceptions=False) as client:
         for _ in range(3):
             assert client.get("/profile/ann", headers=_headers()).status_code == 500
 
@@ -106,7 +106,7 @@ def test_dev_mode_logs_the_fix_one_time_for_each_route(caplog):
 def test_no_hint_outside_dev_mode(caplog, debug, monkeypatch):
     monkeypatch.delenv("DJANGO_BOLT_DEV_WORKER", raising=False)
     caplog.set_level(logging.WARNING, logger="django_bolt")
-    with override_settings(DEBUG=debug), TestClient(_api()) as client:
+    with override_settings(DEBUG=debug), TestClient(_api(), raise_server_exceptions=False) as client:
         assert client.get("/profile/ann", headers=_headers()).status_code == 500
 
     assert not [r for r in caplog.records if r.levelno == logging.WARNING and "await request.auser()" in r.getMessage()]
@@ -122,7 +122,7 @@ _WHERE = re.escape(f"{__name__}._api.<locals>.profile (") + r".*?test_lane_affin
 
 def test_the_error_names_the_qualified_name_of_the_handler(caplog):
     caplog.set_level(logging.ERROR)
-    with TestClient(_api()) as client:
+    with TestClient(_api(), raise_server_exceptions=False) as client:
         assert client.get("/profile/ann", headers=_headers()).status_code == 500
 
     message = str(_error_records(caplog)[0].exc_info[1])
@@ -131,7 +131,7 @@ def test_the_error_names_the_qualified_name_of_the_handler(caplog):
 
 def test_the_dev_mode_hint_names_the_handler_the_route_and_the_fix(caplog):
     caplog.set_level(logging.WARNING, logger="django_bolt")
-    with override_settings(DEBUG=True), TestClient(_api()) as client:
+    with override_settings(DEBUG=True), TestClient(_api(), raise_server_exceptions=False) as client:
         assert client.get("/profile/ann", headers=_headers()).status_code == 500
 
     hints = _hint_records(caplog)
@@ -149,7 +149,7 @@ def test_the_dev_worker_of_runbolt_logs_the_hint_with_debug_off(caplog, monkeypa
     """``runbolt --dev`` sets DJANGO_BOLT_DEV_WORKER=1 in its worker."""
     monkeypatch.setenv("DJANGO_BOLT_DEV_WORKER", "1")
     caplog.set_level(logging.WARNING, logger="django_bolt")
-    with override_settings(DEBUG=False), TestClient(_api()) as client:
+    with override_settings(DEBUG=False), TestClient(_api(), raise_server_exceptions=False) as client:
         assert client.get("/profile/ann", headers=_headers()).status_code == 500
 
     assert len(_hint_records(caplog)) == 1
