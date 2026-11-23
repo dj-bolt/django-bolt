@@ -24,6 +24,7 @@ import os
 import platform
 import signal
 import socket
+import sys
 import time
 
 import httpx
@@ -372,9 +373,12 @@ def test_runbolt_stops_with_exit_status_1_after_each_worker_failed(make_server_p
 
     server = project.start(processes=2)
     try:
-        # Each worker must listen before the first /die. Otherwise each /die can
-        # find no socket after the first worker stops, and the second worker lives.
-        server.wait_for_workers(2)
+        # On Linux, each worker must listen before the first /die. Otherwise each
+        # /die can find no socket after the first worker stops, and the second
+        # worker lives. macOS sends each connection to one socket, so two PIDs
+        # never answer there; the next /die goes to the other worker.
+        if sys.platform.startswith("linux"):
+            server.wait_for_workers(2)
         # Each /die stops one worker with exit status 1. The connection drops.
         for _ in range(40):
             if server.process.poll() is not None:
