@@ -276,6 +276,30 @@ def django_db_setup(django_db_blocker):
                     schema_editor.create_model(model)
 
 
+@pytest.fixture
+def transactional_db(request):
+    """Give a transactional database, also when a test gets this fixture with ``getfixturevalue``.
+
+    pytest-django looks for ``transactional_db`` only in the fixtures of the test signature.
+    Without this override, a test that gets it with ``getfixturevalue`` runs in one transaction, as for ``db``.
+    An async ORM call writes on the connection of an ORM pool thread, so the rollback does not undo its rows.
+    The next transactional test then starts with these rows (#941).
+    Thus the override gives such a test the marker ``django_db(transaction=True)`` before pytest-django reads it.
+    """
+    from django.db import connection  # noqa: PLC0415
+
+    if "transactional_db" not in request.fixturenames:
+        request.node.add_marker(pytest.mark.django_db(transaction=True))
+    request.getfixturevalue("_django_db_helper")
+    # pytest-django sets up the database one time for each test, at the first request.
+    # A test with db or a django_db marker got its database before this fixture.
+    if connection.in_atomic_block:
+        pytest.fail(
+            "transactional_db came after db or django_db: the test already runs in one transaction. "
+            "Put transactional_db in the test signature, or use django_db(transaction=True)."
+        )
+
+
 def pytest_unconfigure(config):
     """Remove the database directory at the end of the session.
 
