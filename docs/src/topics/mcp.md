@@ -478,6 +478,13 @@ The auth and the guards of the mount run first, and do not replace those of the 
 - `tools/list` does not show the tool to a caller that the route refuses.
 - Tool middleware gets the principal from the auth of the route.
 
+A route with a `revocation_store` or a `revoked_token_handler` also checks revocation on each tool call.
+The check is the same as for an HTTP request to the route, and it runs before tool middleware.
+A revoked token gets `Permission denied for tool 'read_article'`, and the handler does not run.
+An error of the store gives an error result, and Bolt logs the traceback.
+`tools/list` does not check revocation, because the check needs a store lookup for each tool.
+Thus a revoked token can still see the tool in the list, but it cannot call the tool.
+
 **Behavior change:** a tool call cannot run middleware.
 Thus `mount_mcp()` raises `ValueError` for an exposed route with `@rate_limit`, Python middleware or Django middleware.
 This includes the middleware of the API and of the router, and a route with `SessionAuthentication`.
