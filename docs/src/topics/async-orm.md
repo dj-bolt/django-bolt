@@ -76,6 +76,7 @@ The return type tells Bolt how to read the rows:
 A nested Struct reads only a foreign key or a one-to-one relation. A `None` relation gives `null`, so type the field `AuthorOut | None` when the key can be empty.
 A reverse one-to-one relation with no row also gives `null`, with a default on the field or without one.
 Name the field of a reverse relation as the attribute of the model instance: the `related_name`, not the `related_query_name`.
+A hidden relation (`related_name="+"`) has no attribute. Only a QuerySet reads it, with its `related_query_name`.
 For a list of related rows, such as the tags of an article, use a Bolt `Serializer` as the item type. A Struct field for such a relation gives a `TypeError` that names the field.
 
 Bolt also loads the relations of a nested Struct for model instances. This applies to a page of `@paginate`, to a model instance that a handler returns, and to a list of model instances. Each relation costs one query for all the instances. A relation that the QuerySet loads with `select_related()` costs no query.

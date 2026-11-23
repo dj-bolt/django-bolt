@@ -15,12 +15,12 @@ from django.db.backends import utils as db_utils
 from django.db.models.functions import JSONObject
 
 from django_bolt import BoltAPI, ViewSet
-from django_bolt.pagination import CursorPagination, PageNumberPagination, paginate
+from django_bolt.pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
 from django_bolt.responses import JSON
 from django_bolt.testing import TestClient
 from django_bolt.views import RetrieveMixin
 
-from .test_models import Author, BlogPost, Comment, User, UserBadge, UserProfile
+from .test_models import Author, BlogPost, Comment, User, UserBadge, UserProfile, UserSecret
 
 
 class AuthorOut(msgspec.Struct):
@@ -872,3 +872,89 @@ def test_accessor_relation_loads_with_one_query_for_each_relation(sql_statements
             expected = rows[0] if path.startswith(("/one/", "/viewset/")) else rows
             assert (body["items"] if path.startswith("/page") else body) == expected, path
             assert len(sql_statements) == queries, (path, sql_statements)
+
+
+class OneUserCursor(CursorPagination):
+    page_size = 1
+    ordering = "id"
+
+
+class OneUserPage(PageNumberPagination):
+    page_size = 1
+
+
+class OneUserLimit(LimitOffsetPagination):
+    page_size = 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_each_paginator_pages_through_instances_that_become_rows():
+    """CursorPagination reads the ordering field of the last instance. Bolt makes the rows after that."""
+    ada, bob = _make_users()
+    UserProfile.objects.filter(user=bob).delete()
+    pages = [{"username": "ada", "profile": {"bio": "Hi"}}, {"username": "bob", "profile": None}]
+    api = BoltAPI()
+
+    @api.get("/cursor", response_model=list[UserWithRequiredProfile])
+    @paginate(OneUserCursor)
+    async def cursor():
+        return User.objects.all()
+
+    @api.get("/cursor-sync", response_model=list[UserWithRequiredProfile])
+    @paginate(OneUserCursor)
+    def cursor_sync():
+        return User.objects.all()
+
+    @api.get("/page", response_model=list[UserWithRequiredProfile])
+    @paginate(OneUserPage)
+    async def page():
+        return User.objects.order_by("id")
+
+    @api.get("/limit", response_model=list[UserWithRequiredProfile])
+    @paginate(OneUserLimit)
+    async def limit():
+        return User.objects.order_by("id")
+
+    with TestClient(api) as client:
+        for path in ("/cursor", "/cursor-sync"):
+            first = client.get(path)
+            assert first.status_code == 200, (path, first.text)
+            assert first.json()["items"] == pages[:1], path
+            cursor_value = first.json()["next_cursor"]
+            assert cursor_value, path
+            second = client.get(path, params={"cursor": cursor_value})
+            assert second.status_code == 200, (path, second.text)
+            assert second.json()["items"] == pages[1:], path
+        for path, params in (("/page", {"page": 2}), ("/limit", {"offset": 1})):
+            response = client.get(path, params=params)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json()["items"] == pages[1:], path
+
+
+class SecretOut(msgspec.Struct):
+    code: str
+
+
+class UserWithSecretRow(msgspec.Struct):
+    username: str
+    secret_row: SecretOut | None = None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_hidden_reverse_relation_reads_only_through_a_query():
+    """A hidden relation has no accessor. A QuerySet reads it. A model instance cannot, so Bolt names the field.
+
+    The default of the field would be ``null`` for a user who has the related row.
+    """
+    ada, bob = _make_users()
+    UserSecret.objects.create(user=ada, code="s1")
+    rows = [{"username": "ada", "secret_row": {"code": "s1"}}, {"username": "bob", "secret_row": None}]
+    api, list_paths, one_paths = _routes_of(UserWithSecretRow, User, "username")
+    values_paths = [path for path in list_paths if path.startswith("/values")]
+    _assert_each_path(api, values_paths, [], rows, [ada.pk, bob.pk])
+    instance_paths = [path for path in list_paths if not path.startswith("/values")]
+    instance_paths += [path.format(pk=ada.pk) for path in one_paths]
+    with TestClient(api) as client:
+        for path in instance_paths:
+            with pytest.raises(TypeError, match=r"UserWithSecretRow\.secret_row is a hidden relation"):
+                client.get(path)

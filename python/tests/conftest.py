@@ -256,6 +256,7 @@ def django_db_setup(django_db_blocker):
                 User,
                 UserBadge,
                 UserProfile,
+                UserSecret,
             )
 
             models = [
@@ -267,6 +268,7 @@ def django_db_setup(django_db_blocker):
                 User,
                 UserProfile,
                 UserBadge,
+                UserSecret,
                 Document,
                 Release,
                 Country,

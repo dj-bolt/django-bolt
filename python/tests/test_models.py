@@ -139,6 +139,16 @@ class UserBadge(models.Model):
         app_label = "django_bolt"
 
 
+class UserSecret(models.Model):
+    """Hidden one-to-one relation to User: it has a query name, but no accessor."""
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="+", related_query_name="secret_row")
+    code = models.CharField(max_length=50)
+
+    class Meta:
+        app_label = "django_bolt"
+
+
 class Document(models.Model):
     """Document model for testing file upload integration."""
 
