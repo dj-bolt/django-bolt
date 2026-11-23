@@ -7,6 +7,8 @@ memory fails these tests.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from .apps import app_module
@@ -38,9 +40,22 @@ def _refresh(server, token):
     return response.cookies["refresh_token"]
 
 
+def _wait_for_both_workers(server, timeout=30.0):
+    """Wait until each of the two workers answers ``/pid``.
+
+    The server is ready when one worker answers. The other worker can bind its
+    socket later. Each probe opens a new connection, so the kernel can send it
+    to each worker that listens.
+    """
+    pids = set()
+    deadline = time.monotonic() + timeout
+    while len(pids) < 2:
+        assert time.monotonic() < deadline, f"only the workers {pids} answered"
+        pids.add(server.get("/pid", headers={"Connection": "close"}).json()["pid"])
+
+
 def _check_session_lifecycle(server):
-    pids = {server.get("/pid", headers={"Connection": "close"}).json()["pid"] for _ in range(20)}
-    assert len(pids) == 2, pids
+    _wait_for_both_workers(server)
 
     # A used refresh token that comes back ends its family, also the token that replaced it.
     first = _login(server)
