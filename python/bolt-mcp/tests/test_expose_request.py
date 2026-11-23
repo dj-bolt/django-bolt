@@ -5,11 +5,20 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from _helpers import mint_jwt, parse_rpc, post_rpc_modern
+from _helpers import (
+    DUAL_ACCEPT,
+    JSON_CONTENT_TYPE,
+    PROTOCOL_MODERN,
+    mint_jwt,
+    modern_meta,
+    parse_rpc,
+    post_rpc_modern,
+    rpc_body,
+)
 from bolt_mcp import MCP, Context, expose_as_tool, expose_routes
 from django.contrib.auth import get_user_model
 
-from django_bolt import BoltAPI, Depends, IsAuthenticated, JWTAuthentication, Request
+from django_bolt import APIKeyAuthentication, BoltAPI, Depends, IsAuthenticated, JWTAuthentication, Request
 from django_bolt.testing import TestClient
 
 SECRET = "expose-request-secret-key-0123456789-abcdef"
@@ -222,3 +231,45 @@ def test_the_context_of_a_tool_holds_the_request():
     api.mount_mcp(mcp)
     with TestClient(api) as client:
         assert _call(client, "traced", headers_override={"X-Trace": "c"}) == {"trace": "c", "anonymous": True}
+
+
+def test_each_mount_of_one_server_loads_the_user_with_its_own_backends(user):
+    """A second mount with other auth backends does not change the user of the first mount."""
+    api = BoltAPI()
+    mcp = MCP(name="t")
+
+    @mcp.tool
+    async def whoami(request) -> dict:
+        user = await request.auser()
+        return {"username": user.username, "backend": request.context["auth_backend"]}
+
+    api.mount_mcp(mcp, "/jwt", auth=[JWTAuthentication(secret=SECRET)])
+    api.mount_mcp(mcp, "/key", auth=[APIKeyAuthentication(api_keys={"k"})])
+    params = {"name": "whoami", "arguments": {}, "_meta": modern_meta()}
+    headers = {
+        "Accept": DUAL_ACCEPT,
+        "Content-Type": JSON_CONTENT_TYPE,
+        "MCP-Protocol-Version": PROTOCOL_MODERN,
+        "Mcp-Method": "tools/call",
+        "Mcp-Name": "whoami",
+        "Authorization": f"Bearer {mint_jwt(SECRET, sub=str(user.pk))}",
+    }
+    with TestClient(api) as client:
+        resp = client.post("/jwt", content=rpc_body("tools/call", params), headers=headers)
+    result = parse_rpc(resp)["result"]
+    assert result["isError"] is False, result
+    assert result["structuredContent"] == {"username": user.username, "backend": "jwt"}
+
+
+def test_a_route_with_no_auth_and_no_guards_gives_the_user_of_the_mount(user):
+    """With no gate of the route, the principal of the mount stays, as for tool middleware (#939)."""
+    api = BoltAPI()
+
+    @api.get("/open", auth=[], guards=[])
+    async def open_route(request: Request) -> dict:
+        return {"username": request.user.username, "backend": request.context["auth_backend"]}
+
+    api.mount_mcp(MCP(name="t"), expose=[open_route], auth=[JWTAuthentication(secret=SECRET)])
+    bearer = f"Bearer {mint_jwt(SECRET, sub=str(user.pk))}"
+    with TestClient(api) as client:
+        assert _call(client, "open_route", authorization=bearer) == {"username": user.username, "backend": "jwt"}

@@ -56,7 +56,9 @@ def _set_user(request: Any, loaders: tuple[Any, ...]) -> None:
         request.user = LazyUser(user_loaders, user_id, auth_context)
 
 
-async def _call_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any], raw: Any) -> dict[str, Any]:
+async def _call_tool(
+    tool: ToolDef, mcp: MCP, user_loaders: tuple[Any, ...], payload: dict[str, Any], raw: Any
+) -> dict[str, Any]:
     try:
         args = msgspec.convert(raw or {}, tool.args_struct)
     except msgspec.ValidationError as exc:
@@ -65,8 +67,7 @@ async def _call_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any], raw: Any)
     # Rust builds the request only for a tool that takes it or a Context.
     request = payload["request"]
     if request is not None:
-        # The principal of an exposed route comes from the auth of the route, else from the mount.
-        _set_user(request, tool.user_loaders if tool.route_auth is not None else mcp._user_loaders)
+        _set_user(request, user_loaders)
         if tool.request_param is not None:
             kwargs[tool.request_param] = request
     if tool.ctx_param is not None:
@@ -95,9 +96,9 @@ async def _call_through_middleware(
     return await call_next(0)
 
 
-async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
+async def _run_tool(tool: ToolDef, mcp: MCP, user_loaders: tuple[Any, ...], payload: dict[str, Any]) -> bytes:
     raw = json_decode(payload["arguments_json"])
-    call_tool = partial(_call_tool, tool, mcp, payload, raw)
+    call_tool = partial(_call_tool, tool, mcp, user_loaders, payload, raw)
     try:
         if mcp._tool_middleware:
             call = ToolCall(
@@ -129,10 +130,15 @@ async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
     return json_encode(result)
 
 
-def tool_entry(mcp: MCP, tool: ToolDef) -> dict[str, Any]:
-    """The per-tool config dict Rust stores in its registry."""
+def tool_entry(mcp: MCP, tool: ToolDef, mount_user_loaders: tuple[Any, ...]) -> dict[str, Any]:
+    """The per-tool config dict Rust stores in its registry.
+
+    ``mount_user_loaders`` are the user loaders of the auth backends of the mount.
+    """
+    # The principal of an exposed route comes from the auth of the route, else from the mount.
+    user_loaders = tool.user_loaders if tool.route_auth is not None else mount_user_loaders
     return {
-        "dispatch": partial(_run_tool, tool, mcp),
+        "dispatch": partial(_run_tool, tool, mcp, user_loaders),
         "needs_context": tool.ctx_param is not None,
         "needs_request": tool.request_param is not None or tool.ctx_param is not None,
         "guards": [g.to_metadata() for g in tool.guards],

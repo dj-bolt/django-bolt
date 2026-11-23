@@ -176,8 +176,6 @@ def mount_mcp(
         # As for a route: a guard that needs a user and no backend gives JWTAuthentication().
         backends = get_default_authentication_classes(needs_user=guards_need_user(mount_guards)) or []
     auth_metadata = [b.to_metadata() for b in backends] or None
-    # A tool that takes the request gets the user of the mount principal, as a route does.
-    mcp._user_loaders = tuple(resolve_user_loader(backend) for backend in backends)
     guards_metadata = [g.to_metadata() for g in mount_guards]
 
     verify_token = None
@@ -220,6 +218,8 @@ def mount_mcp(
         www_authenticate=www_authenticate,
         allowed_hosts=list(allowed_hosts) if allowed_hosts is not None else None,
         allowed_origins=list(allowed_origins) if allowed_origins is not None else None,
+        # A tool that takes the request gets the user of the mount principal, as a route does.
+        user_loaders=tuple(resolve_user_loader(backend) for backend in backends),
     )
     api._mcp_mounts.append(definition)
     mcp._mounted = True

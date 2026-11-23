@@ -491,7 +491,9 @@ The auth and the guards of the mount run first, and do not replace those of the 
 A handler with a `request` or `req` argument gets the request of the tool call, as an `@mcp.tool` does.
 See [Read the request](#read-the-request).
 `request.context` is the principal from the auth of the route, so `request.user` and `await request.auser()` give the same user as over HTTP.
-A route with no auth backend has no principal. Thus `request.user` is `AnonymousUser`, also on a mount with `auth`.
+A public route has the guard `AllowAny` from `BOLT_DEFAULT_PERMISSION_CLASSES` and no backend, so it has no principal.
+Thus `request.user` is `AnonymousUser`, also on a mount with `auth`.
+A route with `auth=[]` and `guards=[]` has no gate, so it gets the principal of the mount.
 The path parameters of the route are tool arguments, so `request.params` is empty.
 
 **Behavior change:** a tool call cannot run middleware.

@@ -145,8 +145,6 @@ class MCP:
         self._tool_middleware: list[ToolMiddleware] = []
         self._resource_middleware: list[ResourceMiddleware] = []
         self._prompt_middleware: list[PromptMiddleware] = []
-        # The user loaders of the auth backends of the mount, by auth_backend_index. Set by mount_mcp.
-        self._user_loaders: tuple[Any, ...] = ()
         self._mounted = False
 
     # ── Registration decorators ──────────────────────────────────────────────
