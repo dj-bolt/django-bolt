@@ -117,11 +117,13 @@ def build_mount_definition(
     www_authenticate: str | None,
     allowed_hosts: list[str] | None,
     allowed_origins: list[str] | None,
+    user_loaders: tuple[Any, ...],
 ) -> dict[str, Any]:
     """Build the mount definition dict consumed by ``_core.register_mcp_mounts``.
 
     Every key the Rust parser reads is always present (registration-time
     guarantee rule) — Rust uses direct access, never defaults.
+    ``user_loaders`` are the user loaders of the auth backends of this mount.
     """
     from ._dispatch import prompt_dispatch, resource_dispatch, tool_entry  # noqa: PLC0415 — avoid import cycle
 
@@ -139,7 +141,7 @@ def build_mount_definition(
         "allowed_origins": allowed_origins,
         "auth_backends": auth_metadata,
         "guards": guards_metadata,
-        "tools": {name: tool_entry(mcp, tool) for name, tool in mcp._tools.items()},
+        "tools": {name: tool_entry(mcp, tool, user_loaders) for name, tool in mcp._tools.items()},
         "resource_dispatch": resource_dispatch(mcp),
         "prompt_dispatch": prompt_dispatch(mcp),
         # Rust sends the request `_meta` and the principal only to middleware.
