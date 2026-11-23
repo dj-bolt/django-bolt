@@ -27,6 +27,7 @@ from django_bolt import BoltAPI, ModelViewSet
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import OpenAPIStrictError, SchemaGenerator
 from django_bolt.pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
+from django_bolt.params import Body
 from django_bolt.responses import (
     HTML,
     JSON,
@@ -678,6 +679,169 @@ def test_str_or_bytes_in_a_union_or_a_response_map_documents_the_media_type_that
     assert sent_media_type in content
     documented = {media_type: media["schema"] for media_type, media in content.items()}
     assert documented == (expected or _PROBLEM_JSON)
+
+
+# ---------------------------------------------------------------------------
+# #945 — the msgspec.Meta of an Annotated component reference
+# ---------------------------------------------------------------------------
+
+USER_REF = {"$ref": "#/components/schemas/UserRead"}
+USER_META = msgspec.Meta(
+    title="The user",
+    description="The user of the request.",
+    examples=[{"id": 1, "name": "a"}],
+    extra_json_schema={"deprecated": True},
+)
+USER_META_KEYWORDS = {
+    "title": "The user",
+    "description": "The user of the request.",
+    "examples": [{"id": 1, "name": "a"}],
+    "deprecated": True,
+}
+
+# ``reference`` and ``to_schema`` are attributes of the generator classes, not schema keywords.
+NOT_SCHEMA_KEYWORDS_META = msgspec.Meta(description="A user.", extra_json_schema={"reference": "x", "to_schema": "y"})
+
+
+def _plain_user_component() -> dict:
+    """The component of ``UserRead`` in an API with no ``Meta``."""
+    api = BoltAPI(openapi_config=_config())
+
+    @api.get("/plain")
+    async def plain() -> UserRead:
+        pass
+
+    return _get_schema(api)["components"]["schemas"]["UserRead"]
+
+
+@pytest.mark.parametrize("declared_by", ["annotation", "response_model"])
+@pytest.mark.parametrize(
+    ("return_type", "expected"),
+    [
+        (Annotated[UserRead, USER_META], {**USER_REF, **USER_META_KEYWORDS}),
+        (list[Annotated[UserRead, USER_META]], {"type": "array", "items": {**USER_REF, **USER_META_KEYWORDS}}),
+        (Annotated[list[UserRead], USER_META], {"type": "array", "items": USER_REF, **USER_META_KEYWORDS}),
+        (Annotated[UserRead, USER_META] | None, {"anyOf": [{**USER_REF, **USER_META_KEYWORDS}, {"type": "null"}]}),
+        (Annotated[UserRead | None, USER_META], {"anyOf": [USER_REF, {"type": "null"}], **USER_META_KEYWORDS}),
+    ],
+    ids=["annotated", "list-of-annotated", "annotated-list", "annotated-or-none", "annotated-optional"],
+)
+def test_meta_of_an_annotated_response_type_is_next_to_the_component_reference(return_type, expected, declared_by):
+    """``-> Annotated[Item, Meta(...)]`` keeps the Meta keywords next to the ``$ref`` (#945).
+
+    OpenAPI 3.1 allows keywords next to ``$ref``. The shared component does not change.
+    """
+    api = BoltAPI(openapi_config=_config())
+    _register_with_return_type(api, "/thing", return_type, declared_by)
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _ok_response(schema, "/thing")["content"] == {"application/json": {"schema": expected}}
+    assert schema["components"]["schemas"]["UserRead"] == _plain_user_component()
+
+
+def test_meta_of_an_annotated_request_body_item_is_next_to_the_component_reference():
+    """A body of the type ``list[Annotated[Item, Meta(...)]]`` keeps the Meta keywords next to each ``$ref`` (#945).
+
+    A body of the type ``Annotated[Item, Meta(...)]`` keeps only ``Item`` when Bolt binds the parameter.
+    """
+    api = BoltAPI(openapi_config=_config())
+
+    @api.post("/users")
+    async def create_users(body: Annotated[list[Annotated[UserRead, USER_META]], Body()]):
+        pass
+
+    schema = _get_schema(api)
+    validate(schema)
+    body = schema["paths"]["/users"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+    assert body == {"type": "array", "items": {**USER_REF, **USER_META_KEYWORDS}}
+    assert schema["components"]["schemas"]["UserRead"] == _plain_user_component()
+
+
+def test_each_annotated_reference_keeps_its_own_meta():
+    """Two routes with a different Meta on one component each document their own Meta (#945)."""
+    api = BoltAPI(openapi_config=_config())
+
+    @api.get("/first")
+    async def first() -> Annotated[UserRead, msgspec.Meta(description="The first user.")]:
+        pass
+
+    @api.get("/second")
+    async def second() -> Annotated[UserRead, msgspec.Meta(description="The second user.")]:
+        pass
+
+    @api.get("/plain")
+    async def plain() -> UserRead:
+        pass
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _ok_response(schema, "/first")["content"]["application/json"]["schema"] == {
+        **USER_REF,
+        "description": "The first user.",
+    }
+    assert _ok_response(schema, "/second")["content"]["application/json"]["schema"] == {
+        **USER_REF,
+        "description": "The second user.",
+    }
+    assert _ok_response(schema, "/plain")["content"]["application/json"]["schema"] == USER_REF
+    assert schema["components"]["schemas"]["UserRead"] == _plain_user_component()
+
+
+def test_extra_json_schema_sets_only_schema_keywords_next_to_the_reference():
+    """A key of ``extra_json_schema`` that is not a schema keyword does not change the schema (#945).
+
+    The generator ignores the key, next to a reference and on an inline schema.
+    """
+    api = BoltAPI(openapi_config=_config())
+
+    @api.get("/thing")
+    async def thing() -> Annotated[UserRead, NOT_SCHEMA_KEYWORDS_META]:
+        pass
+
+    @api.get("/numbers")
+    async def numbers() -> list[Annotated[int, NOT_SCHEMA_KEYWORDS_META]]:
+        pass
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _ok_response(schema, "/thing")["content"]["application/json"]["schema"] == {
+        **USER_REF,
+        "description": "A user.",
+    }
+    assert _ok_response(schema, "/numbers")["content"]["application/json"]["schema"] == {
+        "type": "array",
+        "items": {"type": "integer", "description": "A user."},
+    }
+
+
+def test_annotated_reference_follows_the_qualified_component_name():
+    """The ``$ref`` next to the Meta keywords uses the final name of the component (#945).
+
+    Two classes with one name get their qualified names after the routes are read.
+    """
+    first = types.new_class("Item", (msgspec.Struct,), {}, lambda ns: ns.update({"__annotations__": {"id": int}}))
+    first.__module__ = "app_one.schemas"
+    second = types.new_class("Item", (msgspec.Struct,), {}, lambda ns: ns.update({"__annotations__": {"name": str}}))
+    second.__module__ = "app_two.schemas"
+
+    api = BoltAPI(openapi_config=_config())
+
+    @api.get("/one", response_model=Annotated[first, msgspec.Meta(description="The first item.")])
+    async def one():
+        pass
+
+    @api.get("/two", response_model=second)
+    async def two():
+        pass
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _ok_response(schema, "/one")["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/app_one.schemas.Item",
+        "description": "The first item.",
+    }
+    assert "app_one.schemas.Item" in schema["components"]["schemas"]
 
 
 # ---------------------------------------------------------------------------

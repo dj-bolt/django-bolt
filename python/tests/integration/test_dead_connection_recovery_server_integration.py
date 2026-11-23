@@ -327,21 +327,6 @@ DATABASES["default"]["OPTIONS"] = {"pool": {"min_size": 4, "max_size": 16}}
 """
 
 
-def wait_for_workers(server: Any, count: int) -> None:
-    """Wait until ``count`` workers answer ``/echo``.
-
-    The server is ready when one worker answers. Another worker can bind its
-    socket later, and a keep-alive connection that opens before that bind
-    always goes to the first worker. Each probe opens a new connection, so
-    the kernel can send it to each worker that listens.
-    """
-    pids: set[int] = set()
-    deadline = time.monotonic() + 30
-    while len(pids) < count:
-        assert time.monotonic() < deadline, f"only the workers {pids} answered"
-        pids.add(httpx.get(server.url("/echo?token=probe"), timeout=10).json()["pid"])
-
-
 # macOS does not spread connections across SO_REUSEPORT sockets: one worker
 # serves each request, so the two workers never share a connection there.
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Multiprocess load balancing only runs on Linux.")
@@ -371,7 +356,7 @@ def test_forked_workers_do_not_share_the_connections_of_the_parent(make_server_p
 
     try:
         with server, ThreadPoolExecutor(32) as senders:
-            wait_for_workers(server, 2)
+            server.wait_for_workers(2, "/echo?token=probe")
             results = list(senders.map(send, tokens))
     finally:
         for client in opened:

@@ -39,8 +39,8 @@ def _refresh(server, token):
 
 
 def _check_session_lifecycle(server):
-    pids = {server.get("/pid", headers={"Connection": "close"}).json()["pid"] for _ in range(20)}
-    assert len(pids) == 2, pids
+    # Each worker must answer before the checks. Then a store in the memory of one process fails them.
+    server.wait_for_workers(2)
 
     # A used refresh token that comes back ends its family, also the token that replaced it.
     first = _login(server)

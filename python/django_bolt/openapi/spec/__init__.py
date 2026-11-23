@@ -23,7 +23,7 @@ from .reference import Reference
 from .request_body import RequestBody
 from .response import OpenAPIResponse
 from .responses import Responses
-from .schema import Schema
+from .schema import ReferenceWithKeywords, Schema
 from .security_requirement import SecurityRequirement
 from .security_scheme import SecurityScheme
 from .server import Server
@@ -57,6 +57,7 @@ __all__ = (
     "PathItem",
     "Paths",
     "Reference",
+    "ReferenceWithKeywords",
     "RequestBody",
     "Responses",
     "Schema",
