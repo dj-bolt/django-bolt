@@ -90,7 +90,7 @@ pub enum ServeMode {
 #[derive(Clone, Debug)]
 pub struct ScopeConfig {
     pub url_prefix: String,
-    pub directories: Vec<PathBuf>,
+    pub directories: Vec<ServeDir>,
     pub csp_header: Option<HeaderValue>,
     pub cache_control: Option<HeaderValue>,
     pub mode: ServeMode,
@@ -98,6 +98,24 @@ pub struct ScopeConfig {
     /// finders fallback inside `handle_file`, only for `ServeMode::Static`
     /// with `DEBUG=True`. A file from a finder must stay inside its root.
     pub django_finders: Option<Vec<FinderRoot>>,
+}
+
+/// One directory that a static or media scope serves, read once at startup.
+#[derive(Clone, Debug)]
+pub struct ServeDir {
+    /// The URL prefix of a `(prefix, path)` entry of `STATICFILES_DIRS`,
+    /// with a trailing `/`, as Django's `FileSystemFinder` uses it. A request
+    /// path must start with it. `None` serves the directory at the scope root.
+    pub prefix: Option<String>,
+    /// The canonical, absolute directory.
+    pub root: PathBuf,
+}
+
+impl ServeDir {
+    /// A directory with no URL prefix.
+    pub fn at_root(root: PathBuf) -> Self {
+        Self { prefix: None, root }
+    }
 }
 
 /// The directory of one staticfiles finder location, read once at startup.

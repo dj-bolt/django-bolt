@@ -269,3 +269,30 @@ def test_debug_finders_refuse_a_symlink_out_of_their_root(make_server_project):
     assert "color: teal" in served.text
     assert leak.status_code == 404
     assert "SECRET_CONTENT" not in leak.text
+
+
+def test_prefixed_staticfiles_dir_is_served_with_no_startup_warning(make_server_project):
+    """A (prefix, path) entry serves its files under `prefix/` and prints no warning (#944)."""
+    project = make_server_project(
+        installed_apps=["django.contrib.staticfiles"],
+        settings_extra="""
+        DEBUG = False
+        STATIC_URL = "/static/"
+        STATICFILES_DIRS = [("vendor", BASE_DIR / "assets" / "vendor")]
+        """,
+        extra_files={"assets/vendor/app.css": "body { color: olive; }\n"},
+    )
+
+    with project.start() as server:
+        served = server.get("/static/vendor/app.css")
+        unprefixed = server.get("/static/app.css")
+        missing = server.get("/static/vendor/missing.css")
+        stdout, stderr = server.stop()
+
+    assert served.status_code == 200
+    assert "color: olive" in served.text
+    assert unprefixed.status_code == 404
+    assert missing.status_code == 404
+    output = stdout + stderr
+    assert "cannot resolve directory" not in output
+    assert "No valid directories" not in output
