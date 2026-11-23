@@ -1206,7 +1206,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
             return _serialize_json_payload_sync(result, current_status, validator_sync)
         if isinstance(result, list):
             if relation_loader is not None:
-                await relation_loader.aload(result)
+                result = await relation_loader.aload(result)
             return await _serialize_json_payload_async(prepare_list(result), current_status, validator_async)
         if struct_first and isinstance(result, msgspec.Struct):
             if is_serializer_response:
@@ -1246,8 +1246,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 result = await run_in_orm_executor(list, result)
             return await _serialize_json_payload_async(result, current_status, validator_async)
 
-        if relation_loader is not None and isinstance(result, Model):
-            await run_in_orm_executor(relation_loader.load, [result])
+        if relation_loader is not None and validator_async is not None and isinstance(result, Model):
+            result = (await run_in_orm_executor(relation_loader.load, [result]))[0]
         if isinstance(result, msgspec.Struct) or validator_async is not None:
             return await _serialize_json_payload_async(result, current_status, validator_async)
 
@@ -1271,7 +1271,7 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
         if isinstance(result, list):
             if relation_loader is not None and result and isinstance(result[0], Model):
                 # An async handler with no await runs here on the thread of the worker loop.
-                run_orm_blocking(relation_loader.load, result)
+                result = run_orm_blocking(relation_loader.load, result)
             return _serialize_json_payload_sync(prepare_list(result), current_status, validator_sync)
         if struct_first and isinstance(result, msgspec.Struct):
             if not is_serializer_response:
@@ -1307,8 +1307,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 result = list(result)
             return _serialize_json_payload_sync(result, current_status, validator_sync)
 
-        if relation_loader is not None and isinstance(result, Model):
-            run_orm_blocking(relation_loader.load, [result])
+        if relation_loader is not None and validator_sync is not None and isinstance(result, Model):
+            result = run_orm_blocking(relation_loader.load, [result])[0]
         if isinstance(result, msgspec.Struct) or validator_sync is not None:
             return _serialize_json_payload_sync(result, current_status, validator_sync)
 

@@ -11,11 +11,11 @@ import datetime
 import enum
 import inspect
 from collections.abc import Callable
-from typing import Annotated, Any, Literal, get_args, get_origin
+from typing import Annotated, Any, Literal, NamedTuple, get_args, get_origin
 
 import msgspec
 from django.core.exceptions import FieldDoesNotExist
-from django.db.models import Model, QuerySet, prefetch_related_objects
+from django.db.models import ForeignObjectRel, Model, QuerySet, prefetch_related_objects
 from django.db.models.query import ModelIterable
 
 from .._field_marker import _FieldMarker
@@ -1396,7 +1396,26 @@ def compile_struct_row_readers(
     return load_rows, project
 
 
-_RowPlan = tuple[tuple[str, ...], Callable[[dict[str, Any]], dict[str, Any]], tuple[str, ...]]
+class _RowPlan(NamedTuple):
+    """How Bolt reads a Struct with a nested Struct field from one model.
+
+    A query names a reverse relation by its query name. A model instance
+    names it by its accessor. The two names can differ, so the plan keeps
+    a path of each kind.
+    """
+
+    paths: tuple[str, ...]
+    """The ``.values()`` paths, with query names."""
+    build: Callable[[dict[str, Any]], dict[str, Any]]
+    """Nests a ``.values()`` row."""
+    joins: tuple[str, ...]
+    """The ``select_related()`` paths, with query names."""
+    prefetches: tuple[str, ...]
+    """The ``prefetch_related_objects()`` paths, with accessors."""
+    read_instance: Callable[[Any], dict[str, Any]]
+    """Reads a model instance into a row with the wire names."""
+    needs_rows: bool
+    """True if a reverse one-to-one relation can have no row. msgspec then reads rows, not instances."""
 
 
 def _field_value_type(annotation: Any) -> Any:
@@ -1441,7 +1460,7 @@ def _compile_plan_getter(item_type: type) -> Callable[[type], _RowPlan]:
         plan = plans.get(model)
         if plan is None:
             # Benign race: two threads make the same plan.
-            plan = plans[model] = _row_plan(model, item_type, "", (item_type,))
+            plan = plans[model] = _row_plan(model, item_type, "", "", (item_type,))
         return plan
 
     return plan_of
@@ -1456,8 +1475,9 @@ def _compile_nested_row_loader(item_type: type) -> Callable[[QuerySet], list[dic
     plan_of = _compile_plan_getter(item_type)
 
     def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
-        paths, build, _ = plan_of(queryset.model)
-        return [build(row) for row in queryset.values(*paths)]
+        plan = plan_of(queryset.model)
+        build = plan.build
+        return [build(row) for row in queryset.values(*plan.paths)]
 
     return load_rows
 
@@ -1529,35 +1549,44 @@ class StructRelationLoader:
             or query.deferred_loading[0]
         ):
             return queryset
-        relations = self._plan_of(queryset.model)[2]
-        return queryset.select_related(*relations) if relations else queryset
+        joins = self._plan_of(queryset.model).joins
+        return queryset.select_related(*joins) if joins else queryset
 
-    def load(self, items: list[Any]) -> None:
+    def load(self, items: list[Any]) -> list[Any]:
         """Load the relations of the model instances in ``items``. Run it where sync ORM calls are safe.
 
         A relation that is already loaded makes no query. Each batch holds the
         instances of one model and one database: Django reads the database of
         the related rows from the first instance of a batch.
+
+        Return the items for msgspec. An instance with a reverse one-to-one
+        relation becomes a row: msgspec cannot read a relation with no row
+        as None.
         """
         groups: dict[tuple[type, str | None], list[Model]] = {}
         for item in items:
             if isinstance(item, Model):
                 groups.setdefault((type(item), item._state.db), []).append(item)
+        readers: dict[type, Callable[[Any], dict[str, Any]]] = {}
         for (model, _), instances in groups.items():
-            relations = self._plan_of(model)[2]
-            if relations:
-                prefetch_related_objects(instances, *relations)
+            plan = self._plan_of(model)
+            if plan.prefetches:
+                prefetch_related_objects(instances, *plan.prefetches)
+            if plan.needs_rows:
+                readers[model] = plan.read_instance
+        if not readers:
+            return items
+        return [item if (read := readers.get(type(item))) is None else read(item) for item in items]
 
-    async def aload(self, items: list[Any]) -> None:
+    async def aload(self, items: list[Any]) -> list[Any]:
         """Run :meth:`load` on the ORM executor, if ``items`` holds model instances."""
         if items and isinstance(items[0], Model):
-            await run_in_orm_executor(self.load, items)
+            return await run_in_orm_executor(self.load, items)
+        return items
 
     def evaluate(self, queryset: QuerySet) -> list[Any]:
         """Evaluate ``queryset`` with its relations loaded."""
-        items = list(self.select_related(queryset))
-        self.load(items)
-        return items
+        return self.load(list(self.select_related(queryset)))
 
 
 def compile_struct_relation_loader(item_type: type) -> StructRelationLoader | None:
@@ -1565,61 +1594,130 @@ def compile_struct_relation_loader(item_type: type) -> StructRelationLoader | No
     return StructRelationLoader(item_type) if _has_nested_struct(item_type) else None
 
 
-def _relation_field(model: type, name: str) -> Any:
-    """Return the model field of the relation ``name``, or None."""
+class _Relation(NamedTuple):
+    """A relation that a Struct field names."""
+
+    field: Any
+    """The model field, or the ``ForeignObjectRel`` of a reverse relation."""
+    query_name: str
+    """The name of the relation in a query."""
+    accessor: str
+    """The name of the relation on a model instance."""
+
+
+def _relation_of(model: type, name: str) -> _Relation | None:
+    """Return the relation that the Struct field ``name`` names, or None.
+
+    A Struct reads a model instance by attribute, so the accessor of a reverse
+    relation comes first. Django names a reverse relation by its query name
+    in a query. That name can also be the name of the field.
+    """
+    for rel in model._meta.related_objects:
+        if rel.get_accessor_name() == name:
+            return _Relation(rel, rel.name, name)
     try:
         field = model._meta.get_field(name)
     except FieldDoesNotExist:
         return None
-    if field.is_relation and field.related_model is not None:
-        return field
-    return None
+    if not field.is_relation or field.related_model is None:
+        return None
+    if isinstance(field, ForeignObjectRel):
+        return _Relation(field, name, field.get_accessor_name())
+    return _Relation(field, name, name)
 
 
-def _row_plan(model: type, struct_type: type, prefix: str, outer: tuple[type, ...]) -> _RowPlan:
-    """Return the ``.values()`` paths of ``struct_type``, the function that nests a row, and the relations.
+def _row_plan(model: type, struct_type: type, prefix: str, attr_prefix: str, outer: tuple[type, ...]) -> _RowPlan:
+    """Return the plan that reads ``struct_type`` from ``model``.
 
     A nested Struct field of a relation reads the relation itself first. A
-    row with no related object gives None for the field. ``outer`` holds
-    ``struct_type`` and the Structs that contain it. The relations are the
-    ``select_related()`` paths of the nested Struct fields.
+    row with no related object gives None for the field. ``prefix`` and
+    ``attr_prefix`` are the query path and the accessor path to ``model``.
+    ``outer`` holds ``struct_type`` and the Structs that contain it.
     """
     paths: list[str] = []
-    relations: list[str] = []
+    joins: list[str] = []
+    prefetches: list[str] = []
     readers: list[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]] | None]] = []
+    # The attribute, the wire name, the reader of a nested instance, and the
+    # error of a reverse one-to-one relation with no row.
+    attributes: list[tuple[str, str, Callable[[Any], dict[str, Any]] | None, type | None]] = []
+    needs_rows = False
     for field in msgspec.structs.fields(struct_type):
-        path = prefix + field.name
-        paths.append(path)
         nested_type = _nested_struct_type(field.type)
-        relation = _relation_field(model, field.name) if nested_type is not None else None
-        if relation is not None and (relation.one_to_many or relation.many_to_many):
+        relation = _relation_of(model, field.name) if nested_type is not None else None
+        if relation is not None and (relation.field.one_to_many or relation.field.many_to_many):
             raise TypeError(
                 f"{struct_type.__name__}.{field.name} is a relation with many rows. "
                 "A plain Struct response cannot load it. "
                 "Use a Bolt Serializer for this response: it loads the rows with prefetch_related()."
             )
         if relation is None or not is_msgspec_struct(_field_value_type(field.type)):
+            path = prefix + field.name
+            paths.append(path)
             readers.append((field.encode_name, path, None))
+            attributes.append((field.name, field.encode_name, None, None))
             continue
         if nested_type in outer:
             raise TypeError(
                 f"{nested_type.__name__} nests itself across the relation {struct_type.__name__}.{field.name}. "
                 "One .values() query cannot load it. Build the Structs in the handler and return them."
             )
-        nested_paths, nested_build, nested_relations = _row_plan(
-            relation.related_model, nested_type, path + "__", (*outer, nested_type)
+        path = prefix + relation.query_name
+        attr_path = attr_prefix + relation.accessor
+        nested_plan = _row_plan(
+            relation.field.related_model, nested_type, path + "__", attr_path + "__", (*outer, nested_type)
         )
-        paths.extend(nested_paths)
-        relations.append(path)
-        relations.extend(nested_relations)
-        readers.append((field.encode_name, path, nested_build))
+        paths.append(path)
+        paths.extend(nested_plan.paths)
+        joins.append(path)
+        joins.extend(nested_plan.joins)
+        prefetches.append(attr_path)
+        prefetches.extend(nested_plan.prefetches)
+        readers.append((field.encode_name, path, nested_plan.build))
+        no_row = None
+        if isinstance(relation.field, ForeignObjectRel):
+            # Only a reverse one-to-one gets here: the check above refuses the other reverse relations.
+            no_row = getattr(model, relation.accessor).RelatedObjectDoesNotExist
+            needs_rows = True
+        needs_rows = needs_rows or nested_plan.needs_rows
+        attributes.append((relation.accessor, field.encode_name, nested_plan.read_instance, no_row))
 
     def build(row: dict[str, Any]) -> dict[str, Any]:
         return {
             wire: row[path] if nested is None or row[path] is None else nested(row) for wire, path, nested in readers
         }
 
-    return tuple(paths), build, tuple(relations)
+    return _RowPlan(
+        tuple(paths), build, tuple(joins), tuple(prefetches), _compile_instance_reader(tuple(attributes)), needs_rows
+    )
+
+
+def _compile_instance_reader(
+    attributes: tuple[tuple[str, str, Callable[[Any], dict[str, Any]] | None, type | None], ...],
+) -> Callable[[Any], dict[str, Any]]:
+    """Build the reader of a model instance into a row with the wire names, once per model.
+
+    A relation to read must be loaded already. A reverse one-to-one with no
+    row gives None. Another missing attribute gives no key: msgspec then
+    uses the default of the field or reports the missing field, as it does
+    when it reads the attributes itself.
+    """
+
+    def read_instance(instance: Any) -> dict[str, Any]:
+        row: dict[str, Any] = {}
+        for attribute, wire, read_nested, no_row in attributes:
+            try:
+                value = getattr(instance, attribute)
+            except AttributeError as exc:
+                if no_row is None or not isinstance(exc, no_row):
+                    continue
+                value = None
+            if read_nested is not None and value is not None:
+                value = read_nested(value)
+            row[wire] = value
+        return row
+
+    return read_instance
 
 
 def _compile_struct_coercer(annotation: type) -> Callable[[Any], Any]:

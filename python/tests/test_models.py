@@ -129,6 +129,16 @@ class UserProfile(models.Model):
         return f"Profile for {self.user.username}"
 
 
+class UserBadge(models.Model):
+    """One-to-one relation to User whose query name differs from its accessor."""
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="badge", related_query_name="badge_row")
+    label = models.CharField(max_length=50)
+
+    class Meta:
+        app_label = "django_bolt"
+
+
 class Document(models.Model):
     """Document model for testing file upload integration."""
 

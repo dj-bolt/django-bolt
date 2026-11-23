@@ -363,7 +363,7 @@ class PaginationBase(ABC):
         else:
             items = list(queryset)
         if relation_loader is not None:
-            await relation_loader.aload(items)
+            items = await relation_loader.aload(items)
         return items
 
     def _model_to_dict(self, item: Any) -> Any:

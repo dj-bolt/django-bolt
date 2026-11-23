@@ -254,6 +254,7 @@ def django_db_setup(django_db_blocker):
                 ShortJtiRevokedToken,
                 Tag,
                 User,
+                UserBadge,
                 UserProfile,
             )
 
@@ -265,6 +266,7 @@ def django_db_setup(django_db_blocker):
                 Comment,
                 User,
                 UserProfile,
+                UserBadge,
                 Document,
                 Release,
                 Country,
