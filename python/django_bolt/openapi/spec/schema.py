@@ -28,7 +28,7 @@ if TYPE_CHECKING:
         __dataclass_fields__: Any
 
 
-__all__ = ("Schema", "SchemaDataContainer")
+__all__ = ("ReferenceWithKeywords", "Schema", "SchemaDataContainer")
 
 _DEFAULT_UNSET = object()
 
@@ -673,6 +673,29 @@ class Schema(BaseSchemaObject):
                 retval[field_alias] = field_def.name
         cls._field_aliases = retval  # type: ignore[attr-defined]
         return retval
+
+
+@dataclass(kw_only=True)
+class ReferenceWithKeywords(Schema):
+    """A ``$ref`` to a component, with schema keywords next to it.
+
+    OpenAPI 3.1 allows keywords next to ``$ref``. The component does not change.
+    The ``$ref`` comes from the shared ``Reference`` when the document is made.
+    Thus it has the final name of the component.
+    """
+
+    reference: Reference
+    """The shared reference to the component."""
+
+    def __hash__(self) -> int:
+        return _recursive_hash(self)
+
+    @property
+    def _exclude_fields(self) -> set[str]:
+        return {"reference"}
+
+    def to_schema(self) -> dict[str, Any]:
+        return {"$ref": self.reference.ref, **super().to_schema()}
 
 
 @dataclass
