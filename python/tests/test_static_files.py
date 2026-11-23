@@ -1173,3 +1173,20 @@ class TestPrefixedStaticfilesDirs:
         assert "STATICFILES_DIRS entry ('vendor'" in err
         assert "STATICFILES_DIRS entry (1, " in err
         assert err.count("is not a path or a (prefix, path) pair") == 2
+
+    @pytest.mark.parametrize("debug", [False, True])
+    def test_symlink_keeps_the_content_type_of_the_requested_name(self, settings, vendor, debug):
+        # The finders fallback keeps the requested name (#933). The fast path must do the same.
+        settings.DEBUG = debug
+        (vendor / "payload.txt").write_text("body{}")
+        try:
+            (vendor / "style.css").symlink_to(vendor / "payload.txt")
+        except OSError:
+            pytest.skip("Symlink creation not supported on this system")
+        settings.STATICFILES_DIRS = [("vendor", vendor), vendor]
+        with TestClient(BoltAPI()) as client:
+            for path in ("/static/vendor/style.css", "/static/style.css"):
+                response = client.get(path)
+                assert response.status_code == 200
+                assert response.content == b"body{}"
+                assert response.headers["content-type"].startswith("text/css")

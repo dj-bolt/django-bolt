@@ -69,7 +69,13 @@ fn has_dotfile_component(relative_path: &str) -> bool {
 /// and Bolt removes the prefix before the join, as Django's
 /// `FileSystemFinder` does. The rest of the path must be a plain relative
 /// path too: `vendor//etc/passwd` leaves `/etc/passwd` after the prefix.
-fn find_in_directories(relative_path: &str, directories: &[ServeDir]) -> Option<PathBuf> {
+///
+/// Gives the canonical path to open, and the requested path before symlinks
+/// resolve. The requested name gives the content type, as for a finder.
+fn find_in_directories(
+    relative_path: &str,
+    directories: &[ServeDir],
+) -> Option<(PathBuf, PathBuf)> {
     // Security: prevent directory traversal. A path of plain names only: no
     // `..`, no root (`/etc`) and, on Windows, no drive or UNC prefix (`C:\`).
     if relative_path.contains("..") || !is_plain_relative(relative_path) {
@@ -93,7 +99,7 @@ fn find_in_directories(relative_path: &str, directories: &[ServeDir]) -> Option<
             && canonical.starts_with(&dir.root)
             && canonical.is_file()
         {
-            return Some(canonical);
+            return Some((canonical, full_path));
         }
     }
     None
@@ -260,10 +266,10 @@ pub async fn handle_file(
         return response;
     }
 
-    // The path to open, and for a finder result the path whose name gives
-    // the content type. `None` takes the type from the opened path.
-    let mut file_path: Option<(PathBuf, Option<PathBuf>)> =
-        find_in_directories(relative_path, &config.directories).map(|path| (path, None));
+    // The path to open, and the requested path whose name gives the content
+    // type. A symlink keeps the type of its own name, not of its target.
+    let mut file_path: Option<(PathBuf, PathBuf)> =
+        find_in_directories(relative_path, &config.directories);
 
     // Static-only: fall back to Django finders in debug mode for app static
     // files like admin. Media intentionally skips this — finders only know
@@ -274,16 +280,19 @@ pub async fn handle_file(
         && let Some(ref roots) = config.django_finders
     {
         file_path = find_with_django_finders(relative_path).and_then(|found| {
-            contain_finder_result(&found, roots).map(|canonical| (canonical, Some(found)))
+            contain_finder_result(&found, roots).map(|canonical| (canonical, found))
         });
     }
 
     let mut response = if let Some((ref resolved, ref name)) = file_path {
-        let mut r = serve_file(&req, resolved, name.as_deref().unwrap_or(resolved)).await;
+        let mut r = serve_file(&req, resolved, name).await;
         // XSS disarm: rewrite Content-Type and force download for any media
         // upload whose extension can carry JS. Static keeps native types — a
-        // CMS-served `theme.html` is admin-curated.
-        if matches!(config.mode, ServeMode::Media) && is_dangerous_media_ext(resolved) {
+        // CMS-served `theme.html` is admin-curated. The type comes from the
+        // requested name, so check it and the symlink target both.
+        if matches!(config.mode, ServeMode::Media)
+            && (is_dangerous_media_ext(name) || is_dangerous_media_ext(resolved))
+        {
             disarm_scripting_response(&mut r);
         }
         r
@@ -339,6 +348,11 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    /// The canonical path that the fast path opens.
+    fn find_canonical(relative_path: &str, directories: &[ServeDir]) -> Option<PathBuf> {
+        find_in_directories(relative_path, directories).map(|(canonical, _)| canonical)
+    }
+
     /// Canonicalize as the server does at startup. The tests pass
     /// pre-canonicalized roots so they exercise the same fast path
     /// production uses (no per-request canonicalize() on the directory).
@@ -360,19 +374,19 @@ mod tests {
         let directories = vec![ServeDir::at_root(canon(temp_path))];
 
         // Should find existing file
-        let result = find_in_directories("css/style.css", &directories);
+        let result = find_canonical("css/style.css", &directories);
         assert!(result.is_some());
 
         // Should not find non-existent file
-        let result = find_in_directories("css/missing.css", &directories);
+        let result = find_canonical("css/missing.css", &directories);
         assert!(result.is_none());
 
         // Should reject directory traversal
-        let result = find_in_directories("../etc/passwd", &directories);
+        let result = find_canonical("../etc/passwd", &directories);
         assert!(result.is_none());
 
         // Should reject absolute paths
-        let result = find_in_directories("/etc/passwd", &directories);
+        let result = find_canonical("/etc/passwd", &directories);
         assert!(result.is_none());
     }
 
@@ -386,10 +400,10 @@ mod tests {
         File::create(root.join("app.js")).unwrap();
         let directories = vec![ServeDir::at_root(root.clone())];
 
-        assert!(find_in_directories("app.js", &directories).is_some());
-        assert!(find_in_directories("css/../app.js", &directories).is_none());
+        assert!(find_canonical("app.js", &directories).is_some());
+        assert!(find_canonical("css/../app.js", &directories).is_none());
         let absolute = root.join("app.js");
-        assert!(find_in_directories(absolute.to_str().unwrap(), &directories).is_none());
+        assert!(find_canonical(absolute.to_str().unwrap(), &directories).is_none());
     }
 
     fn prefixed(prefix: &str, root: &Path) -> ServeDir {
@@ -410,19 +424,19 @@ mod tests {
         let directories = vec![prefixed("vendor", &vendor)];
 
         assert_eq!(
-            find_in_directories("vendor/app.css", &directories),
+            find_canonical("vendor/app.css", &directories),
             Some(canon(&vendor.join("app.css")))
         );
         assert_eq!(
-            find_in_directories("vendor/css/site.css", &directories),
+            find_canonical("vendor/css/site.css", &directories),
             Some(canon(&vendor.join("css/site.css")))
         );
-        assert!(find_in_directories("app.css", &directories).is_none());
-        assert!(find_in_directories("vendorapp.css", &directories).is_none());
-        assert!(find_in_directories("vendor", &directories).is_none());
-        assert!(find_in_directories("vendor/", &directories).is_none());
-        assert!(find_in_directories("vendor/css", &directories).is_none());
-        assert!(find_in_directories("vendor/missing.css", &directories).is_none());
+        assert!(find_canonical("app.css", &directories).is_none());
+        assert!(find_canonical("vendorapp.css", &directories).is_none());
+        assert!(find_canonical("vendor", &directories).is_none());
+        assert!(find_canonical("vendor/", &directories).is_none());
+        assert!(find_canonical("vendor/css", &directories).is_none());
+        assert!(find_canonical("vendor/missing.css", &directories).is_none());
     }
 
     /// The rest of the path after the prefix must be a plain relative path.
@@ -437,8 +451,8 @@ mod tests {
         let directories = vec![prefixed("vendor", &vendor)];
 
         let request = format!("vendor/{}", absolute.to_str().unwrap());
-        assert!(find_in_directories(&request, &directories).is_none());
-        assert!(find_in_directories("vendor/../vendor/app.css", &directories).is_none());
+        assert!(find_canonical(&request, &directories).is_none());
+        assert!(find_canonical("vendor/../vendor/app.css", &directories).is_none());
     }
 
     #[cfg(unix)]
@@ -452,7 +466,7 @@ mod tests {
             .unwrap();
         let directories = vec![prefixed("vendor", &vendor)];
 
-        assert!(find_in_directories("vendor/leak.txt", &directories).is_none());
+        assert!(find_canonical("vendor/leak.txt", &directories).is_none());
     }
 
     /// Plain and prefixed entries keep their order, as in Django.
@@ -469,11 +483,11 @@ mod tests {
         ];
 
         assert_eq!(
-            find_in_directories("vendor/app.css", &directories),
+            find_canonical("vendor/app.css", &directories),
             Some(canon(&first.path().join("app.css")))
         );
         assert_eq!(
-            find_in_directories("app.css", &directories),
+            find_canonical("app.css", &directories),
             Some(canon(&second.path().join("app.css")))
         );
     }
@@ -531,6 +545,54 @@ mod tests {
             Some("text/plain; charset=utf-8")
         );
         assert_ne!(header_of(&notes, "content-disposition"), Some("attachment"));
+    }
+
+    /// The content type comes from the requested name. Thus a media symlink
+    /// with a script name must download, also when its target has a safe
+    /// name. A symlink to a script file must download too.
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn media_symlink_with_a_script_name_or_target_is_a_download() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::write(root.join("notes.txt"), "<script>alert(1)</script>").unwrap();
+        fs::write(root.join("page.html"), "<script>alert(1)</script>").unwrap();
+        std::os::unix::fs::symlink(root.join("notes.txt"), root.join("evil.html")).unwrap();
+        std::os::unix::fs::symlink(root.join("page.html"), root.join("alias.txt")).unwrap();
+        let media = || scope(root, ServeMode::Media, false);
+
+        for name in ["evil.html", "alias.txt"] {
+            let response = get(media(), name).await;
+            assert_eq!(response.status(), 200, "{name}");
+            assert_eq!(
+                header_of(&response, "content-type"),
+                Some("application/octet-stream"),
+                "{name}"
+            );
+            assert_eq!(
+                header_of(&response, "content-disposition"),
+                Some("attachment"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A static symlink keeps the content type of its own name, as a file
+    /// from the finders does.
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn static_symlink_keeps_the_type_of_the_requested_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::write(root.join("payload.txt"), "body{}").unwrap();
+        std::os::unix::fs::symlink(root.join("payload.txt"), root.join("style.css")).unwrap();
+
+        let response = get(scope(root, ServeMode::Static, false), "style.css").await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            header_of(&response, "content-type"),
+            Some("text/css; charset=utf-8")
+        );
     }
 
     #[actix_web::test]
@@ -715,12 +777,12 @@ mod tests {
         ];
 
         // Should find file1 in dir1
-        let result = find_in_directories("file1.txt", &directories);
+        let result = find_canonical("file1.txt", &directories);
         assert!(result.is_some());
         assert!(result.unwrap().to_string_lossy().contains("file1.txt"));
 
         // Should find file2 in dir2
-        let result = find_in_directories("file2.txt", &directories);
+        let result = find_canonical("file2.txt", &directories);
         assert!(result.is_some());
         assert!(result.unwrap().to_string_lossy().contains("file2.txt"));
     }
@@ -795,7 +857,7 @@ mod tests {
             ServeDir::at_root(canon(dir2.path())),
         ];
 
-        let result = find_in_directories("shared.txt", &directories);
+        let result = find_canonical("shared.txt", &directories);
         assert!(result.is_some());
 
         // Verify it's from dir1
