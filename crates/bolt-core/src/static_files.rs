@@ -17,7 +17,7 @@ use pyo3::prelude::*;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use crate::state::{FinderRoot, ScopeConfig, ServeMode};
+use crate::state::{FinderRoot, ScopeConfig, ServeDir, ServeMode};
 
 /// Extensions that can carry executable script in a browser context.
 /// For media (user uploads), these are rewritten to `application/octet-stream`
@@ -64,21 +64,33 @@ fn has_dotfile_component(relative_path: &str) -> bool {
 /// multi-syscall `realpath(3)` — off the per-request directory lookup; it
 /// runs only on the resolved file path, where it must (to follow symlinks
 /// in the user-supplied portion).
-fn find_in_directories(relative_path: &str, directories: &[PathBuf]) -> Option<PathBuf> {
+///
+/// A directory with a prefix serves only a path that starts with the prefix,
+/// and Bolt removes the prefix before the join, as Django's
+/// `FileSystemFinder` does. The rest of the path must be a plain relative
+/// path too: `vendor//etc/passwd` leaves `/etc/passwd` after the prefix.
+fn find_in_directories(relative_path: &str, directories: &[ServeDir]) -> Option<PathBuf> {
     // Security: prevent directory traversal. A path of plain names only: no
     // `..`, no root (`/etc`) and, on Windows, no drive or UNC prefix (`C:\`).
     if relative_path.contains("..") || !is_plain_relative(relative_path) {
         return None;
     }
 
-    for dir_canonical in directories {
-        let full_path = dir_canonical.join(relative_path);
+    for dir in directories {
+        let rest = match dir.prefix {
+            Some(ref prefix) => match relative_path.strip_prefix(prefix.as_str()) {
+                Some(rest) if is_plain_relative(rest) => rest,
+                _ => continue,
+            },
+            None => relative_path,
+        };
+        let full_path = dir.root.join(rest);
 
         // Canonicalize the *file* (not the dir) to resolve any symlinks in
         // the relative portion, then verify the result is still inside the
         // canonical root. Stops a symlink-out-of-root from escaping.
         if let Ok(canonical) = full_path.canonicalize()
-            && canonical.starts_with(dir_canonical)
+            && canonical.starts_with(&dir.root)
             && canonical.is_file()
         {
             return Some(canonical);
@@ -345,7 +357,7 @@ mod tests {
         let mut file = File::create(css_dir.join("style.css")).unwrap();
         file.write_all(b"body { color: red; }").unwrap();
 
-        let directories = vec![canon(temp_path)];
+        let directories = vec![ServeDir::at_root(canon(temp_path))];
 
         // Should find existing file
         let result = find_in_directories("css/style.css", &directories);
@@ -372,7 +384,7 @@ mod tests {
         let root = canon(temp_dir.path());
         fs::create_dir(root.join("css")).unwrap();
         File::create(root.join("app.js")).unwrap();
-        let directories = vec![root.clone()];
+        let directories = vec![ServeDir::at_root(root.clone())];
 
         assert!(find_in_directories("app.js", &directories).is_some());
         assert!(find_in_directories("css/../app.js", &directories).is_none());
@@ -380,10 +392,96 @@ mod tests {
         assert!(find_in_directories(absolute.to_str().unwrap(), &directories).is_none());
     }
 
+    fn prefixed(prefix: &str, root: &Path) -> ServeDir {
+        ServeDir {
+            prefix: Some(format!("{prefix}/")),
+            root: canon(root),
+        }
+    }
+
+    /// A `(prefix, path)` entry serves its files under `prefix/` only (#944).
+    #[test]
+    fn prefixed_directory_serves_only_under_its_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let vendor = temp_dir.path().join("vendor");
+        fs::create_dir_all(vendor.join("css")).unwrap();
+        fs::write(vendor.join("app.css"), "app").unwrap();
+        fs::write(vendor.join("css/site.css"), "site").unwrap();
+        let directories = vec![prefixed("vendor", &vendor)];
+
+        assert_eq!(
+            find_in_directories("vendor/app.css", &directories),
+            Some(canon(&vendor.join("app.css")))
+        );
+        assert_eq!(
+            find_in_directories("vendor/css/site.css", &directories),
+            Some(canon(&vendor.join("css/site.css")))
+        );
+        assert!(find_in_directories("app.css", &directories).is_none());
+        assert!(find_in_directories("vendorapp.css", &directories).is_none());
+        assert!(find_in_directories("vendor", &directories).is_none());
+        assert!(find_in_directories("vendor/", &directories).is_none());
+        assert!(find_in_directories("vendor/css", &directories).is_none());
+        assert!(find_in_directories("vendor/missing.css", &directories).is_none());
+    }
+
+    /// The rest of the path after the prefix must be a plain relative path.
+    /// A join with an absolute rest would leave the directory.
+    #[test]
+    fn prefixed_directory_rejects_an_absolute_rest() {
+        let temp_dir = TempDir::new().unwrap();
+        let vendor = temp_dir.path().join("vendor");
+        fs::create_dir(&vendor).unwrap();
+        fs::write(vendor.join("app.css"), "app").unwrap();
+        let absolute = canon(&vendor.join("app.css"));
+        let directories = vec![prefixed("vendor", &vendor)];
+
+        let request = format!("vendor/{}", absolute.to_str().unwrap());
+        assert!(find_in_directories(&request, &directories).is_none());
+        assert!(find_in_directories("vendor/../vendor/app.css", &directories).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prefixed_directory_refuses_a_symlink_out_of_its_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let vendor = temp_dir.path().join("vendor");
+        fs::create_dir(&vendor).unwrap();
+        fs::write(temp_dir.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(temp_dir.path().join("secret.txt"), vendor.join("leak.txt"))
+            .unwrap();
+        let directories = vec![prefixed("vendor", &vendor)];
+
+        assert!(find_in_directories("vendor/leak.txt", &directories).is_none());
+    }
+
+    /// Plain and prefixed entries keep their order, as in Django.
+    #[test]
+    fn prefixed_and_plain_directories_are_searched_in_order() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        fs::write(first.path().join("app.css"), "first").unwrap();
+        fs::write(second.path().join("app.css"), "second").unwrap();
+        let directories = vec![
+            prefixed("vendor", first.path()),
+            ServeDir::at_root(canon(second.path())),
+            prefixed("vendor", second.path()),
+        ];
+
+        assert_eq!(
+            find_in_directories("vendor/app.css", &directories),
+            Some(canon(&first.path().join("app.css")))
+        );
+        assert_eq!(
+            find_in_directories("app.css", &directories),
+            Some(canon(&second.path().join("app.css")))
+        );
+    }
+
     fn scope(root: &Path, mode: ServeMode, finders: bool) -> ScopeConfig {
         ScopeConfig {
             url_prefix: "/files".to_string(),
-            directories: vec![canon(root)],
+            directories: vec![ServeDir::at_root(canon(root))],
             csp_header: None,
             cache_control: Some(header::HeaderValue::from_static("max-age=60")),
             mode,
@@ -611,7 +709,10 @@ mod tests {
         let mut file2 = File::create(dir2.path().join("file2.txt")).unwrap();
         file2.write_all(b"content2").unwrap();
 
-        let directories = vec![canon(dir1.path()), canon(dir2.path())];
+        let directories = vec![
+            ServeDir::at_root(canon(dir1.path())),
+            ServeDir::at_root(canon(dir2.path())),
+        ];
 
         // Should find file1 in dir1
         let result = find_in_directories("file1.txt", &directories);
@@ -689,7 +790,10 @@ mod tests {
         file2.write_all(b"from_dir2").unwrap();
 
         // dir1 should take priority (listed first)
-        let directories = vec![canon(dir1.path()), canon(dir2.path())];
+        let directories = vec![
+            ServeDir::at_root(canon(dir1.path())),
+            ServeDir::at_root(canon(dir2.path())),
+        ];
 
         let result = find_in_directories("shared.txt", &directories);
         assert!(result.is_some());
