@@ -11,6 +11,7 @@ import fnmatch
 import inspect
 import re
 from collections.abc import Callable, Iterable
+from functools import partial
 from typing import Any
 
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack
@@ -145,6 +146,13 @@ def expose_routes(
             continue
 
         route_auth = _route_auth(handler, method, path, api._handler_middleware.get(handler_id) or {}, meta)
+        # The revocation check of the route, as HTTP runs it. None when no backend of the route has revocation.
+        revocation_handlers = meta.get("_revocation_handlers")
+        revocation_check = (
+            partial(api._check_revocation, revocation_handlers=revocation_handlers)
+            if revocation_handlers is not None
+            else None
+        )
 
         marker = marker or {}
         # Name/description derive from the route itself; @expose_as_tool only overrides.
@@ -172,6 +180,7 @@ def expose_routes(
                 is_async=inspect.iscoroutinefunction(handler),
                 injects_request=any(f.source == "request" for f in fields),
                 route_auth=route_auth,
+                revocation_check=revocation_check,
             )
         )
 
