@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -46,10 +47,13 @@ def test_a_row_of_one_transactional_test_is_gone_in_the_next_one(tmp_path):
     already runs in one transaction cannot get ``transactional_db``.
     """
     report = tmp_path / "report.xml"
+    # The child must run each case. Options such as -x from PYTEST_ADDOPTS stop it at the first expected failure.
+    env = {name: value for name, value in os.environ.items() if name != "PYTEST_ADDOPTS"}
 
     subprocess.run(
         [sys.executable, "-m", "pytest", str(_CASES), "-p", "no:cacheprovider", "-q", f"--junitxml={report}"],
         cwd=_REPO_ROOT,
+        env=env,
         capture_output=True,
         check=False,
         timeout=120,
