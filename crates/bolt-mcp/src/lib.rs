@@ -41,12 +41,21 @@ use registry::McpRegistry;
 #[derive(Clone)]
 pub struct McpAuthExt(pub Option<Arc<AuthContext>>);
 
-/// The parts of the MCP HTTP request that the gate of an exposed route reads.
-/// The bridge adds them only for a mount with such a gate.
+/// The parts of the MCP HTTP request that the gate of an exposed route and
+/// the `request` of a tool read. The bridge adds them only for a mount with
+/// such a gate or such a tool.
 pub struct McpRouteRequest {
     pub headers: AHashMap<String, String>,
     pub method: String,
+    /// The scheme of the connection. The cookie CSRF check reads it.
     pub scheme: String,
+    pub path: String,
+    /// The query string as the client sent it, still encoded.
+    pub query_string: String,
+    /// The scheme that a trusted proxy can set, as for a route request.
+    pub conn_scheme: &'static str,
+    /// The client address, as for a route request.
+    pub conn_remote_addr: Option<std::net::IpAddr>,
 }
 
 /// Carries an `McpRouteRequest` through the http request extensions into
@@ -92,9 +101,10 @@ pub struct McpMount {
     pub auth_challenge: Option<HeaderValue>,
     pub guards: GuardSet,
     pub oauth: Option<McpOAuth>,
-    /// Whether a tool runs the auth and the guards of an exposed route. Only
-    /// then does the bridge copy the request headers for the handler.
-    pub route_gates: bool,
+    /// Whether a tool runs the auth and the guards of an exposed route, or
+    /// takes the request. Only then does the bridge copy the request parts
+    /// for the handler.
+    pub needs_request_parts: bool,
     pub service: McpService,
 }
 
@@ -221,7 +231,7 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
         config = config.with_allowed_origins(origins);
     }
 
-    let route_gates = registry.route_gates;
+    let needs_request_parts = registry.route_gates || registry.needs_request;
     let mcp_handler = McpHandler { registry };
     let service = if legacy_sessions {
         McpService::Sessions(StreamableHttpService::new(
@@ -243,7 +253,7 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
         auth_challenge,
         guards,
         oauth,
-        route_gates,
+        needs_request_parts,
         service,
     })
 }

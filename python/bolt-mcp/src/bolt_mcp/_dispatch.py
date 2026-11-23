@@ -24,6 +24,7 @@ import msgspec
 
 from django_bolt._json import decode as json_decode
 from django_bolt._json import encode as json_encode
+from django_bolt.auth.user_loader import LazyUser
 from django_bolt.exceptions import HTTPException
 
 from ._execute import RESULT_TYPE_COMPLETE, error_result, execute_tool, tool_failed
@@ -38,33 +39,42 @@ _KIND_METHOD = {"elicitation": "elicitation/create", "sampling": "sampling/creat
 logger = logging.getLogger(__name__)
 
 
-class McpRequest:
-    """Minimal request stand-in handed to tools that declare ``request``.
+def _set_user(request: Any, loaders: tuple[Any, ...]) -> None:
+    """Give ``request.user`` the user of the principal, as the dispatch of a route does.
 
-    The HTTP request itself is consumed by the Rust transport; what tools
-    actually need from it is the authenticated principal (``bolt_mcp.principal``
-    reads ``.context``) and a mutable scratch ``state``.
+    ``loaders`` are the user loaders of the backends that ``auth_backend_index`` counts.
+    With no user, ``request.user`` stays Django's ``AnonymousUser``.
     """
+    auth_context = request.context
+    if auth_context is None:
+        return
+    user_id = auth_context.get("user_id")
+    index = auth_context.get("auth_backend_index")
+    if not user_id or index is None:
+        return
+    user_loaders = loaders[index]
+    if user_loaders is not None:
+        request.user = LazyUser(user_loaders, user_id, auth_context)
 
-    __slots__ = ("context", "state")
 
-    def __init__(self, context: dict[str, Any] | None) -> None:
-        self.context = context
-        self.state: dict[str, Any] = {}
-
-
-async def _call_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any], raw: Any) -> dict[str, Any]:
+async def _call_tool(
+    tool: ToolDef, mcp: MCP, user_loaders: tuple[Any, ...], payload: dict[str, Any], raw: Any
+) -> dict[str, Any]:
     try:
         args = msgspec.convert(raw or {}, tool.args_struct)
     except msgspec.ValidationError as exc:
         return error_result(f"Invalid arguments: {exc}")
     kwargs = msgspec.structs.asdict(args)
-    if tool.injects_request:
-        kwargs["request"] = McpRequest(payload["auth"])
+    # Rust builds the request only for a tool that takes it or a Context.
+    request = payload["request"]
+    if request is not None:
+        _set_user(request, user_loaders)
+        if tool.request_param is not None:
+            kwargs[tool.request_param] = request
     if tool.ctx_param is not None:
         kwargs[tool.ctx_param] = Context(
             payload["ctx"],
-            request=McpRequest(payload["auth"]),
+            request=request,
             resolver=partial(_resolve_resource, mcp),
         )
     return await execute_tool(tool, kwargs, mask_error_details=mcp.mask_error_details)
@@ -87,13 +97,13 @@ async def _call_through_middleware(
     return await call_next(0)
 
 
-async def _run_tool(tool: ToolDef, mcp: MCP, payload: dict[str, Any]) -> bytes:
+async def _run_tool(tool: ToolDef, mcp: MCP, user_loaders: tuple[Any, ...], payload: dict[str, Any]) -> bytes:
     if tool.revocation_check is not None and payload["auth"]:
         refused = await _revoked_token_refusal(tool, mcp, payload["auth"])
         if refused is not None:
             return refused
     raw = json_decode(payload["arguments_json"])
-    call_tool = partial(_call_tool, tool, mcp, payload, raw)
+    call_tool = partial(_call_tool, tool, mcp, user_loaders, payload, raw)
     try:
         if mcp._tool_middleware:
             call = ToolCall(
@@ -140,11 +150,17 @@ async def _revoked_token_refusal(tool: ToolDef, mcp: MCP, auth: dict[str, Any]) 
     return None
 
 
-def tool_entry(mcp: MCP, tool: ToolDef) -> dict[str, Any]:
-    """The per-tool config dict Rust stores in its registry."""
+def tool_entry(mcp: MCP, tool: ToolDef, mount_user_loaders: tuple[Any, ...]) -> dict[str, Any]:
+    """The per-tool config dict Rust stores in its registry.
+
+    ``mount_user_loaders`` are the user loaders of the auth backends of the mount.
+    """
+    # The principal of an exposed route comes from the auth of the route, else from the mount.
+    user_loaders = tool.user_loaders if tool.route_auth is not None else mount_user_loaders
     return {
-        "dispatch": partial(_run_tool, tool, mcp),
+        "dispatch": partial(_run_tool, tool, mcp, user_loaders),
         "needs_context": tool.ctx_param is not None,
+        "needs_request": tool.request_param is not None or tool.ctx_param is not None,
         "guards": [g.to_metadata() for g in tool.guards],
         "route_auth": tool.route_auth,
     }

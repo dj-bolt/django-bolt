@@ -33,6 +33,10 @@ use crate::state_codec;
 use crate::{McpAuthExt, McpRouteRequest, McpRouteRequestExt};
 use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
 use bolt_core::permissions::{GuardResult, evaluate_guards};
+use bolt_core::request::PyRequest;
+use bolt_core::router::parse_query_string;
+use bolt_core::type_coercion::string_map_to_py_dict;
+use bolt_core::validation::parse_cookies_inline;
 use bolt_loop as worker_loop;
 
 #[derive(Clone)]
@@ -206,6 +210,55 @@ fn auth_dict(py: Python<'_>, auth: Option<&AuthContext>) -> PyResult<Py<PyAny>> 
     }
 }
 
+/// The request object of a tool that takes `request`, built from the MCP
+/// HTTP request. `context` is the principal of the call.
+///
+/// A tool call has no route, so the request has no path parameters, no form
+/// and no files. The body stays empty: the JSON-RPC message is not data of
+/// the handler. The query is that of the MCP endpoint.
+fn tool_request(
+    py: Python<'_>,
+    parts: Option<&McpRouteRequest>,
+    context: &Py<PyAny>,
+) -> PyResult<Py<PyAny>> {
+    // The bridge adds the parts for each mount with a tool that takes the request.
+    let parts = parts.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("MCP request parts are missing")
+    })?;
+    let context = context
+        .bind(py)
+        .cast::<PyDict>()
+        .ok()
+        .map(|dict| dict.clone().unbind());
+    let cookies = parse_cookies_inline(parts.headers.get("cookie").map(String::as_str));
+    let request = PyRequest {
+        method: parts.method.clone().into(),
+        path: parts.path.clone(),
+        body: Vec::new(),
+        path_params: None,
+        query_params: Some(
+            string_map_to_py_dict(py, &parse_query_string(&parts.query_string), &[])?.unbind(),
+        ),
+        query_string: parts.query_string.clone(),
+        headers: Some(string_map_to_py_dict(py, &parts.headers, &[])?.unbind()),
+        cookies: Some(string_map_to_py_dict(py, &cookies, &[])?.unbind()),
+        raw_headers: None,
+        raw_cookies: None,
+        context,
+        user: None,
+        anonymous_user: pyo3::sync::PyOnceLock::new(),
+        state: std::sync::OnceLock::new(),
+        form_map: None,
+        files_map: None,
+        meta_cache: std::sync::OnceLock::new(),
+        conn_host: parts.headers.get("host").cloned().unwrap_or_default(),
+        conn_scheme: parts.conn_scheme,
+        conn_remote_addr: parts.conn_remote_addr,
+        rust_answer: None,
+    };
+    Ok(Py::new(py, request)?.into_any())
+}
+
 impl McpHandler {
     /// Forward one execution request to Python and parse its result.
     ///
@@ -334,6 +387,12 @@ impl McpHandler {
             } else {
                 py.None()
             };
+            let auth_obj = auth_dict(py, auth.as_deref())?;
+            let request_obj = if entry.needs_request {
+                tool_request(py, route_request_from_ctx(ctx), &auth_obj)?
+            } else {
+                py.None()
+            };
             let payload = build_payload(
                 py,
                 &[
@@ -342,8 +401,9 @@ impl McpHandler {
                         PyString::new(py, &arguments_json).into_any().unbind(),
                     ),
                     ("ctx", ctx_obj),
-                    ("auth", auth_dict(py, auth.as_deref())?),
+                    ("auth", auth_obj),
                     ("meta_json", meta_py(py, meta_json.as_deref())),
+                    ("request", request_obj),
                 ],
             )?;
             Ok::<_, PyErr>((entry.dispatch.clone_ref(py), payload))
