@@ -7,7 +7,7 @@ use std::io::ErrorKind;
 use std::path::Prefix;
 use std::path::{Component, Path, PathBuf};
 
-use actix_web::cookie::time::{Date, Month};
+use cookie::time::{Date, Month};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDateTime, PyDict, PyTuple};
