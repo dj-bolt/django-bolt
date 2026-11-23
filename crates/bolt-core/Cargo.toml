@@ -18,6 +18,7 @@ base64 = { workspace = true }
 brotli = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+cookie = { workspace = true }
 dashmap = { workspace = true }
 flate2 = { workspace = true }
 futures-util = { workspace = true }
