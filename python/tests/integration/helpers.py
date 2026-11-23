@@ -461,6 +461,33 @@ class RunningServer:
             )
         _raise_process_failure(self.process, message)
 
+    def wait_for_workers(self, count: int, path: str = "/pid") -> set[int]:
+        """Wait until ``count`` workers answer ``path``, and return their PIDs.
+
+        The server is ready when one worker answers. Each worker binds its own
+        ``SO_REUSEPORT`` socket after its own startup. The kernel gives a new
+        connection only to a socket that listens. Thus a test that starts
+        before the last bind sends no request to the late workers.
+
+        Each probe sends ``Connection: close``, so each probe opens a new
+        connection, and the kernel selects a socket again. ``path`` must
+        answer JSON with a ``pid`` key.
+        """
+        pids: set[int] = set()
+        deadline = time.monotonic() + self.timeout
+        while len(pids) < count:
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"only {len(pids)} of {count} workers answered {path} in {self.timeout} s: {sorted(pids)}"
+                )
+            response = self.get(path, headers={"Connection": "close"})
+            assert response.status_code == 200, f"{path} answered {response.status_code}: {response.text}"
+            pid = response.json()["pid"]
+            if pid in pids:
+                time.sleep(0.05)
+            pids.add(pid)
+        return pids
+
     def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         if self.process.poll() is not None:
             # Refuse to send the request: with our process dead, whatever
