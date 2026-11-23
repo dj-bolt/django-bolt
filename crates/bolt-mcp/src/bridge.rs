@@ -14,6 +14,7 @@ use pyo3::types::PyDict;
 
 use crate::{McpAuthExt, McpMount, McpRouteRequest, McpRouteRequestExt};
 use bolt_core::middleware::auth::AuthContext;
+use bolt_core::middleware::client_ip;
 use bolt_core::request_pipeline::extract_headers;
 use bolt_core::responses;
 use bolt_core::state::AppState;
@@ -176,14 +177,29 @@ pub async fn handle_mcp_request(
     request
         .extensions_mut()
         .insert(McpAuthExt(auth_ctx.map(std::sync::Arc::new)));
-    if mount.route_gates {
+    if mount.needs_request_parts {
         let scheme = req.connection_info().scheme().to_owned();
+        // The same trust rules as for a route request: only a trusted proxy
+        // sets the scheme and the client address.
+        let peer_ip = req.peer_addr().map(|address| address.ip());
+        let conn_scheme = client_ip::resolve_scheme(
+            req.headers(),
+            peer_ip,
+            req.app_config().secure(),
+            &state.trusted_proxies,
+        );
+        let conn_remote_addr =
+            client_ip::resolve_from_headers(req.headers(), peer_ip, &state.trusted_proxies);
         request
             .extensions_mut()
             .insert(McpRouteRequestExt(std::sync::Arc::new(McpRouteRequest {
                 headers,
                 method,
                 scheme,
+                path: req.path().to_owned(),
+                query_string: req.query_string().to_owned(),
+                conn_scheme,
+                conn_remote_addr,
             })));
     }
 

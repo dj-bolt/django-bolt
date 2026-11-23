@@ -59,7 +59,7 @@ def test_tools_list_lists_native_and_exposed_tools(feature_server):
     listed = _post(feature_server, "tools/list", session_id=sid)
     names = {t["name"] for t in parse_rpc(listed)["result"]["tools"]}
     # native tools plus the explicitly exposed REST route
-    assert {"add", "boom", "crunch", "double"} <= names
+    assert {"add", "boom", "crunch", "double", "client"} <= names
 
 
 def test_tool_call_returns_structured_content(feature_server):
@@ -74,6 +74,20 @@ def test_exposed_rest_route_is_callable_as_a_tool(feature_server):
     sid, _ = _init(feature_server)
     called = _post(feature_server, "tools/call", {"name": "double", "arguments": {"n": 21}}, session_id=sid)
     assert parse_rpc(called)["result"]["structuredContent"] == {"result": 42}
+
+
+def test_exposed_route_gets_the_request_of_the_tool_call(feature_server):
+    """A route that takes ``request`` gets the client of the MCP request over real TCP (#948)."""
+    sid, _ = _init(feature_server)
+    over_http = feature_server.client.get(feature_server.url("/client"), headers={"User-Agent": "it-agent"}).json()
+    called = feature_server.client.post(
+        feature_server.url("/mcp"),
+        content=rpc_body("tools/call", {"name": "client", "arguments": {}}),
+        headers={**mcp_headers(session_id=sid), "User-Agent": "it-agent"},
+    )
+    result = parse_rpc(called)["result"]
+    assert result["isError"] is False, result
+    assert result["structuredContent"] == over_http == {"remote": "127.0.0.1", "agent": "it-agent", "anonymous": True}
 
 
 def test_failing_tool_returns_in_band_error(feature_server):

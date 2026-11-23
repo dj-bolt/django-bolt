@@ -253,6 +253,16 @@ On a mount with `auth=[JWTAuthentication()]`, a caller with a JWT of the user `a
 
 For an anonymous caller, `principal()` gives `{}`.
 
+Bolt makes a new request for each tool call, from the HTTP request to the MCP endpoint:
+
+- `request.headers`, `request.cookies` and `request.META` come from the MCP request. `request.META["REMOTE_ADDR"]` is the address of the client, with the rules of `BOLT_TRUSTED_PROXIES`.
+- `request.method` is `POST`, and `request.path` is the path of the MCP endpoint, for example `/mcp`. `request.query` is the query of the MCP endpoint.
+- `request.context` is the principal of the call. `request.user` and `await request.auser()` give its user, as on a route with the same auth. With no user, they give Django's `AnonymousUser`.
+- `request.body` is empty. The JSON-RPC message is not data of the tool.
+- `request.state` is an empty dict for each call.
+
+A tool with a `Context` argument gets the same request as `ctx.request`.
+
 ## Write a resource
 
 A resource is data that the client reads by its URI. The function returns the text:
@@ -485,6 +495,14 @@ An error of the store gives an error result, and Bolt logs the traceback.
 `tools/list` does not check revocation, because the check needs a store lookup for each tool.
 Thus a revoked token can still see the tool in the list, but it cannot call the tool.
 
+A handler with a `request` or `req` argument gets the request of the tool call, as an `@mcp.tool` does.
+See [Read the request](#read-the-request).
+`request.context` is the principal from the auth of the route, so `request.user` and `await request.auser()` give the same user as over HTTP.
+A public route has the guard `AllowAny` from `BOLT_DEFAULT_PERMISSION_CLASSES` and no backend, so it has no principal.
+Thus `request.user` is `AnonymousUser`, also on a mount with `auth`.
+A route with `auth=[]` and `guards=[]` has no gate, so it gets the principal of the mount.
+The path parameters of the route are tool arguments, so `request.params` is empty.
+
 **Behavior change:** a tool call cannot run middleware.
 Thus `mount_mcp()` raises `ValueError` for an exposed route with `@rate_limit`, Python middleware or Django middleware.
 This includes the middleware of the API and of the router, and a route with `SessionAuthentication`.
@@ -534,7 +552,8 @@ When a tool has an `outputSchema`, a success result with a different body is an 
 An example is a `PlainText` return from a route with `response_model=PublicUser`.
 
 `mount_mcp()` exposes only the routes that you name.
-A handler that is not a route of the API, a handler with `File` or `Form` parameters, or a duplicate tool name raises `ValueError`.
+A handler that is not a route of the API, a handler with `File`, `Form` or `Depends` parameters, or a duplicate tool name raises `ValueError`.
+A tool call cannot resolve a dependency. Write an `@mcp.tool` for such an operation.
 A route that returns a stream or a file also raises `ValueError`.
 For example, a generator handler, a stream return annotation, a `StreamingResponse` or `FileResponse` annotation, or `response_class=EventSourceResponse`.
 `expose_routes()` with patterns skips these routes.
