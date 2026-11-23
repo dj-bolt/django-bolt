@@ -55,7 +55,8 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
     }
 
     // Build cookie using the cookie crate
-    let mut cookie = Cookie::build((c.name.as_str(), quote_cookie_value(&c.value))).path(c.path.as_str());
+    let mut cookie =
+        Cookie::build((c.name.as_str(), quote_cookie_value(&c.value))).path(c.path.as_str());
 
     // Max-Age (validate non-negative)
     if let Some(max_age) = c.max_age {
