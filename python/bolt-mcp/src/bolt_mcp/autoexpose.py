@@ -14,14 +14,20 @@ from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any
 
+from django_bolt._response_dump import compile_serializer_dumper
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack
+from django_bolt.responses import File, FileResponse, StreamingResponse
+from django_bolt.serialization import _is_plain_struct, serialize_response, serialize_response_sync
+from django_bolt.typing import unwrap_optional
 
 from . import schema
+from ._execute import call_route_async, call_route_sync, route_tool_result
 from .registry import ToolDef
 from .server import MCP
 
 _MARKER_ATTR = "__bolt_mcp__"
 _SKIP_SOURCES = frozenset({"file", "form"})
+_STREAM_RESPONSE_TYPES = (StreamingResponse, FileResponse, File)
 
 
 def expose_as_tool(name: str | None = None, description: str | None = None):
@@ -87,6 +93,52 @@ def _route_auth(
     return {"auth_backends": backends, "guards": guards}
 
 
+def _streams(handler: Callable, meta: dict[str, Any]) -> bool:
+    """Return True when the route answers with a stream or a file, which a tool result cannot hold."""
+    if meta["_stream_info"][0] or inspect.isgeneratorfunction(handler) or inspect.isasyncgenfunction(handler):
+        return True
+    response_type = unwrap_optional(meta["response_type"])
+    response_class = meta["response_class"]
+    return (isinstance(response_type, type) and issubclass(response_type, _STREAM_RESPONSE_TYPES)) or (
+        response_class is not None and issubclass(response_class, _STREAM_RESPONSE_TYPES)
+    )
+
+
+def _output_schema(meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the output schema of an exposed route, or None when Bolt does not hold its body to one object shape.
+
+    Bolt validates each body of the default status against a plain Struct. A Serializer can dump other fields,
+    and a list body goes in ``{"result": ...}``, so these routes get no schema.
+    """
+    response_type = meta["response_type"]
+    if (
+        not meta["validate_response"]
+        or meta["is_multi_response"]
+        or meta["default_status_code"] == 204
+        or not _is_plain_struct(response_type)
+        or compile_serializer_dumper(response_type) is not None
+    ):
+        return None
+    return schema.object_schema(response_type)
+
+
+def _route_tool_fn(name: str, handler: Callable, meta: dict[str, Any], output_schema: dict[str, Any] | None) -> Any:
+    """Return the tool function of an exposed route. Bind the route's response handlers once, at registration.
+
+    The function calls the handler and serializes its result with the handlers that HTTP uses. Thus the
+    ``response_model``, the return annotation and the response validation of the route apply to the tool result.
+    """
+    to_result = partial(route_tool_result, name, meta["default_status_code"] if output_schema is not None else None)
+    if meta["is_multi_response"]:
+        serialize_async, serialize_sync = meta["_multi_response_serializers"]
+    else:
+        serialize_async = partial(serialize_response, meta=meta)
+        serialize_sync = partial(serialize_response_sync, meta=meta)
+    if inspect.iscoroutinefunction(handler):
+        return partial(call_route_async, handler, serialize_async, to_result)
+    return partial(call_route_sync, handler, serialize_sync, to_result)
+
+
 def expose_routes(
     mcp: MCP,
     api: Any,
@@ -106,7 +158,10 @@ def expose_routes(
     is intent enough) — and ``include``/``exclude``/``methods``/``only_marked`` are
     ignored. A listed handler that isn't a route on ``api``, or that takes file/form
     parameters (which can't be represented as JSON tool arguments), raises ``ValueError``
-    rather than being silently skipped.
+    rather than being silently skipped. So does a route that returns a stream or a file.
+
+    The tool result holds the body that HTTP sends for the route: the response handlers
+    of the route serialize the return value.
     """
     explicit = handlers is not None
     # Materialize once — `handlers` may be a generator, and we iterate it twice
@@ -144,6 +199,14 @@ def expose_routes(
                     f"can't be represented as JSON tool arguments."
                 )
             continue
+        if _streams(handler, meta):
+            if explicit:
+                raise ValueError(
+                    f"Cannot expose handler {_name(handler)!r} ({method} {path}) as an MCP tool: it returns "
+                    f"a streaming or file response, and a tool result cannot hold one. "
+                    f"Write an @mcp.tool for this operation."
+                )
+            continue
 
         route_auth = _route_auth(handler, method, path, api._handler_middleware.get(handler_id) or {}, meta)
         # The revocation check of the route, as HTTP runs it. None when no backend of the route has revocation.
@@ -170,11 +233,13 @@ def expose_routes(
             or meta.get("openapi_summary")
         )
         args_struct = schema.struct_from_fields(name, fields)
+        output_schema = _output_schema(meta)
         mcp.add_tool(
             ToolDef(
                 name=name,
-                fn=handler,
+                fn=_route_tool_fn(name, handler, meta, output_schema),
                 description=description,
+                output_schema=output_schema,
                 args_struct=args_struct,
                 input_schema=schema.input_schema_for(args_struct),
                 is_async=inspect.iscoroutinefunction(handler),

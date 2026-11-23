@@ -94,6 +94,11 @@ def output_schema_from_return(fn: Callable) -> dict[str, Any] | None:
             f"{getattr(fn, '__name__', fn)!r} returns ToolResult, so its output schema cannot be derived. "
             "Pass output_schema as a JSON Schema dict for the structured content, or leave it out."
         )
+    return object_schema(annotation)
+
+
+def object_schema(annotation: Any) -> dict[str, Any] | None:
+    """Return the JSON Schema of ``annotation`` when it describes an object, else None."""
     schema = _inline_root_ref(msgspec.json.schema(annotation))
     if schema.get("type") != "object":
         return None

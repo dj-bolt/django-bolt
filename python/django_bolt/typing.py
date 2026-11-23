@@ -134,6 +134,10 @@ class HandlerMetadata(TypedDict, total=False):
     """Pre-built per-status-code meta dicts for O(1) lookup at request time.
     Keys mirror ``response_map`` (int codes + optional ``...``)."""
 
+    _multi_response_serializers: tuple[Callable[[Any], Any], Callable[[Any], Any]]
+    """Multi-response routes only: the (async, sync) functions that serialize a handler result.
+    An MCP tool call of the route uses them."""
+
     _stream_item_validator: Callable[[Any], Any] | None
     """Compiled sync validator for typed stream items"""
 

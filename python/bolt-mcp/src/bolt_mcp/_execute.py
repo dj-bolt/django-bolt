@@ -8,13 +8,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 import msgspec
 
+from django_bolt._json import decode as json_decode
 from django_bolt._json import default_serializer
 from django_bolt._json import encode as json_encode
+from django_bolt.serialization import (
+    _BODY_BYTES,
+    _RESPONSE_META_EMPTY,
+    _RESPONSE_META_HTML,
+    _RESPONSE_META_JSON,
+    _RESPONSE_META_OCTETSTREAM,
+    _RESPONSE_META_PLAINTEXT,
+    ResponseWireV1,
+    _is_json_media_type,
+)
 
 from .context import McpClientError
 from .registry import ToolDef
@@ -90,6 +102,82 @@ def to_call_tool_result(result: Any) -> dict[str, Any]:
         "isError": False,
         "resultType": RESULT_TYPE_COMPLETE,
     }
+
+
+# The media type of each static meta tag and each response type of a ResponseWireV1.
+_TAG_MEDIA_TYPES = {
+    _RESPONSE_META_JSON: "application/json",
+    _RESPONSE_META_PLAINTEXT: "text/plain",
+    _RESPONSE_META_OCTETSTREAM: "application/octet-stream",
+    _RESPONSE_META_EMPTY: "",
+    _RESPONSE_META_HTML: "text/html",
+}
+_TYPE_MEDIA_TYPES = {"json": "application/json", "plaintext": "text/plain", "html": "text/html", "empty": ""}
+
+
+def _media_type(meta: Any) -> str:
+    if isinstance(meta, int):
+        return _TAG_MEDIA_TYPES[meta]
+    response_type, custom_content_type = meta[0], meta[1]
+    if custom_content_type:
+        return custom_content_type.split(";", 1)[0].strip().lower()
+    # Rust sends each other response type as application/octet-stream.
+    return _TYPE_MEDIA_TYPES.get(response_type, "application/octet-stream")
+
+
+def route_tool_result(name: str, schema_status: int | None, wire: ResponseWireV1) -> ToolResult:
+    """Map the HTTP response of an exposed route to its tool result.
+
+    ``wire`` is the response that Bolt serializes for the route, with its ``response_model``
+    and its response validation. A 2xx JSON body is the structured content, and its text is
+    the HTTP body. A 2xx text body is text content only. Any other status raises ``ToolError``
+    with the HTTP body. A tool result has no headers or cookies, so they are not sent.
+
+    ``schema_status`` is the status of the body that the output schema of the tool describes,
+    or None when the tool has no output schema. Each other success body raises ``TypeError``.
+    """
+    status, meta, body_kind, body = wire
+    if body_kind != _BODY_BYTES:
+        raise TypeError(f"Tool {name!r} returned a streaming or file response. A tool result cannot hold one.")
+    if not 200 <= status < 300:
+        raise ToolError(body.decode(errors="replace") if body else f"Tool {name!r} answered with HTTP status {status}.")
+    media_type = _media_type(meta)
+    if schema_status is not None and (status != schema_status or not _is_json_media_type(media_type)):
+        raise TypeError(
+            f"Tool {name!r} returned a body that its output schema does not describe (status {status}, {media_type!r})."
+        )
+    if not body:
+        return ToolResult(content=[])
+    if _is_json_media_type(media_type):
+        payload = json_decode(body)
+        return ToolResult(
+            content=body.decode(), structured=payload if isinstance(payload, dict) else {"result": payload}
+        )
+    if media_type.startswith("text/"):
+        return ToolResult(content=body.decode())
+    raise TypeError(f"Tool {name!r} returned a body of type {media_type!r}. A tool result holds only JSON or text.")
+
+
+async def call_route_async(
+    handler: Callable[..., Awaitable[Any]],
+    serialize: Callable[[Any], Awaitable[ResponseWireV1]],
+    to_result: Callable[[ResponseWireV1], ToolResult],
+    /,
+    **kwargs: Any,
+) -> ToolResult:
+    """Call an async route handler and serialize its result as HTTP does."""
+    return to_result(await serialize(await handler(**kwargs)))
+
+
+def call_route_sync(
+    handler: Callable[..., Any],
+    serialize: Callable[[Any], ResponseWireV1],
+    to_result: Callable[[ResponseWireV1], ToolResult],
+    /,
+    **kwargs: Any,
+) -> ToolResult:
+    """Call a sync route handler and serialize its result as HTTP does, on the same thread."""
+    return to_result(serialize(handler(**kwargs)))
 
 
 async def run_tool(tool: ToolDef, kwargs: dict[str, Any]) -> Any:

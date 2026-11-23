@@ -114,6 +114,10 @@ that the route refuses gets `Permission denied for tool '<name>'`, and `tools/li
 tool from that caller. A tool call cannot run middleware, so a route with `@rate_limit`,
 Python middleware or Django middleware raises `ValueError`.
 
+The tool result holds the body that HTTP sends for the route. The `response_model`, the return
+annotation and the response validation of the route apply, so a field that HTTP removes is not
+in the tool result. A route that returns a stream or a file raises `ValueError`.
+
 Exposure is **per-handler by design**: there is no "expose everything" switch, because a
 marker scattered across the codebase must never silently turn a route into an AI-callable
 tool. For deliberate bulk selection, call `expose_routes(mcp, api, include=[...], methods=(...))`
