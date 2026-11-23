@@ -68,6 +68,9 @@ pub struct McpToolEntry {
     pub needs_context: bool,
     /// The auth and the guards of the route, for a tool that exposes a route.
     pub route_gate: Option<RouteGate>,
+    /// Whether the tool takes the request, or a `Context` that holds it.
+    /// Only then does a call build the request object.
+    pub needs_request: bool,
 }
 
 pub struct McpRegistry {
@@ -96,6 +99,8 @@ pub struct McpRegistry {
     pub list_cache_scope: CacheScope,
     /// Whether a tool has a `route_gate`.
     pub route_gates: bool,
+    /// Whether a tool takes the request.
+    pub needs_request: bool,
 }
 
 /// Serde model of the wire-format catalog JSON produced by
@@ -215,6 +220,14 @@ impl McpRegistry {
                     ))
                 })?
                 .extract()?;
+            let needs_request: bool = cfg
+                .get_item("needs_request")?
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "MCP tool '{name}' config missing 'needs_request'"
+                    ))
+                })?
+                .extract()?;
             let guards_obj = cfg.get_item("guards")?.ok_or_else(|| {
                 PyValueError::new_err(format!("MCP tool '{name}' config missing 'guards'"))
             })?;
@@ -232,6 +245,7 @@ impl McpRegistry {
                     dispatch,
                     needs_context,
                     route_gate,
+                    needs_request,
                 },
             );
         }
@@ -286,6 +300,7 @@ impl McpRegistry {
         server_info.instructions = catalog.instructions;
 
         let route_gates = tools.values().any(|entry| entry.route_gate.is_some());
+        let needs_request = tools.values().any(|entry| entry.needs_request);
         Ok(Self {
             server_info,
             tool_order,
@@ -301,6 +316,7 @@ impl McpRegistry {
             list_ttl_ms: catalog.list_ttl_ms.unwrap_or(0),
             list_cache_scope,
             route_gates,
+            needs_request,
         })
     }
 
@@ -349,6 +365,10 @@ mod tests {
             headers: AHashMap::new(),
             method: "POST".to_owned(),
             scheme: "http".to_owned(),
+            path: "/mcp".to_owned(),
+            query_string: String::new(),
+            conn_scheme: "http",
+            conn_remote_addr: None,
         }
     }
 

@@ -253,6 +253,16 @@ On a mount with `auth=[JWTAuthentication()]`, a caller with a JWT of the user `a
 
 For an anonymous caller, `principal()` gives `{}`.
 
+Bolt makes a new request for each tool call, from the HTTP request to the MCP endpoint:
+
+- `request.headers`, `request.cookies` and `request.META` come from the MCP request. `request.META["REMOTE_ADDR"]` is the address of the client, with the rules of `BOLT_TRUSTED_PROXIES`.
+- `request.method` is `POST`, and `request.path` is the path of the MCP endpoint, for example `/mcp`. `request.query` is the query of the MCP endpoint.
+- `request.context` is the principal of the call. `request.user` and `await request.auser()` give its user, as on a route with the same auth. With no user, they give Django's `AnonymousUser`.
+- `request.body` is empty. The JSON-RPC message is not data of the tool.
+- `request.state` is an empty dict for each call.
+
+A tool with a `Context` argument gets the same request as `ctx.request`.
+
 ## Write a resource
 
 A resource is data that the client reads by its URI. The function returns the text:
@@ -478,6 +488,12 @@ The auth and the guards of the mount run first, and do not replace those of the 
 - `tools/list` does not show the tool to a caller that the route refuses.
 - Tool middleware gets the principal from the auth of the route.
 
+A handler with a `request` or `req` argument gets the request of the tool call, as an `@mcp.tool` does.
+See [Read the request](#read-the-request).
+`request.context` is the principal from the auth of the route, so `request.user` and `await request.auser()` give the same user as over HTTP.
+A route with no auth backend has no principal. Thus `request.user` is `AnonymousUser`, also on a mount with `auth`.
+The path parameters of the route are tool arguments, so `request.params` is empty.
+
 **Behavior change:** a tool call cannot run middleware.
 Thus `mount_mcp()` raises `ValueError` for an exposed route with `@rate_limit`, Python middleware or Django middleware.
 This includes the middleware of the API and of the router, and a route with `SessionAuthentication`.
@@ -487,7 +503,8 @@ The guards of a tool do not limit the rate of calls.
 If the route has `@rate_limit`, add an equal limit for the tool, for example in tool middleware or at a gateway.
 
 `mount_mcp()` exposes only the routes that you name.
-A handler that is not a route of the API, a handler with `File` or `Form` parameters, or a duplicate tool name raises `ValueError`.
+A handler that is not a route of the API, a handler with `File`, `Form` or `Depends` parameters, or a duplicate tool name raises `ValueError`.
+A tool call cannot resolve a dependency. Write an `@mcp.tool` for such an operation.
 
 To change the name or the description, use `@expose_as_tool`:
 

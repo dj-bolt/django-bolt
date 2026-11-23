@@ -167,6 +167,7 @@ def mount_mcp(
     from django_bolt.auth import get_default_authentication_classes  # noqa: PLC0415 — Django must be configured first
     from django_bolt.auth.backends import www_authenticate_challenge  # noqa: PLC0415 — Django must be configured first
     from django_bolt.auth.session import auth_without_session  # noqa: PLC0415 — Django must be configured first
+    from django_bolt.auth.user_loader import resolve_user_loader  # noqa: PLC0415 — Django must be configured first
 
     # Django middleware does not run on a mount, so a session backend cannot work there.
     backends = auth_without_session(auth, f"MCP mount {path}")
@@ -175,6 +176,8 @@ def mount_mcp(
         # As for a route: a guard that needs a user and no backend gives JWTAuthentication().
         backends = get_default_authentication_classes(needs_user=guards_need_user(mount_guards)) or []
     auth_metadata = [b.to_metadata() for b in backends] or None
+    # A tool that takes the request gets the user of the mount principal, as a route does.
+    mcp._user_loaders = tuple(resolve_user_loader(backend) for backend in backends)
     guards_metadata = [g.to_metadata() for g in mount_guards]
 
     verify_token = None

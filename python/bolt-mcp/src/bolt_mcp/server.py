@@ -145,6 +145,8 @@ class MCP:
         self._tool_middleware: list[ToolMiddleware] = []
         self._resource_middleware: list[ResourceMiddleware] = []
         self._prompt_middleware: list[PromptMiddleware] = []
+        # The user loaders of the auth backends of the mount, by auth_backend_index. Set by mount_mcp.
+        self._user_loaders: tuple[Any, ...] = ()
         self._mounted = False
 
     # ── Registration decorators ──────────────────────────────────────────────
@@ -181,7 +183,7 @@ class MCP:
                     "been removed — declare a Context parameter and call ctx.report_progress(...) "
                     "/ ctx.info(...) for progress, then return the final result."
                 )
-            params = set(inspect.signature(fn).parameters)
+            params = inspect.signature(fn).parameters
             ctx_param = _find_context_param(fn)
             exclude = schema.INJECTED_PARAMS | ({ctx_param} if ctx_param else set())
             args_struct = schema.struct_from_signature(fn, exclude=exclude)
@@ -199,7 +201,7 @@ class MCP:
                 args_struct=args_struct,
                 input_schema=schema.input_schema_for(args_struct),
                 is_async=inspect.iscoroutinefunction(fn),
-                injects_request=bool(params & schema.INJECTED_PARAMS),
+                request_param=next((p for p in params if p in schema.INJECTED_PARAMS), None),
                 ctx_param=ctx_param,
             )
             return fn
