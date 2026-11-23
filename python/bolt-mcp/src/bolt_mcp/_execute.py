@@ -115,14 +115,21 @@ _TAG_MEDIA_TYPES = {
 _TYPE_MEDIA_TYPES = {"json": "application/json", "plaintext": "text/plain", "html": "text/html", "empty": ""}
 
 
-def _media_type(meta: Any) -> str:
+def _content_type(meta: Any) -> tuple[str, str]:
+    """Return the media type of a response and the charset of its text, ``utf-8`` when it declares none."""
     if isinstance(meta, int):
-        return _TAG_MEDIA_TYPES[meta]
+        return _TAG_MEDIA_TYPES[meta], "utf-8"
     response_type, custom_content_type = meta[0], meta[1]
-    if custom_content_type:
-        return custom_content_type.split(";", 1)[0].strip().lower()
-    # Rust sends each other response type as application/octet-stream.
-    return _TYPE_MEDIA_TYPES.get(response_type, "application/octet-stream")
+    if not custom_content_type:
+        # Rust sends each other response type as application/octet-stream.
+        return _TYPE_MEDIA_TYPES.get(response_type, "application/octet-stream"), "utf-8"
+    media_type, *parameters = custom_content_type.split(";")
+    charset = "utf-8"
+    for parameter in parameters:
+        name, _, value = parameter.partition("=")
+        if name.strip().lower() == "charset" and value.strip():
+            charset = value.strip().strip('"')
+    return media_type.strip().lower(), charset
 
 
 def route_tool_result(name: str, schema_status: int | None, wire: ResponseWireV1) -> ToolResult:
@@ -141,7 +148,7 @@ def route_tool_result(name: str, schema_status: int | None, wire: ResponseWireV1
         raise TypeError(f"Tool {name!r} returned a streaming or file response. A tool result cannot hold one.")
     if not 200 <= status < 300:
         raise ToolError(body.decode(errors="replace") if body else f"Tool {name!r} answered with HTTP status {status}.")
-    media_type = _media_type(meta)
+    media_type, charset = _content_type(meta)
     if schema_status is not None and (status != schema_status or not _is_json_media_type(media_type)):
         raise TypeError(
             f"Tool {name!r} returned a body that its output schema does not describe (status {status}, {media_type!r})."
@@ -154,7 +161,7 @@ def route_tool_result(name: str, schema_status: int | None, wire: ResponseWireV1
             content=body.decode(), structured=payload if isinstance(payload, dict) else {"result": payload}
         )
     if media_type.startswith("text/"):
-        return ToolResult(content=body.decode())
+        return ToolResult(content=body.decode(charset))
     raise TypeError(f"Tool {name!r} returned a body of type {media_type!r}. A tool result holds only JSON or text.")
 
 

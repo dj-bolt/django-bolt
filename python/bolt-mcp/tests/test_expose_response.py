@@ -16,7 +16,7 @@ from bolt_mcp import MCP, expose_routes
 from django.contrib.auth.models import Group
 
 from django_bolt import JSON, BoltAPI, StreamingResponse
-from django_bolt.responses import PlainText, Redirect
+from django_bolt.responses import PlainText, Redirect, Response
 from django_bolt.testing import TestClient
 
 
@@ -391,3 +391,54 @@ def test_expose_routes_with_patterns_skips_a_stream_route():
     with TestClient(api) as client:
         assert set(_tools(client)) == {"user"}
         assert _call(client, "user")["structuredContent"] == {"name": "a"}
+
+
+def test_text_body_decodes_with_its_declared_charset():
+    """A text body is decoded with the charset of its media type, as an HTTP client does."""
+    api = BoltAPI()
+
+    @api.get("/latin")
+    async def latin():
+        return Response(b"caf\xe9", media_type="text/plain; charset=iso-8859-1")
+
+    api.mount_mcp(MCP("t", mask_error_details=False), expose=[latin])
+    with TestClient(api) as client:
+        assert client.get("/latin").text == "café"
+        result = _call(client, "latin")
+    assert result == {"content": [{"type": "text", "text": "café"}], "isError": False, "resultType": "complete"}
+
+
+class Node(msgspec.Struct):
+    name: str
+    children: list[Node] = []
+
+
+def _refs(value) -> set[str]:
+    """Collect each ``$ref`` in a JSON Schema."""
+    if isinstance(value, dict):
+        found = {value["$ref"]} if isinstance(value.get("$ref"), str) else set()
+        for item in value.values():
+            found |= _refs(item)
+        return found
+    if isinstance(value, list):
+        return set().union(*(_refs(item) for item in value)) if value else set()
+    return set()
+
+
+def test_output_schema_of_a_recursive_struct_has_no_dangling_reference():
+    """The root of the schema is inlined, so a reference to the root becomes ``#``."""
+    api = BoltAPI()
+
+    @api.get("/tree", response_model=Node)
+    async def tree() -> dict:
+        return {"name": "root", "children": [{"name": "leaf"}]}
+
+    api.mount_mcp(MCP("t"), expose=[tree])
+    with TestClient(api) as client:
+        schema = _tools(client)["tree"]["outputSchema"]
+        result = _call(client, "tree")
+    defs = schema.get("$defs", {})
+    for ref in _refs(schema):
+        assert ref == "#" or ref.removeprefix("#/$defs/") in defs, ref
+    assert schema["properties"]["children"]["items"] == {"$ref": "#"}
+    assert result["structuredContent"] == {"name": "root", "children": [{"name": "leaf", "children": []}]}

@@ -554,9 +554,10 @@ An example is a `PlainText` return from a route with `response_model=PublicUser`
 `mount_mcp()` exposes only the routes that you name.
 A handler that is not a route of the API, a handler with `File`, `Form` or `Depends` parameters, or a duplicate tool name raises `ValueError`.
 A tool call cannot resolve a dependency. Write an `@mcp.tool` for such an operation.
-A route that returns a stream or a file also raises `ValueError`.
+A route that declares a stream or a file also raises `ValueError`.
 For example, a generator handler, a stream return annotation, a `StreamingResponse` or `FileResponse` annotation, or `response_class=EventSourceResponse`.
 `expose_routes()` with patterns skips these routes.
+A route that returns a stream or a file with no such declaration passes registration. Each call of its tool gives an error result.
 
 To change the name or the description, use `@expose_as_tool`:
 
