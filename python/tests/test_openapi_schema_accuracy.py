@@ -593,7 +593,8 @@ def test_struct_field_refers_to_the_component_of_each_named_type():
         "pair": {"type": "array", "prefixItems": [WIDGET_REF, PROBLEM_REF], "minItems": 2, "maxItems": 2},
         "many": {"type": "array", "items": WIDGET_REF},
         "by_name": {"type": "object", "additionalProperties": WIDGET_REF},
-        "noted": WIDGET_REF,
+        # The Meta of ``Annotated`` is next to the reference (#945).
+        "noted": {**WIDGET_REF, "description": "The first widget"},
         "widgets": {"type": "array", "items": WIDGET_REF},
         "position": {"$ref": "#/components/schemas/Position"},
     }
