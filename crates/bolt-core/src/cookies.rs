@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 
-use actix_web::cookie::{Cookie, SameSite, time};
+use cookie::{Cookie, SameSite, time};
 
 use crate::response_meta::CookieData;
 
@@ -55,7 +55,8 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
     }
 
     // Build cookie using the cookie crate
-    let mut cookie = Cookie::build(&c.name, quote_cookie_value(&c.value)).path(&c.path);
+    let mut cookie =
+        Cookie::build((c.name.as_str(), quote_cookie_value(&c.value))).path(c.path.as_str());
 
     // Max-Age (validate non-negative)
     if let Some(max_age) = c.max_age {
@@ -100,7 +101,7 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
         cookie = cookie.same_site(ss);
     }
 
-    let built = cookie.finish();
+    let built = cookie.build();
     let mut result = built.to_string();
 
     // Append Expires manually if provided (cookie crate requires OffsetDateTime)

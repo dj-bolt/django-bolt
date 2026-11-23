@@ -17,7 +17,10 @@ repository = "https://github.com/dj-bolt/django-bolt"
 # module (cp314t). CI builds that wheel with `--interpreter 3.14t`.
 pyo3 = { version = "0.30.1", features = ["abi3-py312", "chrono"] }
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
-actix-web = { version = "4.18.2", features = ["compress-gzip", "compress-brotli", "compress-zstd", "cookies"] }
+# The `cookies` feature is off: it pulls cookie 0.16 (RUSTSEC-2026-0594). Bolt
+# builds Set-Cookie with cookie 0.18 directly. The other features are the defaults.
+actix-web = { version = "4.20.0", default-features = false, features = ["macros", "compress-gzip", "compress-brotli", "compress-zstd", "http2", "unicode", "compat", "ws"] }
+cookie = "0.18.3"
 actix-http = "3.21.3"
 actix-web-actors = "4"  # WebSocket support
 actix = "0.13"  # Actor framework for WebSocket
@@ -112,6 +115,7 @@ actix-web-actors = { workspace = true }
 ahash = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+cookie = { workspace = true }
 ctrlc = { workspace = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
