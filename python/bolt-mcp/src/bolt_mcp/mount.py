@@ -167,6 +167,7 @@ def mount_mcp(
     from django_bolt.auth import get_default_authentication_classes  # noqa: PLC0415 — Django must be configured first
     from django_bolt.auth.backends import www_authenticate_challenge  # noqa: PLC0415 — Django must be configured first
     from django_bolt.auth.session import auth_without_session  # noqa: PLC0415 — Django must be configured first
+    from django_bolt.auth.user_loader import resolve_user_loader  # noqa: PLC0415 — Django must be configured first
 
     # Django middleware does not run on a mount, so a session backend cannot work there.
     backends = auth_without_session(auth, f"MCP mount {path}")
@@ -217,6 +218,8 @@ def mount_mcp(
         www_authenticate=www_authenticate,
         allowed_hosts=list(allowed_hosts) if allowed_hosts is not None else None,
         allowed_origins=list(allowed_origins) if allowed_origins is not None else None,
+        # A tool that takes the request gets the user of the mount principal, as a route does.
+        user_loaders=tuple(resolve_user_loader(backend) for backend in backends),
     )
     api._mcp_mounts.append(definition)
     mcp._mounted = True

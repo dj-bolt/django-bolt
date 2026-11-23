@@ -21,7 +21,9 @@ from .registry import ToolDef
 from .server import MCP
 
 _MARKER_ATTR = "__bolt_mcp__"
-_SKIP_SOURCES = frozenset({"file", "form"})
+# A tool argument is JSON, so it cannot hold a file or a form. A tool call has no route
+# request for the dependency of a parameter to read.
+_SKIP_SOURCES = frozenset({"file", "form", "dependency"})
 
 
 def expose_as_tool(name: str | None = None, description: str | None = None):
@@ -46,6 +48,17 @@ def _tool_name(handler: Callable, method: str, path: str) -> str:
     """Default MCP tool name: the handler's function name, else a path slug."""
     name = getattr(handler, "__name__", None)
     return name if name and not name.startswith("<") else _slug(method, path)
+
+
+def _request_param(meta: dict[str, Any], fields: list[Any]) -> str | None:
+    """Return the name of the parameter that Bolt gives the request to, or None.
+
+    Registration of the route found it: a handler with only a request parameter has
+    ``mode`` ``"request_only"`` and no fields, and each other one has a field of source ``"request"``.
+    """
+    if meta.get("mode") == "request_only":
+        return next(iter(meta["sig"].parameters))
+    return next((f.name for f in fields if f.source == "request"), None)
 
 
 def _middleware_names(spec: Any) -> list[str]:
@@ -104,9 +117,8 @@ def expose_routes(
     ``handlers`` is an explicit allowlist of route handler callables. When given, only
     those handlers are exposed — regardless of HTTP method or marker (naming a handler
     is intent enough) — and ``include``/``exclude``/``methods``/``only_marked`` are
-    ignored. A listed handler that isn't a route on ``api``, or that takes file/form
-    parameters (which can't be represented as JSON tool arguments), raises ``ValueError``
-    rather than being silently skipped.
+    ignored. A listed handler that isn't a route on ``api``, or that takes file, form or
+    ``Depends`` parameters, raises ``ValueError`` rather than being silently skipped.
     """
     explicit = handlers is not None
     # Materialize once — `handlers` may be a generator, and we iterate it twice
@@ -140,8 +152,9 @@ def expose_routes(
             if explicit:
                 raise ValueError(
                     f"Cannot expose handler {_name(handler)!r} as an MCP tool: it uses "
-                    f"unsupported parameter source(s) {unsupported} — file/form uploads "
-                    f"can't be represented as JSON tool arguments."
+                    f"unsupported parameter source(s) {unsupported}. A JSON tool argument "
+                    f"cannot hold a file or a form, and a tool call cannot resolve a dependency "
+                    f"(Depends) of a parameter. Write an @mcp.tool for this operation."
                 )
             continue
 
@@ -178,9 +191,10 @@ def expose_routes(
                 args_struct=args_struct,
                 input_schema=schema.input_schema_for(args_struct),
                 is_async=inspect.iscoroutinefunction(handler),
-                injects_request=any(f.source == "request" for f in fields),
+                request_param=_request_param(meta, fields),
                 route_auth=route_auth,
                 revocation_check=revocation_check,
+                user_loaders=meta.get("_user_loaders", ()),
             )
         )
 
