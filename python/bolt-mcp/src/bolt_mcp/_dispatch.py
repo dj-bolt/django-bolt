@@ -25,6 +25,7 @@ import msgspec
 from django_bolt._json import decode as json_decode
 from django_bolt._json import encode as json_encode
 from django_bolt.auth.user_loader import LazyUser
+from django_bolt.exceptions import HTTPException
 
 from ._execute import RESULT_TYPE_COMPLETE, error_result, execute_tool, tool_failed
 from .context import Context, _InputRequired
@@ -97,6 +98,10 @@ async def _call_through_middleware(
 
 
 async def _run_tool(tool: ToolDef, mcp: MCP, user_loaders: tuple[Any, ...], payload: dict[str, Any]) -> bytes:
+    if tool.revocation_check is not None and payload["auth"]:
+        refused = await _revoked_token_refusal(tool, mcp, payload["auth"])
+        if refused is not None:
+            return refused
     raw = json_decode(payload["arguments_json"])
     call_tool = partial(_call_tool, tool, mcp, user_loaders, payload, raw)
     try:
@@ -128,6 +133,21 @@ async def _run_tool(tool: ToolDef, mcp: MCP, user_loaders: tuple[Any, ...], payl
             }
         )
     return json_encode(result)
+
+
+async def _revoked_token_refusal(tool: ToolDef, mcp: MCP, auth: dict[str, Any]) -> bytes | None:
+    """Run the revocation check of an exposed route. Return the refusal, or None when the token is valid.
+
+    ``auth`` is the principal from the auth of the route. It has the backend index and the claims that HTTP reads.
+    A revoked token gets the refusal of the other route checks. A store error gives an error result.
+    """
+    try:
+        await tool.revocation_check(auth)
+    except HTTPException:
+        return json_encode(error_result(f"Permission denied for tool '{tool.name}'"))
+    except Exception as exc:
+        return json_encode(tool_failed(tool, exc, mask_error_details=mcp.mask_error_details))
+    return None
 
 
 def tool_entry(mcp: MCP, tool: ToolDef, mount_user_loaders: tuple[Any, ...]) -> dict[str, Any]:

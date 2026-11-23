@@ -116,6 +116,8 @@ class ToolDef:
     ctx_param: str | None = None  # name of the parameter to inject the Context under
     # An exposed route: {"auth_backends": [...], "guards": [...]} of the route. Rust runs them for each call.
     route_auth: dict[str, Any] | None = None
+    # An exposed route with revocation: ``await revocation_check(auth)`` raises ``HTTPException`` for a revoked token.
+    revocation_check: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     # An exposed route with route_auth: the user loaders of its auth backends, by auth_backend_index.
     user_loaders: tuple[Any, ...] = ()
 
