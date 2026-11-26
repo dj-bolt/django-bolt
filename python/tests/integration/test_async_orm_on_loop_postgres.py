@@ -8,15 +8,21 @@ result of the sync ORM.
 Each test adds one database to Django: a new PostgreSQL database with the
 tables of the test models. ``default`` stays the SQLite database.
 
+Each ``on_loop`` test runs two times, one time for each way to send a query:
+Rust on the connection of psycopg, and the async cursor of psycopg.
+
 Set ``DJANGO_BOLT_TEST_POSTGRES_DSN`` to run them. Without the variable, they skip.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -38,7 +44,7 @@ from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils.deprecation import MiddlewareMixin
 
-from django_bolt import BoltAPI, Request, concurrency
+from django_bolt import BoltAPI, Request, async_orm, concurrency
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.auth.jwt_utils import create_jwt_for_user
 from django_bolt.middleware import DjangoMiddlewareStack
@@ -108,6 +114,29 @@ class ProbeWithComputedField(Serializer):
 
 FAR_FUTURE = datetime(2999, 1, 1, tzinfo=UTC)
 
+# More than the socket buffers of a slow link hold, so one send or one read cannot move the data.
+LARGE_STATEMENT = 12_000_000
+# name -> how many times each row repeats its text: a result of 0.4 MB, which
+# the server sends at one time, and a result of 11 MB.
+RESULT_SIZES = {"one-burst": 2_000, "many-buffers": 50_000}
+
+# Functions of the test database: an error with each field that a client can read, and a notice.
+DATABASE_FUNCTIONS = (
+    """
+    CREATE FUNCTION bolt_fail() RETURNS integer AS $$
+    BEGIN
+        RAISE EXCEPTION 'custom failure' USING ERRCODE = '22B99', DETAIL = 'the detail', HINT = 'the hint';
+    END $$ LANGUAGE plpgsql
+    """,
+    """
+    CREATE FUNCTION bolt_notice() RETURNS integer AS $$
+    BEGIN
+        RAISE NOTICE 'a notice from the server';
+        RETURN 7;
+    END $$ LANGUAGE plpgsql
+    """,
+)
+
 
 class LoopDb(NamedTuple):
     params: dict[str, Any]
@@ -135,8 +164,7 @@ def _seed() -> None:
     LoopProbe.objects.using(ALIAS).create(label="b")
 
 
-@pytest.fixture
-def loop_db(postgres_database, monkeypatch, django_db_blocker):
+def _add_database(postgres_database, monkeypatch, django_db_blocker, options: dict[str, Any]) -> Any:
     """Add a PostgreSQL database to Django, with the tables and the rows of the tests.
 
     Each test gets a new alias. The threads of the framework live longer than
@@ -152,7 +180,7 @@ def loop_db(postgres_database, monkeypatch, django_db_blocker):
         "PASSWORD": postgres_database.get("password", ""),
         "HOST": postgres_database.get("host", ""),
         "PORT": postgres_database.get("port", ""),
-        "OPTIONS": {"application_name": application_name},
+        "OPTIONS": {"application_name": application_name, **options},
     }
     configured = connections.configure_settings({"default": connections.settings["default"], ALIAS: database})
     monkeypatch.setitem(connections.settings, ALIAS, configured[ALIAS])
@@ -161,6 +189,9 @@ def loop_db(postgres_database, monkeypatch, django_db_blocker):
             with connections[ALIAS].schema_editor() as editor:
                 for model in MODELS:
                     editor.create_model(model)
+            with connections[ALIAS].cursor() as cursor:
+                for function in DATABASE_FUNCTIONS:
+                    cursor.execute(function)
             _seed()
             yield LoopDb(postgres_database, application_name)
         finally:
@@ -169,12 +200,114 @@ def loop_db(postgres_database, monkeypatch, django_db_blocker):
 
 
 @pytest.fixture
-def on_loop(loop_db):
-    """Turn the setting on for the servers of the test."""
-    with override_settings(BOLT_ASYNC_ORM_ON_LOOP=True):
-        yield loop_db
-    # A server that starts with the setting off gives Django its own methods back.
-    concurrency.check_pool_environment()
+def loop_db(postgres_database, monkeypatch, django_db_blocker):
+    yield from _add_database(postgres_database, monkeypatch, django_db_blocker, {})
+
+
+class _SlowLink:
+    """A relay to the database that moves 16 KB in each millisecond.
+
+    On the loopback interface, the server reads a statement as fast as the
+    client sends it, and the client reads a result as fast as the server sends
+    it. Behind this relay, the socket of the client fills during a large
+    statement, and a large result comes in many small parts.
+    """
+
+    CHUNK = 16 * 1024
+
+    def __init__(self, params: dict[str, Any]) -> None:
+        host = params.get("host") or "/var/run/postgresql"
+        port = int(params.get("port") or 5432)
+        # libpq reads a host that starts with a slash as the directory of a Unix socket.
+        self.target: Any = f"{host}/.s.PGSQL.{port}" if host.startswith("/") else (host, port)
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        # ``accept`` must return so that its thread can see ``closed``.
+        self.listener.settimeout(0.05)
+        self.closed = False
+        self.port = self.listener.getsockname()[1]
+        self.sockets: list[socket.socket] = []
+        self.lock = threading.Lock()
+        self.threads = [threading.Thread(target=self._accept, daemon=True)]
+        self.threads[0].start()
+
+    def _accept(self) -> None:
+        while not self.closed:
+            try:
+                client, _address = self.listener.accept()
+            except TimeoutError:
+                continue
+            client.settimeout(None)
+            family = socket.AF_UNIX if isinstance(self.target, str) else socket.AF_INET
+            server = socket.socket(family, socket.SOCK_STREAM)
+            server.connect(self.target)
+            pumps = [
+                threading.Thread(target=self._pump, args=(client, server), daemon=True),
+                threading.Thread(target=self._pump, args=(server, client), daemon=True),
+            ]
+            with self.lock:
+                self.sockets += [client, server]
+                self.threads += pumps
+            for pump in pumps:
+                pump.start()
+
+    def _pump(self, source: socket.socket, sink: socket.socket) -> None:
+        with contextlib.suppress(OSError):
+            while data := source.recv(self.CHUNK):
+                sink.sendall(data)
+                time.sleep(0.001)
+        # The other side must see the end of the data.
+        for end in (source, sink):
+            with contextlib.suppress(OSError):
+                end.shutdown(socket.SHUT_RDWR)
+
+    def close(self) -> None:
+        self.closed = True
+        # The accept thread is first. After it ends, no new socket and no new thread can come.
+        self.threads[0].join(timeout=10)
+        self.listener.close()
+        for link in self.sockets:
+            with contextlib.suppress(OSError):
+                link.shutdown(socket.SHUT_RDWR)
+        for thread in self.threads:
+            thread.join(timeout=10)
+        for link in self.sockets:
+            link.close()
+
+
+RUST = "rust"
+PSYCOPG = "psycopg"
+# The database options that select each way to send a query. With
+# ``server_side_binding``, psycopg must send the query: see ``async_orm._new_pool``.
+TRANSPORT_OPTIONS: dict[str, dict[str, Any]] = {RUST: {}, PSYCOPG: {"server_side_binding": True}}
+
+
+@pytest.fixture(params=sorted(TRANSPORT_OPTIONS))
+def transport(request) -> str:
+    return request.param
+
+
+@pytest.fixture
+def on_loop(transport, postgres_database, monkeypatch, django_db_blocker):
+    """Add the database and turn the setting on for the servers of the test."""
+    for database in _add_database(postgres_database, monkeypatch, django_db_blocker, TRANSPORT_OPTIONS[transport]):
+        with override_settings(BOLT_ASYNC_ORM_ON_LOOP=True):
+            yield database
+        # A server that starts with the setting off gives Django its own methods back.
+        concurrency.check_pool_environment()
+
+
+@pytest.fixture
+def on_loop_through_a_slow_link(transport, postgres_database, monkeypatch, django_db_blocker):
+    """``on_loop``, with the database behind a ``_SlowLink``."""
+    link = _SlowLink(postgres_database)
+    behind = {**postgres_database, "host": "127.0.0.1", "port": str(link.port)}
+    try:
+        for database in _add_database(behind, monkeypatch, django_db_blocker, TRANSPORT_OPTIONS[transport]):
+            with override_settings(BOLT_ASYNC_ORM_ON_LOOP=True):
+                yield database
+            concurrency.check_pool_environment()
+    finally:
+        link.close()
 
 
 def _post(post: BlogPost) -> dict[str, Any]:
@@ -308,13 +441,63 @@ def _probe_with_backend_pid() -> Any:
     return LoopProbe.objects.using(ALIAS).annotate(pid=RawSQL("pg_backend_pid()", [])).order_by("-label")
 
 
-async def _backend_pid() -> int:
+async def _backend_pid(nap: float = 0.05) -> int:
     probe = await (
         LoopProbe.objects.using(ALIAS)
-        .annotate(pid=RawSQL("pg_backend_pid()", []), nap=RawSQL("(SELECT 1 FROM pg_sleep(0.05))", []))
+        .annotate(pid=RawSQL("pg_backend_pid()", []), nap=RawSQL("(SELECT 1 FROM pg_sleep(%s))", [nap]))
         .aget(label="a")
     )
     return probe.pid
+
+
+def _large_values(size: str) -> Any:
+    """27 rows, each with its name repeated."""
+    return (
+        Tag.objects.using(ALIAS)
+        .annotate(big=RawSQL("repeat(name, %s)", [RESULT_SIZES[size]]))
+        .values_list("big", flat=True)
+        .order_by("id")
+    )
+
+
+def _digest(values: list[str]) -> dict[str, Any]:
+    return {"rows": len(values), "sha256": hashlib.sha256("".join(values).encode()).hexdigest()}
+
+
+# name -> a QuerySet that the database refuses
+ERROR_QUERIES: dict[str, Callable[[], Any]] = {
+    "cast": lambda: _probes().extra(where=["label::integer = 1"]),
+    "syntax": lambda: _probes().extra(where=["no such syntax"]),
+    # An SQLSTATE that psycopg has no class for, with a detail and a hint. Its first 2 characters give the class.
+    "custom": lambda: _probes().annotate(value=RawSQL("bolt_fail()", [])),
+}
+
+
+def _error_outcome(error: Exception) -> dict[str, Any]:
+    """What a caller can read from a database error: the Django error, and the psycopg error that it wraps."""
+    cause = error.__cause__
+    return {
+        "module": type(error).__module__,
+        "error": type(error).__qualname__,
+        "message": str(error),
+        "cause": type(cause).__qualname__,
+        "sqlstate": cause.sqlstate,
+        "severity": cause.diag.severity_nonlocalized,
+        "primary": cause.diag.message_primary,
+        "detail": cause.diag.message_detail,
+        "hint": cause.diag.message_hint,
+        "position": cause.diag.statement_position,
+    }
+
+
+# name -> a statement that is not one SELECT
+STATEMENTS = {
+    "copy": "COPY (SELECT 1) TO STDOUT",
+    "no-rows": "DO $$ BEGIN END $$",
+    "empty": "",
+    "two": "SELECT 1; SELECT 2",
+    "second-fails": "SELECT 1; SELECT 1 / 0",
+}
 
 
 class _ServerVersion(Func):
@@ -530,14 +713,15 @@ def _api() -> BoltAPI:
 
     @api.get("/cancelled-query")
     async def cancelled_query():
-        slow = LoopProbe.objects.using(ALIAS).annotate(nap=RawSQL("(SELECT 1 FROM pg_sleep(30))", []))
+        # Open the one connection of the loop.
+        before = await _backend_pid()
         try:
-            await asyncio.wait_for(slow.aget(label="a"), timeout=0.05)
+            await asyncio.wait_for(_backend_pid(nap=30), timeout=0.05)
         except TimeoutError:
             # With one connection for the loop, this read needs the connection of the cancelled query.
-            following = await asyncio.wait_for(LoopProbe.objects.using(ALIAS).aget(label="b"), timeout=5)
-            return {"next": following.label}
-        return {"next": None}
+            following = await asyncio.wait_for(_backend_pid(), timeout=5)
+            return {"same_connection": following == before}
+        return {"same_connection": None}
 
     @api.get("/cancelled-waiter")
     async def cancelled_waiter():
@@ -575,6 +759,39 @@ def _api() -> BoltAPI:
             return [author.id async for author in Author.objects.using(ALIAS).extra(where=["1 / (id - id) = 1"])]
         except Exception as error:
             return {"module": type(error).__module__, "error": type(error).__qualname__}
+
+    @api.get("/large-result/{size}")
+    async def large_result(size: str):
+        return _digest([value async for value in _large_values(size)])
+
+    @api.get("/large-statement")
+    async def large_statement():
+        text = "x" * LARGE_STATEMENT
+        probe = await _probes().annotate(length=RawSQL("length(%s)", [text])).aget(label="a")
+        return {"length": probe.length}
+
+    @api.get("/error/{name}")
+    async def error(name: str):
+        try:
+            return [probe.label async for probe in ERROR_QUERIES[name]()]
+        except Exception as error:
+            return _error_outcome(error)
+
+    @api.get("/notice")
+    async def notice():
+        probe = await asyncio.wait_for(_probes().annotate(value=RawSQL("bolt_notice()", [])).aget(label="a"), 10)
+        return {"value": probe.value}
+
+    @api.get("/statement/{name}")
+    async def statement(name: str):
+        try:
+            return {"rows": await async_orm.fetch(ALIAS, STATEMENTS[name], None)}
+        except Exception as error:
+            return {"module": type(error).__module__, "error": type(error).__qualname__, "message": str(error)}
+
+    @api.get("/slow-backend-pid")
+    async def slow_backend_pid():
+        return {"pid": await asyncio.wait_for(_backend_pid(nap=1), 10)}
 
     @api.get("/two-at-once")
     async def two_at_once():
@@ -842,16 +1059,19 @@ def test_aget_gives_the_object_or_the_error_of_get(on_loop, name):
     assert response.json() == expected
 
 
+def _last_statement(db: LoopDb, pid: int) -> str:
+    """The last statement that the server got on the connection ``pid``."""
+    with psycopg.connect(**db.params, autocommit=True) as admin:
+        (statement,) = admin.execute("SELECT query FROM pg_stat_activity WHERE pid = %s", (pid,)).fetchone()
+    return statement
+
+
 def test_aget_sends_the_sql_of_get(on_loop):
     """``get`` drops the order of the QuerySet and limits the rows. The database must get the same statement."""
-    with CaptureQueriesContext(connections[ALIAS]) as captured:
-        _probe_with_backend_pid().get(label="a")
-    expected = captured[-1]["sql"]
+    expected = _last_statement(on_loop, _probe_with_backend_pid().get(label="a").pid)
 
     with TestClient(_api()) as client:
-        pid = client.get("/get-backend-pid").json()["pid"]
-        with psycopg.connect(**on_loop.params, autocommit=True) as admin:
-            (sent,) = admin.execute("SELECT query FROM pg_stat_activity WHERE pid = %s", (pid,)).fetchone()
+        sent = _last_statement(on_loop, client.get("/get-backend-pid").json()["pid"])
 
     assert sent == expected
     assert "ORDER BY" not in sent
@@ -872,9 +1092,8 @@ def test_afirst_alast_and_aexists_give_the_result_or_the_error_of_the_sync_call(
 
 def test_aexists_sends_the_sql_of_exists(on_loop):
     """``exists`` selects no column and limits the rows to one. The database must get the same statement."""
-    with CaptureQueriesContext(connections[ALIAS]) as captured:
-        assert ONE_ROW_QUERIES["ordered"]().exists()
-    expected = captured[-1]["sql"]
+    assert ONE_ROW_QUERIES["ordered"]().exists()
+    expected = _last_statement(on_loop, connections[ALIAS].connection.info.backend_pid)
     connections[ALIAS].close()
 
     with TestClient(_api()) as client:
@@ -1040,7 +1259,7 @@ def test_the_connection_of_a_cancelled_query_serves_the_next_query(on_loop, monk
         response = client.get("/cancelled-query")
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"next": "b"}
+    assert response.json() == {"same_connection": True}
 
 
 def test_a_cancelled_waiter_gives_its_turn_to_the_next_waiter(on_loop, monkeypatch):
@@ -1258,3 +1477,131 @@ def test_a_closed_client_leaves_no_connection_open(on_loop):
     connections[ALIAS].close()
 
     on_loop.wait_for_backends(0)
+
+
+def _loop_log(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == "django_bolt.async_orm"]
+
+
+def test_a_log_line_tells_how_a_loop_sends_its_queries(on_loop, transport, caplog):
+    caplog.set_level(logging.INFO, logger="django_bolt.async_orm")
+    with TestClient(_api()) as client:
+        assert client.get("/authors").status_code == 200
+        assert client.get("/authors").status_code == 200
+
+    expected = {
+        RUST: f"The loop connections to the database {ALIAS!r} send their queries from Rust.",
+        PSYCOPG: f"The loop connections to the database {ALIAS!r} use psycopg: server_side_binding is on.",
+    }
+    assert _loop_log(caplog) == [expected[transport]]
+
+
+def _check_large_result(size: str) -> None:
+    expected = _digest(list(_large_values(size)))
+    assert expected["rows"] == 27
+
+    with TestClient(_api()) as client:
+        response = client.get(f"/large-result/{size}")
+        after = client.get("/authors")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+@pytest.mark.parametrize("size", sorted(RESULT_SIZES))
+def test_a_result_larger_than_the_read_buffer_has_each_row(on_loop, size):
+    """The socket can hold more data than one read takes. No event of the socket then tells of the rest."""
+    _check_large_result(size)
+
+
+def test_a_result_that_comes_in_many_parts_has_each_row(on_loop_through_a_slow_link):
+    _check_large_result("many-buffers")
+
+
+def test_a_statement_larger_than_the_socket_buffer_reaches_the_database(on_loop_through_a_slow_link):
+    with TestClient(_api()) as client:
+        response = client.get("/large-statement")
+        after = client.get("/authors")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"length": LARGE_STATEMENT}
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+@pytest.mark.parametrize("name", sorted(ERROR_QUERIES))
+def test_a_database_error_has_the_fields_of_the_error_of_the_sync_orm(on_loop, name):
+    with pytest.raises(Exception) as sync_error:  # noqa: PT011
+        list(ERROR_QUERIES[name]())
+    expected = _error_outcome(sync_error.value)
+    assert expected["module"] == "django.db.utils"
+    assert expected["sqlstate"] == {"cast": "22P02", "syntax": "42601", "custom": "22B99"}[name]
+    assert expected["error"] == {"cast": "DataError", "syntax": "ProgrammingError", "custom": "DataError"}[name]
+
+    with TestClient(_api()) as client:
+        response = client.get(f"/error/{name}")
+        after = client.get("/authors")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+def test_a_notice_of_the_server_does_not_stop_the_query(on_loop):
+    with TestClient(_api()) as client:
+        response = client.get("/notice")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"value": 7}
+
+
+PROGRAMMING_ERROR = {"module": "django.db.utils", "error": "ProgrammingError"}
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("copy", {**PROGRAMMING_ERROR, "message": "COPY cannot be used with this method; use copy() instead"}),
+        ("no-rows", PROGRAMMING_ERROR),
+        ("empty", PROGRAMMING_ERROR),
+        # The rows of the first statement, as a psycopg cursor gives them.
+        ("two", {"rows": [[1]]}),
+        ("second-fails", {"module": "django.db.utils", "error": "DataError"}),
+    ],
+)
+def test_a_statement_that_is_not_one_select_gives_the_outcome_of_psycopg(on_loop, monkeypatch, name, expected):
+    # With one connection, the read after the statement needs the connection of the statement, or a new one.
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    with TestClient(_api()) as client:
+        response = client.get(f"/statement/{name}")
+        after = client.get("/authors")
+
+    assert response.status_code == 200, response.text
+    outcome = response.json()
+    # psycopg and Rust name the result of a statement with no rows in different words.
+    assert {key: outcome[key] for key in expected} == expected
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+def _terminate_backend(db: LoopDb, pid: int) -> None:
+    with psycopg.connect(**db.params, autocommit=True) as admin:
+        admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+
+
+def test_a_connection_that_dies_during_a_query_fails_no_request(on_loop):
+    """The pool sends the query again on a new connection: see ``_Pool.fetch``."""
+    with TestClient(_api()) as client:
+        assert client.get("/authors").json() == ["Ada", "Bob", "Cy"]
+        connections[ALIAS].close()
+        (before,) = backend_pids(on_loop.params, on_loop.application_name)
+
+        # The query takes 1 second. The server ends its connection after 0.3 seconds.
+        killer = threading.Timer(0.3, _terminate_backend, args=(on_loop, before))
+        killer.start()
+        try:
+            response = client.get("/slow-backend-pid")
+        finally:
+            killer.join()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["pid"] != before

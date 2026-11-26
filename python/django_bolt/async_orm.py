@@ -9,8 +9,9 @@ The flow of one read:
 
 1. Django compiles the QuerySet to SQL on the event loop thread. The compile
    step is CPU work and sends nothing to the database.
-2. A psycopg async connection sends the SQL. The event loop watches its
-   socket and runs other requests while the database works.
+2. Rust sends the SQL on a connection that psycopg opened, and reads the
+   result: see ``_RustCursor``. The event loop runs other requests while the
+   database works.
 3. Django's own iterable class builds the result from the rows. Thus the
    field conversion and the model instances are those of the sync ORM.
 
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import ctypes
 import logging
 import math
 import os
@@ -36,6 +38,7 @@ from asgiref.sync import SyncToAsync
 from django.conf import settings
 from django.core.exceptions import EmptyResultSet, ImproperlyConfigured, SynchronousOnlyOperation
 from django.db import connections
+from django.db.backends.base.operations import BaseDatabaseOperations
 from django.db.backends.utils import CursorDebugWrapper, CursorWrapper
 from django.db.models.query import MAX_GET_RESULTS, QuerySet
 from django.db.utils import (
@@ -50,6 +53,7 @@ from django.db.utils import (
     ProgrammingError,
 )
 
+from . import _core
 from ._worker_loop import WorkerLoop
 from .concurrency import _thread_count, in_lane_mode, run_in_orm_executor
 
@@ -92,6 +96,14 @@ _django_aexists = QuerySet.aexists
 
 _thread_sensitive_context = SyncToAsync.thread_sensitive_context
 _MISSING: Any = object()
+
+# The Rust object that sends the queries of a ``_RustCursor``. The Windows
+# build does not have it, and the setting has no effect there.
+_Libpq: Any = getattr(_core, "LibpqConnection", None)
+
+# The codes of the error fields of libpq (``PG_DIAG_SEVERITY`` and ``PG_DIAG_SQLSTATE``).
+_SEVERITY = ord("S")
+_SQLSTATE = ord("C")
 
 # True when the setting is on. ``configure`` sets it.
 enabled = False
@@ -151,6 +163,185 @@ def _read_template(alias: str) -> _Template:
             wrapper.close()
 
 
+def _libpq_addresses(database: Any) -> dict[str, int] | None:
+    """Return the address of each libpq function that Rust calls, or None when psycopg does not give them.
+
+    Rust must call the libpq that holds the connections of psycopg. The
+    ctypes implementation of psycopg has that library as an object. The C
+    implementation is an extension module that links to the library. A symbol
+    lookup from that module searches the libraries that the module needs.
+    """
+    pq = database.pq
+    implementation = sys.modules[pq.PGconn.__module__]
+    if pq.__impl__ == "python":
+        library = getattr(implementation.impl, "pq", None)
+        if library is None:
+            return None
+    else:
+        library = ctypes.CDLL(implementation.__file__)
+    addresses = {}
+    for name in _Libpq.FUNCTIONS:
+        function = getattr(library, name, None)
+        if function is None:
+            return None
+        addresses[name] = ctypes.cast(function, ctypes.c_void_p).value
+    return addresses
+
+
+def _deliver(cursor: _RustCursor, result: tuple[int, Any, Any]) -> None:
+    """Take the result of a query from Rust. Runs on the event loop."""
+    cursor.pending = False
+    waiter = cursor.waiter
+    if not waiter.done():
+        waiter.set_result(result)
+        return
+    # The query was cancelled. The pool waits for its connection.
+    on_result = cursor.on_result
+    if on_result is not None:
+        cursor.on_result = None
+        on_result(cursor)
+
+
+class _RustCursor:
+    """A loop connection whose queries Rust sends: see ``src/pg.rs``.
+
+    psycopg owns the connection. Its client cursor merges the parameters into
+    the statement, and its loaders make the Python values, as for a query of
+    Django. Rust sends the statement and reads the result on the Tokio
+    reactor. No Python code runs while the query waits for the database.
+
+    The pool uses this object as it uses a psycopg cursor: ``execute``,
+    ``fetchall`` and ``connection``.
+    """
+
+    __slots__ = (
+        "connection",
+        "create_future",
+        "database",
+        "encoding",
+        "mogrify",
+        "native",
+        "oids",
+        "on_result",
+        "pending",
+        "query",
+        "result",
+        "transformer",
+        "waiter",
+    )
+
+    def __init__(self, database: Any, cursor: Any, addresses: dict[str, int], loop: WorkerLoop) -> None:
+        connection = cursor.connection
+        pgconn = connection.pgconn
+        self.connection = connection
+        self.database = database
+        self.encoding = connection.info.encoding
+        self.mogrify = cursor.mogrify
+        self.transformer = database.adapt.Transformer(connection)
+        # The column types that the loaders of ``transformer`` are for.
+        self.oids: tuple[int, ...] | None = None
+        self.create_future = loop.create_future
+        self.waiter: Any = None
+        # True from the send of a query until Rust gives its result.
+        self.pending = False
+        # The pool sets this callback for a cancelled query. It gets this cursor when the result is here.
+        self.on_result: Any = None
+        self.query = b""
+        self.result: Any = None
+        self.native = _Libpq(addresses, pgconn.pgconn_ptr, pgconn.socket, connection, loop.call_soon, _deliver)
+
+    @property
+    def _query(self) -> _RustCursor:
+        # ``last_executed_query`` of Django reads ``cursor._query.query`` for the debug log.
+        return self
+
+    async def execute(self, sql: Any, params: Any = None) -> None:
+        self.result = None
+        query = self.query = self.mogrify(sql, params).encode(self.encoding)
+        waiter = self.waiter = self.create_future()
+        self.native.query(query, self)
+        self.pending = True
+        try:
+            kind, first, second = await waiter
+        except asyncio.CancelledError:
+            if self.pending:
+                self._cancel_on_server()
+            raise
+        if kind == _Libpq.ROWS:
+            self.result = (first, second)
+            return
+        database = self.database
+        if kind == _Libpq.SERVER_ERROR:
+            raise self._server_error(first, second)
+        if kind == _Libpq.CONNECTION_ERROR:
+            raise database.OperationalError(second)
+        status = database.pq.ExecStatus(first)
+        if status in (status.COMMAND_OK, status.EMPTY_QUERY):
+            self.result = status
+            return
+        # The errors of psycopg for these results. The pool closes the connection of a COPY.
+        if status in (status.COPY_OUT, status.COPY_IN, status.COPY_BOTH):
+            raise database.ProgrammingError("COPY cannot be used with this method; use copy() instead")
+        raise database.InternalError(f"unexpected result status from query: {status.name}")
+
+    async def fetchall(self) -> list[tuple[Any, ...]]:
+        result = self.result
+        if type(result) is not tuple:
+            if result is None:
+                raise self.database.ProgrammingError("no result available")
+            raise self.database.ProgrammingError(
+                f"the last operation didn't produce records (result status: {result.name})"
+            )
+        self.result = None
+        oids, rows = result
+        transformer = self.transformer
+        if oids != self.oids:
+            transformer.set_loader_types(oids, self.database.pq.Format.TEXT)
+            self.oids = oids
+        return list(map(transformer.load_sequence, rows))
+
+    def _server_error(self, fields: dict[int, bytes], message: bytes) -> Exception:
+        """Return the psycopg error for an error of the server, as ``psycopg.errors.error_from_result`` makes it."""
+        errors = self.database.errors
+        encoding = self.encoding
+        state = fields.get(_SQLSTATE, b"").decode(encoding, "replace")
+        try:
+            error_class = errors.lookup(state)
+        except KeyError:
+            error_class = errors.get_base_exception(state)
+        # libpq starts the message with the severity, and psycopg removes it.
+        severity = fields.get(_SEVERITY)
+        if severity and message.startswith(severity + b":"):
+            message = message[len(severity) + 1 :]
+        text = message.decode(encoding, "replace").strip() or "no error details available"
+        return error_class(text, info=fields, encoding=encoding)
+
+    def _cancel_on_server(self) -> None:
+        """Ask the server to stop the query, as psycopg does for a cancelled task.
+
+        Without the request, the query runs to its end and keeps its
+        connection busy. The request is a short blocking call on a connection
+        of its own.
+        """
+        try:
+            self.connection.cancel()
+        except self.database.Error as error:
+            logger.warning("The server did not get the cancel request of a loop query: %s", error)
+
+    def close(self) -> None:
+        """Close the connection. Rust makes no call on it after ``native.close()`` returns."""
+        self.native.close()
+        self.connection.pgconn.finish()
+
+
+def _close(cursor: Any) -> None:
+    """Close the connection of ``cursor``. This call does not wait, so a cancelled task can make it."""
+    if type(cursor) is _RustCursor:
+        cursor.close()
+    else:
+        cursor.connection.pgconn.finish()
+
+
 class _Pool:
     """The connections of one event loop to one database.
 
@@ -158,7 +349,9 @@ class _Pool:
     ``close_connections`` runs on another thread when no request runs.
 
     The pool holds cursors. One cursor serves each query of its connection,
-    which is cheaper than a new cursor for each query.
+    which is cheaper than a new cursor for each query. A cursor is a
+    ``_RustCursor`` when ``addresses`` is not None. If not, it is an async
+    cursor of psycopg, and the event loop watches the socket.
 
     The pool follows the pool of sqlx. A read takes a free connection. With
     no free connection, the pool opens one, up to the limit. At the limit, the
@@ -174,8 +367,10 @@ class _Pool:
     """
 
     __slots__ = (
+        "addresses",
         "alias",
         "born",
+        "cancelled",
         "closed",
         "database",
         "expirer",
@@ -189,9 +384,13 @@ class _Pool:
         "waiting_since",
     )
 
-    def __init__(self, alias: str, database: Any) -> None:
+    def __init__(self, alias: str, database: Any, addresses: dict[str, int] | None) -> None:
         self.alias = alias
         self.database = database
+        # The libpq functions for ``_RustCursor``, or None when psycopg sends the queries.
+        self.addresses = addresses
+        # The cursors of cancelled queries that Rust did not end yet.
+        self.cancelled: set[_RustCursor] = set()
         self.idle: collections.deque[Any] = collections.deque()
         # The loop time at which each idle cursor came back, in the order of ``idle``.
         self.idle_since: collections.deque[float] = collections.deque()
@@ -274,8 +473,9 @@ class _Pool:
         template = self.template
         wrapper = connections[self.alias]
         database = self.database
+        addresses = self.addresses
         params = wrapper.get_connection_params()
-        server_side = wrapper.settings_dict["OPTIONS"].get("server_side_binding") is True
+        server_side = wrapper.features.uses_server_side_binding
         params["cursor_factory"] = database.AsyncCursor if server_side else database.AsyncClientCursor
         params["context"] = template.adapters
         connection = await database.AsyncConnection.connect(**params, autocommit=True)
@@ -283,6 +483,8 @@ class _Pool:
             cursor = connection.cursor()
             if template.session_sql:
                 await cursor.execute(template.session_sql, template.session_values)
+            if addresses is not None:
+                cursor = _RustCursor(database, cursor, addresses, asyncio.get_running_loop())
         except BaseException:
             connection.pgconn.finish()
             raise
@@ -315,16 +517,25 @@ class _Pool:
         psycopg cancels the query of a cancelled task and reads its end, so
         the connection is idle again. A connection that is not idle still
         runs a query, and the next query on it would fail.
+
+        A ``_RustCursor`` asks the server to cancel the query and does not
+        wait. Its connection comes back here when Rust read the end of the query.
         """
+        if type(cursor) is _RustCursor:
+            if cursor.pending:
+                self.cancelled.add(cursor)
+                cursor.on_result = self._give_back
+                return
+            self.cancelled.discard(cursor)
         if cursor.connection.pgconn.transaction_status == self.database.pq.TransactionStatus.IDLE:
             self.release(cursor)
         else:
             self.discard(cursor)
 
     def discard(self, cursor: Any) -> None:
-        """Close the connection of ``cursor``. ``finish`` does not wait, so a cancelled task can call it."""
+        """Close the connection of ``cursor``."""
         del self.born[cursor]
-        cursor.connection.pgconn.finish()
+        _close(cursor)
         self._closed_one()
 
     def discard_idle(self) -> None:
@@ -336,6 +547,11 @@ class _Pool:
     def close(self) -> None:
         self.closed = True
         self.discard_idle()
+        while self.cancelled:
+            cursor = self.cancelled.pop()
+            # A result that is already on its way to the loop must not give this connection back.
+            cursor.on_result = None
+            self.discard(cursor)
         for name in ("reaper", "expirer"):
             timer = getattr(self, name)
             if timer is not None:
@@ -372,9 +588,7 @@ class _Pool:
                 raise _django_error(self.database, error) from error
             try:
                 if wrapper.queries_logged:
-                    # ``connection.queries`` and the ``django.db.backends`` logger, as with the cursor of Django.
-                    with CursorDebugWrapper(cursor, wrapper).debug_sql(sql, params, use_last_executed_query=True):
-                        await _execute(cursor, wrapper, sql, params)
+                    await _execute_logged(cursor, wrapper, sql, params)
                 else:
                     await _execute(cursor, wrapper, sql, params)
                 rows = await cursor.fetchall()
@@ -414,6 +628,25 @@ async def _execute(cursor: Any, wrapper: Any, sql: str, params: Any) -> None:
     await pending
 
 
+async def _execute_logged(cursor: Any, wrapper: Any, sql: str, params: Any) -> None:
+    """``_execute`` with ``connection.queries`` and the ``django.db.backends`` logger, as with the cursor of Django."""
+    debug = CursorDebugWrapper(cursor, wrapper)
+    if not wrapper.features.uses_server_side_binding:
+        with debug.debug_sql(sql, params, use_last_executed_query=True):
+            await _execute(cursor, wrapper, sql, params)
+        return
+    # With server_side_binding, Django merges the parameters for the log with
+    # a cursor of its own connection. The event loop cannot open that
+    # connection. A client cursor of the loop connection gives the same text.
+    database = wrapper.Database
+    try:
+        text = database.AsyncClientCursor(cursor.connection).mogrify(sql, params)
+    except database.errors.DataError:
+        text = BaseDatabaseOperations.last_executed_query(wrapper.ops, cursor, sql, params)
+    with debug.debug_sql(text, params):
+        await _execute(cursor, wrapper, sql, params)
+
+
 def _django_error(database: Any, error: Exception) -> Exception:
     """Return the ``django.db`` error for a psycopg error, as ``DatabaseErrorWrapper`` does."""
     for django_type in _DJANGO_ERRORS:
@@ -429,7 +662,22 @@ def _new_pool(loop: WorkerLoop, alias: str) -> _Pool | None:
     # psycopg 2 has no async connection.
     if type(wrapper).__module__ != _BACKEND_MODULE or getattr(database, "AsyncClientCursor", None) is None:
         return None
-    pool = _Pool(alias, database)
+    if wrapper.features.uses_server_side_binding:
+        # The server merges the parameters, which needs the extended query protocol of psycopg.
+        addresses = None
+        logger.info("The loop connections to the database %r use psycopg: server_side_binding is on.", alias)
+    else:
+        addresses = _libpq_addresses(database)
+        if addresses is None:
+            logger.warning(
+                "The loop connections to the database %r use psycopg, which is slower than Rust. "
+                "The %s implementation of psycopg does not give its libpq functions.",
+                alias,
+                database.pq.__impl__,
+            )
+        else:
+            logger.info("The loop connections to the database %r send their queries from Rust.", alias)
+    pool = _Pool(alias, database, addresses)
     with _loops_lock:
         if loop not in _loops:
             _loops.append(loop)

@@ -231,6 +231,24 @@ A loop connection is not a connection of Django. Each worker thread has its own 
 
 Add the loop connections to the connection count of your database. See [Tune the thread pools](#tune-the-thread-pools).
 
+### How a loop connection sends a query
+
+psycopg opens each loop connection. Rust then sends each statement on that connection and reads the result. No Python code runs while a query waits for the database.
+
+- psycopg merges the parameters into the statement, as for a query of Django.
+- The type adapters of psycopg convert the values of the rows.
+- A database error is a `django.db` error around the psycopg error, with the fields that the sync ORM gives.
+- When a request stops during a query, Bolt asks the server to cancel the query, as psycopg does.
+
+In two conditions, the async cursor of psycopg sends the statements. It uses more CPU for a query:
+
+| Condition | Cause |
+| --- | --- |
+| `OPTIONS["server_side_binding"]` is on | The server merges the parameters. Only psycopg sends such a statement. |
+| psycopg does not give its libpq functions to Bolt | Rust calls the libpq that psycopg loaded. Bolt logs a warning when it cannot find the functions. |
+
+For each worker thread and database, the `django_bolt.async_orm` logger tells which of the two sends the statements, at the `INFO` level.
+
 ### Set the number of loop connections
 
 One connection runs one query at a time. Thus a worker thread needs this number of connections:
