@@ -24,6 +24,7 @@ use bolt_core::permissions::{Guard, GuardSet};
 use bolt_core::validation::{AuthGuardResult, cookie_csrf_blocks, validate_auth_and_guards};
 
 use crate::McpRouteRequest;
+use crate::tasks::{TaskOptions, TaskStore};
 
 /// The auth and the guards of an exposed route. Each call of its tool runs
 /// them on the MCP request, as an HTTP request to the route runs them.
@@ -71,6 +72,8 @@ pub struct McpToolEntry {
     /// Whether the tool takes the request, or a `Context` that holds it.
     /// Only then does a call build the request object.
     pub needs_request: bool,
+    /// The task settings of a tool with `task=True` (SEP-2663).
+    pub task: Option<TaskOptions>,
 }
 
 pub struct McpRegistry {
@@ -101,6 +104,8 @@ pub struct McpRegistry {
     pub route_gates: bool,
     /// Whether a tool takes the request.
     pub needs_request: bool,
+    /// The tasks of the mount. Present when a tool has `task=True`.
+    pub tasks: Option<TaskStore>,
 }
 
 /// Serde model of the wire-format catalog JSON produced by
@@ -171,6 +176,27 @@ fn parse_route_gate(
     }))
 }
 
+/// Parse the `task` of a tool: None, or {"ttl_ms": int, "poll_interval_ms": int}.
+fn parse_task_options(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<Option<TaskOptions>> {
+    if obj.is_none() {
+        return Ok(None);
+    }
+    let invalid = |e: &dyn std::fmt::Display| {
+        PyValueError::new_err(format!("Invalid 'task' of MCP tool '{name}': {e}"))
+    };
+    let dict = obj.cast::<PyDict>().map_err(|e| invalid(&e))?;
+    let field = |key: &str| -> PyResult<u64> {
+        dict.get_item(key)?
+            .ok_or_else(|| invalid(&format!("missing '{key}'")))?
+            .extract()
+            .map_err(|e| invalid(&e))
+    };
+    Ok(Some(TaskOptions {
+        ttl_ms: field("ttl_ms")?,
+        poll_interval_ms: field("poll_interval_ms")?,
+    }))
+}
+
 impl McpRegistry {
     /// Build the registry from the catalog JSON and the per-tool Python config.
     ///
@@ -236,6 +262,10 @@ impl McpRegistry {
                 PyValueError::new_err(format!("MCP tool '{name}' config missing 'route_auth'"))
             })?;
             let route_gate = parse_route_gate(py, &name, &route_obj)?;
+            let task_obj = cfg.get_item("task")?.ok_or_else(|| {
+                PyValueError::new_err(format!("MCP tool '{name}' config missing 'task'"))
+            })?;
+            let task = parse_task_options(&name, &task_obj)?;
             tool_order.push(name.clone());
             tools.insert(
                 name,
@@ -246,6 +276,7 @@ impl McpRegistry {
                     needs_context,
                     route_gate,
                     needs_request,
+                    task,
                 },
             );
         }
@@ -282,15 +313,28 @@ impl McpRegistry {
             }
         };
 
+        let max_tasks: usize = config
+            .get_item("max_tasks")?
+            .ok_or_else(|| PyValueError::new_err("MCP mount config missing 'max_tasks'"))?
+            .extract()?;
+        let tasks = tools
+            .values()
+            .any(|entry| entry.task.is_some())
+            .then(|| TaskStore::new(max_tasks));
+
         // Logging capability is deprecated in 2026-07-28 but stays advertised
         // for legacy session clients that use `ctx.log()` streams.
         #[allow(deprecated)]
-        let capabilities = ServerCapabilities::builder()
+        let mut capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
             .enable_prompts()
-            .enable_logging()
-            .build();
+            .enable_logging();
+        // Advertise the Tasks extension only when a tool can run as a task.
+        if tasks.is_some() {
+            capabilities = capabilities.enable_tasks();
+        }
+        let capabilities = capabilities.build();
         let mut server_info = ServerConfig::new(capabilities);
         // Pin the advertised revision. The rmcp default is its LATEST, and a
         // minor release of rmcp can change LATEST. `initialize` falls back
@@ -317,6 +361,7 @@ impl McpRegistry {
             list_cache_scope,
             route_gates,
             needs_request,
+            tasks,
         })
     }
 

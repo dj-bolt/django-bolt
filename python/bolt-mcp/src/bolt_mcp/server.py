@@ -30,6 +30,16 @@ _TEMPLATE_VAR = re.compile(r"\{(\w+)\}")
 
 _CACHE_SCOPES = frozenset({"public", "private"})
 
+# SEP-2663 task defaults, in milliseconds.
+DEFAULT_TASK_TTL_MS = 300_000
+DEFAULT_TASK_POLL_INTERVAL_MS = 1_000
+
+
+def _positive_int(name: str, value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
 
 def _compile_uri_template(uri_template: str) -> tuple[re.Pattern[str], list[str]]:
     """Compile a ``{var}`` URI template into a matching regex + ordered variable names.
@@ -105,6 +115,7 @@ class MCP:
         list_ttl_ms: int = 0,
         list_cache_scope: str = "private",
         mask_error_details: bool = True,
+        max_tasks: int = 1000,
     ) -> None:
         """Declare an MCP server.
 
@@ -122,6 +133,10 @@ class MCP:
         not reach the client. ``ToolError`` messages are sent either way. Every
         such exception is logged with its traceback. Set ``False`` only for
         development.
+
+        ``max_tasks`` limits the tasks that the mount keeps in memory, running
+        or finished (see ``@mcp.tool(task=True)``). A call over the limit
+        gets an error result.
         """
         if list_cache_scope not in _CACHE_SCOPES:
             raise ValueError(f"list_cache_scope must be 'public' or 'private', got {list_cache_scope!r}")
@@ -138,6 +153,7 @@ class MCP:
         self.list_ttl_ms = list_ttl_ms
         self.list_cache_scope = list_cache_scope
         self.mask_error_details = mask_error_details
+        self.max_tasks = _positive_int("max_tasks", max_tasks)
         self._tools: dict[str, ToolDef] = {}
         self._resources: dict[str, ResourceDef] = {}
         self._resource_templates: dict[str, ResourceTemplateDef] = {}
@@ -160,6 +176,9 @@ class MCP:
         icons: list[dict[str, Any]] | None = None,
         meta: dict[str, Any] | None = None,
         guards: list[Any] | None = None,
+        task: bool = False,
+        ttl_ms: int | None = None,
+        poll_interval_ms: int | None = None,
     ):
         """Register a tool.
 
@@ -169,9 +188,28 @@ class MCP:
         etc.). ``meta`` is sent as the tool's ``_meta`` in ``tools/list``, for
         example MCP Apps' ``{"ui": {"resourceUri": ...}}``. ``guards`` are evaluated natively in Rust, both for
         ``tools/call`` denial and per-principal ``tools/list`` filtering.
+
+        ``task=True`` runs a call as a task (MCP Tasks extension, SEP-2663)
+        when the client declares the extension on the request. The client gets
+        the task at once and polls ``tasks/get`` for the result. ``ttl_ms`` is
+        the life of the task (default 300000). ``poll_interval_ms`` is the poll
+        interval that the server suggests (default 1000). Tasks live in the
+        memory of one process. Thus ``runbolt`` refuses to start with more than
+        one process or with worker recycling.
         """
         if isinstance(output_schema, str) and output_schema != "auto":
             raise ValueError(f"output_schema must be a JSON Schema dict, 'auto', or None, got {output_schema!r}")
+        task_options = None
+        if task:
+            task_options = {
+                "ttl_ms": _positive_int("ttl_ms", DEFAULT_TASK_TTL_MS if ttl_ms is None else ttl_ms),
+                "poll_interval_ms": _positive_int(
+                    "poll_interval_ms",
+                    DEFAULT_TASK_POLL_INTERVAL_MS if poll_interval_ms is None else poll_interval_ms,
+                ),
+            }
+        elif ttl_ms is not None or poll_interval_ms is not None:
+            raise ValueError("ttl_ms and poll_interval_ms apply only to a tool with task=True")
 
         def register(fn: Callable) -> Callable:
             tool_name = name or getattr(fn, "__name__", "tool")
@@ -201,6 +239,7 @@ class MCP:
                 is_async=inspect.iscoroutinefunction(fn),
                 request_param=next((p for p in params if p in schema.INJECTED_PARAMS), None),
                 ctx_param=ctx_param,
+                task=task_options,
             )
             return fn
 
