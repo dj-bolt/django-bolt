@@ -13,13 +13,16 @@ import datetime
 import decimal
 import itertools
 import sys
+import time
 import types
+import unicodedata
 import uuid
 from http.cookies import SimpleCookie
 from typing import Annotated
 from urllib.parse import quote
 
 import httpx
+import jwt
 import pytest
 from django.http import HttpResponse, QueryDict
 from django.http.cookie import parse_cookie
@@ -31,6 +34,8 @@ from hypothesis import strategies as st
 
 from django_bolt import BoltAPI
 from django_bolt._urlconf import join_mount_path, urlconf_mounts
+from django_bolt.auth import JWTAuthentication
+from django_bolt.auth.revocation import DjangoCacheRevocation, DjangoORMRevocation
 from django_bolt.param_functions import Cookie, Form, Query
 from django_bolt.responses import JSON, FileResponse
 from django_bolt.testing import TestClient
@@ -504,3 +509,85 @@ def test_a_mounted_route_path_is_the_path_that_django_reverses(prefix, route, tr
         for name in names:
             sys.modules.pop(name)
     assert served == expected
+
+
+# A revocation store refuses a jti that a database collation can read as the key
+# of a family or of a user version (#931). MySQL compares text without case or
+# accents by default, and it skips some characters.
+
+REVOCATION_SECRET = "a-secure-test-secret-that-is-long-enough"
+STORE_PREFIXES = {"/cache": ("fam:", "ver:"), "/orm": ("family:", "version:")}
+revocation_api = BoltAPI()
+
+
+@revocation_api.get(
+    "/cache", auth=[JWTAuthentication(secret=REVOCATION_SECRET, revocation_store=DjangoCacheRevocation())]
+)
+async def cache_store_route():
+    return {"ok": True}
+
+
+@revocation_api.get("/orm", auth=[JWTAuthentication(secret=REVOCATION_SECRET, revocation_store=DjangoORMRevocation())])
+async def orm_store_route():
+    return {"ok": True}
+
+
+@pytest.fixture(scope="module")
+def revocation_client(django_db_setup, django_db_blocker):
+    # The ORM store reads its table for each token that it does not refuse. No test writes to it.
+    with django_db_blocker.unblock(), TestClient(revocation_api) as test_client:
+        yield test_client
+
+
+def _bearer(jti: str) -> dict[str, str]:
+    now = int(time.time())
+    token = jwt.encode({"sub": "u", "iat": now, "exp": now + 3600, "jti": jti}, REVOCATION_SECRET, algorithm="HS256")
+    return {"Authorization": f"Bearer {token}"}
+
+
+# MySQL 8.0 skips each of these characters (utf8mb4_0900_ai_ci and utf8mb4_unicode_ci).
+SKIPPED_CHARACTERS = ["\u00ad", "\u200b", "\u200d", "\u2060", "\ufeff", "\u034f", "\x01", "\x7f"]
+# A collation of MySQL 8.0 compares each of these letters equal to the prefix letter. For example,
+# utf8mb4_general_ci has ß = s and ı = i, and utf8mb4_la_0900_ai_ci has u = v.
+LOOK_ALIKE_LETTERS = {"i": "ıjy", "o": "ø", "l": "ł", "s": "ß", "y": "iü", "v": "u"}
+COMBINING_MARKS = [chr(n) for n in range(0x0300, 0x0363)]
+
+
+@st.composite
+def look_alike(draw, char: str) -> str:
+    """Draw a text that a collation of MySQL 8.0 compares equal to the prefix character ``char``."""
+    skipped = "".join(draw(st.lists(st.sampled_from(SKIPPED_CHARACTERS), max_size=2)))
+    look_alikes = LOOK_ALIKE_LETTERS.get(char, "")
+    # Each printable ASCII character has a fullwidth form at this offset.
+    letter = draw(st.sampled_from([char, char.upper(), chr(ord(char) + 0xFEE0), *look_alikes]))
+    if letter in look_alikes:
+        # MySQL compares only the whole letter equal, with no mark and not split by NFD.
+        return skipped + letter
+    marks = "".join(draw(st.lists(st.sampled_from(COMBINING_MARKS), max_size=2)))
+    return skipped + unicodedata.normalize(draw(st.sampled_from(["NFC", "NFD"])), letter + marks)
+
+
+@st.composite
+def reserved_look_alikes(draw) -> tuple[str, str]:
+    """Draw a route and a jti that starts with a look-alike of a reserved prefix of its store."""
+    path = draw(st.sampled_from(sorted(STORE_PREFIXES)))
+    prefix = draw(st.sampled_from(STORE_PREFIXES[path]))
+    return path, "".join(draw(look_alike(char)) for char in prefix) + draw(st.text(max_size=20))
+
+
+@given(case=reserved_look_alikes())
+@example(case=("/orm", "VERSION:u"))
+@example(case=("/orm", "vérsion:u"))
+@example(case=("/cache", "f\u00adam:f"))
+def test_a_jti_that_a_collation_reads_as_a_reserved_key_gets_a_401(revocation_client, case):
+    path, jti = case
+    assert revocation_client.get(path, headers=_bearer(jti)).status_code == 401
+
+
+@given(
+    path=st.sampled_from(sorted(STORE_PREFIXES)),
+    value=st.uuids(),
+    form=st.sampled_from([str, lambda u: u.hex, lambda u: str(u).upper(), lambda u: u.hex.upper()]),
+)
+def test_a_uuid_or_hex_jti_is_not_refused(revocation_client, path, value, form):
+    assert revocation_client.get(path, headers=_bearer(form(value))).status_code == 200
