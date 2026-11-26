@@ -597,13 +597,13 @@ def _validate_option_ranges(options) -> None:
             raise CommandError(f"{flag} must be at most {highest}, got {value}")
 
 
-def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int, handler) -> None:
-    """Copy one handler of ``api`` into ``merged`` with a new handler id.
+def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int) -> None:
+    """Copy the metadata of one handler of ``api`` into ``merged`` with a new handler id.
 
-    The handler keeps the API that owns it, so it keeps the logging, auth and
-    middleware of that API. A route that ``api`` mounted keeps its sub-app.
+    The metadata keeps the logging, auth and middleware of ``api``. A route
+    that ``api`` mounted keeps those of its sub-app. The handler keeps its owner
+    API, because the mount cycle check of ``mount()`` reads it.
     """
-    merged._handlers[new_handler_id] = handler
     merged._handler_api_map[new_handler_id] = api._handler_api_map.get(old_handler_id, api)
     if old_handler_id in api._handler_meta:
         merged._handler_meta[new_handler_id] = api._handler_meta[old_handler_id]
@@ -892,7 +892,7 @@ class Command(BaseCommand):
         # Check admin
         admin_enabled = not options.get("no_admin", False)
         if admin_enabled and detect_admin_url_prefix is not None:
-            merged_api._register_admin_routes(options["host"], options["port"])
+            merged_api._register_admin_routes()
             # The root mount for an admin site behind a path parameter has no admin URL to print.
             if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():
                 admin_prefix = detect_admin_url_prefix()
@@ -998,7 +998,7 @@ class Command(BaseCommand):
 
         if admin_enabled and detect_admin_url_prefix is not None:
             # Register admin routes
-            merged_api._register_admin_routes(options["host"], options["port"])
+            merged_api._register_admin_routes()
 
             # The root mount for an admin site behind a path parameter has no admin URL to print.
             if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():
@@ -1431,9 +1431,6 @@ class Command(BaseCommand):
         merged.trailing_slash = apis[0][1].trailing_slash
         route_map = {}  # Track conflicts
 
-        # Map handler_id -> original API instance (preserves per-API context)
-        merged._handler_api_map = {}
-
         # Track next available handler_id to avoid collisions
         next_handler_id = 0
 
@@ -1455,7 +1452,7 @@ class Command(BaseCommand):
 
                 route_map[route_key] = api_path
                 merged._routes.append((method, path, new_handler_id, handler))
-                _merge_handler(merged, api, old_handler_id, new_handler_id, handler)
+                _merge_handler(merged, api, old_handler_id, new_handler_id)
 
             # Merge WebSocket routes from this API
             for path, old_ws_handler_id, ws_handler in api._websocket_routes:
@@ -1474,7 +1471,7 @@ class Command(BaseCommand):
 
                 route_map[ws_route_key] = api_path
                 merged._websocket_routes.append((path, new_ws_handler_id, ws_handler))
-                _merge_handler(merged, api, old_ws_handler_id, new_ws_handler_id, ws_handler)
+                _merge_handler(merged, api, old_ws_handler_id, new_ws_handler_id)
 
             # Merge HTTP ASGI mounts from this API
             for asgi_prefix, asgi_app in getattr(api, "_asgi_mounts", []):
@@ -1532,7 +1529,7 @@ class Command(BaseCommand):
         first_api = apis[0][1]
         no_route_id, no_route_handler = first_api._no_route_handler()
         merged._no_route = (next_handler_id, no_route_handler)
-        _merge_handler(merged, first_api, no_route_id, next_handler_id, no_route_handler)
+        _merge_handler(merged, first_api, no_route_id, next_handler_id)
         next_handler_id += 1
 
         # Update next handler ID

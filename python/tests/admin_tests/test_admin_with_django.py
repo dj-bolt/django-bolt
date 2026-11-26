@@ -21,7 +21,7 @@ def test_admin_root_redirect():
     assert should_enable_admin()
 
     api = BoltAPI()
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     @api.get("/test")
     async def test_route():
@@ -62,7 +62,7 @@ def test_admin_mount_uses_the_prefix_of_the_admin_site(settings, urlconf, login_
     """The admin answers at the prefix of its URL pattern, also for a regex pattern or a later pattern."""
     settings.ROOT_URLCONF = urlconf
     api = BoltAPI()
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     with TestClient(api, use_http_layer=True) as client:
         response = client.get(login_path)
@@ -81,7 +81,7 @@ def test_admin_at_the_root_path_leaves_the_bolt_routes(settings, capsys):
     async def item(item_id: int):
         return {"item_id": item_id}
 
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     assert "Django answers each path that has no Bolt route" in capsys.readouterr().err
     with TestClient(api, use_http_layer=True) as client:
@@ -111,7 +111,7 @@ def test_admin_in_i18n_patterns_answers_for_each_language(settings):
     """The admin answers at the prefix of each language, and Django redirects the path with no prefix."""
     _use_two_languages(settings, "tests.admin_tests.urls_i18n")
     api = BoltAPI()
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     with TestClient(api, use_http_layer=True) as client:
         english = client.get("/en/admin/login/")
@@ -132,7 +132,7 @@ def test_admin_in_i18n_patterns_with_no_prefix_for_the_default_language(settings
     """With prefix_default_language=False, the default language has no prefix."""
     _use_two_languages(settings, "tests.admin_tests.urls_i18n_no_default_prefix")
     api = BoltAPI()
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     with TestClient(api, use_http_layer=True) as client:
         english = client.get("/admin/login/")
@@ -150,7 +150,7 @@ def test_admin_in_i18n_patterns_uses_the_default_language_that_django_serves(set
     _use_two_languages(settings, "tests.admin_tests.urls_i18n")
     settings.LANGUAGE_CODE = "en-us"
     api = BoltAPI()
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     with TestClient(api, use_http_layer=True) as client:
         # runbolt shows the first prefix in its banner.
@@ -173,7 +173,7 @@ def test_admin_in_i18n_patterns_with_no_prefix_keeps_the_path_of_language_code(s
     _use_two_languages(settings, "tests.admin_tests.urls_i18n_no_default_prefix")
     settings.LANGUAGE_CODE = "en-us"
     api = BoltAPI()
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     assert detect_admin_url_prefixes() == ["admin", "en/admin", "fr/admin"]
     with TestClient(api, use_http_layer=True) as client:
@@ -194,7 +194,7 @@ def test_admin_behind_a_path_parameter_is_served_with_no_user_action(settings, c
     async def item(item_id: int):
         return {"item_id": item_id}
 
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     err = capsys.readouterr().err
     assert err.count("[django-bolt] Warning") == 1
@@ -222,7 +222,7 @@ def test_admin_at_the_root_path_keeps_the_root_mount_of_the_user(settings):
     api = BoltAPI()
     api.mount_django("/", clear_root_path=True)
 
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     with TestClient(api, use_http_layer=True) as client:
         response = client.get("/login/")
@@ -243,7 +243,7 @@ def test_admin_behind_a_path_parameter_keeps_the_root_mount_of_a_merged_api(sett
         return {"api": "first"}
 
     merged = Command().merge_apis([("first.api", first), ("second.api", second)])
-    merged._register_admin_routes("127.0.0.1", 8000)
+    merged._register_admin_routes()
 
     with TestClient(merged, use_http_layer=True) as client:
         response = client.get("/acme/admin/login/")
@@ -258,7 +258,7 @@ def test_admin_behind_a_path_parameter_keeps_the_root_mount_of_the_user(settings
     api = BoltAPI()
     api.mount_django("/", clear_root_path=True)
 
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     assert "[django-bolt] Warning" not in capsys.readouterr().err
     with TestClient(api, use_http_layer=True) as client:
@@ -276,7 +276,7 @@ def test_admin_login_page():
     assert should_enable_admin()
 
     api = BoltAPI()
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     @api.get("/test")
     async def test_route():
@@ -316,7 +316,7 @@ def test_admin_mount_serves_only_the_admin_prefix(settings):
     """The admin mount gives Django the admin prefix, not each path of the URLconf."""
     settings.ROOT_URLCONF = "tests.admin_tests.urls_site_page"
     api = BoltAPI()
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     with TestClient(api, use_http_layer=True) as client:
         admin_response = client.get("/admin/login/")

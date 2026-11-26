@@ -411,9 +411,7 @@ def set_token_cookies(
     return response
 
 
-async def _user_version(store: Any, user_id: str | None) -> int:
-    if user_id is None:
-        return 0
+async def _user_version(store: Any, user_id: str) -> int:
     try:
         return await store.get_user_version(user_id)
     except NotImplementedError:

@@ -789,7 +789,6 @@ class BoltAPI:
         # Handler IDs whose lane affinity error was logged with its fix, one time each.
         self._lane_affinity_hinted: set[int] = set()
         self._websocket_routes: list[tuple[str, int, Callable]] = []  # (path, handler_id, handler)
-        self._handlers: dict[int, Callable] = {}
         # OPTIMIZATION: Use handler_id (int) as key instead of callable
         # Integer hashing is O(1) with minimal overhead vs callable hashing
         self._handler_meta: dict[int, HandlerMetadata] = {}
@@ -913,7 +912,8 @@ class BoltAPI:
         # ``_no_route_handler`` makes it at the first call.
         self._no_route: tuple[int, Callable] | None = None
 
-        # Handler-to-API mapping for merged APIs (initialized here to avoid hasattr in hot path)
+        # The API that owns each route that mount() or the runbolt merge copied.
+        # The mount cycle check reads it.
         self._handler_api_map: dict[int, BoltAPI] = {}
 
         # Signal emission - disabled by default for performance
@@ -1317,7 +1317,6 @@ class BoltAPI:
             full_path = _normalize_path(f"{self.prefix}{_leading_slash(path)}", "strip")
             _refuse_repeated_path_params(full_path)
 
-            self._handlers[handler_id] = fn
             # A config decorator that runs after this one is above it, and has no effect.
             mark_route_handler(fn)
 
@@ -1325,7 +1324,6 @@ class BoltAPI:
             # This enables injection of path params, query params, headers, cookies
             meta = self._compile_websocket_binder(fn, full_path)
             meta["is_async"] = True
-            meta["is_websocket"] = True
             # Rust reads this key for every route. A WebSocket route never uses it.
             meta["default_status_code"] = 200
             self._apply_dependency_tree(meta, "WEBSOCKET", full_path)
@@ -2027,7 +2025,6 @@ class BoltAPI:
             # The router does not get a route that is not routable.
             if _routable:
                 self._routes.append((method, full_path, handler_id, fn))
-            self._handlers[handler_id] = fn
             # A config decorator that runs after this one is above it, and has no effect.
             mark_route_handler(fn)
 
@@ -3984,11 +3981,11 @@ class BoltAPI:
         registrar = OpenAPIRouteRegistrar(self, middleware=middleware)
         registrar.register_routes()
 
-    def _register_admin_routes(self, host: str = "localhost", port: int = 8000) -> None:
+    def _register_admin_routes(self) -> None:
         """Register Django admin as an ASGI mount."""
 
         registrar = AdminRouteRegistrar(self)
-        registrar.register_routes(host, port)
+        registrar.register_routes()
 
     def _register_auth_backends(self) -> None:
         """
@@ -4165,7 +4162,6 @@ class BoltAPI:
 
             # Register route in parent
             self._routes.append((method, new_path, new_handler_id, handler))
-            self._handlers[new_handler_id] = handler
 
             # Copy handler metadata (now keyed by handler_id for performance)
             if handler_id in app._handler_meta:
@@ -4183,7 +4179,6 @@ class BoltAPI:
                 middleware_meta["path"] = new_path
                 self._handler_middleware[new_handler_id] = middleware_meta
 
-            # Track which API owns this handler (for logging, global middleware, etc.).
             # A route that ``app`` mounted from another API keeps that API.
             self._handler_api_map[new_handler_id] = app._handler_api_map.get(handler_id, app)
 
@@ -4201,7 +4196,6 @@ class BoltAPI:
             self._next_handler_id += 1
 
             self._websocket_routes.append((new_path, new_handler_id, handler))
-            self._handlers[new_handler_id] = handler
 
             # Copy handler metadata, layered as for HTTP routes above.
             if handler_id in app._handler_meta:
@@ -4216,7 +4210,6 @@ class BoltAPI:
                 middleware_meta["path"] = new_path
                 self._handler_middleware[new_handler_id] = middleware_meta
 
-            # Track which API owns this handler (for logging, global middleware, etc.).
             # A route that ``app`` mounted from another API keeps that API.
             self._handler_api_map[new_handler_id] = app._handler_api_map.get(handler_id, app)
 
