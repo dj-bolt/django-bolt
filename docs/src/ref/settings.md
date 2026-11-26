@@ -309,7 +309,7 @@ It applies to each API with no `logging_config`. It is the `min_duration_ms` of 
 
 Default: `False`. Type: `bool`.
 
-Run `async for` over a QuerySet, `aget()`, `afirst()`, `alast()` and `aexists()` on the event loop, with no thread. The setting applies to PostgreSQL with psycopg 3.
+Run these reads on the event loop, with no thread: a QuerySet that a handler returns, `async for` over a QuerySet, `aget()`, `afirst()`, `alast()` and `aexists()`. The setting applies to PostgreSQL with psycopg 3.
 It has no effect on Windows.
 See [Async ORM](../topics/async-orm.md#run-async-reads-on-the-event-loop).
 

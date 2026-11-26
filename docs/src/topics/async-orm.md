@@ -140,7 +140,7 @@ curl localhost:8000/articles/99
 A sync ORM call in an `async def` handler raises Django's `SynchronousOnlyOperation`, and the client gets a `500` response. This also applies to a relation that is not loaded, for example `article.author` after `aget()`.
 
 Bolt sends each async ORM call to the ORM thread pool. Thus `DJANGO_BOLT_ORM_THREADS` limits the queries in flight. See [Tune the thread pools](#tune-the-thread-pools).
-On PostgreSQL, `async for`, `aget()`, `afirst()`, `alast()` and `aexists()` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
+On PostgreSQL, a returned QuerySet, `async for`, `aget()`, `afirst()`, `alast()` and `aexists()` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
 
 ## Iterate over a QuerySet
 
@@ -168,7 +168,13 @@ A returned QuerySet with a `list[Struct]` return type reads only the Struct fiel
 
 ## Run async reads on the event loop
 
-Django's async ORM runs each call on a thread. On PostgreSQL, Bolt can run these reads on the event loop, with no thread: `async for`, `aget()`, `afirst()`, `alast()` and `aexists()`. Add the setting:
+Django's async ORM runs each call on a thread, and Bolt loads a QuerySet that a handler returns on a thread. On PostgreSQL, Bolt can run these reads on the event loop, with no thread:
+
+- a QuerySet that a handler returns,
+- `async for` over a QuerySet,
+- `aget()`, `afirst()`, `alast()` and `aexists()`.
+
+Add the setting:
 
 ```python title="blog/settings.py"
 BOLT_ASYNC_ORM_ON_LOOP = True
@@ -193,7 +199,8 @@ Some reads need the database connection of Django. For these reads, Bolt uses th
 | A read on a route with Django middleware | The thread of the request keeps state, for example the schema of a tenant. |
 | A read in a transaction | Only the connection of the transaction has its rows. A `TestClient` in a Django `TestCase` gives such a connection to the handlers. |
 | A database with another `ENGINE`, for example PostGIS or django-tenants | Another backend can change how a connection opens. |
-| The other async calls, for example `acount()`, `aaggregate()`, `acreate()` and `asave()` | Bolt replaces only the five reads above. |
+| A returned QuerySet with the return type `list[SomeSerializer]`, when the Serializer reads model instances | On the ORM pool, a relation that the QuerySet did not load can still load. A plain Serializer reads `.values()` rows, and its QuerySet loads on the event loop. |
+| The other async calls, for example `acount()`, `aaggregate()`, `acreate()` and `asave()` | Bolt replaces only the reads above. |
 
 ### Connections of the event loop
 

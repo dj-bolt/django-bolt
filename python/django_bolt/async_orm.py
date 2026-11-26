@@ -93,6 +93,9 @@ _django_aexists = QuerySet.aexists
 _thread_sensitive_context = SyncToAsync.thread_sensitive_context
 _MISSING: Any = object()
 
+# True when the setting is on. ``configure`` sets it.
+enabled = False
+
 # The connections of each loop for each database. ``configure`` sets the limit.
 _connection_limit = DEFAULT_CONNECTIONS
 
@@ -516,6 +519,20 @@ async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
         del query.get_compiler
 
 
+async def load(queryset: QuerySet) -> bool:
+    """Read the rows of ``queryset`` from the event loop, for a QuerySet that a handler returns.
+
+    Returns False for a read that must use the ORM thread pool (see
+    ``_pool_for``). The caller then loads the QuerySet there. Call this
+    function only when ``enabled`` is true.
+    """
+    pool = _pool_for(queryset)
+    if pool is None:
+        return False
+    await _fetch_all(queryset, pool)
+    return True
+
+
 def _aiter(self: QuerySet) -> Any:
     """``QuerySet.__aiter__``: the rows of ``async for``."""
     if self._result_cache is not None:
@@ -669,7 +686,7 @@ def configure() -> None:
             DJANGO_BOLT_LOOP_ACQUIRE_SECONDS, DJANGO_BOLT_LOOP_IDLE_SECONDS or
             DJANGO_BOLT_LOOP_LIFETIME_SECONDS is not a number more than 0.
     """
-    global _connection_limit, _acquire_seconds, _idle_seconds, _lifetime_seconds
+    global enabled, _connection_limit, _acquire_seconds, _idle_seconds, _lifetime_seconds
     limit = _thread_count(CONNECTIONS_VARIABLE)
     acquire_seconds = _seconds(ACQUIRE_VARIABLE, DEFAULT_ACQUIRE_SECONDS)
     idle_seconds = _seconds(IDLE_VARIABLE, DEFAULT_IDLE_SECONDS)
@@ -682,13 +699,14 @@ def configure() -> None:
     _lifetime_seconds = lifetime_seconds
     # The settings of a database can change between two servers of one process, as in tests.
     _templates.clear()
-    enabled = getattr(settings, SETTING, False)
-    if type(enabled) is not bool:
-        raise ImproperlyConfigured(f"{SETTING} must be a bool, got {type(enabled).__name__} {enabled!r}.")
-    if enabled and sys.platform == "win32":
+    setting = getattr(settings, SETTING, False)
+    if type(setting) is not bool:
+        raise ImproperlyConfigured(f"{SETTING} must be a bool, got {type(setting).__name__} {setting!r}.")
+    if setting and sys.platform == "win32":
         # The event loop of a worker watches sockets only on Unix.
         logger.warning("%s has no effect on Windows. The async ORM uses the ORM thread pool.", SETTING)
-        enabled = False
+        setting = False
+    enabled = setting
     QuerySet.__aiter__ = _aiter if enabled else _django_aiter
     QuerySet.aget = _aget if enabled else _django_aget
     QuerySet.afirst = _afirst if enabled else _django_afirst

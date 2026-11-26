@@ -24,6 +24,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
+import msgspec
 import psycopg
 import pytest
 from django.db import connections, models, transaction
@@ -36,6 +37,7 @@ from django.utils.deprecation import MiddlewareMixin
 
 from django_bolt import BoltAPI, concurrency
 from django_bolt.middleware import DjangoMiddlewareStack
+from django_bolt.serializers import Serializer, computed_field
 from django_bolt.testing import TestClient
 from tests.test_models import Author, BlogPost, Tag
 
@@ -64,6 +66,41 @@ class LoopProbe(models.Model):
 
 
 MODELS = (Author, Tag, BlogPost, LoopProbe)
+
+
+class ProbeItem(msgspec.Struct):
+    label: str
+    built_on: str
+
+
+class ProbeRenamed(msgspec.Struct):
+    label: str = msgspec.field(name="Label")
+    built_on: str = msgspec.field(name="builtOn")
+
+
+class AuthorItem(msgspec.Struct):
+    name: str
+
+
+class PostWithAuthor(msgspec.Struct):
+    title: str
+    author: AuthorItem
+
+
+class ProbeSerializer(Serializer):
+    label: str
+    built_on: str
+
+
+class ProbeWithComputedField(Serializer):
+    label: str
+    built_on: str
+
+    @computed_field
+    def shout(self) -> str:
+        return self.label.upper()
+
+
 FAR_FUTURE = datetime(2999, 1, 1, tzinfo=UTC)
 
 
@@ -329,9 +366,50 @@ async def _probe_threads_on_this_loop() -> list[str]:
     return [probe.built_on async for probe in LoopProbe.objects.using(ALIAS).order_by("id")]
 
 
+def _returned_queryset_routes(api: BoltAPI) -> None:
+    """Async handlers that return a QuerySet. Bolt reads the rows after the handler."""
+
+    @api.get("/returned/struct")
+    async def returned_struct() -> list[ProbeItem]:
+        return _probes().order_by("id")
+
+    @api.get("/returned/renamed")
+    async def returned_renamed() -> list[ProbeRenamed]:
+        return _probes().order_by("id")
+
+    @api.get("/returned/nested")
+    async def returned_nested() -> list[PostWithAuthor]:
+        return _posts().order_by("id")
+
+    @api.get("/returned/serializer")
+    async def returned_serializer() -> list[ProbeSerializer]:
+        return _probes().order_by("id")
+
+    @api.get("/returned/computed")
+    async def returned_computed() -> list[ProbeWithComputedField]:
+        return _probes().order_by("id")
+
+    @api.get("/returned/values")
+    async def returned_values():
+        return _probes().order_by("id").values("label", "built_on")
+
+    @api.get("/returned/no-rows")
+    async def returned_no_rows() -> list[ProbeItem]:
+        return _probes().filter(label="no such label")
+
+    @api.get("/returned/unknown-field")
+    async def returned_unknown_field() -> list[PostWithAuthor]:
+        # ``LoopProbe`` has no ``title`` and no ``author``.
+        return _probes()
+
+
+RETURNED = ("struct", "renamed", "nested", "serializer", "computed", "values", "no-rows", "unknown-field")
+
+
 def _api() -> BoltAPI:
     api = BoltAPI()
     _probe_threads_route(api)
+    _returned_queryset_routes(api)
 
     @api.get("/compiled/{name}")
     async def compiled(name: str):
@@ -549,6 +627,39 @@ def test_the_reads_use_the_orm_pool_when_the_setting_is_off(loop_db):
 
     assert _built_on_orm_threads(threads), threads
     assert not threads["handler"].startswith(ORM_THREAD)
+
+
+def _thread_names(rows: Any) -> list[str]:
+    """The thread names in the rows of a response, and the rows with no thread name."""
+    names = []
+    if isinstance(rows, list):
+        for row in rows:
+            for key in ("built_on", "builtOn"):
+                if key in row:
+                    names.append(row.pop(key))
+    return names
+
+
+@pytest.mark.parametrize("name", RETURNED)
+def test_a_returned_queryset_gives_the_response_of_the_thread_path(loop_db, name):
+    # The route with the unknown field gives a 500. The client must not raise the error of the server.
+    with TestClient(_api(), raise_server_exceptions=False) as client:
+        threads = client.get(f"/returned/{name}")
+    with (
+        override_settings(BOLT_ASYNC_ORM_ON_LOOP=True),
+        TestClient(_api(), raise_server_exceptions=False) as client,
+    ):
+        loop = client.get(f"/returned/{name}")
+    concurrency.check_pool_environment()
+
+    assert loop.status_code == threads.status_code == (500 if name == "unknown-field" else 200)
+    thread_rows, loop_rows = threads.json(), loop.json()
+    built_by_threads, built_by_loop = _thread_names(thread_rows), _thread_names(loop_rows)
+    assert loop_rows == thread_rows
+    assert all(name.startswith(ORM_THREAD) for name in built_by_threads), built_by_threads
+    assert not any(name.startswith(ORM_THREAD) for name in built_by_loop), built_by_loop
+    if name in ("struct", "renamed", "serializer", "computed", "values"):
+        assert len(built_by_loop) == 2
 
 
 def _built_on_orm_threads(threads: dict[str, Any]) -> bool:
