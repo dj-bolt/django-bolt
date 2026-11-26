@@ -131,7 +131,7 @@ api.mount_mcp(mcp, auth=[JWTAuthentication(secret=...)], guards=[IsAuthenticated
 
 Per-tool guards: `@mcp.tool(guards=[HasPermission("x")])` — failing tools are filtered from
 `tools/list` and rejected on `tools/call`. Tools may declare `request: Request` to read
-`request.context` (the authenticated principal).
+`request.context` (the authenticated principal), `request.user` and the headers of the MCP request.
 
 **Tier 2 — OAuth 2.1 Resource Server** (RFC 9728 metadata + `WWW-Authenticate` challenge):
 
