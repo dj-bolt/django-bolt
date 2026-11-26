@@ -1309,7 +1309,6 @@ class BoltAPI:
             # This enables injection of path params, query params, headers, cookies
             meta = self._compile_websocket_binder(fn, full_path)
             meta["is_async"] = True
-            meta["is_websocket"] = True
             # Rust reads this key for every route. A WebSocket route never uses it.
             meta["default_status_code"] = 200
             self._apply_dependency_tree(meta, "WEBSOCKET", full_path)
