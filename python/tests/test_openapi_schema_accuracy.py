@@ -25,6 +25,7 @@ from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import ComponentNameCollisionError, SchemaGenerator
 from django_bolt.openapi.spec import Components, SecurityScheme
 from django_bolt.param_functions import File, Form, Query
+from django_bolt.responses import HTML, JSON, PlainText, Redirect
 from django_bolt.serializers import Serializer, computed_field, field
 from django_bolt.serializers.types import Email, HttpsURL, PositiveInt
 from django_bolt.testing import TestClient
@@ -370,6 +371,14 @@ class Square(msgspec.Struct, tag="square"):
 
 
 WIDGET_REF = {"$ref": "#/components/schemas/Widget"}
+SHAPES_SCHEMA = {"oneOf": [{"$ref": "#/components/schemas/Circle"}, {"$ref": "#/components/schemas/Square"}]}
+SHAPE_EXAMPLES = {
+    "circle": {
+        "summary": "Circle variant",
+        "value": {"type": "circle", "center": {"name": "string"}, "labels": {}, "note": "string", "radius": 0.0},
+    },
+    "square": {"summary": "Square variant", "value": {"type": "square", "side": 0.0}},
+}
 PROBLEM_REF = {"$ref": "#/components/schemas/Problem"}
 
 
@@ -410,16 +419,9 @@ def test_tagged_union_examples_show_nested_values_for_each_response():
         pass
 
     responses = _get_schema(api)["paths"]["/shape"]["get"]["responses"]
-    examples = {
-        "circle": {
-            "summary": "Circle variant",
-            "value": {"type": "circle", "center": {"name": "string"}, "labels": {}, "note": "string", "radius": 0.0},
-        },
-        "square": {"summary": "Square variant", "value": {"type": "square", "side": 0.0}},
-    }
 
-    assert responses["200"]["content"]["application/json"]["examples"] == examples
-    assert responses["default"]["content"]["application/json"]["examples"] == examples
+    assert responses["200"]["content"]["application/json"]["examples"] == SHAPE_EXAMPLES
+    assert responses["default"]["content"]["application/json"]["examples"] == SHAPE_EXAMPLES
 
 
 def test_request_body_is_required_when_the_route_needs_a_value():
@@ -1809,3 +1811,97 @@ def test_shared_enum_reuses_single_component():
     assert components["TwoGates"]["properties"]["secondary"] == ref
     # Exactly one shared enum component, not one per use site.
     assert sum(1 for name in components if name == "GateReason") == 1
+
+
+TEXT_CONTENT = {"text/plain": {"schema": {"type": "string"}}}
+
+
+def test_json_content_of_a_union_with_a_str_arm_holds_each_other_arm():
+    """A ``str`` result is text. The JSON content has each other arm of the union, with its examples."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/two")
+    async def two() -> str | int | Widget:
+        pass
+
+    @api.get("/three")
+    async def three() -> str | int | Widget | None:
+        pass
+
+    @api.get("/null-first")
+    async def null_first() -> str | None | Widget:
+        pass
+
+    @api.get("/shape")
+    async def shape() -> str | Circle | Square:
+        pass
+
+    schema = _get_schema(api)
+    validate(schema)
+    content = {path: schema["paths"][path]["get"]["responses"]["200"]["content"] for path in schema["paths"]}
+
+    assert content["/two"] == {**TEXT_CONTENT, **_json_content({"anyOf": [{"type": "integer"}, WIDGET_REF]})}
+    assert content["/three"] == {
+        **TEXT_CONTENT,
+        **_json_content({"anyOf": [{"type": "integer"}, WIDGET_REF, {"type": "null"}]}),
+    }
+    assert content["/null-first"] == {**TEXT_CONTENT, **_json_content({"anyOf": [WIDGET_REF, {"type": "null"}]})}
+    assert content["/shape"] == {
+        **TEXT_CONTENT,
+        "application/json": {"schema": SHAPES_SCHEMA, "examples": SHAPE_EXAMPLES},
+    }
+
+
+def test_response_class_documents_the_return_type_under_its_media_type():
+    """``response_class`` sets the media type, and the return type sets the schema of the body."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/page", response_class=HTML)
+    async def page() -> str:
+        pass
+
+    @api.get("/short-page", response_class=HTML)
+    async def short_page() -> Annotated[str, msgspec.Meta(max_length=100)]:
+        pass
+
+    @api.get("/fragment", response_class=HTML)
+    async def fragment() -> Annotated[str, msgspec.Meta(max_length=100)] | HTML:
+        pass
+
+    @api.get("/moved")
+    async def moved() -> Redirect | PlainText:
+        pass
+
+    schema = _get_schema(api)
+    validate(schema)
+    content = {path: schema["paths"][path]["get"]["responses"]["200"]["content"] for path in schema["paths"]}
+    short_text = {"type": "string", "maxLength": 100}
+
+    assert content["/page"] == {"text/html": {"schema": {"type": "string"}}}
+    assert content["/short-page"] == {"text/html": {"schema": short_text}}
+    assert content["/fragment"] == {"text/html": {"schema": short_text}}
+    assert content["/moved"] == TEXT_CONTENT
+
+
+def test_response_class_in_the_return_type_keeps_the_examples_and_the_components_of_the_body():
+    """``JSON`` in the return type keeps the examples of a tagged union and the component of a named enum."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/shape")
+    async def shape() -> Circle | Square | JSON:
+        pass
+
+    @api.get("/reason")
+    async def reason() -> str | GateReason | JSON:
+        pass
+
+    schema = _get_schema(api)
+    validate(schema)
+    responses = {path: schema["paths"][path]["get"]["responses"]["200"] for path in schema["paths"]}
+
+    assert responses["/shape"]["content"] == {"application/json": {"schema": SHAPES_SCHEMA, "examples": SHAPE_EXAMPLES}}
+    assert responses["/reason"]["content"] == {
+        **TEXT_CONTENT,
+        **_json_content({"anyOf": [{"type": "string"}, {"$ref": "#/components/schemas/GateReason"}]}),
+    }
+    assert schema["components"]["schemas"]["GateReason"]["enum"] == ["entitlement", "capability"]
