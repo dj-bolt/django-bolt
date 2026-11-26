@@ -86,6 +86,26 @@ client replies on a separate POST (correlated by id). They therefore require **s
 capabilities — otherwise they raise (surfaced as an in-band tool error). `report_progress`/logging
 work in stateless mode too.
 
+## Long-running tools: tasks
+
+`@mcp.tool(task=True)` runs a call as a task (the MCP Tasks extension, SEP-2663). A 2026-07-28
+client that declares `io.modelcontextprotocol/tasks` on its request gets `resultType: "task"` at
+once. It polls `tasks/get` for the result, answers `ctx.elicit()` with `tasks/update`, and stops
+the task with `tasks/cancel`. Other clients get the result as before.
+
+```python
+@mcp.tool(task=True, ttl_ms=600_000, poll_interval_ms=2_000)
+async def build_report(month: str, ctx: Context) -> dict:
+    await ctx.report_progress(1, 2, "Collecting data")  # sets the statusMessage of the task
+    return {"month": month}
+```
+
+Cancel, the end of the TTL and `SIGTERM` cancel an `async def` tool. A `def` tool runs in a
+thread, which runs to its end. Only the principal that created a task can reach it.
+`MCP(max_tasks=1000, max_tasks_per_principal=100)` limits the tasks of a mount and of one
+principal. Tasks live in the memory of one process, so `runbolt` refuses to start with
+`--processes` above 1, `--max-rss` or `--workers-lifetime` when a mount has a task tool.
+
 ## Expose existing endpoints as tools
 
 Existing REST routes are **never exposed implicitly** — `api.mount_mcp(mcp)` serves only
@@ -191,11 +211,10 @@ The protocol core is the official MCP Rust SDK (rmcp), embedded in django-bolt >
 protocol revisions `2024-11-05` through `2026-07-28` are served dual-era. Implemented on
 top of it: tools/resources/prompts with msgspec schemas, MRTR elicitation with replay and
 signed `requestState`, per-request log gating, SEP-2549 `ttlMs`/`cacheScope` hints,
-SEP-2243 routing-header validation, Rust-evaluated per-tool guards, all three auth tiers
-(with RFC 9207 `iss` and DCR `application_type`), auto-expose, localhost-only Host
-validation by default, and configurable Host/Origin DNS-rebinding protection
-(`mount_mcp(allowed_hosts=..., allowed_origins=...)`).
+SEP-2243 routing-header validation, the SEP-2663 tasks extension, Rust-evaluated per-tool
+guards, all three auth tiers (with RFC 9207 `iss` and DCR `application_type`), auto-expose,
+localhost-only Host validation by default, and configurable Host/Origin DNS-rebinding
+protection (`mount_mcp(allowed_hosts=..., allowed_origins=...)`).
 
-Not yet: `completion/complete`, the tasks extension (`io.modelcontextprotocol/tasks`),
-list-changed notifications (catalogs are static), and CIMD client registration in the
-built-in Authorization Server.
+Not yet: `completion/complete`, `notifications/tasks`, list-changed notifications (catalogs
+are static), and CIMD client registration in the built-in Authorization Server.

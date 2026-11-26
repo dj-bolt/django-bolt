@@ -462,6 +462,11 @@ pub struct WorkerLoopScheduler {
 
 #[pymethods]
 impl WorkerLoopScheduler {
+    /// True when the pump is gone: the worker thread of the loop stopped.
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     fn call_soon(&self, handle: Py<PyAny>) -> PyResult<()> {
         self.tx.send(WorkerLoopCommand::Soon(handle)).map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err("worker asyncio loop is unavailable")
@@ -700,6 +705,27 @@ pub async fn dispatch_cancellable(
     payload: Py<PyAny>,
     ct: tokio_util::sync::CancellationToken,
 ) -> PyResult<Py<PyAny>> {
+    run_cancellable(dispatch, payload, ct, false).await
+}
+
+/// Like [`dispatch_cancellable`], but after the token fires it waits until
+/// the Python task has ended. The `except` and `finally` blocks of the
+/// coroutine then ran when this returns. MCP tasks use it, so a stop of the
+/// server can wait for their cleanup.
+pub async fn dispatch_cancellable_joined(
+    dispatch: Py<PyAny>,
+    payload: Py<PyAny>,
+    ct: tokio_util::sync::CancellationToken,
+) -> PyResult<Py<PyAny>> {
+    run_cancellable(dispatch, payload, ct, true).await
+}
+
+async fn run_cancellable(
+    dispatch: Py<PyAny>,
+    payload: Py<PyAny>,
+    ct: tokio_util::sync::CancellationToken,
+    join: bool,
+) -> PyResult<Py<PyAny>> {
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     let handle = Python::attach(|py| {
         let resolver = Py::new(
@@ -756,6 +782,11 @@ pub async fn dispatch_cancellable(
                     }
                 }
             });
+            if join {
+                // The resolver gets the end of the task: its result, or the
+                // CancelledError after the coroutine handled the cancel.
+                let _ = rx.await;
+            }
             Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "MCP request cancelled by client",
             ))

@@ -541,12 +541,15 @@ dependencies = [
  "http-body-util",
  "log",
  "once_cell",
+ "proptest",
  "pyo3",
  "rmcp",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

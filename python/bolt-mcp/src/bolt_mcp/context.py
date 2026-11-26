@@ -15,7 +15,9 @@ schema, like ``request``). Through it a tool can, while running:
   answer attached — **the tool function re-runs from the top on each retry**
   (earlier ``elicit`` calls return instantly from the replayed answers).
   Code before an ``elicit`` must therefore be idempotent, or guarded with
-  ``ctx.is_replay``.
+  ``ctx.is_replay``. In a task (``@mcp.tool(task=True)``), ``elicit`` does
+  not end the call: the task reports ``input_required``, and the coroutine
+  continues when the client answers with ``tasks/update``.
 
 The heavy lifting lives in Rust (``django_bolt._core.McpCallContext``): this
 class is a thin asyncio-friendly wrapper.
@@ -80,6 +82,11 @@ class Context:
         return self._rust.era
 
     @property
+    def task_id(self) -> str | None:
+        """The task id when this call runs as a task (SEP-2663), else ``None``."""
+        return self._rust.task_id
+
+    @property
     def is_replay(self) -> bool:
         """True when this invocation is an MRTR retry (requestState was present)."""
         return self._rust.is_replay
@@ -134,24 +141,35 @@ class Context:
     async def _input(self, kind: str, params: dict[str, Any], *, key: str | None) -> Any:
         self._input_seq += 1
         key = key or f"input-{self._input_seq}"
-        if self._rust.era == "legacy":
+        era = self._rust.era
+        if era == "modern" and kind == "sampling":
+            raise McpClientError(
+                "ctx.sample() is not supported for 2026-07-28 clients: sampling is "
+                "deprecated by the MCP spec (SEP-2577) — integrate with an LLM "
+                "provider API directly instead."
+            )
+        if era == "legacy" or self._rust.task_id is not None:
+            # Wait for the answer: a live request to a legacy client, or an
+            # input request of a task, which tasks/update answers.
             capability_ok = self._rust.supports_elicitation if kind == "elicitation" else self._rust.supports_sampling
             if not capability_ok:
                 raise McpClientError(
-                    f"The connected MCP client did not advertise the {kind!r} capability at "
-                    f"initialize, so this tool cannot call back into it. Use a client that "
+                    f"The connected MCP client did not advertise the {kind!r} capability, "
+                    f"so this tool cannot call back into it. Use a client that "
                     f"supports {kind} (e.g. MCP Inspector)."
                 )
             future: asyncio.Future = asyncio.get_running_loop().create_future()
-            self._rust.server_request_send(kind, json_encode(params).decode(), future)
-            envelope = json_decode(await future)
+            self._rust.server_request_send(kind, key, json_encode(params).decode(), future)
+            try:
+                raw = await future
+            except asyncio.CancelledError:
+                # The tool stopped waiting, for example after its own timeout.
+                # The task must not stay input_required for this request.
+                if self._rust.task_id is not None:
+                    self._rust.input_closed(key)
+                raise
+            envelope = json_decode(raw)
         else:
-            if kind == "sampling":
-                raise McpClientError(
-                    "ctx.sample() is not supported for 2026-07-28 clients: sampling is "
-                    "deprecated by the MCP spec (SEP-2577) — integrate with an LLM "
-                    "provider API directly instead."
-                )
             raw = self._rust.input_response(key)
             if raw is None:
                 # Terminates the tool call; the client retries with the answer
