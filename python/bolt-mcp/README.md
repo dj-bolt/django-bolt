@@ -145,6 +145,27 @@ api.mount_mcp(mcp, oauth=ProtectedResource(
 ))
 ```
 
+## Tracing
+
+`pip install "bolt-mcp[otel]"` installs `opentelemetry-api`. Then call `instrument(mcp)`
+before you register your own middleware:
+
+```python
+from bolt_mcp import MCP
+from bolt_mcp.otel import instrument
+
+mcp = MCP("my-server", "1.0.0")
+instrument(mcp)
+```
+
+Each `tools/call`, `resources/read` and `prompts/get` then gets one `SERVER` span, for
+example `tools/call greet`, with the attributes of the
+[OpenTelemetry semantic conventions for MCP](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/).
+The parent of the span is the `traceparent` in the request `_meta`. A span that a tool makes
+is a child of it. The span records the tool arguments and result only when
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. `bolt_mcp` does not import
+OpenTelemetry, so a server that does not call `instrument()` does not change.
+
 ## Development
 
 This package is a uv-workspace member of the django-bolt repo.
