@@ -140,7 +140,7 @@ curl localhost:8000/articles/99
 A sync ORM call in an `async def` handler raises Django's `SynchronousOnlyOperation`, and the client gets a `500` response. This also applies to a relation that is not loaded, for example `article.author` after `aget()`.
 
 Bolt sends each async ORM call to the ORM thread pool. Thus `DJANGO_BOLT_ORM_THREADS` limits the queries in flight. See [Tune the thread pools](#tune-the-thread-pools).
-On PostgreSQL, `aget()` and `async for` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
+On PostgreSQL, `async for`, `aget()`, `afirst()`, `alast()` and `aexists()` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
 
 ## Iterate over a QuerySet
 
@@ -168,13 +168,13 @@ A returned QuerySet with a `list[Struct]` return type reads only the Struct fiel
 
 ## Run async reads on the event loop
 
-Django's async ORM runs each call on a thread. On PostgreSQL, Bolt can run `async for` and `aget()` on the event loop, with no thread. Add the setting:
+Django's async ORM runs each call on a thread. On PostgreSQL, Bolt can run these reads on the event loop, with no thread: `async for`, `aget()`, `afirst()`, `alast()` and `aexists()`. Add the setting:
 
 ```python title="blog/settings.py"
 BOLT_ASYNC_ORM_ON_LOOP = True
 ```
 
-Your handlers do not change. Bolt reads the setting when the server starts. Each `async for` and each `aget()` then has three steps:
+Your handlers do not change. Bolt reads the setting when the server starts. Each of these reads then has three steps:
 
 1. Django builds the SQL statement.
 2. Bolt sends the statement on a connection of the event loop. The event loop serves other requests while the database works.
@@ -194,7 +194,7 @@ Some reads need the database connection of Django. For these reads, Bolt uses th
 | A read in a transaction | Only the connection of the transaction has its rows. A `TestClient` in a Django `TestCase` gives such a connection to the handlers. |
 | A read with `DEBUG = True` | Django logs each query from its own cursor. |
 | A database with another `ENGINE`, for example PostGIS or django-tenants | Another backend can change how a connection opens. |
-| The other async calls, for example `afirst()`, `acount()`, `acreate()` and `asave()` | Bolt replaces only `async for` and `aget()`. |
+| The other async calls, for example `acount()`, `aaggregate()`, `acreate()` and `asave()` | Bolt replaces only the five reads above. |
 
 ### Connections of the event loop
 

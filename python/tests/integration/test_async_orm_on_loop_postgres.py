@@ -203,6 +203,57 @@ GETS: dict[str, tuple[Callable[[], Any], dict[str, Any]]] = {
 }
 
 
+def _probes() -> Any:
+    return LoopProbe.objects.using(ALIAS)
+
+
+# name -> the QuerySet for ``first``, ``last`` and ``exists``
+ONE_ROW_QUERIES: dict[str, Callable[[], Any]] = {
+    "ordered": lambda: _posts().order_by("title"),
+    # The model has a default order.
+    "default_order": _posts,
+    # The model has no default order, so ``first`` and ``last`` order by the primary key.
+    "no_default_order": _probes,
+    "no_rows": lambda: _posts().filter(title="No such post"),
+    "values": lambda: _posts().order_by("id").values("id", "title"),
+    "values_list": lambda: _posts().order_by("-id").values_list("title", flat=True),
+    # ``last`` cannot reverse a slice.
+    "sliced": lambda: _posts().order_by("id")[1:3],
+    "slice_after_the_rows": lambda: _posts().order_by("id")[5:6],
+    "empty_in": lambda: _posts().filter(id__in=[]),
+    "none": lambda: _posts().none(),
+    "union": lambda: _posts().filter(published=True).union(_posts().filter(published=False)).order_by("title"),
+    # ``first`` and ``last`` refuse an aggregation with no order.
+    "aggregation_with_no_order": lambda: Author.objects.using(ALIAS).values("name").annotate(Count("posts")),
+    "distinct": lambda: _posts().order_by("published").values_list("published", flat=True).distinct(),
+    # The prefetch queries are sync code, so this QuerySet stays on the thread path.
+    "prefetch": lambda: _posts().prefetch_related("tags").order_by("id"),
+    # Django needs a connection to compile this QuerySet, so its query runs on the thread path.
+    "needs_a_connection_to_compile": lambda: _probes().annotate(value=_OpensConnection()).filter(value=7),
+}
+
+
+def _one_row_outcome(call: Callable[[], Any]) -> Any:
+    """The plain form of a row, or of the error of the call."""
+    try:
+        row = call()
+    except Exception as error:
+        return {"error": type(error).__qualname__, "message": str(error)}
+    if isinstance(row, models.Model):
+        return {"model": type(row).__name__, "pk": row.pk}
+    return _as_json(row)
+
+
+async def _one_row_outcome_async(call: Callable[[], Any]) -> Any:
+    try:
+        row = await call()
+    except Exception as error:
+        return {"error": type(error).__qualname__, "message": str(error)}
+    if isinstance(row, models.Model):
+        return {"model": type(row).__name__, "pk": row.pk}
+    return row
+
+
 def _get_outcome(error: Exception | None, post: BlogPost | None) -> dict[str, Any]:
     if error is not None:
         return {"error": type(error).__qualname__, "message": str(error)}
@@ -256,6 +307,15 @@ def _probe_threads_route(api: BoltAPI) -> None:
             "aget": (await probes.aget(label="a")).built_on,
         }
 
+    @api.get("/first-and-last-threads")
+    async def first_and_last_threads():
+        probes = LoopProbe.objects.using(ALIAS)
+        return {
+            "handler": threading.current_thread().name,
+            "afirst": (await probes.afirst()).built_on,
+            "alast": (await probes.order_by("label").alast()).built_on,
+        }
+
 
 def _lane_api() -> BoltAPI:
     """The route runs behind Django middleware, so its request has a lane."""
@@ -295,6 +355,36 @@ def _api() -> BoltAPI:
     @api.get("/get-backend-pid")
     async def get_backend_pid():
         return {"pid": (await _probe_with_backend_pid().aget(label="a")).pid}
+
+    @api.get("/first/{name}")
+    async def first(name: str):
+        return {"outcome": await _one_row_outcome_async(ONE_ROW_QUERIES[name]().afirst)}
+
+    @api.get("/last/{name}")
+    async def last(name: str):
+        return {"outcome": await _one_row_outcome_async(ONE_ROW_QUERIES[name]().alast)}
+
+    @api.get("/exists/{name}")
+    async def exists(name: str):
+        return {"outcome": await _one_row_outcome_async(ONE_ROW_QUERIES[name]().aexists)}
+
+    @api.get("/cached")
+    async def cached():
+        posts = _posts().filter(published=True).order_by("id")
+        rows = [post async for post in posts]
+        # The QuerySet has its rows now. Django answers ``exists`` and ``first`` from the rows, with no query.
+        # ``last`` reverses the QuerySet, which gives a new QuerySet and a new query.
+        last = await posts.alast()
+        probes = _probes().filter(label="b")
+        assert [probe.label async for probe in probes] == ["b"]
+        await _probes().filter(label="b").adelete()
+        return {
+            # The row is gone from the table, and the QuerySet still has it.
+            "exists": await probes.aexists(),
+            "first_is_cached": await posts.afirst() is rows[0],
+            "last_is_cached": last is rows[-1],
+            "last_is_the_last_row": last.pk == rows[-1].pk,
+        }
 
     @api.get("/twice")
     async def twice():
@@ -521,6 +611,80 @@ def test_aget_sends_the_sql_of_get(on_loop):
     assert sent == expected
     assert "ORDER BY" not in sent
     assert "LIMIT 21" in sent
+
+
+@pytest.mark.parametrize("name", sorted(ONE_ROW_QUERIES))
+@pytest.mark.parametrize("method", ["first", "last", "exists"])
+def test_afirst_alast_and_aexists_give_the_result_or_the_error_of_the_sync_call(on_loop, method, name):
+    expected = {"outcome": _one_row_outcome(getattr(ONE_ROW_QUERIES[name](), method))}
+
+    with TestClient(_api()) as client:
+        response = client.get(f"/{method}/{name}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+def test_aexists_sends_the_sql_of_exists(on_loop):
+    """``exists`` selects no column and limits the rows to one. The database must get the same statement."""
+    with CaptureQueriesContext(connections[ALIAS]) as captured:
+        assert ONE_ROW_QUERIES["ordered"]().exists()
+    expected = captured[-1]["sql"]
+    connections[ALIAS].close()
+
+    with TestClient(_api()) as client:
+        assert client.get("/exists/ordered").json() == {"outcome": True}
+        with psycopg.connect(**on_loop.params, autocommit=True) as admin:
+            (sent,) = admin.execute(
+                "SELECT query FROM pg_stat_activity WHERE application_name = %s ORDER BY query_start DESC LIMIT 1",
+                (on_loop.application_name,),
+            ).fetchone()
+
+    assert sent == expected
+    assert "LIMIT 1" in sent
+
+
+def test_afirst_and_alast_build_their_row_on_the_thread_of_the_handler(on_loop):
+    with TestClient(_api()) as client:
+        threads = client.get("/first-and-last-threads").json()
+
+    handler = threads["handler"]
+    assert not handler.startswith(ORM_THREAD)
+    assert threads == {"handler": handler, "afirst": handler, "alast": handler}
+
+
+def test_aexists_opens_no_django_connection(on_loop):
+    """A read on the thread path opens a connection of Django on an ORM thread. A read on the loop opens none."""
+    opened = []
+
+    def count(sender: Any, connection: Any, **kwargs: Any) -> None:
+        if connection.alias == ALIAS:
+            opened.append(threading.current_thread().name)
+
+    with TestClient(_api()) as client:
+        # The first read of a loop reads the state of a Django connection, and closes that connection.
+        assert client.get("/authors").status_code == 200
+        connection_created.connect(count)
+        try:
+            response = client.get("/exists/ordered")
+        finally:
+            connection_created.disconnect(count)
+
+    assert response.json() == {"outcome": True}
+    assert opened == []
+
+
+def test_a_queryset_that_has_its_rows_answers_from_them(on_loop):
+    with TestClient(_api()) as client:
+        response = client.get("/cached")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "exists": True,
+        "first_is_cached": True,
+        "last_is_cached": False,
+        "last_is_the_last_row": True,
+    }
 
 
 def test_a_second_async_for_reads_the_cache_of_the_queryset(on_loop):

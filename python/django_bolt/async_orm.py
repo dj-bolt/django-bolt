@@ -1,8 +1,9 @@
 """Run the read calls of Django's async ORM on the event loop of the worker.
 
 Django's async ORM API is ``sync_to_async`` around the sync API, so each call
-runs on a thread. With ``BOLT_ASYNC_ORM_ON_LOOP = True``, Bolt replaces two
-read calls of ``QuerySet``: ``async for`` (``__aiter__``) and ``aget()``.
+runs on a thread. With ``BOLT_ASYNC_ORM_ON_LOOP = True``, Bolt replaces these
+read calls of ``QuerySet``: ``async for`` (``__aiter__``), ``aget()``,
+``afirst()``, ``alast()`` and ``aexists()``.
 
 The flow of one read:
 
@@ -84,6 +85,9 @@ _DJANGO_ERRORS = (
 
 _django_aiter = QuerySet.__aiter__
 _django_aget = QuerySet.aget
+_django_afirst = QuerySet.afirst
+_django_alast = QuerySet.alast
+_django_aexists = QuerySet.aexists
 
 _thread_sensitive_context = SyncToAsync.thread_sensitive_context
 _MISSING: Any = object()
@@ -445,22 +449,32 @@ def _pool_for(queryset: QuerySet) -> _Pool | None:
     return pool
 
 
-async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
-    """Fill the result cache of ``queryset``: ``QuerySet._fetch_all`` with the query on the event loop."""
+async def _rows(pool: _Pool, compiler: Any) -> Any:
+    """Compile the query of ``compiler`` and return its rows from the database.
+
+    Returns None when an expression needed the database to compile. The thread
+    path gives such an expression a connection.
+    """
     if pool.template is None:
         await pool.prepare()
-    query = queryset.query
-    compiler = query.get_compiler(using=queryset.db)
     try:
         sql, params = compiler.as_sql()
     except EmptyResultSet:
         # ``execute_sql`` gives no rows for a query that can match nothing.
-        sql = ""
+        return ()
     except SynchronousOnlyOperation:
-        # An expression needed the database to compile. The thread path gives it a connection.
+        return None
+    return await pool.fetch(sql, params) if sql else ()
+
+
+async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
+    """Fill the result cache of ``queryset``: ``QuerySet._fetch_all`` with the query on the event loop."""
+    query = queryset.query
+    compiler = query.get_compiler(using=queryset.db)
+    rows = await _rows(pool, compiler)
+    if rows is None:
         await SyncToAsync(queryset._fetch_all)()
         return
-    rows = await pool.fetch(sql, params) if sql else ()
 
     # The iterable class asks the query for a compiler and the compiler for
     # the rows. Give it this compiler, which has the rows.
@@ -534,10 +548,89 @@ def _seconds(name: str, default: float) -> float:
     return seconds
 
 
+class _Unfetched(Exception):  # noqa: N818 - not an error: it carries a QuerySet out of a sync method
+    """A sync ``QuerySet`` method reached the point where it reads its rows."""
+
+    def __init__(self, queryset: QuerySet) -> None:
+        # The QuerySet is not an argument of the exception: the text of an exception shows its arguments.
+        super().__init__()
+        self.queryset = queryset
+
+
+# QuerySet class -> its subclass that raises ``_Unfetched`` where it would query.
+_stopping_classes: dict[type, type] = {}
+
+
+def _stopping_class(queryset_class: type) -> type:
+    stopping = _stopping_classes.get(queryset_class)
+    if stopping is None:
+
+        def _fetch_all(self: QuerySet) -> None:
+            raise _Unfetched(self)
+
+        stopping = _stopping_classes[queryset_class] = type(
+            queryset_class.__name__, (queryset_class,), {"_fetch_all": _fetch_all, "__module__": __name__}
+        )
+    return stopping
+
+
+async def _first_row(queryset: QuerySet, method: str, pool: _Pool) -> Any:
+    """Run ``first`` or ``last`` of Django, with the query on the event loop.
+
+    The two methods differ between Django versions, so this function does not
+    copy them. It calls the method of Django on a clone that stops where it
+    would query. That clone gives the QuerySet that Django built: ordered,
+    reversed and limited to one row. The event loop then reads its rows.
+    """
+    queryset_class = type(queryset)
+    clone = queryset._chain()
+    clone.__class__ = _stopping_class(queryset_class)
+    try:
+        return getattr(clone, method)()
+    except _Unfetched as unfetched:
+        built = unfetched.queryset
+    built.__class__ = queryset_class
+    await _fetch_all(built, pool)
+    # ``for obj in queryset[:1]: return obj``
+    for row in built._result_cache:
+        return row
+    return None
+
+
+async def _afirst(self: QuerySet) -> Any:
+    """``QuerySet.afirst``."""
+    # A QuerySet that has its rows answers from them, and has no query to move to the loop.
+    pool = _pool_for(self) if self._result_cache is None else None
+    if pool is None:
+        return await _django_afirst(self)
+    return await _first_row(self, "first", pool)
+
+
+async def _alast(self: QuerySet) -> Any:
+    """``QuerySet.alast``."""
+    pool = _pool_for(self)
+    if pool is None:
+        return await _django_alast(self)
+    return await _first_row(self, "last", pool)
+
+
+async def _aexists(self: QuerySet) -> bool:
+    """``QuerySet.aexists``: the lines of ``QuerySet.exists`` and ``Query.has_results``, with the query awaited."""
+    if self._result_cache is not None:
+        return bool(self._result_cache)
+    pool = _pool_for(self)
+    if pool is None:
+        return await _django_aexists(self)
+    rows = await _rows(pool, self.query.exists().get_compiler(using=self.db))
+    if rows is None:
+        return await _django_aexists(self)
+    return bool(rows)
+
+
 def configure() -> None:
     """Read the setting and the limits of the pools. The server calls this function at startup.
 
-    With the setting on, ``QuerySet`` gets the two methods of this module.
+    With the setting on, ``QuerySet`` gets the methods of this module.
     With the setting off, it gets Django's methods back.
 
     Raises:
@@ -568,6 +661,9 @@ def configure() -> None:
         enabled = False
     QuerySet.__aiter__ = _aiter if enabled else _django_aiter
     QuerySet.aget = _aget if enabled else _django_aget
+    QuerySet.afirst = _afirst if enabled else _django_afirst
+    QuerySet.alast = _alast if enabled else _django_alast
+    QuerySet.aexists = _aexists if enabled else _django_aexists
 
 
 def close_connections() -> None:
