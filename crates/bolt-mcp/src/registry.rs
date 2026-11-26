@@ -330,7 +330,6 @@ impl McpRegistry {
             .enable_resources()
             .enable_prompts()
             .enable_logging();
-        // Advertise the Tasks extension only when a tool can run as a task.
         if tasks.is_some() {
             capabilities = capabilities.enable_tasks();
         }
