@@ -85,7 +85,7 @@ def _text_item_hint(field_type: Any) -> int | None:
     The type is ``list[T]``, ``set[T]``, ``frozenset[T]``, ``tuple[T]`` or
     ``tuple[T, ...]``, also behind ``Optional`` or ``Annotated``. ``T`` is
     ``int``, ``float``, ``date``, ``time`` or ``datetime``, also behind
-    ``Annotated``. msgspec then gets the converted items and checks the
+    ``Annotated`` layers and type aliases. msgspec then gets the converted items and checks the
     ``msgspec.Meta`` constraints.
     """
     inner = unwrap_optional(resolve_type_alias(field_type))
@@ -97,7 +97,8 @@ def _text_item_hint(field_type: Any) -> int | None:
     if len(items) != 1:
         return None
     item = resolve_type_alias(items[0])
-    if get_origin(item) is Annotated:
+    # An alias can hold another Annotated layer, as in Annotated[X, ...] with type X = Annotated[int, ...].
+    while get_origin(item) is Annotated:
         item = resolve_type_alias(get_args(item)[0])
     return _TEXT_ITEM_HINTS.get(item)
 

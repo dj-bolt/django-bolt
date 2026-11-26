@@ -693,6 +693,39 @@ def test_a_list_out_of_its_length_bounds_gets_the_length_error_before_an_item_is
         assert too_few.json()["detail"][0]["msg"] == "Expected `array` of length >= 2"
 
 
+type AtLeastOne = Annotated[int, msgspec.Meta(ge=1)]
+type OneToNine = Annotated[AtLeastOne, msgspec.Meta(le=9)]
+
+
+class NestedAlias(msgspec.Struct):
+    v: list[OneToNine]
+
+
+@pytest.mark.parametrize("path", ["/nested", "/nested-model"])
+def test_an_item_behind_nested_aliases_converts_as_an_int_and_keeps_each_constraint(path):
+    """Each Annotated layer and alias of the item unwraps, so Rust reads the item as a single int."""
+    api = BoltAPI()
+
+    @api.get("/nested")
+    async def nested(v: Annotated[list[Annotated[AtLeastOne, msgspec.Meta(le=9)]], Query()]):
+        return v
+
+    @api.get("/nested-model")
+    async def nested_model(model: Annotated[NestedAlias, Query()]):
+        return model.v
+
+    with TestClient(api) as client:
+        assert client.get(path, params={"v": ["+5", "9", "1"]}).json() == [5, 9, 1]
+        for text, msg in [
+            ("5.0", f"{INT_ERROR} - at `$[1]`"),
+            ("0", "Expected `int` >= 1 - at `$[1]`"),
+            ("10", "Expected `int` <= 9 - at `$[1]`"),
+        ]:
+            response = client.get(path, params={"v": ["1", text]})
+            assert response.status_code == 422, response.text
+            assert response.json()["detail"][0]["msg"] == msg, text
+
+
 def test_a_float_list_item_with_a_long_fraction_and_a_large_exponent_is_inf(monkeypatch):
     """float() reads 0.<9999 zeros>1e100000 as 1e90000, which is inf. msgspec read it as 1.0."""
     text = "0." + "0" * 9999 + "1e100000"
