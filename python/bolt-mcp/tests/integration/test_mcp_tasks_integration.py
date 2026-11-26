@@ -131,4 +131,5 @@ def test_runbolt_refuses_task_tools_with_more_than_one_process(make_server_proje
         process.kill()
     assert process.returncode != 0, stdout
     assert option in stderr
-    assert "task tools (cleanup, confirm, multiply, sync_sleep)" in stderr
+    assert "'/mcp' has task tools (cleanup, confirm, multiply, sync_sleep)" in stderr
+    assert "'/mcp-small' has task tools (tiny)" in stderr

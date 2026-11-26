@@ -28,10 +28,11 @@ use rmcp::RoleServer;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
     CreateTaskResult, DiscoverResult, ErrorCode, ErrorData as McpError, GetPromptRequestParams,
-    GetPromptResponse, GetPromptResult, GetTaskParams, GetTaskResult, InputRequest, InputRequests, InputRequiredResult, ListPromptsResult,
+    GetPromptResponse, GetPromptResult, GetTaskParams, GetTaskResult, InitializeRequestParams,
+    InitializeResult, InputRequest, InputRequests, InputRequiredResult, ListPromptsResult,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
     ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
-    ResultType, ServerConfig, Tool, UpdateTaskParams,
+    ResultType, ServerConfig, TASKS_EXTENSION_ID, Tool, UpdateTaskParams,
 };
 use rmcp::service::RequestContext;
 use serde_json::Value;
@@ -827,6 +828,25 @@ impl McpHandler {
 impl rmcp::ServerHandler for McpHandler {
     fn get_info(&self) -> ServerConfig {
         self.registry.server_info.clone()
+    }
+
+    /// Only a client of the `initialize` handshake sends `initialize`. The
+    /// Tasks extension does not apply to it (SEP-2663, backward
+    /// compatibility), so its capabilities do not list the extension.
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        context.peer.set_peer_info(request.clone());
+        let mut result = self.negotiate_initialize(&request)?;
+        if let Some(extensions) = &mut result.capabilities.extensions {
+            extensions.remove(TASKS_EXTENSION_ID);
+            if extensions.is_empty() {
+                result.capabilities.extensions = None;
+            }
+        }
+        Ok(result)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

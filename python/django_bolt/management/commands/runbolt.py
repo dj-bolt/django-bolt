@@ -614,15 +614,18 @@ def _option_that_splits_mcp_tasks(options) -> str | None:
 
 def _reject_mcp_task_tools(mcp_mounts: list[dict], option: str) -> None:
     """Stop startup when an MCP mount has a tool with ``task=True`` and ``option`` is set."""
+    mounts = []
     for mount in mcp_mounts:
         task_tools = sorted(name for name, tool in mount["tools"].items() if tool["task"] is not None)
         if task_tools:
-            raise CommandError(
-                f"The MCP mount at {mount['path']!r} has task tools ({', '.join(task_tools)}). "
-                "MCP tasks live in the memory of one process, so tasks/get must reach that process. "
-                f"With {option}, another process can get the request. "
-                "Run one process with no --max-rss and no --workers-lifetime, or remove task=True."
-            )
+            mounts.append(f"{mount['path']!r} has task tools ({', '.join(task_tools)})")
+    if mounts:
+        raise CommandError(
+            f"The MCP mount at {'; the MCP mount at '.join(mounts)}. "
+            "MCP tasks live in the memory of one process, so tasks/get must reach that process. "
+            f"With {option}, another process can get the request. "
+            "Run one process with no --max-rss and no --workers-lifetime, or remove task=True."
+        )
 
 
 def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int, handler) -> None:

@@ -345,6 +345,8 @@ def test_a_legacy_client_gets_the_plain_result_also_when_it_declares_the_extensi
         params = {**INITIALIZE_PARAMS, "capabilities": TASK_CAPS}
         resp = post_rpc(client, "initialize", params)
         assert resp.status_code == 200, resp.content
+        # The server does not advertise an extension that this client cannot use.
+        assert TASKS_EXTENSION not in (parse_rpc(resp)["result"]["capabilities"].get("extensions") or {})
         session_id = resp.headers["mcp-session-id"]
         post_rpc(client, "notifications/initialized", id=None, session_id=session_id)
         resp = post_rpc(

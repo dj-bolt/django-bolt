@@ -48,3 +48,14 @@ async def cleanup(marker: str) -> dict:
 
 
 mount_mcp(api, mcp)
+
+# A second mount with a task tool: the startup refusal names each mount.
+small = MCP("tasks-itest-small", "1.0")
+
+
+@small.tool(task=True)
+async def tiny() -> dict:
+    return {}
+
+
+mount_mcp(api, small, path="/mcp-small")
