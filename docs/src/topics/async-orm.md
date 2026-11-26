@@ -202,8 +202,15 @@ A loop connection is not a connection of Django. Each worker thread has its own 
 
 - A loop connection opens with the connection parameters of `DATABASES`.
 - A loop connection copies the session settings and the type adapters of a Django connection to the same database. The changes of a `connection_created` receiver are thus on it.
-- `DJANGO_BOLT_LOOP_CONNECTIONS` sets the connections of one worker thread to one database. The default is `4`. A read waits when each connection is in use.
-- A connection that no read used for 300 seconds closes. `DJANGO_BOLT_LOOP_IDLE_SECONDS` sets this time.
+- A read takes a free connection. With no free connection, the loop opens one, up to the limit. At the limit, the read waits. The pool of [sqlx](https://github.com/launchbadge/sqlx) has the same rules and the same defaults.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `DJANGO_BOLT_LOOP_CONNECTIONS` | `10` | The limit: connections of one worker thread to one database. |
+| `DJANGO_BOLT_LOOP_ACQUIRE_SECONDS` | `30` | A read that waits this long for a free connection fails with Django's `OperationalError`. |
+| `DJANGO_BOLT_LOOP_IDLE_SECONDS` | `600` | A connection that no read used for this time closes. |
+| `DJANGO_BOLT_LOOP_LIFETIME_SECONDS` | `1800` | A connection older than this time closes before its next use. |
+
 - `CONN_MAX_AGE` does not apply to a loop connection, and Django's connection pool (`OPTIONS["pool"]`) does not hold it.
 - After a database restart, Bolt sends a read that failed on a dead connection one more time, on a new connection.
 - A tool that records queries from the cursor of Django does not see these reads.
@@ -219,7 +226,7 @@ connections = reads in one second x seconds that one read holds a connection
 ```
 
 A read holds its connection for the round trip to the database, and for the time until the event loop reads the answer.
-For a database on the same host, the default of `4` is sufficient. For a database on another host, increase the value and measure.
+A loop opens connections up to the limit when that number of reads run at the same time. A higher limit thus does not always give more throughput.
 
 Measured with one process, one route and a database 2 ms away:
 
@@ -229,6 +236,7 @@ Measured with one process, one route and a database 2 ms away:
 | `16` | 2,156 |
 | `64` | 2,250 |
 
+With `64`, the loop kept 64 connections open for 4% more throughput than with `16`.
 With `4`, the ORM thread pool with 4 threads was faster in this test (1,323). With `16`, it was slower (1,377).
 
 ```bash
@@ -420,7 +428,7 @@ DJANGO_BOLT_ORM_THREADS=8 python manage.py runbolt --processes 4
 On a route with Django middleware, the ORM calls of a request run on the thread of that request, not on the ORM pool. See [Middleware](middleware.md).
 
 Each thread that runs a query keeps its own database connection. These are the threads of the two pools, the worker threads, and one thread for each running request with Django middleware. Add up the threads of all processes. Keep the total below the connection limit of your database.
-With `BOLT_ASYNC_ORM_ON_LOOP`, each worker thread also has up to `DJANGO_BOLT_LOOP_CONNECTIONS` connections to each PostgreSQL database.
+With `BOLT_ASYNC_ORM_ON_LOOP`, each worker thread also has up to `DJANGO_BOLT_LOOP_CONNECTIONS` connections (10 by default) to each PostgreSQL database.
 
 SQLite gets one ORM thread by default, because SQLite has one writer and a file lock. PostgreSQL and MySQL can serve parallel queries, so they get four.
 

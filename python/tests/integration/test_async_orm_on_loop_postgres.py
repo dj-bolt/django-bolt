@@ -268,20 +268,9 @@ async def _probe_threads_on_this_loop() -> list[str]:
     return [probe.built_on async for probe in LoopProbe.objects.using(ALIAS).order_by("id")]
 
 
-async def _fast_backend_pid() -> int:
-    return (await LoopProbe.objects.using(ALIAS).annotate(pid=RawSQL("pg_backend_pid()", [])).aget(label="a")).pid
-
-
 def _api() -> BoltAPI:
     api = BoltAPI()
     _probe_threads_route(api)
-
-    @api.get("/fast-queries-at-once")
-    async def fast_queries_at_once():
-        # This query takes 50 ms. The loop then knows how long a query can take here.
-        await _backend_pid()
-        pids = await asyncio.gather(*(_fast_backend_pid() for _ in range(6)))
-        return {"connections": len(set(pids))}
 
     @api.get("/compiled/{name}")
     async def compiled(name: str):
@@ -365,6 +354,21 @@ def _api() -> BoltAPI:
     @api.get("/two-at-once")
     async def two_at_once():
         return list(await asyncio.gather(_backend_pid(), _backend_pid()))
+
+    @api.get("/many-at-once/{count}")
+    async def many_at_once(count: int):
+        return {"connections": len(set(await asyncio.gather(*(_backend_pid() for _ in range(count)))))}
+
+    @api.get("/wait-too-long")
+    async def wait_too_long():
+        slow = LoopProbe.objects.using(ALIAS).annotate(nap=RawSQL("(SELECT 1 FROM pg_sleep(1))", []))
+        held, waited = await asyncio.gather(slow.aget(label="a"), _backend_pid(), return_exceptions=True)
+        return {
+            "held": held.label,
+            "module": type(waited).__module__,
+            "error": type(waited).__qualname__,
+            "message": str(waited),
+        }
 
     @api.get("/session")
     async def session():
@@ -571,13 +575,46 @@ def test_reads_that_start_together_open_one_django_connection(on_loop):
     assert len(opened) == 1, opened
 
 
-def test_a_read_waits_for_a_connection_that_comes_back_soon(on_loop):
-    """A new connection costs more than a short wait. The limit of the loop allows 4 connections here."""
+def test_a_loop_opens_ten_connections_by_default(on_loop):
+    """Each read at the same time gets a connection, up to the limit. The other reads wait."""
     with TestClient(_api()) as client:
-        response = client.get("/fast-queries-at-once")
+        response = client.get("/many-at-once/12")
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"connections": 1}
+    assert response.json() == {"connections": 10}
+
+
+def test_a_read_that_waits_for_the_acquire_time_fails_with_the_django_error(on_loop, monkeypatch):
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_ACQUIRE_SECONDS", "0.2")
+    with TestClient(_api()) as client:
+        outcome = client.get("/wait-too-long").json()
+        after = client.get("/authors")
+
+    assert outcome == {
+        "held": "a",
+        "module": "django.db.utils",
+        "error": "OperationalError",
+        "message": (
+            f"No loop connection to the database {ALIAS!r} came free in 0.2 seconds. "
+            "Each of the 1 connections of DJANGO_BOLT_LOOP_CONNECTIONS was in use."
+        ),
+    }
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+def test_a_connection_older_than_the_lifetime_closes(on_loop, monkeypatch):
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_LIFETIME_SECONDS", "0.3")
+    with TestClient(_api()) as client:
+        first = client.get("/get-backend-pid").json()["pid"]
+        again = client.get("/get-backend-pid").json()["pid"]
+        time.sleep(0.4)
+        later = client.get("/get-backend-pid").json()["pid"]
+        connections[ALIAS].close()
+        on_loop.wait_for_backends(1)
+
+    assert again == first
+    assert later != first
 
 
 def test_a_query_waits_when_each_connection_is_in_use(on_loop, monkeypatch):

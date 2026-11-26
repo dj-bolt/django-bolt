@@ -92,10 +92,12 @@ def test_an_invalid_connection_count_stops_the_server_at_startup(monkeypatch, va
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "soon", "nan", "inf"])
-def test_an_invalid_idle_time_stops_the_server_at_startup(monkeypatch, value):
-    monkeypatch.setenv("DJANGO_BOLT_LOOP_IDLE_SECONDS", value)
+@pytest.mark.parametrize("name", ["ACQUIRE", "IDLE", "LIFETIME"])
+def test_an_invalid_time_stops_the_server_at_startup(monkeypatch, name, value):
+    variable = f"DJANGO_BOLT_LOOP_{name}_SECONDS"
+    monkeypatch.setenv(variable, value)
 
-    with pytest.raises(ImproperlyConfigured, match="DJANGO_BOLT_LOOP_IDLE_SECONDS must be a number more than 0"):
+    with pytest.raises(ImproperlyConfigured, match=f"{variable} must be a number more than 0"):
         TestClient(_api())
 
 

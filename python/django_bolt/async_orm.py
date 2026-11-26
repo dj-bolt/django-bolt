@@ -54,13 +54,15 @@ from .concurrency import _thread_count, in_lane_mode, run_in_orm_executor
 logger = logging.getLogger(__name__)
 
 SETTING = "BOLT_ASYNC_ORM_ON_LOOP"
+# The limits of a pool, with the defaults of the sqlx pool.
 CONNECTIONS_VARIABLE = "DJANGO_BOLT_LOOP_CONNECTIONS"
-DEFAULT_CONNECTIONS = 4
+DEFAULT_CONNECTIONS = 10
+ACQUIRE_VARIABLE = "DJANGO_BOLT_LOOP_ACQUIRE_SECONDS"
+DEFAULT_ACQUIRE_SECONDS = 30.0
 IDLE_VARIABLE = "DJANGO_BOLT_LOOP_IDLE_SECONDS"
-DEFAULT_IDLE_SECONDS = 300.0
-
-# The time that a read waits for a connection before the pool has timed a query.
-_FIRST_WAIT_SECONDS = 0.005
+DEFAULT_IDLE_SECONDS = 600.0
+LIFETIME_VARIABLE = "DJANGO_BOLT_LOOP_LIFETIME_SECONDS"
+DEFAULT_LIFETIME_SECONDS = 1800.0
 
 # The module of the backend that Bolt supports. A subclass can change how a
 # connection opens or how a cursor runs a query, and a loop connection would
@@ -89,8 +91,12 @@ _MISSING: Any = object()
 # The connections of each loop for each database. ``configure`` sets the limit.
 _connection_limit = DEFAULT_CONNECTIONS
 
-# A connection that no query used for this time closes. ``configure`` sets it.
+# ``configure`` sets these times. A read waits this long for a free connection.
+_acquire_seconds = DEFAULT_ACQUIRE_SECONDS
+# A connection that no query used for this time closes.
 _idle_seconds = DEFAULT_IDLE_SECONDS
+# A connection older than this time closes before its next use.
+_lifetime_seconds = DEFAULT_LIFETIME_SECONDS
 
 # alias -> what a loop connection copies from a Django connection.
 _templates: dict[str, _Template] = {}
@@ -143,25 +149,28 @@ class _Pool:
     The pool holds cursors. One cursor serves each query of its connection,
     which is cheaper than a new cursor for each query.
 
-    A query takes the cursor that came back last. Thus a pool with more
-    connections than its load needs leaves the others idle, and they close
-    after the idle time.
+    The pool follows the pool of sqlx. A read takes a free connection. With
+    no free connection, the pool opens one, up to the limit. At the limit, the
+    read waits in a queue, and fails after the acquire time. A connection
+    closes after the idle time, or when it is older than the lifetime.
 
-    A read with no free connection waits for one. The pool opens a new
-    connection only for a read that waited for the time of one query: the
-    connections then come back too slowly for the load. The first connection
-    opens at once.
+    Two things differ from sqlx. sqlx tests a connection with a ping before
+    each use, which adds a round trip to each query. This pool sends a query
+    again when its connection was dead (see ``fetch``). sqlx takes the
+    connection that was idle for the longest time. This pool takes the one
+    that came back last, so the connections that the load does not need go
+    idle and close.
     """
 
     __slots__ = (
         "alias",
+        "born",
         "closed",
         "database",
-        "grower",
+        "expirer",
         "idle",
         "idle_since",
         "opened",
-        "query_seconds",
         "preparing",
         "reaper",
         "template",
@@ -177,14 +186,13 @@ class _Pool:
         self.idle_since: collections.deque[float] = collections.deque()
         # The timer that closes idle connections, or None when no connection is idle.
         self.reaper: asyncio.TimerHandle | None = None
-        # A waiter gets True when it must open a connection, and None when one came back.
-        self.waiters: collections.deque[asyncio.Future[bool | None]] = collections.deque()
+        self.waiters: collections.deque[asyncio.Future[None]] = collections.deque()
         # The loop time at which each waiter started to wait, in the order of ``waiters``.
         self.waiting_since: collections.deque[float] = collections.deque()
-        # The timer that lets the oldest waiter open a connection, or None.
-        self.grower: asyncio.TimerHandle | None = None
-        # The time for which a query holds its connection: a moving average. 0 before the first query.
-        self.query_seconds = 0.0
+        # The timer that fails the waiters that waited for the acquire time, or None.
+        self.expirer: asyncio.TimerHandle | None = None
+        # cursor -> the loop time at which its connection opened.
+        self.born: dict[Any, float] = {}
         self.opened = 0
         self.closed = False
         # None until ``prepare`` runs.
@@ -207,55 +215,53 @@ class _Pool:
 
     async def acquire(self) -> Any:
         """Return a cursor that no other query uses. Wait when each connection is in use."""
-        must_open = not self.opened
+        loop = asyncio.get_running_loop()
         while True:
             if self.idle:
                 self.idle_since.pop()
-                return self.idle.pop()
-            if must_open and self.opened < _connection_limit:
+                cursor = self.idle.pop()
+                if loop.time() - self.born[cursor] <= _lifetime_seconds:
+                    return cursor
+                self.discard(cursor)
+                continue
+            if self.opened < _connection_limit:
                 self.opened += 1
                 try:
-                    return await self._open()
+                    cursor = await self._open()
                 except BaseException:
                     self._closed_one()
                     raise
-            loop = asyncio.get_running_loop()
+                self.born[cursor] = loop.time()
+                return cursor
             waiter = loop.create_future()
             self.waiters.append(waiter)
             self.waiting_since.append(loop.time())
-            if self.grower is None and self.opened < _connection_limit:
-                self.grower = loop.call_later(self._patience(), self._grow, loop)
+            if self.expirer is None:
+                self.expirer = loop.call_later(_acquire_seconds, self._expire_waiters, loop)
             try:
-                must_open = await waiter
-            except BaseException:
+                await waiter
+            except asyncio.CancelledError:
                 # A waiter that got its turn and then stops gives the turn to the next one.
-                if waiter.done() and not waiter.cancelled():
+                if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
                     self._wake()
                 raise
 
-    def _patience(self) -> float:
-        """The time that a read waits for a connection before the pool opens one for it."""
-        return self.query_seconds or _FIRST_WAIT_SECONDS
-
-    def _grow(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Let the oldest waiter open a connection when it waited for the time of one query."""
-        self.grower = None
+    def _expire_waiters(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Fail each waiter that waited for the acquire time. The oldest is first in ``waiters``."""
         waiters = self.waiters
         waiting_since = self.waiting_since
-        while waiters and waiters[0].done():
-            waiters.popleft()
+        expired = loop.time() - _acquire_seconds
+        while waiters and (waiters[0].done() or waiting_since[0] <= expired):
             waiting_since.popleft()
-        if not waiters or self.opened >= _connection_limit:
-            return
-        patience = self._patience()
-        remaining = waiting_since[0] + patience - loop.time()
-        if remaining <= 0:
-            waiting_since.popleft()
-            waiters.popleft().set_result(True)
-            if not waiters:
-                return
-            remaining = max(waiting_since[0] + patience - loop.time(), 0.0)
-        self.grower = loop.call_later(remaining, self._grow, loop)
+            waiter = waiters.popleft()
+            if not waiter.done():
+                waiter.set_exception(
+                    OperationalError(
+                        f"No loop connection to the database {self.alias!r} came free in {_acquire_seconds:g} "
+                        f"seconds. Each of the {_connection_limit} connections of {CONNECTIONS_VARIABLE} was in use."
+                    )
+                )
+        self.expirer = loop.call_later(waiting_since[0] - expired, self._expire_waiters, loop) if waiters else None
 
     async def _open(self) -> Any:
         template = self.template
@@ -310,6 +316,7 @@ class _Pool:
 
     def discard(self, cursor: Any) -> None:
         """Close the connection of ``cursor``. ``finish`` does not wait, so a cancelled task can call it."""
+        del self.born[cursor]
         cursor.connection.pgconn.finish()
         self._closed_one()
 
@@ -322,7 +329,7 @@ class _Pool:
     def close(self) -> None:
         self.closed = True
         self.discard_idle()
-        for name in ("reaper", "grower"):
+        for name in ("reaper", "expirer"):
             timer = getattr(self, name)
             if timer is not None:
                 timer.cancel()
@@ -351,13 +358,11 @@ class _Pool:
         new connection.
         """
         database_error = self.database.Error
-        loop = asyncio.get_running_loop()
         for first_try in (True, False):
             try:
                 cursor = await self.acquire()
             except database_error as error:
                 raise _django_error(self.database, error) from error
-            started = loop.time()
             try:
                 await cursor.execute(sql, params)
                 rows = await cursor.fetchall()
@@ -375,9 +380,6 @@ class _Pool:
                 self._give_back(cursor)
                 raise
             else:
-                seconds = loop.time() - started
-                average = self.query_seconds
-                self.query_seconds = average * 0.8 + seconds * 0.2 if average else seconds
                 self.release(cursor)
                 return rows
         raise AssertionError("unreachable")  # pragma: no cover
@@ -513,27 +515,27 @@ async def _aget(self: QuerySet, *args: Any, **kwargs: Any) -> Any:
     )
 
 
-def _idle_time() -> float:
+def _seconds(name: str, default: float) -> float:
     """
-    Read the idle time from ``DJANGO_BOLT_LOOP_IDLE_SECONDS``.
+    Read a time in seconds from the environment variable ``name``.
 
     Raises:
         ImproperlyConfigured: The value is not a number more than 0.
     """
-    raw = os.environ.get(IDLE_VARIABLE, "")
+    raw = os.environ.get(name, "")
     if not raw.strip():
-        return DEFAULT_IDLE_SECONDS
+        return default
     try:
         seconds = float(raw)
     except ValueError:
         seconds = 0.0
     if not math.isfinite(seconds) or seconds <= 0:
-        raise ImproperlyConfigured(f"{IDLE_VARIABLE} must be a number more than 0, got {raw!r}.")
+        raise ImproperlyConfigured(f"{name} must be a number more than 0, got {raw!r}.")
     return seconds
 
 
 def configure() -> None:
-    """Read the setting, the connection limit and the idle time. The server calls this function at startup.
+    """Read the setting and the limits of the pools. The server calls this function at startup.
 
     With the setting on, ``QuerySet`` gets the two methods of this module.
     With the setting off, it gets Django's methods back.
@@ -541,15 +543,20 @@ def configure() -> None:
     Raises:
         ImproperlyConfigured: BOLT_ASYNC_ORM_ON_LOOP is not a bool,
             DJANGO_BOLT_LOOP_CONNECTIONS is not an int of 1 or more, or
-            DJANGO_BOLT_LOOP_IDLE_SECONDS is not a number more than 0.
+            DJANGO_BOLT_LOOP_ACQUIRE_SECONDS, DJANGO_BOLT_LOOP_IDLE_SECONDS or
+            DJANGO_BOLT_LOOP_LIFETIME_SECONDS is not a number more than 0.
     """
-    global _connection_limit, _idle_seconds
+    global _connection_limit, _acquire_seconds, _idle_seconds, _lifetime_seconds
     limit = _thread_count(CONNECTIONS_VARIABLE)
-    idle_seconds = _idle_time()
+    acquire_seconds = _seconds(ACQUIRE_VARIABLE, DEFAULT_ACQUIRE_SECONDS)
+    idle_seconds = _seconds(IDLE_VARIABLE, DEFAULT_IDLE_SECONDS)
+    lifetime_seconds = _seconds(LIFETIME_VARIABLE, DEFAULT_LIFETIME_SECONDS)
     if not settings.configured:
         return
     _connection_limit = limit or DEFAULT_CONNECTIONS
+    _acquire_seconds = acquire_seconds
     _idle_seconds = idle_seconds
+    _lifetime_seconds = lifetime_seconds
     # The settings of a database can change between two servers of one process, as in tests.
     _templates.clear()
     enabled = getattr(settings, SETTING, False)
