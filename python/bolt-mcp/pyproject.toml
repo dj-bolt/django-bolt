@@ -28,6 +28,11 @@ dependencies = [
     "pyjwt>=2.8",
 ]
 
+[project.optional-dependencies]
+# bolt_mcp.otel: OpenTelemetry spans for MCP calls. Releases 1.28 to 1.31 mark a
+# BaseException, for example an MRTR input request, as a span error.
+otel = ["opentelemetry-api>=1.32"]
+
 [project.urls]
 Homepage = "https://github.com/FarhanAliRaza/django-bolt"
 Repository = "https://github.com/FarhanAliRaza/django-bolt"
