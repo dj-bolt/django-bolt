@@ -331,7 +331,6 @@ def test_output_schema_is_the_schema_of_the_validated_struct():
         "properties": {"name": {"type": "string"}},
         "required": ["name"],
     }
-    # structuredContent of the call holds only what the schema describes.
     assert set(result["structuredContent"]) <= set(tools["user"]["outputSchema"]["properties"])
     # A list body goes in {"result": ...}, and a dict body has no fixed shape.
     assert "outputSchema" not in tools["users"]

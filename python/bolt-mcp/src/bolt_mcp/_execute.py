@@ -104,7 +104,6 @@ def to_call_tool_result(result: Any) -> dict[str, Any]:
     }
 
 
-# The media type of each static meta tag and each response type of a ResponseWireV1.
 _TAG_MEDIA_TYPES = {
     _RESPONSE_META_JSON: "application/json",
     _RESPONSE_META_PLAINTEXT: "text/plain",
