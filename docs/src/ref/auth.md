@@ -526,6 +526,8 @@ DjangoCacheRevocation(
 ```
 
 Keeps entries in a Django cache. An entry lives until `exp + leeway`, or `default_ttl` seconds when `revoke()` gets no `exp`. A user version never expires.
+A database cache (`DatabaseCache` or a subclass) runs a query for each call. Thus the store uses the async cache API for it, and each call runs in a thread.
+The store calls each other cache directly on the event loop.
 `consume()` and `bump_user_version()` raise `NotImplementedError` for the file, dummy and database cache backends, and for each backend with no atomic `incr`.
 `leeway < 0` raises `ImproperlyConfigured`.
 
