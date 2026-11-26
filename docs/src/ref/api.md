@@ -259,9 +259,11 @@ The two namespaces are the `namespace` of the API. See [Mount an API in the URLc
 
 **Errors**
 
-- `ImproperlyConfigured`: at startup, `runbolt` and `TestClient` refuse a prefix that Bolt cannot serve at static paths.
-  Examples are `re_path()`, `i18n_patterns()`, a converter other than `str`, two parameters in one segment, no trailing slash, and include keyword arguments.
-  The message names the URLconf entry.
+- `ImproperlyConfigured`: at startup, `runbolt` and the test clients refuse a prefix that Bolt cannot serve at static paths.
+  Examples are `re_path()`, `i18n_patterns()`, a converter other than `str`, two parameters in one segment, one parameter two times, no trailing slash, and include keyword arguments.
+  They also refuse an ASGI mount, a Django mount or an MCP server of the API under a prefix with a parameter.
+  The message names the URLconf entry. Django alone does not refuse the prefix: `manage.py check` and `reverse()` work.
+- `ValueError`: at startup, a handler or a dependency takes a prefix parameter as an argument with no marker. Read it from `request.params` or with `Path()`.
 
 ### api.mount()
 
@@ -283,7 +285,7 @@ The lifespan of `app` runs with this API. It starts after the lifespan of this A
 
 - `TypeError`: `app` is not a `BoltAPI`.
 - `ValueError`: `app` is this API, or `app` already has the routes of this API.
-- `ValueError`: a handler of `app` takes a parameter of `path` as an argument. Read it from `request.params`.
+- `ValueError`: a handler or a dependency of `app` takes a parameter of `path` as an argument with no marker. Read it from `request.params` or with `Path()`.
 - `ValueError`: `app` has a different `error_formatter`.
 
 ### api.mount_asgi()

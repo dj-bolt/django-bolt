@@ -279,7 +279,9 @@ Use a `Router` to share auth and guards. Use `mount()` for a group of routes tha
 To put an API under a path of the Django URLconf, see [Mount an API in the URLconf](#mount-an-api-in-the-urlconf).
 
 A mount path can have a parameter, for example `/tenants/{tenant}`.
-A handler of the mounted API reads its value from `request.params["tenant"]`. It cannot take `tenant` as an argument, and `mount()` raises `ValueError` for such a handler.
+A handler or a dependency of the mounted API reads its value from `request.params["tenant"]`, or from an argument with the `Path()` marker.
+An argument with no marker cannot have the name `tenant`, because it reads the query string. `mount()` raises `ValueError` for such a handler or dependency.
+An argument with another marker, such as `Query()`, reads the source of its marker, as on each route.
 
 To serve a Django view or another ASGI application under a path, see [ASGI mounts](asgi-mounts.md).
 
@@ -388,34 +390,43 @@ urlpatterns = [path("blog/", include("blog.urls"))]
 '/blog/api/articles/42'
 ```
 
-A route that the API copied with `mount()` from an API with a namespace keeps that namespace: `"blog:api:<namespace>:<name>"`.
+A route that the API copied with `mount()` also gets the namespace of the mounted API: `"blog:api:<namespace>:<name>"`.
+Each level of `mount()` adds the namespace of its API. Thus a mounted API can have the same namespace as its parent, for example `"blog:api:api:<name>"`.
+A mounted API with no namespace adds no level, so its names join the names of its parent.
 
 ### Use a parameter in the prefix
 
 A `str` parameter in the prefix becomes a path parameter, for example `path("<tenant>/", api.urls)`.
-A handler reads its value from `request.params["tenant"]`, as for a [mount path](#mount-an-api-in-another-api). `reverse()` needs it as a keyword argument.
+A handler or a dependency reads its value as for a [mount path](#mount-an-api-in-another-api): from `request.params["tenant"]`, or from an argument with `Path()`.
+`reverse()` needs it as a keyword argument.
 The docs of an API cannot be under such a prefix. Set `OpenAPIConfig(enabled=False)` on the API.
+An ASGI mount, a Django mount and an MCP server cannot be under such a prefix either. See [What moves with the prefix](#what-moves-with-the-prefix).
 
-Bolt serves an API at static paths. These prefixes stop the startup with `ImproperlyConfigured`, and the message names the URLconf entry:
+Bolt serves an API at static paths. `runbolt` and the test clients refuse these prefixes with `ImproperlyConfigured`, and the message names the URLconf entry:
 
 - a `re_path()` prefix, an `i18n_patterns()` prefix, or a translated prefix
 - a converter other than `str`, for example `<int:org>`, because the Bolt router does not check it
 - two parameters in one path segment, for example `<a>-<b>/`, because the Bolt router allows one
+- one parameter name two times, for example `<org>/<org>/`, or a prefix parameter with the name of a route parameter
 - a prefix that does not end with a slash, or a prefix that gives an empty path segment
 - keyword arguments in the include, because a Bolt handler does not get them
 
+Django alone does not serve Bolt routes, so it does not refuse these prefixes.
+`manage.py check`, `manage.py migrate`, `reverse()` and the Django views work with such a URLconf.
+
 ### What moves with the prefix
 
-Each kind of route of the API moves under the prefix of `path("blog/", api.urls)`:
+Each kind of route of the API moves under the prefix of `path("blog/", api.urls)`.
+The last column tells if the kind works under a prefix with a parameter, such as `path("<tenant>/", api.urls)`:
 
-| Kind | Path without a mount | Path with the mount |
-| --- | --- | --- |
-| HTTP route | `/articles/{id}` | `/blog/articles/{id}` |
-| WebSocket route | `/live` | `/blog/live` |
-| Native route | `/items/{id}` | `/blog/items/{id}` |
-| `mount_asgi()`, `mount_django()` | `/files` | `/blog/files` |
-| `mount_mcp()` | `/mcp` | `/blog/mcp` |
-| Docs (`OpenAPIConfig.path`) | `/docs` | `/blog/docs` |
+| Kind | Path without a mount | Path with the mount | Under a prefix parameter |
+| --- | --- | --- | --- |
+| HTTP route | `/articles/{id}` | `/blog/articles/{id}` | Yes |
+| WebSocket route | `/live` | `/blog/live` | Yes |
+| Native route | `/items/{id}` | `/blog/items/{id}` | Yes |
+| `mount_asgi()`, `mount_django()` | `/files` | `/blog/files` | No, `runbolt` refuses the prefix |
+| `mount_mcp()` | `/mcp` | `/blog/mcp` | No, `runbolt` refuses the prefix |
+| Docs (`OpenAPIConfig.path`) | `/docs` | `/blog/docs` | No, set `OpenAPIConfig(enabled=False)` |
 
 The paths in the OpenAPI schema are the served paths.
 When `runbolt` joins several APIs, the docs of the first API list each route. They go under the first prefix of that API.
@@ -444,6 +455,8 @@ urlpatterns = [
 A prefix on this include moves these APIs, as `api.urls` does. With `path("api/", include("django_bolt.urls"))`, Bolt serves `/api/articles/42`, and `reverse()` gives the same path.
 The prefix rules of `api.urls` apply, but Bolt ignores the keyword arguments of the include.
 `TestClient(api)` serves such an API under the prefix too.
+Under a prefix that Bolt cannot serve, such as `re_path(r"^api/", ...)`, Django alone gives the same names and paths as before. Only `runbolt` and the test clients refuse it.
+When `ROOT_URLCONF` changes, for example with `override_settings` in a test, `django_bolt.urls` reads the new URLconf.
 
 `django_bolt.urls.urlpatterns` is a list with one include. Thus a URLconf can copy it with `[*urlpatterns]` or join it to a list with `+`.
 
