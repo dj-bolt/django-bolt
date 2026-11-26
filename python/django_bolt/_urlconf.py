@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.urls import URLResolver, get_resolver
 from django.urls.converters import StringConverter
@@ -188,3 +189,45 @@ def _refuse_reverse_only_prefix(chain: tuple[URLResolver, ...]) -> None:
         "own paths, so reverse() would give paths that Bolt does not serve. "
         f'Include {REVERSE_ONLY_URLCONF} with path(""), or mount each API with path({route!r}, api.urls).'
     )
+
+
+def _prefixes_by_api() -> dict[int, tuple[BoltAPI, list[str]]]:
+    """Group the prefixes of the mounts of ``ROOT_URLCONF`` by API, in URLconf order."""
+    grouped: dict[int, tuple[BoltAPI, list[str]]] = {}
+    if not settings.configured or not getattr(settings, "ROOT_URLCONF", None):
+        return grouped
+    for mount in urlconf_mounts():
+        grouped.setdefault(id(mount.api), (mount.api, []))[1].append(mount.prefix)
+    return grouped
+
+
+def _serve(api: BoltAPI, prefixes: list[str]) -> BoltAPI:
+    # A mount at the root serves the paths of the API itself.
+    return api if set(prefixes) == {""} else api._served_at(prefixes)
+
+
+def served_api(api: BoltAPI) -> BoltAPI:
+    """Return the API that serves the routes of ``api`` as ``runbolt`` does.
+
+    It is ``api`` when ``ROOT_URLCONF`` does not mount it. Otherwise it is an
+    API that serves the routes of ``api`` under each prefix of its mounts.
+    """
+    entry = _prefixes_by_api().get(id(api))
+    return api if entry is None else _serve(api, entry[1])
+
+
+def served_apis(apis: list[tuple[str, BoltAPI]]) -> list[tuple[str, BoltAPI]]:
+    """Return ``(label, api)`` for each API that ``runbolt`` serves.
+
+    ``apis`` are the APIs that autodiscovery found. An API that ``ROOT_URLCONF``
+    mounts serves under its prefixes only, also when autodiscovery found it.
+    The mounted APIs that autodiscovery did not find come last, in URLconf order.
+    """
+    grouped = _prefixes_by_api()
+    served = []
+    for label, api in apis:
+        entry = grouped.pop(id(api), None)
+        served.append((label, api if entry is None else _serve(api, entry[1])))
+    for api, prefixes in grouped.values():
+        served.append((f"path({prefixes[0]!r}, api.urls)", _serve(api, prefixes)))
+    return served

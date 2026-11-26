@@ -29,6 +29,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from django_bolt import BoltAPI, _core
+from django_bolt._urlconf import served_api
 from django_bolt.websocket import CloseCode, WebSocket, WebSocketDisconnect, WebSocketException
 from django_bolt.websocket.close_codes import check_close_frame
 from django_bolt.websocket.handlers import build_websocket_request
@@ -98,7 +99,8 @@ class WebSocketTestClient:
             read_django_settings: If True, read CORS settings from Django settings
                                  when cors_allowed_origins is None. Default True.
         """
-        self.api = api
+        # runbolt serves an API that the URLconf mounts under its prefixes.
+        self.api = served_api(api)
         self.path = path
         self.headers = headers or {}
         self.query_string = query_string

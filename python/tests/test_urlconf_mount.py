@@ -10,6 +10,7 @@ import itertools
 import re
 import sys
 import types
+from contextlib import asynccontextmanager
 
 import pytest
 from django.conf.urls.i18n import i18n_patterns
@@ -19,7 +20,9 @@ from django.urls import include, path, re_path, register_converter
 from django.utils.translation import gettext_lazy
 
 from django_bolt import BoltAPI
-from django_bolt._urlconf import UrlconfMount, join_mount_path, urlconf_mounts
+from django_bolt._urlconf import UrlconfMount, join_mount_path, served_apis, urlconf_mounts
+from django_bolt.management.commands.runbolt import Command
+from django_bolt.testing import TestClient
 
 _names = itertools.count()
 
@@ -228,3 +231,190 @@ def test_a_bad_prefix_above_a_plain_django_view_is_not_refused(make_urlconf):
     urlconf = make_urlconf([re_path(r"^legacy/", include([path("<int:pk>/", _django_view)]))])
 
     assert urlconf_mounts(urlconf) == []
+
+
+# --- Served paths -----------------------------------------------------------
+
+
+@pytest.fixture
+def mount_urlconf(make_urlconf, settings):
+    """Return a function that makes a URLconf from ``urlpatterns`` and makes it the ROOT_URLCONF."""
+
+    def make(urlpatterns: list) -> str:
+        settings.ROOT_URLCONF = make_urlconf(urlpatterns)
+        return settings.ROOT_URLCONF
+
+    return make
+
+
+def test_a_mounted_api_serves_at_the_prefixed_path_only(mount_urlconf):
+    api = _api()
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api) as client:
+        assert client.get("/missions/42").json() == {"id": 42}
+        assert client.get("/42").status_code == 404
+
+
+def test_an_api_that_the_urlconf_does_not_mount_serves_its_own_paths(mount_urlconf):
+    mounted, unmounted = _api(), _api()
+    mount_urlconf([path("missions/", mounted.urls)])
+
+    with TestClient(unmounted) as client:
+        assert client.get("/42").json() == {"id": 42}
+        assert client.get("/missions/42").status_code == 404
+
+
+def test_two_apis_serve_at_their_own_prefixes(mount_urlconf):
+    first, second = BoltAPI(), BoltAPI()
+
+    @first.get("/who")
+    async def first_who() -> dict:
+        return {"route": "first"}
+
+    @second.get("/who")
+    async def second_who() -> dict:
+        return {"route": "second"}
+
+    mount_urlconf([path("a/", first.urls), path("b/", include(([path("v1/", second.urls)], "b")))])
+
+    with TestClient(first) as client:
+        assert client.get("/a/who").json() == {"route": "first"}
+        assert client.get("/b/v1/who").status_code == 404
+    with TestClient(second) as client:
+        assert client.get("/b/v1/who").json() == {"route": "second"}
+        assert client.get("/a/who").status_code == 404
+
+
+def test_an_api_mounted_two_times_serves_under_each_prefix(mount_urlconf):
+    api = _api()
+    mount_urlconf([path("v1/", api.urls), path("latest/", include(([path("", api.urls)], "latest")))])
+
+    with TestClient(api) as client:
+        assert client.get("/v1/7").json() == {"id": 7}
+        assert client.get("/latest/7").json() == {"id": 7}
+
+
+@pytest.mark.parametrize(("trailing_slash", "route"), [("strip", "/"), ("strip", ""), ("append", "/"), ("keep", "/")])
+def test_the_root_route_serves_at_the_prefix_with_its_slash_as_django_does(mount_urlconf, trailing_slash, route):
+    api = BoltAPI(trailing_slash=trailing_slash)
+
+    @api.get(route)
+    async def index() -> dict:
+        return {"route": "index"}
+
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api, follow_redirects=False) as client:
+        assert client.get("/missions/").json() == {"route": "index"}
+        response = client.get("/missions?page=2")
+        assert response.status_code == 308
+        assert response.headers["location"] == "/missions/?page=2"
+
+
+def test_a_route_with_a_trailing_slash_keeps_it_under_the_prefix(mount_urlconf):
+    api = BoltAPI(trailing_slash="append")
+
+    @api.get("/list")
+    async def listing() -> dict:
+        return {"route": "list"}
+
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api) as client:
+        assert client.get("/missions/list/").json() == {"route": "list"}
+
+
+def test_the_api_prefix_comes_after_the_urlconf_prefix(mount_urlconf):
+    api = BoltAPI(prefix="/v2")
+
+    @api.get("/{mission_id}")
+    async def detail(mission_id: int) -> dict:
+        return {"id": mission_id}
+
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api) as client:
+        assert client.get("/missions/v2/5").json() == {"id": 5}
+
+
+def test_a_prefix_parameter_is_in_request_params(mount_urlconf):
+    api = BoltAPI()
+
+    @api.get("/{mission_id}")
+    async def detail(request, mission_id: int) -> dict:
+        return {"org": request.params["org"], "id": mission_id}
+
+    mount_urlconf([path("org/<str:org>/missions/", api.urls)])
+
+    with TestClient(api) as client:
+        assert client.get("/org/acme/missions/3").json() == {"org": "acme", "id": 3}
+
+
+def test_a_handler_that_takes_a_prefix_parameter_as_an_argument_is_refused(mount_urlconf):
+    api = BoltAPI()
+
+    @api.get("/{mission_id}")
+    async def detail(mission_id: int, org: str = "") -> dict:
+        return {"id": mission_id}
+
+    mount_urlconf([path("org/<org>/", api.urls)])
+
+    with pytest.raises(ValueError, match="takes the parameter 'org' of the mount path"):
+        TestClient(api)
+
+
+def test_a_mounted_api_keeps_its_middleware_and_its_lifespan(mount_urlconf):
+    events: list[str] = []
+
+    class Tag:
+        def __init__(self, get_response):
+            self.get_response = get_response
+
+        async def __call__(self, request):
+            response = await self.get_response(request)
+            response.headers["x-tag"] = "mounted"
+            return response
+
+    @asynccontextmanager
+    async def lifespan(app):
+        events.append("start")
+        yield
+        events.append("stop")
+
+    api = BoltAPI(middleware=[Tag], lifespan=lifespan)
+
+    @api.get("/ping")
+    async def ping() -> dict:
+        return {"route": "pong"}
+
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api) as client:
+        response = client.get("/missions/ping")
+        missing = client.get("/missions/none")
+    assert response.json() == {"route": "pong"}
+    assert response.headers["x-tag"] == "mounted"
+    assert missing.status_code == 404
+    assert missing.headers["x-tag"] == "mounted"
+    assert events == ["start", "stop"]
+
+
+def test_runbolt_serves_a_found_and_mounted_api_once_and_a_mounted_api_that_it_did_not_find(mount_urlconf):
+    found, mounted, unmounted = _api(namespace="found"), _api(namespace="mounted"), BoltAPI()
+
+    @unmounted.get("/health")
+    async def health() -> dict:
+        return {"status": "ok"}
+
+    mount_urlconf([path("found/", found.urls), path("mounted/", mounted.urls)])
+
+    apis = served_apis([("project.api:api", unmounted), ("found.api:api", found)])
+    merged = Command().merge_apis(apis)
+
+    assert [label for label, _api in apis] == ["project.api:api", "found.api:api", "path('mounted/', api.urls)"]
+    with TestClient(merged) as client:
+        assert client.get("/health").json() == {"status": "ok"}
+        assert client.get("/found/1").json() == {"id": 1}
+        assert client.get("/mounted/2").json() == {"id": 2}
+        assert client.get("/1").status_code == 404

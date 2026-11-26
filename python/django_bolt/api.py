@@ -37,7 +37,7 @@ from ._kwargs import (
     extract_response_metadata,
     field_has_upload_file,
 )
-from ._urlconf import ApiURLConf
+from ._urlconf import ApiURLConf, join_mount_path
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler, annotation_globals
@@ -770,6 +770,19 @@ class BoltAPI:
             ):
                 raise TypeError("error_formatter must be a sync callable, not an async one")
         self._error_formatter = error_formatter
+        # The settings of this API without its routes. ``_served_at`` makes an API with them.
+        self._init_kwargs: dict[str, Any] = {
+            "trailing_slash": trailing_slash,
+            "middleware": middleware,
+            "django_middleware": django_middleware,
+            "enable_logging": enable_logging,
+            "logging_config": logging_config,
+            "compression": compression,
+            "openapi_config": openapi_config,
+            "validate_response": validate_response,
+            "include_in_schema": include_in_schema,
+            "error_formatter": error_formatter,
+        }
         self._routes: list[tuple[str, str, int, Callable]] = []
         # Handler IDs whose lane affinity error was logged with its fix, one time each.
         self._lane_affinity_hinted: set[int] = set()
@@ -4101,6 +4114,17 @@ class BoltAPI:
         stripped_path = path.strip("/")
         mount_path = "/" + stripped_path if stripped_path else ""
 
+        self._mount(app, mount_path, lambda route_path: _normalize_path(mount_path + route_path, self.trailing_slash))
+
+    def _mount(self, app: BoltAPI, mount_path: str, join: Callable[[str], str]) -> None:
+        """Copy each endpoint of ``app`` into this API, as ``mount()`` does.
+
+        ``mount_path`` is the path under which ``app`` serves: a leading slash,
+        and no trailing slash. ``join`` gives the path of a route or a native
+        route of ``app``. The other endpoints join ``mount_path`` and their own path.
+        """
+        child_formatter = app._error_formatter
+
         # Prepare MCP definitions before mutating the parent. A mounted child
         # is removed from global discovery below, so its MCP endpoints must be
         # copied just like its HTTP, WebSocket, and ASGI endpoints.
@@ -4124,12 +4148,11 @@ class BoltAPI:
         mounted_paths = [route_path for _method, route_path, *_rest in app._routes + app._native_routes]
         mounted_paths.extend(ws_path for ws_path, _handler_id, _handler in app._websocket_routes)
         for mounted_path in mounted_paths:
-            _refuse_repeated_path_params(mount_path + mounted_path)
+            _refuse_repeated_path_params(join(mounted_path))
 
         # Copy routes from sub-app to this app with path prefix
         for method, route_path, handler_id, handler in app._routes:
-            # Compute new path with mount prefix and normalize using parent's trailing_slash setting
-            new_path = _normalize_path(mount_path + route_path, self.trailing_slash)
+            new_path = join(route_path)
 
             # Create new handler ID in parent's namespace
             new_handler_id = self._next_handler_id
@@ -4160,14 +4183,14 @@ class BoltAPI:
             self._handler_api_map[new_handler_id] = app._handler_api_map.get(handler_id, app)
 
         for method, route_path, capsule in app._native_routes:
-            new_path = _normalize_path(mount_path + route_path, self.trailing_slash)
+            new_path = join(route_path)
             _refuse_typed_native_path_params(new_path)
             self._native_routes.append((method, new_path, capsule))
 
         # Copy WebSocket routes
         for ws_path, handler_id, handler in app._websocket_routes:
             # A WebSocket route path has no trailing slash: see _websocket_decorator.
-            new_path = _normalize_path(mount_path + ws_path, "strip")
+            new_path = _normalize_path(join(ws_path), "strip")
 
             new_handler_id = self._next_handler_id
             self._next_handler_id += 1
@@ -4215,6 +4238,22 @@ class BoltAPI:
         # Last, so that a mount that raises does not change the formatter.
         if child_formatter is not None:
             self._error_formatter = child_formatter
+
+    def _served_at(self, prefixes: Sequence[str]) -> BoltAPI:
+        """Return an API that serves the routes of this API under each URLconf prefix.
+
+        The new API has the settings of this API, so its own routes (the docs
+        routes and the route for a request that matches no route) behave as
+        the routes of this API. It runs the lifespan of this API one time.
+        """
+        served = BoltAPI(**self._init_kwargs)
+        served._compression = self._compression
+        served._openapi_config = self._openapi_config
+        for prefix in prefixes:
+            mount_path = "/" + prefix.rstrip("/") if prefix else ""
+            _refuse_mount_path_arguments(mount_path, self)
+            served._mount(self, mount_path, functools.partial(join_mount_path, prefix))
+        return served
 
     def mount_asgi(self, path: str, app: Callable[..., Any]) -> None:
         """Mount an ASGI app at a static prefix (evaluated after Bolt route miss)."""
