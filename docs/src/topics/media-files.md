@@ -190,7 +190,7 @@ location ~ ^/media/(.*/)?\. {
     return 404;
 }
 
-location ~* ^/media/(.+\.(?:png|jpe?g|gif|webp|avif|ico|mp3|ogg|wav|mp4|webm|pdf|txt|csv))$ {
+location ~* ^/media/(.+\.(?:png|jpe?g|gif|webp|avif|ico|mp3|ogg|wav|mp4|webm|pdf|txt))$ {
     disable_symlinks on;
     alias /srv/blog/media/$1;
     add_header X-Content-Type-Options nosniff always;
