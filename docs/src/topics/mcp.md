@@ -400,6 +400,74 @@ A changed state gets an error.
 The 2026-07-28 revision removed it, so it works only with an earlier client that supports sampling.
 Otherwise it raises `McpClientError`, and the client gets the message as a tool error.
 
+## Run a long tool as a task
+
+A task lets a tool run longer than one request (the MCP Tasks extension, SEP-2663).
+Add `task=True` to the tool:
+
+```python
+import asyncio
+
+from bolt_mcp import Context
+
+
+@mcp.tool(task=True, ttl_ms=600_000, poll_interval_ms=2_000)
+async def export_articles(ctx: Context) -> dict:
+    """Export the articles to a file."""
+    await ctx.report_progress(1, 2, message="Reading the articles")
+    await asyncio.sleep(5)
+    answer = await ctx.elicit(f"Write {len(ARTICLES)} articles?")
+    if answer["action"] != "accept":
+        return {"exported": 0}
+    return {"exported": len(ARTICLES)}
+```
+
+A 2026-07-28 client that declares the `io.modelcontextprotocol/tasks` extension in its request gets a task at once:
+
+```json
+{"resultType": "task", "taskId": "786512e2-9e0d-44bd-8f29-789f320fe840", "status": "working",
+ "createdAt": "2026-11-26T10:30:00+00:00", "lastUpdatedAt": "2026-11-26T10:30:00+00:00",
+ "ttlMs": 600000, "pollIntervalMs": 2000}
+```
+
+The tool runs on.
+The client sends `tasks/get` with the `taskId` until the status is `completed`, `failed` or `cancelled`.
+A `completed` task has the tool result in `result`. A tool error is a `completed` task with `isError: true` in its result.
+A `failed` task has a JSON-RPC error in `error`.
+Another client gets the tool result, as for any tool. The extension does not apply to a client of an earlier revision.
+
+- `ttl_ms` is the life of the task from its creation. The default is 300000 (5 minutes). When the TTL ends first, the task becomes `failed`, and Bolt cancels the tool.
+- Bolt keeps a finished task for one more TTL, then deletes it. A later `tasks/get` gets the error `-32602`.
+- `poll_interval_ms` is the poll interval that Bolt suggests to the client. The default is 1000.
+- `ctx.report_progress()` and the log methods set the `statusMessage` of the task. A log message sets it at `info` and above, unless the request sets a log level.
+- `ctx.elicit()` does not end the call. The task becomes `input_required`, with the question in `inputRequests`. The client answers with `tasks/update`, and the tool continues from the same line. It does not run again from the start.
+- `ctx.sample()` raises `McpClientError`, as for each 2026-07-28 client.
+- `ctx.task_id` is the task id. It is `None` when the call is not a task.
+- `tasks/cancel` makes the task `cancelled` at once, and Bolt cancels the coroutine of the tool. A `tasks/cancel` after the end of the task has no effect.
+
+!!! warning "A sync tool does not stop"
+    A `def` tool runs in a thread of the default thread pool. Bolt cannot stop a thread.
+    After a cancel or the end of the TTL, the function runs to its end, and Bolt discards the result.
+    Write a long tool as `async def` when it must stop.
+
+`MCP(max_tasks=1000)` limits the tasks that a mount keeps in memory, running and finished.
+A call over the limit gets the tool error `Too many tasks on this server. Try again later.`
+Each finished task holds its result until Bolt deletes it, so the limit also limits the memory.
+
+Only the caller that created a task can read, answer or cancel it.
+Bolt compares the principal of each `tasks/*` request with the principal of the `tools/call`.
+Another caller gets `-32602` with `Unknown task`, as for an id that does not exist.
+All callers without authentication are one principal.
+On a mount without `auth=`, the task id is the only protection. It is a random UUID, so do not show it to other users.
+
+!!! warning "Tasks need one process"
+    A `tasks/get` must reach the process that runs the task.
+    With `--processes 2` or more, the kernel can give the request to another process.
+    Worker recycling (`--max-rss`, `--workers-lifetime`) starts a new process before the old one stops.
+    Thus `runbolt` refuses to start with these options when a mount has a task tool.
+    The worker threads of one process (`--workers`) share its tasks.
+    A restart of the process deletes its tasks.
+
 ## Add middleware
 
 MCP calls do not go through Bolt or Django HTTP middleware.
@@ -718,6 +786,8 @@ An earlier client uses a session, and the `MCP()` options set how Bolt serves it
 | Stateless | `MCP("blog", stateless=True)` | No | No | Yes |
 
 - **Stateful** keeps each session in the memory of one process. Run `runbolt --processes 1`, or a load balancer that sends a session to the same process.
+
+A tool with `task=True` needs one process in each mode. See [Run a long tool as a task](#run-a-long-tool-as-a-task).
 - **JSON response** answers a request with one `application/json` object. A tool that sends notifications still gets an event stream.
 - **Stateless** answers each request with an event stream, and has no `GET` stream.
 
@@ -748,6 +818,7 @@ Another `Host` gets `403` with `Forbidden: Host header is not allowed`.
 | `list_ttl_ms` | `0` | The `ttlMs` cache hint on each list result. `0` asks for no cache. |
 | `list_cache_scope` | `"private"` | The `cacheScope` hint: `"private"` or `"public"`. |
 | `mask_error_details` | `True` | Hide the text of an exception from the client. |
+| `max_tasks` | `1000` | The tasks that the mount keeps in memory, running and finished. |
 
 `api.mount_mcp(mcp, path="/mcp", *, auth=None, guards=None, oauth=None, expose=None, allowed_hosts=None, allowed_origins=None)` mounts the server.
 `bolt_mcp.mount_mcp(api, mcp, ...)` does the same.
@@ -803,15 +874,17 @@ def test_get_article():
 
 The `Mcp-Method` and `Mcp-Name` headers must match the body.
 For `resources/read`, `Mcp-Name` is the URI. For `prompts/get`, it is the prompt name.
+For `tasks/get`, `tasks/update` and `tasks/cancel`, it is the task id.
 To test a guarded tool, add an `Authorization` header with a token.
 
 ## Supported MCP methods
 
 Bolt serves `server/discover`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, `prompts/get` and `subscriptions/listen`.
+When a tool has `task=True`, it also serves `tasks/get`, `tasks/update` and `tasks/cancel` (the Tasks extension, SEP-2663).
 For an earlier client, it also serves `initialize`, `ping`, and the `GET` and `DELETE` requests of a session.
 It speaks the 2026-07-28 revision, and each revision back to 2024-11-05.
 
-Bolt does not serve `completion/complete`, the tasks extension or list-changed notifications.
+Bolt does not serve `completion/complete`, `notifications/tasks` or list-changed notifications.
 The lists of tools, resources and prompts do not change after the mount.
 
 ## See also
