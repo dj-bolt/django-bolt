@@ -78,18 +78,32 @@ def _hammer(base_url: str, requests: int, concurrency: int) -> set[str]:
     seen: set[str] = set()
     lock = threading.Lock()
     routes = itertools.cycle(_ALL_ROUTES)
-    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
-    with httpx.Client(base_url=base_url, limits=limits, timeout=30) as client:
+    # Each thread has its own client. The connection pool of one client is not
+    # safe to share between threads on free-threaded Python.
+    local = threading.local()
+    clients: list[httpx.Client] = []
 
-        def one(route: str) -> None:
-            response = client.get(route)
-            response.raise_for_status()
-            found = _prefixes(response)
+    def thread_client() -> httpx.Client:
+        client = getattr(local, "client", None)
+        if client is None:
+            client = local.client = httpx.Client(base_url=base_url, timeout=30)
             with lock:
-                seen.update(found)
+                clients.append(client)
+        return client
 
+    def one(route: str) -> None:
+        response = thread_client().get(route)
+        response.raise_for_status()
+        found = _prefixes(response)
+        with lock:
+            seen.update(found)
+
+    try:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             list(pool.map(one, [next(routes) for _ in range(requests)]))
+    finally:
+        for client in clients:
+            client.close()
     return seen
 
 

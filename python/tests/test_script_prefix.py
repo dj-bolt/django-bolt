@@ -770,6 +770,45 @@ def test_a_body_with_a_next_of_its_own_streams_with_the_script_prefix(settings):
         assert client.get("/stream").content == b"ab"
 
 
+class _PrefixIterable:
+    """An iterable that reads the script prefix in ``__iter__``."""
+
+    def __iter__(self):
+        return iter([_prefix().encode()])
+
+
+class _ReplacedNext:
+    """A body whose first ``__next__`` puts an end in place of itself, as Rust reads the attribute on each step."""
+
+    def __init__(self):
+        self.calls = 0
+
+        def first() -> bytes:
+            self.calls += 1
+            if self.calls > 3:
+                raise StopIteration
+            self.__next__ = self._end
+            return b"a"
+
+        self.__next__ = first
+
+    def _end(self) -> bytes:
+        raise StopIteration
+
+
+@pytest.mark.parametrize(("body", "expected"), [(_PrefixIterable, b"/myapp/"), (_ReplacedNext, b"a")])
+def test_the_body_with_the_script_prefix_steps_as_rust_does(settings, body, expected):
+    api = BoltAPI()
+
+    @api.get("/stream")
+    def stream():
+        return StreamingResponse(body())
+
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    with TestClient(api) as client:
+        assert client.get("/stream").content == expected
+
+
 def _ws_dependency() -> str:
     return _prefix()
 

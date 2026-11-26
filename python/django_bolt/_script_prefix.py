@@ -182,13 +182,13 @@ def _sync_body(content: Any, script_prefix: str) -> Any:
     # Each step runs in a context of its own, whatever thread iterates the body.
     context = copy_context()
     context.run(set_script_prefix, script_prefix)
-    # Rust calls the __next__ and __iter__ attributes, not the methods of the type.
-    iterator = content if hasattr(content, "__next__") else content.__iter__()
-    step = iterator.__next__
+    # As Rust does: read the __iter__ and __next__ attributes, not the methods of
+    # the type, and read __next__ again on each step.
+    iterator = content if hasattr(content, "__next__") else context.run(content.__iter__)
     try:
         while True:
             try:
-                item = context.run(step)
+                item = context.run(iterator.__next__)
             except StopIteration:
                 return
             yield item
