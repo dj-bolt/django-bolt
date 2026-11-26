@@ -11,38 +11,51 @@
 //! 1. Configured directories (STATIC_ROOT, STATICFILES_DIRS) - fast path
 //! 2. Django's staticfiles finders (for app static files like admin)
 
-use actix_files::NamedFile;
-use actix_web::{HttpRequest, HttpResponse, http::header, web};
+use actix_files::{NamedFile, file_extension_to_mime};
+use actix_web::http::header::{self, ContentDisposition, DispositionType};
+use actix_web::mime::{self, Mime};
+use actix_web::{HttpRequest, HttpResponse, web};
 use pyo3::prelude::*;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::state::{FinderRoot, ScopeConfig, ServeDir, ServeMode};
 
-/// Extensions that can carry executable script in a browser context.
-/// For media (user uploads), these are rewritten to `application/octet-stream`
-/// + `Content-Disposition: attachment` so they cannot run in the site's origin.
+/// True when a browser can run script from a response of this content type.
 ///
-/// Picked for what *actually executes JS in your origin* when fetched directly:
-/// HTML-family (rendered), SVG-family (script-capable), XML/XSLT (XHTML
-/// rendering, XSLT can JS), JS-family (loaded as `<script>`), WASM (loaded by
-/// JS, but a known origin-confused-deputy vector). CSS is omitted: it can
-/// exfiltrate but cannot execute, and forcing CSS to download would be
-/// gratuitous for the common "let users upload theme overrides" case.
-const DANGEROUS_MEDIA_EXTS: &[&str] = &[
-    "html", "htm", "xhtml", "xhtm", "shtml", "shtm", "htc", "hta", "svg", "svgz", "xml", "xsl",
-    "xslt", "js", "mjs", "cjs", "wasm",
-];
-
-fn is_dangerous_media_ext(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    // Hot path: zero-allocation comparison. `to_ascii_lowercase()` would
-    // heap-allocate a String for every media request.
-    DANGEROUS_MEDIA_EXTS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+/// The types are HTML, each XML MIME type and each JavaScript MIME type of
+/// WHATWG MIME Sniffing (section 4.6), and WebAssembly. A browser runs the
+/// XHTML script elements of any XML document, such as SVG, RSS or MathML.
+/// `text/x-component` (`.htc`) and `application/hta` (`.hta`) are HTML that
+/// Internet Explorer runs. CSS is not in the list: it cannot run script.
+/// `Mime` keeps the type and the subtype in lower case.
+fn can_run_script(content_type: &Mime) -> bool {
+    content_type.suffix() == Some(mime::XML)
+        || matches!(
+            content_type.essence_str(),
+            "text/html"
+                | "text/xml"
+                | "application/xml"
+                | "application/wasm"
+                | "text/x-component"
+                | "application/hta"
+                | "application/ecmascript"
+                | "application/javascript"
+                | "application/x-ecmascript"
+                | "application/x-javascript"
+                | "text/ecmascript"
+                | "text/javascript"
+                | "text/javascript1.0"
+                | "text/javascript1.1"
+                | "text/javascript1.2"
+                | "text/javascript1.3"
+                | "text/javascript1.4"
+                | "text/javascript1.5"
+                | "text/jscript"
+                | "text/livescript"
+                | "text/x-ecmascript"
+                | "text/x-javascript"
+        )
 }
 
 /// Rejects any path with a leading-dot component. Matches the nginx/Apache
@@ -205,10 +218,10 @@ pub fn load_finder_roots(py: Python<'_>) -> PyResult<Vec<FinderRoot>> {
 ///   inside the root of its finder location. In production only the
 ///   configured dirs (STATIC_ROOT, STATICFILES_DIRS) are served.
 /// - Media (`ServeMode::Media`): never uses finders (they don't know
-///   MEDIA_ROOT), and any upload whose extension can carry script
-///   (`.html`, `.svg`, `.js`, `.wasm`, …) is force-downloaded as
-///   `application/octet-stream` — `nosniff` alone won't stop a browser from
-///   honouring a `text/html`/`image/svg+xml` type and running its scripts.
+///   MEDIA_ROOT). A file whose content type can run script (HTML, XML,
+///   JavaScript, WebAssembly) is a download as `application/octet-stream`.
+///   `nosniff` alone does not stop a browser that obeys a `text/html` or
+///   `image/svg+xml` type and runs the script. See `can_run_script`.
 pub async fn handle_file(
     req: HttpRequest,
     path: web::Path<String>,
@@ -285,17 +298,7 @@ pub async fn handle_file(
     }
 
     let mut response = if let Some((ref resolved, ref name)) = file_path {
-        let mut r = serve_file(&req, resolved, name).await;
-        // XSS disarm: rewrite Content-Type and force download for any media
-        // upload whose extension can carry JS. Static keeps native types — a
-        // CMS-served `theme.html` is admin-curated. The type comes from the
-        // requested name, so check it and the symlink target both.
-        if matches!(config.mode, ServeMode::Media)
-            && (is_dangerous_media_ext(name) || is_dangerous_media_ext(resolved))
-        {
-            disarm_scripting_response(&mut r);
-        }
-        r
+        serve_file(&req, resolved, name, config.mode).await
     } else {
         not_found_response()
     };
@@ -305,34 +308,48 @@ pub async fn handle_file(
 }
 
 /// Open `file_path`, and take the content type from the name of `name`.
-async fn serve_file(req: &HttpRequest, file_path: &Path, name: &Path) -> HttpResponse {
+///
+/// A media file that a browser can run as script goes out as
+/// `application/octet-stream` with `Content-Disposition: attachment`. The
+/// browser then saves the bytes and does not show them. Static files keep
+/// their type: they are the files of the site. `NamedFile` puts the same
+/// headers on a `200`, a `206`, a `304` and a `HEAD` response.
+///
+/// The disposition has no `filename` parameter, so the URL path does not go
+/// into a header. The browser takes the name from the URL.
+async fn serve_file(
+    req: &HttpRequest,
+    file_path: &Path,
+    name: &Path,
+    mode: ServeMode,
+) -> HttpResponse {
     // Use sync reads for files under 256KB (faster for typical static assets)
     // See: https://github.com/actix/actix-web/pull/3706
     match std::fs::File::open(file_path).and_then(|file| NamedFile::from_file(file, name)) {
-        Ok(named) => named.read_mode_threshold(256 * 1024).into_response(req),
+        Ok(mut named) => {
+            if matches!(mode, ServeMode::Media) && media_can_run_script(&named, file_path, name) {
+                named = named
+                    .set_content_type(mime::APPLICATION_OCTET_STREAM)
+                    .set_content_disposition(ContentDisposition {
+                        disposition: DispositionType::Attachment,
+                        parameters: Vec::new(),
+                    });
+            }
+            named.read_mode_threshold(256 * 1024).into_response(req)
+        }
         Err(_) => not_found_response(),
     }
 }
 
-/// Replace the response's Content-Type with `application/octet-stream` and
-/// force `Content-Disposition: attachment`. Together these tell every modern
-/// browser to download the bytes rather than render them, which neutralises
-/// stored XSS via user-uploaded HTML/SVG/JS in MEDIA_ROOT.
-///
-/// We deliberately do NOT include a `filename=` parameter to avoid feeding
-/// attacker-controlled bytes (the URL path) into header construction. The
-/// browser falls back to the last path segment of the URL for the saved
-/// filename, which is fine.
-fn disarm_scripting_response(response: &mut HttpResponse) {
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/octet-stream"),
-    );
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        header::HeaderValue::from_static("attachment"),
-    );
+/// True when the type of the response, or the type of the name of a symlink
+/// target, can run script. The target name is checked only when it differs.
+fn media_can_run_script(named: &NamedFile, file_path: &Path, name: &Path) -> bool {
+    can_run_script(named.content_type())
+        || (file_path.file_name() != name.file_name()
+            && file_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| can_run_script(&file_extension_to_mime(ext))))
 }
 
 fn not_found_response() -> HttpResponse {
@@ -787,35 +804,146 @@ mod tests {
         assert!(result.unwrap().to_string_lossy().contains("file2.txt"));
     }
 
+    fn mime(essence: &str) -> Mime {
+        essence.parse().unwrap()
+    }
+
     #[test]
-    fn test_is_dangerous_media_ext() {
-        // Script-bearing extensions must be flagged regardless of case.
-        for ext in &[
-            "html", "HTM", "xhtml", "xhtm", "shtml", "shtm", "htc", "hta", "svg", "SVGZ", "xml",
-            "xsl", "xslt", "js", "MJS", "cjs", "wasm",
+    fn html_xml_javascript_and_wasm_types_can_run_script() {
+        for essence in [
+            "text/html",
+            "text/html; charset=utf-8",
+            "TEXT/HTML",
+            "text/xml",
+            "application/xml",
+            "application/xhtml+xml",
+            "image/svg+xml",
+            "IMAGE/SVG+XML",
+            "application/rss+xml",
+            "application/atom+xml",
+            "application/rdf+xml",
+            "application/mathml+xml",
+            "application/xslt+xml",
+            "model/x3d+xml",
+            "application/ecmascript",
+            "application/javascript",
+            "application/x-ecmascript",
+            "application/x-javascript",
+            "text/ecmascript",
+            "text/javascript",
+            "text/javascript1.0",
+            "text/javascript1.5",
+            "text/jscript",
+            "text/livescript",
+            "text/x-ecmascript",
+            "text/x-javascript",
+            "application/wasm",
+            "text/x-component",
+            "application/hta",
         ] {
-            let p = Path::new(&format!("upload.{}", ext)).to_path_buf();
+            assert!(can_run_script(&mime(essence)), "{essence}");
+        }
+        for essence in [
+            "image/png",
+            "image/jpeg",
+            "application/pdf",
+            "text/plain",
+            "text/css",
+            "application/json",
+            "application/octet-stream",
+            "application/xml-dtd",
+            "application/wbxml",
+            "text/javascript2.0",
+            "video/mp4",
+        ] {
+            assert!(!can_run_script(&mime(essence)), "{essence}");
+        }
+    }
+
+    /// Walk each extension that mime_guess knows. A media file of a type that
+    /// can run script must be a download, and any other file keeps its type.
+    /// A new mime_guess release that maps a new extension to such a type
+    /// thus cannot serve that file inline.
+    #[actix_web::test]
+    async fn every_media_extension_with_a_script_type_is_a_download() {
+        let temp_dir = TempDir::new().unwrap();
+        let extensions: std::collections::BTreeSet<&str> = mime_guess::get_extensions("*", "*")
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        let mut downloads = std::collections::BTreeSet::new();
+        for ext in &extensions {
+            let file_name = format!("upload.{ext}");
+            fs::write(temp_dir.path().join(&file_name), "<script>1</script>").unwrap();
+            let sent = mime_guess::from_path(&file_name).first_or_octet_stream();
+            let response = get(scope(temp_dir.path(), ServeMode::Media, false), &file_name).await;
+            assert_eq!(response.status(), 200, "{file_name}");
+            let content_type = header_of(&response, "content-type").unwrap();
+            if can_run_script(&sent) {
+                assert_eq!(content_type, "application/octet-stream", "{file_name}");
+                assert_eq!(
+                    header_of(&response, "content-disposition"),
+                    Some("attachment"),
+                    "{file_name}"
+                );
+                downloads.insert(*ext);
+            } else {
+                assert!(content_type.starts_with(sent.essence_str()), "{file_name}");
+            }
+        }
+        // The ten extensions of audit finding M1 and the common script types.
+        for ext in [
+            "xht", "rss", "atom", "rdf", "mathml", "xsd", "dtd", "es", "jsm", "ecma", "html",
+            "htm", "xhtml", "shtml", "htc", "hta", "svg", "svgz", "xml", "xsl", "xslt", "js",
+            "mjs", "wasm",
+        ] {
+            assert!(downloads.contains(ext), "{ext}");
+        }
+        assert!(downloads.len() > 150, "{}", downloads.len());
+    }
+
+    /// An extension that mime_guess does not know, or no extension, gives
+    /// `application/octet-stream`. A browser saves such a file.
+    #[actix_web::test]
+    async fn media_of_an_unknown_type_is_an_octet_stream_download() {
+        let temp_dir = TempDir::new().unwrap();
+        for name in ["upload.xhtm", "upload.shtm", "upload.cjs", "upload"] {
+            fs::write(temp_dir.path().join(name), "<script>1</script>").unwrap();
+            let response = get(scope(temp_dir.path(), ServeMode::Media, false), name).await;
+            assert_eq!(
+                header_of(&response, "content-type"),
+                Some("application/octet-stream"),
+                "{name}"
+            );
             assert!(
-                is_dangerous_media_ext(&p),
-                "{} must be flagged dangerous (case-insensitive)",
-                ext
+                header_of(&response, "content-disposition")
+                    .unwrap()
+                    .starts_with("attachment"),
+                "{name}"
             );
         }
-        // Inert types stay inline so legitimate avatars/images keep working.
-        for ext in &[
-            "png", "jpg", "jpeg", "gif", "webp", "pdf", "txt", "json", "css",
+    }
+
+    /// Static files are the files of the site, so each keeps its own type.
+    #[actix_web::test]
+    async fn static_files_of_a_script_type_keep_their_type() {
+        let temp_dir = TempDir::new().unwrap();
+        for (name, essence) in [
+            ("page.xht", "application/xhtml+xml"),
+            ("feed.rss", "application/rss+xml"),
+            ("app.js", "text/javascript"),
+            ("logo.svg", "image/svg+xml"),
         ] {
-            let p = Path::new(&format!("upload.{}", ext)).to_path_buf();
+            fs::write(temp_dir.path().join(name), "<script>1</script>").unwrap();
+            let response = get(scope(temp_dir.path(), ServeMode::Static, false), name).await;
             assert!(
-                !is_dangerous_media_ext(&p),
-                "{} must NOT be flagged dangerous",
-                ext
+                header_of(&response, "content-type")
+                    .unwrap()
+                    .starts_with(essence),
+                "{name}"
             );
         }
-        // No extension at all: don't rewrite. Browsers default to octet-stream
-        // for unknown types anyway via nosniff, so this is safe.
-        assert!(!is_dangerous_media_ext(Path::new("Makefile")));
-        assert!(!is_dangerous_media_ext(Path::new("")));
     }
 
     #[test]
