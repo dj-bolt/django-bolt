@@ -244,20 +244,55 @@ def test_resource_read_gets_a_server_span(provider, exporter):
     [
         ("timetable://north", "timetable://north"),
         ("note:42", "note:42"),
-        ("vault://admin:hunter2@db.internal/key?day=mon&sig=abc", "vault://db.internal/key?day=mon&sig=REDACTED"),
-        (
-            "files://reports/q3?AWSAccessKeyId=AKIA1&Signature=c2ln&X-Goog-Signature=Z29v&page=2",
-            "files://reports/q3?AWSAccessKeyId=REDACTED&Signature=REDACTED&X-Goog-Signature=REDACTED&page=2",
-        ),
+        ("vault://admin:hunter2@db.internal/key", "vault://db.internal/key"),
+        ("files://q3?access_token=s3cr3t", "files://q3?access_token=REDACTED"),
+        ("files://q3?sig=abc&page=2", "files://q3?sig=REDACTED&page=REDACTED"),
+        ("files://q3?download", "files://q3?download"),
+        ("files://q3?a=", "files://q3?a=REDACTED"),
+        ("files://q3?tag=x&tag=y", "files://q3?tag=REDACTED&tag=REDACTED"),
+        ("files://q3#page=4", "files://q3"),
+        ("note:42#private", "note:42"),
     ],
 )
-def test_resource_uri_attribute_has_no_credentials(provider, exporter, uri, recorded):
+def test_resource_uri_attribute_without_content_capture(provider, exporter, monkeypatch, uri, recorded):
+    monkeypatch.delenv(CAPTURE_CONTENT, raising=False)
     with TestClient(_server(provider)) as client:
         _rpc(client, "resources/read", {"uri": uri})
     assert _server_span(exporter).attributes["mcp.resource.uri"] == recorded
 
 
-def test_resource_reads_the_uri_as_the_client_sent_it(provider, exporter):
+@pytest.mark.parametrize(
+    ("uri", "hidden"),
+    [
+        ("files://q3?access_token=tok-5d1e", ["tok-5d1e"]),
+        ("files://q3?sig=sig-77ab&page=page-90cf", ["sig-77ab", "page-90cf"]),
+    ],
+)
+def test_query_values_are_nowhere_in_the_span_without_content_capture(provider, exporter, monkeypatch, uri, hidden):
+    monkeypatch.delenv(CAPTURE_CONTENT, raising=False)
+    with TestClient(_server(provider)) as client:
+        _rpc(client, "resources/read", {"uri": uri})
+    exported = _server_span(exporter).to_json()
+    assert [value for value in hidden if value in exported] == []
+
+
+@pytest.mark.parametrize(
+    ("uri", "recorded"),
+    [
+        ("timetable://north", "timetable://north"),
+        ("files://q3?access_token=s3cr3t", "files://q3?access_token=s3cr3t"),
+        ("vault://admin:hunter2@db.internal/key?sig=abc&page=2#top", "vault://db.internal/key?sig=abc&page=2#top"),
+    ],
+)
+def test_resource_uri_attribute_with_content_capture_has_no_userinfo(provider, exporter, monkeypatch, uri, recorded):
+    monkeypatch.setenv(CAPTURE_CONTENT, "true")
+    with TestClient(_server(provider)) as client:
+        _rpc(client, "resources/read", {"uri": uri})
+    assert _server_span(exporter).attributes["mcp.resource.uri"] == recorded
+
+
+def test_resource_reads_the_uri_as_the_client_sent_it(provider, exporter, monkeypatch):
+    monkeypatch.delenv(CAPTURE_CONTENT, raising=False)
     with TestClient(_server(provider)) as client:
         body = _rpc(client, "resources/read", {"uri": "timetable://north?sig=abc"})
     assert body["result"]["contents"][0]["text"] == "north?sig=abc: every 10 minutes"

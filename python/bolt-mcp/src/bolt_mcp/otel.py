@@ -11,8 +11,11 @@ The span follows the OpenTelemetry semantic conventions for MCP. Its parent is
 the trace context in the request ``_meta``. ``bolt_mcp`` does not import this
 module, so an app that does not call ``instrument()`` does not load OpenTelemetry.
 
-Request content leaves the process only when the environment variable
-``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is ``true``.
+The span records the tool arguments, the tool results, the exception text, and
+the query values and fragment of a resource URI only when the environment variable
+``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is ``true``. The tool name,
+the prompt name, and the scheme, host, path and query keys of a resource URI
+always go in the span.
 """
 
 from __future__ import annotations
@@ -41,8 +44,6 @@ if TYPE_CHECKING:
     from .server import MCP
 
 _CAPTURE_MESSAGE_CONTENT = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
-# The OpenTelemetry HTTP conventions redact the values of these query parameters by default.
-_REDACTED_QUERY_KEYS = frozenset({"AWSAccessKeyId", "Signature", "sig", "X-Goog-Signature"})
 
 
 class _MetaGetter(Getter[dict[str, Any]]):
@@ -63,26 +64,30 @@ _META_GETTER = _MetaGetter()
 
 
 def _redact_query_pair(pair: str) -> str:
-    key = pair.partition("=")[0]
-    return f"{key}=REDACTED" if key in _REDACTED_QUERY_KEYS else pair
+    key, separator, _ = pair.partition("=")
+    return f"{key}=REDACTED" if separator else pair
 
 
-def _redact_uri(uri: str) -> str | None:
-    """Give ``uri`` with no userinfo, and with ``REDACTED`` as the value of each key in ``_REDACTED_QUERY_KEYS``.
+def _redact_uri(uri: str, capture_content: bool) -> str | None:
+    """Give ``uri`` with no userinfo. Without content capture, also replace each query value and remove the fragment.
 
     Give ``None`` for a URI that ``urlsplit`` cannot parse, because such a URI can hold credentials.
     """
-    if "@" not in uri and "?" not in uri:
+    if "@" not in uri and "?" not in uri and "#" not in uri:
         return uri
     try:
         parts = urlsplit(uri)
     except ValueError:
         return None
     netloc = parts.netloc.rpartition("@")[2]
-    query = "&".join(_redact_query_pair(pair) for pair in parts.query.split("&"))
-    if netloc == parts.netloc and query == parts.query:
+    if capture_content:
+        query, fragment = parts.query, parts.fragment
+    else:
+        query = "&".join(_redact_query_pair(pair) for pair in parts.query.split("&"))
+        fragment = ""
+    if (netloc, query, fragment) == (parts.netloc, parts.query, parts.fragment):
         return uri
-    return urlunsplit(parts._replace(netloc=netloc, query=query))
+    return urlunsplit(parts._replace(netloc=netloc, query=query, fragment=fragment))
 
 
 def _set_error(span: Span, error_type: str) -> None:
@@ -126,10 +131,11 @@ def instrument(mcp: MCP, *, tracer_provider: TracerProvider | None = None) -> No
     An exception from a resource, a prompt or middleware in the span sets ``error.type``
     to the exception class name and the ``ERROR`` status.
 
-    The span records the tool arguments, the tool result and the exception event (with the
-    exception message) only when the environment variable
-    ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is ``true`` at this call.
-    The ``mcp.resource.uri`` attribute has no userinfo and no signature values.
+    The span records the tool arguments, the tool result, the exception event (with the
+    exception message) and the query values and fragment of a resource URI only when the
+    environment variable ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is ``true``
+    at this call. Without it, each query value in ``mcp.resource.uri`` is ``REDACTED``.
+    The ``mcp.resource.uri`` attribute never has userinfo.
 
     Raise ``ValueError`` when ``mcp`` is already instrumented.
     """
@@ -160,7 +166,7 @@ def instrument(mcp: MCP, *, tracer_provider: TracerProvider | None = None) -> No
     async def trace_resource_read(read: ResourceRead, call_next) -> dict[str, Any]:
         # A URI can hold an id, so it stays out of the span name.
         attributes = {"mcp.method.name": "resources/read"}
-        uri = _redact_uri(read.uri)
+        uri = _redact_uri(read.uri, capture_content)
         if uri is not None:
             attributes["mcp.resource.uri"] = uri
         with _server_span(tracer, "resources/read", read.meta, attributes, capture_content):
