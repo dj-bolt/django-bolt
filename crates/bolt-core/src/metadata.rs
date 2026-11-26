@@ -561,6 +561,9 @@ impl RouteExecutionPlan {
 #[derive(Debug, Clone, Default)]
 pub struct RouteMetadataStore {
     by_handler_id: Vec<Option<RouteMetadata>>,
+    /// Whether a route has a CORS config. Without one and with no global
+    /// config, the CORS middleware does no route lookup.
+    has_cors: bool,
 }
 
 impl RouteMetadataStore {
@@ -570,11 +573,20 @@ impl RouteMetadataStore {
         }
 
         let max_id = map.keys().copied().max().unwrap_or(0);
+        let has_cors = map.values().any(|metadata| metadata.cors_config.is_some());
         let mut by_handler_id: Vec<Option<RouteMetadata>> = (0..=max_id).map(|_| None).collect();
         for (handler_id, metadata) in map {
             by_handler_id[handler_id] = Some(metadata);
         }
-        Self { by_handler_id }
+        Self {
+            by_handler_id,
+            has_cors,
+        }
+    }
+
+    #[inline]
+    pub fn has_cors(&self) -> bool {
+        self.has_cors
     }
 
     #[inline]

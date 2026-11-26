@@ -44,7 +44,11 @@ access-control-allow-origin: https://app.example.com
 vary: Origin
 ```
 
-An origin that is not in the list gets the response with no CORS headers. The browser then hides the response from the page.
+An origin that is not in the list gets the response with no `access-control-allow-origin`. The browser then hides the response from the page.
+
+The answer depends on the `Origin` of the request. Thus each response of the route has `vary: Origin`, also for a refused origin and for a request with no `Origin`.
+A cache then keeps one response for each origin, and it does not give the response of one origin to another.
+Bolt adds `Origin` to the `Vary` values of the handler, one time. It does not change `Vary: *`.
 
 Before a `POST` with a JSON body, the browser sends a preflight `OPTIONS` request. Bolt answers it with a 204:
 
@@ -62,8 +66,13 @@ access-control-allow-origin: https://app.example.com
 access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS, QUERY
 access-control-allow-headers: Content-Type, Authorization
 access-control-max-age: 3600
-vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers
+vary: Origin
+vary: Access-Control-Request-Method
+vary: Access-Control-Request-Headers
 ```
+
+A preflight of a refused origin gets the same three `vary` values, but no `access-control-allow-*` header.
+The answer depends on the requested method, because the route of that method gives the CORS config.
 
 You do not write an `OPTIONS` handler. Bolt answers the preflight of each route path.
 Bolt also adds the CORS headers to error responses, such as a 401, a 404 or a 429. The page can then read the error.
@@ -76,7 +85,7 @@ Bolt reads these settings at startup:
 | --- | --- | --- |
 | `CORS_ALLOWED_ORIGINS` | `[]` | The origins that Bolt allows, for example `"https://app.example.com"` |
 | `CORS_ALLOWED_ORIGIN_REGEXES` | `[]` | Patterns of the origins that Bolt allows |
-| `CORS_ALLOW_ALL_ORIGINS` | `False` | Allow each origin with `access-control-allow-origin: *` |
+| `CORS_ALLOW_ALL_ORIGINS` | `False` | Allow each origin with `access-control-allow-origin: *`. Each response gets `*`, also with no `Origin`, so it needs no `vary: Origin` |
 | `CORS_ALLOW_CREDENTIALS` | `False` | Send `access-control-allow-credentials: true` |
 | `CORS_ALLOW_METHODS` | `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `QUERY` | The methods in a preflight answer |
 | `CORS_ALLOW_HEADERS` | `Content-Type`, `Authorization` | The request headers in a preflight answer |
@@ -109,7 +118,7 @@ CORS_ALLOW_CREDENTIALS = True
 An `Authorization` header with a token is not a credential in this sense. It needs only `Authorization` in `CORS_ALLOW_HEADERS`, which is in the default list.
 
 !!! warning "Do not allow all origins with credentials"
-    With `CORS_ALLOW_ALL_ORIGINS = True` and `CORS_ALLOW_CREDENTIALS = True`, Bolt copies the `Origin` of each request into `access-control-allow-origin`.
+    With `CORS_ALLOW_ALL_ORIGINS = True` and `CORS_ALLOW_CREDENTIALS = True`, Bolt copies the `Origin` of each request into `access-control-allow-origin`, with `vary: Origin`.
     Thus each site on the internet can send requests with the cookies of your users and read the responses. Bolt prints a warning at startup.
     List your origins instead.
 
