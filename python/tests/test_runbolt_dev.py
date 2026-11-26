@@ -689,8 +689,11 @@ def test_merge_apis_runs_the_middleware_of_the_first_api_for_a_path_with_no_rout
     assert second_response.headers["x-api"] == "second"
 
 
-def test_docs_routes_of_a_merged_api_run_the_middleware_that_runbolt_gives_them():
-    """runbolt registers the docs routes of a merged API with the middleware of the first API."""
+def test_docs_routes_of_a_merged_api_run_the_middleware_given_at_registration():
+    """The docs routes of a merged API run the middleware that ``_register_openapi_routes`` gets.
+
+    This test makes the call itself. It does not cover the two call sites in runbolt.
+    """
     first = BoltAPI(middleware=[_FirstApiMiddleware])
     second = BoltAPI(middleware=[_SecondApiMiddleware])
 
