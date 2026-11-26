@@ -356,6 +356,24 @@ def test_a_body_that_the_output_schema_does_not_describe_gives_an_error_result()
     )
 
 
+def test_a_json_body_that_the_output_schema_does_not_describe_gives_an_error_result():
+    """Bolt does not validate the bytes of a ``Response``, so the tool checks them against its schema."""
+    api = BoltAPI()
+
+    @api.get("/user", response_model=Public)
+    async def user():
+        return Response(b'{"name":1}', media_type="application/json")
+
+    api.mount_mcp(MCP("t", mask_error_details=False), expose=[user])
+    with TestClient(api) as client:
+        assert client.get("/user").content == b'{"name":1}'
+        result = _call(client, "user")
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "Tool 'user' returned a body that its output schema does not describe: Expected `str`, got `int` - at `$.name`"
+    )
+
+
 def test_mcp_tool_result_does_not_change():
     """An @mcp.tool is not a route: its return value goes to the client as it is."""
     api = BoltAPI()

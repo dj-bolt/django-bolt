@@ -132,7 +132,7 @@ def _content_type(meta: Any) -> tuple[str, str]:
     return media_type.strip().lower(), charset
 
 
-def route_tool_result(name: str, schema_status: int | None, wire: ResponseWireV1) -> ToolResult:
+def route_tool_result(name: str, output: tuple[int, msgspec.json.Decoder] | None, wire: ResponseWireV1) -> ToolResult:
     """Map the HTTP response of an exposed route to its tool result.
 
     ``wire`` is the response that Bolt serializes for the route, with its ``response_model``
@@ -140,8 +140,10 @@ def route_tool_result(name: str, schema_status: int | None, wire: ResponseWireV1
     the HTTP body. A 2xx text body is text content only. Any other status raises ``ToolError``
     with the HTTP body. A tool result has no headers or cookies, so they are not sent.
 
-    ``schema_status`` is the status of the body that the output schema of the tool describes,
-    or None when the tool has no output schema. Each other success body raises ``TypeError``.
+    ``output`` is None when the tool has no output schema. Else it holds the status of the body
+    that the output schema describes, and the decoder of the Struct of that schema. A success
+    body that this decoder refuses raises ``TypeError``. Bolt does not validate the bytes of a
+    ``Response``, so this check is necessary.
     """
     status, meta, body_kind, body = wire
     if body_kind != _BODY_BYTES:
@@ -149,10 +151,17 @@ def route_tool_result(name: str, schema_status: int | None, wire: ResponseWireV1
     if not 200 <= status < 300:
         raise ToolError(body.decode(errors="replace") if body else f"Tool {name!r} answered with HTTP status {status}.")
     media_type, charset = _content_type(meta)
-    if schema_status is not None and (status != schema_status or not _is_json_media_type(media_type)):
-        raise TypeError(
-            f"Tool {name!r} returned a body that its output schema does not describe (status {status}, {media_type!r})."
-        )
+    if output is not None:
+        schema_status, decoder = output
+        if status != schema_status or not _is_json_media_type(media_type):
+            raise TypeError(
+                f"Tool {name!r} returned a body that its output schema does not describe "
+                f"(status {status}, {media_type!r})."
+            )
+        try:
+            decoder.decode(body)
+        except msgspec.DecodeError as exc:
+            raise TypeError(f"Tool {name!r} returned a body that its output schema does not describe: {exc}") from exc
     if not body:
         return ToolResult(content=[])
     if _is_json_media_type(media_type):

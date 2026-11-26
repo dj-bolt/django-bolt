@@ -14,6 +14,8 @@ from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any
 
+import msgspec
+
 from django_bolt._response_dump import compile_serializer_dumper
 from django_bolt.middleware import DjangoMiddleware, DjangoMiddlewareStack
 from django_bolt.responses import File, FileResponse, StreamingResponse
@@ -141,7 +143,10 @@ def _route_tool_fn(name: str, handler: Callable, meta: dict[str, Any], output_sc
     The function calls the handler and serializes its result with the handlers that HTTP uses. Thus the
     ``response_model``, the return annotation and the response validation of the route apply to the tool result.
     """
-    to_result = partial(route_tool_result, name, meta["default_status_code"] if output_schema is not None else None)
+    output = None
+    if output_schema is not None:
+        output = (meta["default_status_code"], msgspec.json.Decoder(meta["response_type"]))
+    to_result = partial(route_tool_result, name, output)
     if meta["is_multi_response"]:
         serialize_async, serialize_sync = meta["_multi_response_serializers"]
     else:
