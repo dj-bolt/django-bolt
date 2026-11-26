@@ -201,10 +201,10 @@ The path is the full path, with the prefix, the mount path and the trailing slas
   Move the parameter to the end of the path.
 - **Two parameters in one segment.** `/files/{name}-{version}` gives `has two parameters in one segment`.
   Use one parameter for the segment, and split the value in the handler.
-- **A parameter with no name, or a `{` with no `}`.** `/files/{}` and `/files/{id` give `has a parameter with no name, or a brace with no pair`.
+- **A parameter with no name, or a brace with no pair.** `/files/{}`, `/files/{id` and `/files/id}/{item}` give `has a parameter with no name, or a brace with no pair`.
   Write each parameter as `{name}` or `{name:type}`.
-  A `}` with no `{` before it does not stop the startup, but do not use it in a path.
-  Most clients send `}` as `%7D`, and that request gets 404.
+  A path with no `{` is an exception: `/files/id}` does not stop the startup.
+  Do not use such a path. Most clients send `}` as `%7D`, and that request gets 404.
 
 ## Add a prefix to each route
 
