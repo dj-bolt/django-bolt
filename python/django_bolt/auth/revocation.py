@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from django.apps import apps
 from django.core.cache import caches
 from django.core.cache.backends.base import BaseCache, InvalidCacheKey
+from django.core.cache.backends.db import BaseDatabaseCache
 from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError
 from django.db.models import F
@@ -250,7 +251,9 @@ class DjangoCacheRevocation(RevocationStore):
     """
     Django cache-based revocation store.
 
-    Basic revocation works with any Django cache backend. Refresh rotation
+    Basic revocation works with any Django cache backend. A database cache runs a
+    query for each call, so the store uses the async cache API for it. Each other
+    cache stays on the sync API, with no thread hop on the request path. Refresh rotation
     and user-version bumps additionally require a backend whose ``add`` and
     ``incr`` operations are atomic (Redis, Memcached, or LocMem in the
     documented single-process development mode). File-based cache is rejected
@@ -324,21 +327,31 @@ class DjangoCacheRevocation(RevocationStore):
         self.default_ttl = default_ttl
         self.leeway = _checked_leeway("DjangoCacheRevocation", leeway)
         self._cache = None
+        # True for a cache that runs a database query for each call. The cache property sets it.
+        self._queries_db = False
 
     @property
     def cache(self):
         """Lazy-load cache to avoid import issues."""
         if self._cache is None:
-            self._cache = caches[self.cache_alias]
+            cache = caches[self.cache_alias]
+            # Django refuses a query on the event loop, so a database cache needs the async API.
+            # The default async API of Django runs each call in a thread. Thus each other cache
+            # stays on the sync API. Set this flag before _cache: a reader of _cache then sees it.
+            self._queries_db = isinstance(cache, BaseDatabaseCache)
+            self._cache = cache
         return self._cache
 
     async def is_revoked(self, jti: str) -> bool:
         _check_jti(jti, _CACHE_RESERVED_PREFIXES)
         key = f"{self.key_prefix}{jti}"
-        # Django cache get is sync, but fast. A memcached backend refuses a key with a space
-        # or a key over 250 characters.
+        cache = self.cache
+        # This is the body of _get, inline: is_revoked runs for each authenticated request.
+        # A memcached backend refuses a key with a space or a key over 250 characters.
         try:
-            return self.cache.get(key) is not None
+            if self._queries_db:
+                return await cache.aget(key) is not None
+            return cache.get(key) is not None
         except InvalidCacheKey as exc:
             raise _refused_cache_key(exc) from exc
 
@@ -359,9 +372,27 @@ class DjangoCacheRevocation(RevocationStore):
         A key that the cache backend refuses also raises ``ReservedJtiError``.
         """
         _check_jti(jti, _CACHE_RESERVED_PREFIXES)
-        key = f"{self.key_prefix}{jti}"
+        await self._set(f"{self.key_prefix}{jti}", exp)
+
+    async def _set(self, key: str, exp: int | None) -> None:
+        """Set the marker ``key`` until ``exp + self.leeway``."""
+        cache = self.cache
+        timeout = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
         try:
-            self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
+            if self._queries_db:
+                await cache.aset(key, "1", timeout=timeout)
+            else:
+                cache.set(key, "1", timeout=timeout)
+        except InvalidCacheKey as exc:
+            raise _refused_cache_key(exc) from exc
+
+    async def _get(self, key: str):
+        """Return the value of ``key``, or ``None`` when the cache does not have it."""
+        cache = self.cache
+        try:
+            if self._queries_db:
+                return await cache.aget(key)
+            return cache.get(key)
         except InvalidCacheKey as exc:
             raise _refused_cache_key(exc) from exc
 
@@ -371,6 +402,8 @@ class DjangoCacheRevocation(RevocationStore):
         known_non_atomic = {
             "django.core.cache.backends.filebased",
             "django.core.cache.backends.dummy",
+            # A subclass can replace incr, but each call still runs a query on the event loop.
+            "django.core.cache.backends.db",
         }
         inherits_non_atomic_incr = getattr(cache_type, "incr", None) is BaseCache.incr
         if backend_modules.intersection(known_non_atomic) or inherits_non_atomic_incr:
@@ -394,10 +427,7 @@ class DjangoCacheRevocation(RevocationStore):
             raise _refused_cache_key(exc) from exc
 
     async def get_user_version(self, user_id: str) -> int:
-        try:
-            return int(self.cache.get(f"{self.key_prefix}ver:{user_id}") or 0)
-        except InvalidCacheKey as exc:
-            raise _refused_cache_key(exc) from exc
+        return int(await self._get(f"{self.key_prefix}ver:{user_id}") or 0)
 
     async def bump_user_version(self, user_id: str) -> int:
         # User-version keys never expire — they are the source of truth for
@@ -417,17 +447,10 @@ class DjangoCacheRevocation(RevocationStore):
             return self.cache.incr(key)
 
     async def revoke_family(self, fam: str, *, exp: int | None = None) -> None:
-        key = f"{self.key_prefix}fam:{fam}"
-        try:
-            self.cache.set(key, "1", timeout=_ttl_for(exp, self.default_ttl, leeway=self.leeway))
-        except InvalidCacheKey as exc:
-            raise _refused_cache_key(exc) from exc
+        await self._set(f"{self.key_prefix}fam:{fam}", exp)
 
     async def is_family_revoked(self, fam: str) -> bool:
-        try:
-            return self.cache.get(f"{self.key_prefix}fam:{fam}") is not None
-        except InvalidCacheKey as exc:
-            raise _refused_cache_key(exc) from exc
+        return await self._get(f"{self.key_prefix}fam:{fam}") is not None
 
 
 class DjangoORMRevocation(RevocationStore):

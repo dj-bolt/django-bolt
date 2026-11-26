@@ -16,6 +16,7 @@ test-driven (RED first):
 
 from __future__ import annotations
 
+import dataclasses
 import types
 from typing import Annotated, Generic, TypeVar
 
@@ -27,7 +28,7 @@ from django_bolt import BoltAPI, ModelViewSet
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.openapi.schema_generator import OpenAPIStrictError, SchemaGenerator
 from django_bolt.pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
-from django_bolt.params import Body
+from django_bolt.params import Body, Depends
 from django_bolt.responses import (
     HTML,
     JSON,
@@ -842,6 +843,126 @@ def test_annotated_reference_follows_the_qualified_component_name():
         "description": "The first item.",
     }
     assert "app_one.schemas.Item" in schema["components"]["schemas"]
+
+
+# ---------------------------------------------------------------------------
+# #958 — the msgspec.Meta of an Annotated struct body
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class NewUser:
+    name: str
+
+
+async def _user_body_dependency(body: Annotated[UserRead, USER_META]) -> UserRead:
+    return body
+
+
+def _request_body_schema(schema: dict, path: str) -> dict:
+    return schema["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+
+
+def test_meta_of_an_annotated_struct_body_is_next_to_the_component_reference():
+    """``body: Annotated[Item, Meta(...)]`` keeps the Meta keywords next to the ``$ref`` (#958).
+
+    Bolt binds such a body as ``Item``. Only the schema reads the Meta.
+    """
+    api = BoltAPI(openapi_config=_config())
+
+    @api.post("/users")
+    async def create_user(body: Annotated[UserRead, USER_META]):
+        pass
+
+    @api.post("/embedded")
+    async def create_embedded(user: Annotated[UserRead, USER_META, Body(embed=True)]):
+        pass
+
+    @api.post("/dataclass")
+    async def create_dataclass(body: Annotated[NewUser, msgspec.Meta(description="A new user.")]):
+        pass
+
+    @api.post("/optional")
+    async def create_optional(body: Annotated[UserRead | None, USER_META] = None):
+        pass
+
+    @api.post("/dependency")
+    async def create_with_dependency(user=Depends(_user_body_dependency)):
+        pass
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _request_body_schema(schema, "/users") == {**USER_REF, **USER_META_KEYWORDS}
+    assert _request_body_schema(schema, "/optional") == {
+        "anyOf": [USER_REF, {"type": "null"}],
+        **USER_META_KEYWORDS,
+    }
+    assert _request_body_schema(schema, "/dependency") == {**USER_REF, **USER_META_KEYWORDS}
+    assert _request_body_schema(schema, "/embedded") == {
+        "type": "object",
+        "properties": {"user": {**USER_REF, **USER_META_KEYWORDS}},
+        "required": ["user"],
+    }
+    assert _request_body_schema(schema, "/dataclass") == {
+        "$ref": "#/components/schemas/NewUser",
+        "description": "A new user.",
+    }
+    assert schema["components"]["schemas"]["UserRead"] == _plain_user_component()
+
+
+def test_meta_of_an_annotated_struct_body_does_not_change_binding():
+    """The Meta of ``body: Annotated[Item, Meta(...)]`` is for the schema only (#958).
+
+    The body decodes as ``Item``, as with ``body: Item``.
+    """
+    api = BoltAPI()
+
+    @api.post("/users")
+    async def create_user(body: Annotated[UserRead, USER_META]) -> UserRead:
+        return body
+
+    @api.post("/dataclass")
+    async def create_dataclass(body: Annotated[NewUser, msgspec.Meta(description="A new user.")]) -> dict:
+        return {"type": type(body).__name__, "name": body.name}
+
+    with TestClient(api) as client:
+        created = client.post("/users", json={"id": 1, "name": "a"})
+        assert created.status_code == 200
+        assert created.json() == {"id": 1, "name": "a"}
+
+        invalid = client.post("/users", json={"id": "x", "name": "a"})
+        assert invalid.status_code == 422
+
+        dataclass_body = client.post("/dataclass", json={"name": "b"})
+        assert dataclass_body.status_code == 200
+        assert dataclass_body.json() == {"type": "NewUser", "name": "b"}
+
+
+def test_constraint_in_the_meta_of_a_struct_body_stays_out_of_the_schema():
+    """A struct body ignores a constraint such as ``ge`` in its Meta, so the schema ignores it too (#958).
+
+    msgspec cannot apply ``ge`` or ``min_length`` to a struct. The schema
+    keeps only the schema keywords, and ``/docs/openapi.json`` still works.
+    """
+    api = BoltAPI(openapi_config=_config())
+
+    @api.post("/users")
+    async def create_user(body: Annotated[UserRead, msgspec.Meta(min_length=1, description="The user.")]) -> UserRead:
+        return body
+
+    @api.post("/ranked")
+    async def create_ranked(body: Annotated[UserRead, msgspec.Meta(ge=1)]) -> UserRead:
+        return body
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _request_body_schema(schema, "/users") == {**USER_REF, "description": "The user."}
+    assert _request_body_schema(schema, "/ranked") == USER_REF
+
+    with TestClient(api) as client:
+        created = client.post("/users", json={"id": 1, "name": "a"})
+        assert created.status_code == 200
+        assert created.json() == {"id": 1, "name": "a"}
 
 
 # ---------------------------------------------------------------------------
