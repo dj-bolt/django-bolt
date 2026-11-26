@@ -55,6 +55,7 @@ def test_a_server_reads_on_the_event_loop(make_server_project, postgres_database
 
     expected = [(200, {"username": USERNAMES[index % 3], "is_active": True}) for index in range(200)]
     assert results == expected
-    assert project.path("loop.log").read_text().splitlines() == [
-        "The async ORM reads of the database 'default' run on the event loop."
-    ]
+    # Each worker thread writes the line for its own event loop. A free-threaded server has one for each CPU.
+    lines = project.path("loop.log").read_text().splitlines()
+    assert lines, "no worker thread made a pool of loop connections"
+    assert set(lines) == {"The async ORM reads of the database 'default' run on the event loop."}

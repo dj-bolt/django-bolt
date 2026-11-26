@@ -80,8 +80,10 @@ def test_a_sqlite_read_uses_the_orm_pool(on_loop, probe_table):
 
     assert response.status_code == 200, response.text
     threads = response.json()
+    # The two reads are two calls to the pool. A pool with more than one thread can give each call its own thread.
     assert threads["aget"].startswith("bolt_orm"), threads
-    assert threads["async_for"] == [threads["aget"]]
+    assert len(threads["async_for"]) == 1, threads
+    assert threads["async_for"][0].startswith("bolt_orm"), threads
 
 
 @pytest.mark.parametrize("value", ["0", "many"])
