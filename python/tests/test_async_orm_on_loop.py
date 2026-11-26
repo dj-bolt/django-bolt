@@ -87,10 +87,11 @@ def test_a_sqlite_read_uses_the_orm_pool(on_loop, probe_table):
 
 
 @pytest.mark.parametrize("value", ["0", "many"])
-def test_an_invalid_connection_count_stops_the_server_at_startup(monkeypatch, value):
-    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", value)
+@pytest.mark.parametrize("name", ["DJANGO_BOLT_LOOP_CONNECTIONS", "DJANGO_BOLT_LOOP_PIPELINE_DEPTH"])
+def test_an_invalid_count_stops_the_server_at_startup(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
 
-    with pytest.raises(ImproperlyConfigured, match="DJANGO_BOLT_LOOP_CONNECTIONS must be an int of 1 or more"):
+    with pytest.raises(ImproperlyConfigured, match=f"{name} must be an int of 1 or more"):
         TestClient(_api())
 
 

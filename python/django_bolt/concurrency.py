@@ -635,9 +635,9 @@ def check_pool_environment() -> None:
 
     Raises:
         ImproperlyConfigured: DJANGO_BOLT_EXECUTOR_THREADS,
-            DJANGO_BOLT_ORM_THREADS or DJANGO_BOLT_LOOP_CONNECTIONS is not
-            an int of 1 or more, or a DJANGO_BOLT_LOOP_*_SECONDS variable
-            is not a number more than 0.
+            DJANGO_BOLT_ORM_THREADS, DJANGO_BOLT_LOOP_CONNECTIONS or
+            DJANGO_BOLT_LOOP_PIPELINE_DEPTH is not an int of 1 or more, or a
+            DJANGO_BOLT_LOOP_*_SECONDS variable is not a number more than 0.
     """
     _thread_count("DJANGO_BOLT_EXECUTOR_THREADS")
     _thread_count("DJANGO_BOLT_ORM_THREADS")

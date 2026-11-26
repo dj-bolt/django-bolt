@@ -1013,6 +1013,86 @@ def _api() -> BoltAPI:
             "message": str(waited),
         }
 
+    @api.get("/behind-a-slow-read")
+    async def behind_a_slow_read():
+        async def value(index: int) -> Any:
+            probes = LoopProbe.objects.using(ALIAS).annotate(pid=RawSQL("pg_backend_pid()", []))
+            try:
+                probe = await probes.annotate(value=RawSQL("%s", [index])).aget(label="a")
+            except Exception as error:
+                return type(error).__qualname__, None
+            return probe.value, probe.pid
+
+        # The slow read is first, so each other read starts while its statement is in flight.
+        slow, *others = await asyncio.gather(_backend_pid(nap=0.5), *(value(index) for index in range(12)))
+        return {
+            "values": [outcome for outcome, _pid in others],
+            "on_the_connection_of_the_slow_read": [pid == slow for _outcome, pid in others],
+        }
+
+    @api.get("/an-error-between-reads")
+    async def an_error_between_reads():
+        async def divide(by: int) -> Any:
+            try:
+                probe = await LoopProbe.objects.using(ALIAS).annotate(value=RawSQL("6 / %s", [by])).aget(label="a")
+            except Exception as error:
+                return {"module": type(error).__module__, "error": type(error).__qualname__}
+            return probe.value
+
+        _slow, *outcomes = await asyncio.gather(_backend_pid(nap=0.5), divide(1), divide(0), divide(2))
+        return outcomes
+
+    @api.get("/beside-a-slow-read")
+    async def beside_a_slow_read():
+        # Each of these reads is alone on its connection, so the pool learns the time of a fast read.
+        for _ in range(5):
+            await _backend_pid(nap=0)
+        slow = asyncio.ensure_future(_backend_pid(nap=1.5))
+        # The statement of the slow read is now in flight for much longer than a fast read.
+        await asyncio.sleep(0.2)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        fast = await asyncio.gather(*(_backend_pid(nap=0) for _ in range(20)))
+        seconds = loop.time() - start
+        return {
+            "connections_of_the_fast_reads": len(set(fast)),
+            "a_fast_read_behind_the_slow_read": await slow in fast,
+            "fast_reads_in_time": seconds < 1,
+        }
+
+    @api.get("/stop-a-read-behind-another")
+    async def stop_a_read_behind_another():
+        # Open the one connection of the loop.
+        await _backend_pid()
+        first = asyncio.ensure_future(_backend_pid(nap=0.5))
+        second = asyncio.ensure_future(_backend_pid())
+        await asyncio.sleep(0.1)
+        # The server runs the statement of the first read, and the statement of the second read is behind it.
+        second.cancel()
+        try:
+            pid = await first
+        except Exception as error:
+            return {"first": type(error).__qualname__}
+        return {"first": "ok", "second_cancelled": second.cancelled(), "same_connection": await _backend_pid() == pid}
+
+    @api.get("/unsent-statement")
+    async def unsent_statement():
+        outcomes = []
+        # psycopg has no SQL text for this parameter, so the statement of the first read does not go out.
+        for parameter in (object(), 7):
+            try:
+                probe = await _probes().annotate(value=RawSQL("%s", [parameter])).aget(label="a")
+            except Exception as error:
+                outcomes.append({"module": type(error).__module__, "error": type(error).__qualname__})
+            else:
+                outcomes.append(probe.value)
+        return outcomes
+
+    @api.get("/two-slow-reads-outcome")
+    async def two_slow_reads_outcome():
+        outcomes = await asyncio.gather(_backend_pid(nap=20), _backend_pid(nap=20), return_exceptions=True)
+        return [{"module": type(outcome).__module__, "error": type(outcome).__qualname__} for outcome in outcomes]
+
     @api.get("/session")
     async def session():
         probe = await (
@@ -1412,8 +1492,14 @@ def test_two_reads_that_start_together_open_two_connections(on_loop):
     assert all(name.startswith(ORM_THREAD) for name in opened), opened
 
 
+@pytest.fixture
+def one_statement_for_each_connection(monkeypatch):
+    """A connection takes one statement at a time, so a read at the connection limit waits for a connection."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_PIPELINE_DEPTH", "1")
+
+
 def test_a_loop_opens_ten_connections_by_default(on_loop):
-    """Each read at the same time gets a connection, up to the limit. The other reads wait."""
+    """Each read at the same time gets a connection, up to the limit. The other reads use these connections."""
     with TestClient(_api()) as client:
         response = client.get("/many-at-once/12")
 
@@ -1421,7 +1507,9 @@ def test_a_loop_opens_ten_connections_by_default(on_loop):
     assert response.json() == {"connections": 10}
 
 
-def test_a_read_that_waits_for_the_acquire_time_fails_with_the_django_error(on_loop, monkeypatch):
+def test_a_read_that_waits_for_the_acquire_time_fails_with_the_django_error(
+    on_loop, monkeypatch, one_statement_for_each_connection
+):
     monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
     monkeypatch.setenv("DJANGO_BOLT_LOOP_ACQUIRE_SECONDS", "0.2")
     with TestClient(_api()) as client:
@@ -1440,6 +1528,73 @@ def test_a_read_that_waits_for_the_acquire_time_fails_with_the_django_error(on_l
     assert after.json() == ["Ada", "Bob", "Cy"]
 
 
+def test_a_read_at_the_connection_limit_goes_out_behind_the_statement_in_flight(on_loop, monkeypatch):
+    """The reads do not wait for the connection: a read that waits fails after the acquire time, which is short here."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_ACQUIRE_SECONDS", "0.2")
+    with TestClient(_api()) as client:
+        response = client.get("/behind-a-slow-read")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"values": list(range(12)), "on_the_connection_of_the_slow_read": [True] * 12}
+
+
+def test_a_connection_takes_statements_up_to_the_pipeline_depth(on_loop, monkeypatch):
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_PIPELINE_DEPTH", "3")
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_ACQUIRE_SECONDS", "0.2")
+    with TestClient(_api()) as client:
+        response = client.get("/behind-a-slow-read")
+
+    assert response.status_code == 200, response.text
+    # The slow read and two more reads have a place. The other reads wait for the acquire time.
+    assert response.json()["values"] == [0, 1] + ["OperationalError"] * 10
+
+
+def test_an_error_of_one_statement_does_not_fail_the_statements_behind_it(on_loop, monkeypatch):
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_ACQUIRE_SECONDS", "0.2")
+    with TestClient(_api()) as client:
+        response = client.get("/an-error-between-reads")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [6, {"module": "django.db.utils", "error": "DataError"}, 3]
+
+
+def test_a_statement_that_does_not_go_out_gives_its_place_back(on_loop, monkeypatch, one_statement_for_each_connection):
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_ACQUIRE_SECONDS", "0.2")
+    with TestClient(_api()) as client:
+        response = client.get("/unsent-statement")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [{"module": "django.db.utils", "error": "ProgrammingError"}, 7]
+
+
+def test_a_read_does_not_go_out_behind_a_slow_statement(on_loop, monkeypatch):
+    """A statement behind a slow statement waits for it. The other connection takes the fast reads."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "2")
+    with TestClient(_api()) as client:
+        response = client.get("/beside-a-slow-read")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "connections_of_the_fast_reads": 1,
+        "a_fast_read_behind_the_slow_read": False,
+        "fast_reads_in_time": True,
+    }
+
+
+def test_a_read_that_stops_behind_another_statement_does_not_stop_that_statement(on_loop, monkeypatch):
+    """A cancel request names a connection. The server stops the statement that it runs then."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    with TestClient(_api()) as client:
+        response = client.get("/stop-a-read-behind-another")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"first": "ok", "second_cancelled": True, "same_connection": True}
+
+
 def test_a_connection_older_than_the_lifetime_closes(on_loop, monkeypatch):
     monkeypatch.setenv("DJANGO_BOLT_LOOP_LIFETIME_SECONDS", "0.3")
     with TestClient(_api()) as client:
@@ -1454,7 +1609,7 @@ def test_a_connection_older_than_the_lifetime_closes(on_loop, monkeypatch):
     assert later != first
 
 
-def test_a_query_waits_when_each_connection_is_in_use(on_loop, monkeypatch):
+def test_a_query_waits_when_each_connection_is_in_use(on_loop, monkeypatch, one_statement_for_each_connection):
     monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
     with TestClient(_api()) as client:
         first, second = client.get("/two-at-once").json()
@@ -1471,7 +1626,7 @@ def test_the_connection_of_a_cancelled_query_serves_the_next_query(on_loop, monk
     assert response.json() == {"same_connection": True}
 
 
-def test_a_cancelled_waiter_gives_its_turn_to_the_next_waiter(on_loop, monkeypatch):
+def test_a_cancelled_waiter_gives_its_turn_to_the_next_waiter(on_loop, monkeypatch, one_statement_for_each_connection):
     monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
     with TestClient(_api()) as client:
         response = client.get("/cancelled-waiter")
@@ -1818,7 +1973,7 @@ def test_a_model_whose_rows_need_a_query_reads_on_a_thread(on_loop):
     assert all(name.startswith(ORM_THREAD) for name in built), built
 
 
-def test_a_read_that_waits_gets_the_next_free_connection(on_loop, monkeypatch):
+def test_a_read_that_waits_gets_the_next_free_connection(on_loop, monkeypatch, one_statement_for_each_connection):
     """A task that reads again at once must not take the connection before the read that waits for it."""
     monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
     with TestClient(_api()) as client:
@@ -1828,7 +1983,9 @@ def test_a_read_that_waits_gets_the_next_free_connection(on_loop, monkeypatch):
     assert response.json() == {"other_read_in_time": True}
 
 
-def test_a_read_that_waits_opens_a_connection_when_the_one_in_use_closes(on_loop, monkeypatch):
+def test_a_read_that_waits_opens_a_connection_when_the_one_in_use_closes(
+    on_loop, monkeypatch, one_statement_for_each_connection
+):
     """The one connection is too old when its read gives it back, so it closes. Its place goes to the read that waits."""
     monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
     monkeypatch.setenv("DJANGO_BOLT_LOOP_LIFETIME_SECONDS", "0.01")
@@ -1929,9 +2086,9 @@ PROGRAMMING_ERROR = {"module": "django.db.utils", "error": "ProgrammingError"}
         ("copy", {**PROGRAMMING_ERROR, "message": "COPY cannot be used with this method; use copy() instead"}),
         ("no-rows", PROGRAMMING_ERROR),
         ("empty", PROGRAMMING_ERROR),
-        # The rows of the first statement, as a psycopg cursor gives them.
-        ("two", {"rows": [[1]]}),
-        ("second-fails", {"module": "django.db.utils", "error": "DataError"}),
+        # The server refuses a string with two statements, as for psycopg in the pipeline mode.
+        ("two", {**PROGRAMMING_ERROR, "message": "cannot insert multiple commands into a prepared statement"}),
+        ("second-fails", {**PROGRAMMING_ERROR, "message": "cannot insert multiple commands into a prepared statement"}),
     ],
 )
 def test_a_statement_that_is_not_one_select_gives_the_outcome_of_psycopg(on_loop, monkeypatch, name, expected):
@@ -1978,6 +2135,24 @@ def test_a_connection_that_dies_during_a_query_fails_the_read_and_not_the_next_r
         after = client.get("/authors")
 
     assert response.json() == {"module": "django.db.utils", "error": "OperationalError"}
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+def test_a_connection_that_dies_fails_each_read_in_flight_on_it(on_loop, monkeypatch):
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    with TestClient(_api()) as client:
+        assert client.get("/authors").json() == ["Ada", "Bob", "Cy"]
+        connections[ALIAS].close()
+
+        killer = threading.Thread(target=_terminate_the_backend_that_sleeps, args=(on_loop,))
+        killer.start()
+        try:
+            response = client.get("/two-slow-reads-outcome")
+        finally:
+            killer.join()
+        after = client.get("/authors")
+
+    assert response.json() == [{"module": "django.db.utils", "error": "OperationalError"}] * 2
     assert after.json() == ["Ada", "Bob", "Cy"]
 
 

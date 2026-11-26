@@ -202,7 +202,7 @@ Measured on six routes with one process, a local PostgreSQL and 64 connections, 
 | One core | 4 to 11% more requests in one second | 6 to 57% more |
 | Two cores | 82 to 119% more | 97 to 155% more |
 
-It needs PostgreSQL, psycopg 3 and the `django.db.backends.postgresql` engine. It has no effect on Windows.
+It needs PostgreSQL, psycopg 3 with libpq 14 or later, and the `django.db.backends.postgresql` engine. It has no effect on Windows.
 
 For each worker thread and database, the `django_bolt.async_orm` logger tells where the reads run, at the `INFO` level.
 
@@ -232,18 +232,20 @@ Django opens each loop connection, with the parameters of `DATABASES`. No thread
 - A loop connection has the role of `OPTIONS["assume_role"]`, the time zone and the type adapters of each Django connection.
 - Each `connection_created` receiver gets a loop connection when it opens. A session setting of a receiver is thus on it.
 - A loop connection is not in Django's connection pool (`OPTIONS["pool"]`), and `CONN_MAX_AGE` does not apply to it.
-- A read takes a free connection. With no free connection, the loop opens one, up to the limit. At the limit, the read waits, and the read that waited longest gets the next free connection. The pool of [sqlx](https://github.com/launchbadge/sqlx) has the same rules and the same defaults.
+- A read takes an idle connection. With no idle connection, the loop opens one, up to the limit. The pool of [sqlx](https://github.com/launchbadge/sqlx) has the same limits and the same defaults.
+- At the limit, a read uses a connection that is in use. See [Statements in flight on one connection](#statements-in-flight-on-one-connection).
 
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `DJANGO_BOLT_LOOP_CONNECTIONS` | `10` | The limit: connections of one worker thread to one database. |
-| `DJANGO_BOLT_LOOP_ACQUIRE_SECONDS` | `30` | A read that waits this long for a free connection fails with Django's `OperationalError`. |
+| `DJANGO_BOLT_LOOP_PIPELINE_DEPTH` | `16` | Statements that one connection can have in flight. With `1`, a connection runs one statement at a time. |
+| `DJANGO_BOLT_LOOP_ACQUIRE_SECONDS` | `30` | A read that waits this long for a place on a connection fails with Django's `OperationalError`. |
 | `DJANGO_BOLT_LOOP_IDLE_SECONDS` | `600` | A connection that no read used for this time closes. |
 | `DJANGO_BOLT_LOOP_LIFETIME_SECONDS` | `1800` | A connection older than this time closes. |
 
 - A read does not use a connection that the database closed while the connection was idle, for example after a database restart. The loop opens a new one.
-- A connection that ends during a query fails that read, as on a thread. Bolt does not send the statement again, because the database can have run it.
-- When a request stops during a query, Bolt asks the server to cancel the query. The request does not block the event loop.
+- A connection that ends during a query fails each read that has a statement in flight on it. Bolt does not send these statements again, because the database can have run them.
+- When a request stops during a query, Bolt asks the server to cancel the query. The request does not block the event loop. With more statements in flight on the connection, Bolt sends no request, and the query runs to its end. The server cancels the statement that it runs when the request comes, and that can be the statement of another read.
 - With a database router, one read uses one database: the database that the router gives for the first call.
 - With `DEBUG = True`, `connection.queries` and the `django.db.backends` logger have each read, with its time.
 - A database error is a `django.db` error around the psycopg error, with the fields that the sync ORM gives.
@@ -251,31 +253,45 @@ Django opens each loop connection, with the parameters of `DATABASES`. No thread
 
 Add the loop connections to the connection count of your database. See [Tune the thread pools](#tune-the-thread-pools).
 
+### Statements in flight on one connection
+
+A loop connection is in the pipeline mode of libpq. Bolt sends a statement on it while the statements before are in flight.
+The server runs the statements of one connection in their order. Each statement is its own transaction, and an error of one statement does not fail the others.
+
+Thus a read at the connection limit does not wait for the round trip of another read. Its statement goes out at once, behind the statements in flight on the connection with the fewest statements.
+`DJANGO_BOLT_LOOP_PIPELINE_DEPTH` sets how many statements one connection can have in flight.
+With each connection at that number, a read waits, and the read that waited longest gets the next place.
+
+A statement behind a slow statement waits for it. Bolt keeps the time of the fastest reads of a database.
+It puts no statement behind a statement that runs for much longer than that time. Such a read uses another connection, or waits for a place.
+
+Measured with one process on one core, 64 client connections, and a database 2 ms away. The values are requests in one second for a handler that returns a QuerySet:
+
+| `DJANGO_BOLT_LOOP_CONNECTIONS` | `DJANGO_BOLT_LOOP_PIPELINE_DEPTH=1` | `DJANGO_BOLT_LOOP_PIPELINE_DEPTH=16` |
+| --- | --- | --- |
+| `1` | 327 | 3,171 |
+| `4` | 1,155 | 3,510 |
+| `10` | 2,621 | 3,305 |
+| `16` | 3,075 | 3,324 |
+| `64` | 3,180 | 3,232 |
+
+With a depth of `16`, the server used one full core at each limit: the round trip to the database did not set the throughput.
+With a local database and a limit of `10`, a depth of `16` gave 8 to 24% more requests in one second than a depth of `1`.
+
+A string with two statements is an error in the pipeline mode. The reads of the ORM have one statement.
+A connection pooler between Bolt and the database must support the pipeline mode of libpq.
+
 ### Set the number of loop connections
 
-One connection runs one query at a time. Thus a worker thread needs this number of connections:
-
-```text
-connections = reads in one second x seconds that one read holds a connection
-```
-
-A read holds its connection for the round trip to the database, and for the time until the event loop reads the answer.
+The server runs the statements of one connection one after the other. Thus the limit sets how many statements the database runs at the same time for one worker thread.
+A short read needs few connections. A database that needs much time for each read needs more connections, up to the number of reads at the same time.
 A loop opens connections up to the limit when that number of reads run at the same time. A higher limit thus does not always give more throughput.
-
-Measured with one process, one route and a database 2 ms away:
-
-| `DJANGO_BOLT_LOOP_CONNECTIONS` | Requests in one second |
-| --- | --- |
-| `4` | 1,075 |
-| `16` | 2,156 |
-| `64` | 2,250 |
-
-With `64`, the loop kept 64 connections open for 4% more throughput than with `16`.
-With `4`, the ORM thread pool with 4 threads was faster in this test (1,323). With `16`, it was slower (1,377).
 
 ```bash
 DJANGO_BOLT_LOOP_CONNECTIONS=16 python manage.py runbolt --processes 4
 ```
+
+Set `DJANGO_BOLT_LOOP_PIPELINE_DEPTH=1` when each read must have a connection of its own. A read at the limit then waits for a free connection.
 
 ## Avoid N+1 queries
 

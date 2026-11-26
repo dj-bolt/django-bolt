@@ -373,7 +373,8 @@ See [runbolt](runbolt.md) for the options.
 | `DJANGO_BOLT_EXECUTOR_THREADS` | int, 1 or more | CPU count + 4, at most `32` | Threads of the shared pool of one process. Blocking sync handlers and `sync_to_thread` calls run on it. |
 | `DJANGO_BOLT_LANE_IDLE_SECONDS` | number, more than 0 | `10` | Idle seconds after which a request lane closes its database connections and stops. |
 | `DJANGO_BOLT_LOOP_CONNECTIONS` | int, 1 or more | `10` | Largest number of connections of one worker thread to one PostgreSQL database, for [`BOLT_ASYNC_ORM_ON_LOOP`](#bolt_async_orm_on_loop). |
-| `DJANGO_BOLT_LOOP_ACQUIRE_SECONDS` | number, more than 0 | `30` | Seconds that a read waits for a free loop connection. Then it fails with `OperationalError`. |
+| `DJANGO_BOLT_LOOP_PIPELINE_DEPTH` | int, 1 or more | `16` | Largest number of statements in flight on one loop connection. With `1`, a connection runs one statement at a time. See [Statements in flight on one connection](../topics/async-orm.md#statements-in-flight-on-one-connection). |
+| `DJANGO_BOLT_LOOP_ACQUIRE_SECONDS` | number, more than 0 | `30` | Seconds that a read waits for a place on a loop connection. Then it fails with `OperationalError`. |
 | `DJANGO_BOLT_LOOP_IDLE_SECONDS` | number, more than 0 | `600` | Idle seconds after which a loop connection closes. |
 | `DJANGO_BOLT_LOOP_LIFETIME_SECONDS` | number, more than 0 | `1800` | Age in seconds after which a loop connection closes before its next use. |
 

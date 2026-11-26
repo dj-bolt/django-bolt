@@ -10,8 +10,9 @@ The flow of one read:
 1. Django compiles the QuerySet to SQL on the event loop thread. The compile
    step is CPU work and sends nothing to the database.
 2. Rust sends the SQL on a loop connection, and reads the result: see
-   ``_RustCursor``. The event loop runs other requests while the database
-   works.
+   ``_Connection``. The event loop runs other requests while the database
+   works. A connection can have many statements in flight: see
+   ``_Pool.acquire``.
 3. Django's own iterable class builds the result from the rows. Thus the
    field conversion and the model instances are those of the sync ORM.
 
@@ -29,6 +30,7 @@ import asyncio
 import collections
 import ctypes
 import logging
+import math
 import os
 import sys
 import threading
@@ -68,6 +70,17 @@ IDLE_VARIABLE = "DJANGO_BOLT_LOOP_IDLE_SECONDS"
 DEFAULT_IDLE_SECONDS = 600.0
 LIFETIME_VARIABLE = "DJANGO_BOLT_LOOP_LIFETIME_SECONDS"
 DEFAULT_LIFETIME_SECONDS = 1800.0
+# The statements that one connection can have in flight. With 1, a connection has one statement at a time.
+PIPELINE_VARIABLE = "DJANGO_BOLT_LOOP_PIPELINE_DEPTH"
+DEFAULT_PIPELINE_DEPTH = 16
+
+# How ``_Pool.finished`` finds a slow statement. The time of the fastest
+# statements goes up by this factor for each statement that is slower.
+_FASTEST_DRIFT = 1.05
+# A statement is slow after this many times the time of the fastest
+# statements, plus this margin in seconds.
+_SLOW_FACTOR = 2.0
+_SLOW_MARGIN = 0.001
 
 # The module of the backend that Bolt supports. A subclass can change how a
 # connection opens or how a cursor runs a query, and a loop connection would
@@ -105,7 +118,7 @@ _ITERABLES_MODULE = QuerySet.__module__
 _thread_sensitive_context = SyncToAsync.thread_sensitive_context
 _MISSING: Any = object()
 
-# The Rust object that sends the queries of a ``_RustCursor``. The Windows
+# The Rust object that sends the statements of a ``_Connection``. The Windows
 # build does not have it, and the setting has no effect there.
 _Libpq: Any = getattr(_core, "LibpqConnection", None)
 
@@ -118,6 +131,8 @@ enabled = False
 
 # The connections of each loop for each database. ``configure`` sets the limit.
 _connection_limit = DEFAULT_CONNECTIONS
+# The statements in flight on one connection. ``configure`` sets the limit.
+_pipeline_depth = DEFAULT_PIPELINE_DEPTH
 
 # ``configure`` sets these times. A read waits this long for a free connection.
 _acquire_seconds = DEFAULT_ACQUIRE_SECONDS
@@ -180,80 +195,138 @@ def _libpq_addresses(database: Any) -> dict[str, int] | None:
     return addresses
 
 
-def _deliver(cursor: _RustCursor, result: tuple[int, Any, Any]) -> None:
-    """Take the result of a query from Rust, or the end of a cancel request. Runs on the event loop."""
-    if result[0] == _Libpq.CANCEL_SENT:
-        cursor.cancelling = False
+def _deliver(statement: _Statement, result: tuple[int, Any, Any], service: float | None) -> None:
+    """Take the result of a statement from Rust, or the end of a cancel request. Runs on the event loop.
+
+    ``service`` is the time from the send to the result, in seconds. Only a
+    statement that went out on an idle connection has one.
+    """
+    link = statement.link
+    kind = result[0]
+    if kind == _Libpq.CANCEL_SENT:
+        link.cancelling = False
         if result[2] is not None:
             logger.warning("The server did not get the cancel request of a loop query: %s", result[2])
-        cursor.settled()
+        if not link.in_flight:
+            link.pool.settle(link)
         return
-    cursor.pending = False
-    waiter = cursor.waiter
+    statement.pending = False
+    waiter = statement.waiter
+    # A read that stopped does not wait for the result: see ``_Connection.abandon``.
     if not waiter.done():
         waiter.set_result(result)
-        return
-    # The query was cancelled. The pool waits for its connection.
-    cursor.settled()
+    link.pool.finished(link, kind, service)
 
 
 class _StaleConnection(Exception):  # noqa: N818 - not an error of the caller: the pool takes another connection
-    """The database closed the connection while it was idle. The server did not get the statement."""
+    """The connection ended before the send. The server did not get the statement."""
 
 
-class _RustCursor:
-    """A loop connection, with its queries sent from Rust: see ``src/pg.rs``.
+class _Connection:
+    """A loop connection, with its statements sent from Rust: see ``src/pg.rs``.
 
     psycopg owns the connection. The cursor of Django merges the parameters
-    into the statement, and its loaders make the Python values, as for a
-    query of the sync ORM. Rust sends the statement and reads the result on
-    the Tokio reactor. No Python code runs while the query waits for the
+    into each statement, and its loaders make the Python values, as for a
+    query of the sync ORM. Rust sends the statements and reads the results on
+    the Tokio reactor. No Python code runs while a statement waits for the
     database.
 
-    ``CursorWrapper`` of Django uses this object as a cursor: ``execute``.
+    The connection is in the pipeline mode of libpq. Thus many statements can
+    be in flight on it at one time: see ``_Pool.acquire``.
     """
 
     __slots__ = (
+        "born",
         "cancelling",
+        "closed",
         "connection",
         "create_future",
         "database",
         "encoding",
-        "mogrify",
+        "idle_since",
+        "in_flight",
+        "merge",
         "native",
         "oids",
-        "on_result",
-        "pending",
-        "query",
-        "result",
+        "pool",
+        "suspect",
         "transformer",
-        "waiter",
     )
 
-    def __init__(self, database: Any, cursor: Any, addresses: dict[str, int], loop: WorkerLoop) -> None:
+    def __init__(self, pool: _Pool, cursor: Any, loop: WorkerLoop) -> None:
         connection = cursor.connection
         pgconn = connection.pgconn
+        database = pool.database
+        self.pool = pool
         self.connection = connection
         self.database = database
         self.encoding = connection.info.encoding
-        self.mogrify = cursor.mogrify
+        # ``mogrify`` of the cursor of Django: it merges the parameters into a statement.
+        self.merge = cursor.mogrify
         self.transformer = database.adapt.Transformer(cursor)
         # The column types that the loaders of ``transformer`` are for.
         self.oids: tuple[int, ...] | None = None
         self.create_future = loop.create_future
-        self.waiter: Any = None
-        # True from the send of a query until Rust gives its result.
-        self.pending = False
-        # True while Rust sends the cancel request of a cancelled query.
+        # The loop time at which the connection opened.
+        self.born = loop.time()
+        # The loop time at which the connection became idle.
+        self.idle_since = 0.0
+        # The reads that have a place on this connection: see ``_Pool.acquire``.
+        self.in_flight = 0
+        # True while Rust sends the cancel request of a statement. The connection takes no statement then.
         self.cancelling = False
-        # The pool sets this callback for a cancelled query. It gets this cursor when the query is settled.
-        self.on_result: Any = None
-        self.query = b""
+        # True after a result that can leave a transaction open: see ``_Pool.settle``.
+        self.suspect = False
+        self.closed = False
+        self.native = _Libpq(pool.addresses, pgconn.pgconn_ptr, pgconn.socket, connection, loop.call_soon, _deliver)
+
+    def abandon(self, statement: _Statement) -> None:
+        """The read of a statement in flight stopped. Ask the server to stop the statement, when that is safe.
+
+        Without the request, the statement runs to its end and holds back the
+        statements behind it. The server stops the statement that it runs when
+        the request comes. With more statements in flight, that can be a
+        statement of another read, so the connection sends no request then.
+        With one statement, the connection takes no statement until the
+        request ended: a late request would stop the next statement.
+
+        The request opens a connection of its own and blocks, so Rust sends
+        it from another thread, with no GIL.
+        """
+        if self.in_flight == 1 and not self.cancelling:
+            self.cancelling = self.native.cancel(statement)
+
+    def in_transaction(self) -> bool:
+        """True when the server holds a transaction open. Call it with no statement in flight."""
+        return self.connection.pgconn.transaction_status != self.database.pq.TransactionStatus.IDLE
+
+    def close(self) -> None:
+        """Close the connection. Rust makes no call on it after ``native.close()`` returns."""
+        self.closed = True
+        self.native.close()
+        self.connection.pgconn.finish()
+
+
+class _Statement:
+    """One statement on a loop connection, and its result.
+
+    ``CursorWrapper`` of Django uses this object as a cursor: ``execute``.
+    """
+
+    __slots__ = ("link", "pending", "query", "result", "waiter")
+
+    def __init__(self, link: _Connection) -> None:
+        self.link = link
+        # The future of the result, or None until the statement went out.
+        self.waiter: Any = None
+        # True from the send until Rust gives the result.
+        self.pending = False
+        # The statement with its parameters. Django logs it when the statement has an error.
+        self.query: bytes | None = None
         self.result: Any = None
-        self.native = _Libpq(addresses, pgconn.pgconn_ptr, pgconn.socket, connection, loop.call_soon, _deliver)
 
     @property
-    def _query(self) -> _RustCursor:
+    def _query(self) -> _Statement:
         # ``last_executed_query`` of Django reads ``cursor._query.query`` for the debug log.
         return self
 
@@ -263,31 +336,38 @@ class _RustCursor:
         The method does not wait: ``wait`` gives the outcome. Code around
         ``CursorWrapper.execute`` thus gets the statement, and an error of
         its parameters, but no query time and no error of the database.
+
+        Rust sends the statement with the extended query protocol, as psycopg
+        does in the pipeline mode. Thus the string has one statement.
         """
-        self.result = None
-        # Not the statement of the query before: Django logs ``query`` when this statement has an error.
-        self.query = None
-        query = self.query = self.mogrify(sql, params).encode(self.encoding)
-        self.waiter = self.create_future()
-        self.native.query(query, self)
+        link = self.link
+        native = link.native
+        # psycopg reads the connection to escape a parameter, so Rust keeps its task out of libpq for that time.
+        query = self.query = native.exclusive(link.merge, sql, params).encode(link.encoding)
+        waiter = link.create_future()
+        if not native.query(query, self):
+            link.pool.fail(link)
+            raise _StaleConnection("the connection ended")
+        self.waiter = waiter
         self.pending = True
 
     async def wait(self) -> None:
         """Wait for the statement that ``execute`` sent, and raise its error."""
         waiter = self.waiter
+        link = self.link
+        database = link.database
         if waiter is None:
             # The code around ``CursorWrapper.execute`` did not call it. A cursor of psycopg then has no result.
-            raise self.database.ProgrammingError("no result available")
+            raise database.ProgrammingError("no result available")
         try:
             kind, first, second = await waiter
         except asyncio.CancelledError:
             if self.pending:
-                self._cancel_on_server()
+                link.abandon(self)
             raise
         if kind == _Libpq.ROWS:
             self.result = (first, second)
             return
-        database = self.database
         if kind == _Libpq.SERVER_ERROR:
             raise self._server_error(first, second)
         if kind == _Libpq.CONNECTION_ERROR:
@@ -298,31 +378,35 @@ class _RustCursor:
         if status in (status.COMMAND_OK, status.EMPTY_QUERY):
             self.result = status
             return
-        # The errors of psycopg for these results. The pool closes the connection of a COPY.
+        # The errors of psycopg for these results.
         if status in (status.COPY_OUT, status.COPY_IN, status.COPY_BOTH):
+            # The connection stays in the COPY, and Rust ended it.
+            link.pool.fail(link)
             raise database.ProgrammingError("COPY cannot be used with this method; use copy() instead")
         raise database.InternalError(f"unexpected result status from query: {status.name}")
 
     def fetchall(self) -> list[tuple[Any, ...]]:
         result = self.result
+        link = self.link
         if type(result) is not tuple:
             if result is None:
-                raise self.database.ProgrammingError("no result available")
-            raise self.database.ProgrammingError(
+                raise link.database.ProgrammingError("no result available")
+            raise link.database.ProgrammingError(
                 f"the last operation didn't produce records (result status: {result.name})"
             )
         self.result = None
         oids, rows = result
-        transformer = self.transformer
-        if oids != self.oids:
-            transformer.set_loader_types(oids, self.database.pq.Format.TEXT)
-            self.oids = oids
+        transformer = link.transformer
+        if oids != link.oids:
+            transformer.set_loader_types(oids, link.database.pq.Format.TEXT)
+            link.oids = oids
         return list(map(transformer.load_sequence, rows))
 
     def _server_error(self, fields: dict[int, bytes], message: bytes) -> Exception:
         """Return the psycopg error for an error of the server, as ``psycopg.errors.error_from_result`` makes it."""
-        errors = self.database.errors
-        encoding = self.encoding
+        link = self.link
+        errors = link.database.errors
+        encoding = link.encoding
         state = fields.get(_SQLSTATE, b"").decode(encoding, "replace")
         try:
             error_class = errors.lookup(state)
@@ -335,29 +419,6 @@ class _RustCursor:
         text = message.decode(encoding, "replace").strip() or "no error details available"
         return error_class(text, info=fields, encoding=encoding)
 
-    def _cancel_on_server(self) -> None:
-        """Ask the server to stop the query, as psycopg does for a cancelled task.
-
-        Without the request, the query runs to its end and keeps its
-        connection busy. The request opens a connection of its own and
-        blocks, so Rust sends it from another thread, with no GIL.
-        ``settled`` gives the connection back only after the request ended:
-        a request that comes late would stop the next query of the connection.
-        """
-        self.cancelling = self.native.cancel(self)
-
-    def settled(self) -> None:
-        """Give the connection of a cancelled query back to the pool, when Rust and the cancel request ended."""
-        on_result = self.on_result
-        if on_result is not None and not self.pending and not self.cancelling:
-            self.on_result = None
-            on_result(self)
-
-    def close(self) -> None:
-        """Close the connection. Rust makes no call on it after ``native.close()`` returns."""
-        self.native.close()
-        self.connection.pgconn.finish()
-
 
 class _Pool:
     """The connections of one event loop to one database.
@@ -365,37 +426,35 @@ class _Pool:
     Only the thread of the loop uses a pool, with one exception:
     ``close_connections`` runs on another thread when no request runs.
 
-    The pool holds cursors: one ``_RustCursor`` for each connection.
+    The pool follows the pool of sqlx. A read takes an idle connection. With
+    no idle connection, the pool opens one, up to the limit. A connection
+    closes after the idle time, or when it is older than the lifetime.
 
-    The pool follows the pool of sqlx. A read takes a free connection. With
-    no free connection, the pool opens one, up to the limit. At the limit, the
-    read waits in a queue, and fails after the acquire time. A connection that
-    comes back goes to the read that waited longest. A connection closes
-    after the idle time, or when it is older than the lifetime.
-
-    Two things differ from sqlx. sqlx tests a connection with a ping before
-    each use, which adds a round trip to each query. This pool sends a query
-    again when its connection was dead (see ``fetch``). sqlx takes the
-    connection that was idle for the longest time. This pool takes the one
-    that came back last, so the connections that the load does not need go
-    idle and close.
+    Three things differ from sqlx. At the limit, a read of sqlx waits for an
+    idle connection. A read of this pool goes out on a connection that is in
+    use, behind the statements in flight there: see ``acquire``. sqlx tests a
+    connection with a ping before each use, which adds a round trip to each
+    query. Rust looks at the socket of an idle connection before it sends
+    (see ``fetch``). sqlx takes the connection that was idle for the longest
+    time. This pool takes the one that became idle last, so the connections
+    that the load does not need stay idle and close.
     """
 
     __slots__ = (
         "addresses",
         "alias",
-        "born",
-        "cancelled",
         "closed",
         "database",
         "expirer",
+        "fastest",
         "idle",
-        "idle_since",
+        "links",
         "opened",
         "pg_version",
         "preparing",
         "reaper",
         "settings_dict",
+        "slow_after",
         "waiters",
         "waiting_since",
         "wrapped",
@@ -412,25 +471,26 @@ class _Pool:
         # ``_connect`` opens each connection with this class and these settings.
         self.wrapper_class = wrapper_class
         self.settings_dict = settings_dict
-        # The cursors of cancelled queries that Rust did not end yet.
-        self.cancelled: set[_RustCursor] = set()
-        self.idle: collections.deque[_RustCursor] = collections.deque()
-        # The loop time at which each idle cursor came back, in the order of ``idle``.
-        self.idle_since: collections.deque[float] = collections.deque()
+        # Each open connection.
+        self.links: list[_Connection] = []
+        # The connections with no statement, in the order in which they became idle.
+        self.idle: collections.deque[_Connection] = collections.deque()
         # The timer that closes idle connections, or None when no connection is idle.
         self.reaper: asyncio.TimerHandle | None = None
-        # A waiter gets a cursor, or None when it must open a connection.
+        # A waiter gets a connection with a place for its statement, or None when it must open a connection.
         # While a read waits, ``idle`` is empty and ``opened`` is the limit.
-        self.waiters: collections.deque[asyncio.Future[_RustCursor | None]] = collections.deque()
+        self.waiters: collections.deque[asyncio.Future[_Connection | None]] = collections.deque()
         # The loop time at which each waiter started to wait, in the order of ``waiters``.
         self.waiting_since: collections.deque[float] = collections.deque()
         # The timer that fails the waiters that waited for the acquire time, or None.
         self.expirer: asyncio.TimerHandle | None = None
-        # cursor -> the loop time at which its connection opened.
-        self.born: dict[_RustCursor, float] = {}
         # The connections that are open, plus those that a read opens now.
         self.opened = 0
         self.closed = False
+        # The service time of the fastest statements, in seconds: see ``finished``.
+        self.fastest = math.inf
+        # A statement that is first on its connection for longer than this time is slow.
+        self.slow_after = math.inf
         # The server version, or None until the first connection opens.
         self.pg_version: int | None = None
         # True when a ``connection_created`` receiver installs an execute wrapper: see ``_pool_of``.
@@ -446,30 +506,64 @@ class _Pool:
         """
         async with self.preparing:
             if self.pg_version is None:
-                self.release(await self.acquire())
+                self.finished(await self.acquire())
         if self.wrapped:
             self.close()
 
-    async def acquire(self) -> _RustCursor:
-        """Return a cursor that no other query uses. Wait when each connection is in use."""
+    async def acquire(self) -> _Connection:
+        """Return a connection with a place for one statement. ``finished`` gives the place back.
+
+        The order of the choices:
+
+        1. An idle connection.
+        2. A new connection, below the limit of ``DJANGO_BOLT_LOOP_CONNECTIONS``.
+        3. The connection with the fewest statements in flight, below the
+           limit of ``DJANGO_BOLT_LOOP_PIPELINE_DEPTH``. The statement goes
+           out behind those statements, and the server runs it after them.
+           The read does not wait for a round trip of another read.
+        4. The read waits in a queue, and fails after the acquire time.
+
+        A statement behind a slow statement waits for it. Choice 3 thus
+        skips a connection whose first statement is slow: see ``finished``.
+        """
         loop = asyncio.get_running_loop()
         idle = self.idle
-        while idle:
-            self.idle_since.pop()
-            cursor = idle.pop()
-            if loop.time() - self.born[cursor] <= _lifetime_seconds:
-                return cursor
-            self.discard(cursor)
+        if idle:
+            now = loop.time()
+            while idle:
+                link = idle.pop()
+                if now - link.born <= _lifetime_seconds:
+                    link.in_flight = 1
+                    return link
+                self.discard(link)
         if self.opened < _connection_limit:
             self.opened += 1
             return await self._open(loop)
-        waiter: asyncio.Future[_RustCursor | None] = loop.create_future()
+        fewest = _pipeline_depth
+        if fewest > 1:
+            # Each connection has a statement in flight here.
+            chosen = None
+            slow_after = self.slow_after
+            now = loop.time()
+            for link in self.links:
+                if (
+                    link.in_flight < fewest
+                    and not link.cancelling
+                    and now - link.born <= _lifetime_seconds
+                    and not link.native.stalled(slow_after)
+                ):
+                    chosen = link
+                    fewest = link.in_flight
+            if chosen is not None:
+                chosen.in_flight += 1
+                return chosen
+        waiter: asyncio.Future[_Connection | None] = loop.create_future()
         self.waiters.append(waiter)
         self.waiting_since.append(loop.time())
         if self.expirer is None:
             self.expirer = loop.call_later(_acquire_seconds, self._expire_waiters, loop)
         try:
-            cursor = await waiter
+            link = await waiter
         except asyncio.CancelledError:
             # A read that got its turn and then stops gives the turn to the next read.
             if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
@@ -477,13 +571,13 @@ class _Pool:
                 if taken is None:
                     self._closed_one()
                 else:
-                    self.release(taken)
+                    self.finished(taken)
             raise
-        if cursor is None:
+        if link is None:
             return await self._open(loop)
-        return cursor
+        return link
 
-    def _next_waiter(self) -> asyncio.Future[_RustCursor | None] | None:
+    def _next_waiter(self) -> asyncio.Future[_Connection | None] | None:
         """Take the read that waited longest out of the queue."""
         waiters = self.waiters
         waiting_since = self.waiting_since
@@ -511,8 +605,8 @@ class _Pool:
                 )
         self.expirer = loop.call_later(waiting_since[0] - expired, self._expire_waiters, loop) if waiters else None
 
-    async def _open(self, loop: asyncio.AbstractEventLoop) -> _RustCursor:
-        """Open one connection. ``opened`` counts it already."""
+    async def _open(self, loop: asyncio.AbstractEventLoop) -> _Connection:
+        """Open one connection, with a place for the statement of the caller. ``opened`` counts it already."""
         # The connect runs to its end on its thread, also when this read stops.
         opening = asyncio.ensure_future(
             run_in_orm_executor(_connect, self.wrapper_class, self.settings_dict, self.alias)
@@ -526,7 +620,7 @@ class _Pool:
             self._closed_one()
             raise
         try:
-            cursor = _RustCursor(self.database, django_cursor, self.addresses, loop)
+            link = _Connection(self, django_cursor, loop)
         except BaseException:
             own.connection.pgconn.finish()
             self._closed_one()
@@ -539,8 +633,9 @@ class _Pool:
                 "a connection_created receiver installs an execute wrapper.",
                 self.alias,
             )
-        self.born[cursor] = loop.time()
-        return cursor
+        link.in_flight = 1
+        self.links.append(link)
+        return link
 
     def _close_unused(self, opening: asyncio.Future[tuple[Any, Any]]) -> None:
         """Close a connection that opened after its read stopped."""
@@ -549,70 +644,105 @@ class _Pool:
             own.connection.pgconn.finish()
         self._closed_one()
 
-    def release(self, cursor: _RustCursor) -> None:
-        loop = asyncio.get_running_loop()
-        if self.closed or loop.time() - self.born[cursor] > _lifetime_seconds:
-            self.discard(cursor)
-            return
-        waiter = self._next_waiter()
-        if waiter is not None:
-            # The read that waited longest gets the connection. A read that
-            # starts now cannot take it first.
-            waiter.set_result(cursor)
-            return
-        self.idle.append(cursor)
-        self.idle_since.append(loop.time())
-        if self.reaper is None:
-            self.reaper = loop.call_later(_idle_seconds, self._close_idle, loop)
+    def finished(self, link: _Connection, kind: int = 0, service: float | None = None) -> None:
+        """Give one place of ``link`` back: its statement has a result of ``kind``, or did not go out.
 
-    def _close_idle(self, loop: asyncio.AbstractEventLoop) -> None:
+        ``service`` is the time that the database and the network took for a
+        statement with no statement before it. The pool keeps the time of the
+        fastest ones. A statement that is first on its connection for much
+        longer than that time is slow, and ``acquire`` puts no statement
+        behind it.
+        """
+        link.in_flight -= 1
+        if service is not None:
+            # A slow statement moves the time up by a small step, and a fast one moves it down at once.
+            fastest = self.fastest * _FASTEST_DRIFT
+            if service < fastest:
+                fastest = service
+            self.fastest = fastest
+            self.slow_after = fastest * _SLOW_FACTOR + _SLOW_MARGIN
+        if link.closed:
+            return
+        if kind >= _Libpq.CONNECTION_ERROR:
+            # The connection ended, and Rust gives each of its statements this result.
+            # A database restart also ends each idle connection.
+            self.discard(link)
+            self.discard_idle()
+            return
+        if kind:
+            link.suspect = True
+        self.settle(link)
+
+    def settle(self, link: _Connection) -> None:
+        """Find the next work of ``link`` after a statement or a cancel request ended."""
+        if link.closed or link.cancelling:
+            return
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        retired = self.closed or now - link.born > _lifetime_seconds
+        if link.in_flight:
+            if self.waiters and not retired:
+                self._serve_waiters(link)
+            return
+        if link.suspect:
+            # A result with no rows, or an error. A statement such as BEGIN leaves a
+            # transaction open, and the next statement would run in it.
+            link.suspect = False
+            retired = retired or link.in_transaction()
+        if retired:
+            self.discard(link)
+            return
+        if self.waiters:
+            self._serve_waiters(link)
+            if link.in_flight:
+                return
+        link.idle_since = now
+        self.idle.append(link)
+        if self.reaper is None:
+            self.reaper = loop.call_later(_idle_seconds, self._close_idle)
+
+    def _serve_waiters(self, link: _Connection) -> None:
+        """Give the free places of ``link`` to the reads that waited longest."""
+        places = _pipeline_depth - link.in_flight
+        while places > 0:
+            waiter = self._next_waiter()
+            if waiter is None:
+                return
+            link.in_flight += 1
+            places -= 1
+            waiter.set_result(link)
+
+    def _close_idle(self) -> None:
         """Close each connection that was idle for the idle time. The oldest is first in ``idle``."""
         idle = self.idle
-        idle_since = self.idle_since
+        loop = asyncio.get_running_loop()
         expired = loop.time() - _idle_seconds
-        while idle and idle_since[0] <= expired:
-            idle_since.popleft()
+        while idle and idle[0].idle_since <= expired:
             self.discard(idle.popleft())
-        self.reaper = loop.call_later(idle_since[0] - expired, self._close_idle, loop) if idle else None
+        self.reaper = loop.call_later(idle[0].idle_since - expired, self._close_idle) if idle else None
 
-    def _give_back(self, cursor: _RustCursor) -> None:
-        """Take ``cursor`` back after a query that did not complete.
+    def fail(self, link: _Connection) -> None:
+        """Close a connection that ended. The statements in flight on it get their results from Rust."""
+        if not link.closed:
+            self.discard(link)
 
-        A cancelled query asked the server to cancel it, and did not wait. Its
-        connection comes back here when the query is settled: see
-        ``_RustCursor.settled``. A connection that is not idle then still
-        runs a query, and the next query on it would fail.
-        """
-        if cursor.pending or cursor.cancelling:
-            self.cancelled.add(cursor)
-            cursor.on_result = self._give_back
-            return
-        self.cancelled.discard(cursor)
-        if cursor.connection.pgconn.transaction_status == self.database.pq.TransactionStatus.IDLE:
-            self.release(cursor)
-        else:
-            self.discard(cursor)
-
-    def discard(self, cursor: _RustCursor) -> None:
-        """Close the connection of ``cursor``. This call does not wait, so a cancelled task can make it."""
-        del self.born[cursor]
-        cursor.close()
+    def discard(self, link: _Connection) -> None:
+        """Close ``link``, which is not in ``idle``. This call does not wait, so a cancelled task can make it."""
+        self.links.remove(link)
+        link.close()
         self._closed_one()
 
     def discard_idle(self) -> None:
         idle = self.idle
-        self.idle_since.clear()
         while idle:
             self.discard(idle.pop())
 
     def close(self) -> None:
+        """Close each connection. Call it when no read is in flight: such a read gets no result."""
         self.closed = True
-        self.discard_idle()
-        while self.cancelled:
-            cursor = self.cancelled.pop()
-            # A result that is already on its way to the loop must not give this connection back.
-            cursor.on_result = None
-            self.discard(cursor)
+        self.idle.clear()
+        for link in list(self.links):
+            self.discard(link)
         for name in ("reaper", "expirer"):
             timer = getattr(self, name)
             if timer is not None:
@@ -632,48 +762,40 @@ class _Pool:
 
         The statement goes through ``CursorWrapper.execute`` of Django, so a
         tool that replaces that method gets each statement of the loop: see
-        ``_RustCursor.execute``. With
-        ``wrapper.queries_logged``, ``connection.queries`` and the
-        ``django.db.backends`` logger get the query, as with the cursor of Django.
+        ``_Statement.execute``. With ``wrapper.queries_logged``,
+        ``connection.queries`` and the ``django.db.backends`` logger get the
+        query, as with the cursor of Django.
 
         A database restart ends each idle connection of the pool. Rust finds
         such a connection before it sends the statement. The pool then closes
-        its idle connections, which are of the same age, and takes a new one.
+        its idle connections, which are of the same age, and the read takes
+        another connection.
 
-        A connection that ends after the send fails the read. The database
-        can have run the statement, so the pool does not send it again.
+        A connection that ends after the send fails each read in flight on
+        it. The database can have run their statements, so the pool does not
+        send them again.
         """
         database_error = self.database.Error
         while True:
-            cursor = await self.acquire()
-            cursor.waiter = None
+            link = await self.acquire()
+            statement = _Statement(link)
             try:
                 if wrapper.queries_logged:
-                    with CursorDebugWrapper(cursor, wrapper).debug_sql(sql, params, use_last_executed_query=True):
-                        CursorWrapper(cursor, wrapper).execute(sql, params)
-                        await cursor.wait()
+                    with CursorDebugWrapper(statement, wrapper).debug_sql(sql, params, use_last_executed_query=True):
+                        CursorWrapper(statement, wrapper).execute(sql, params)
+                        await statement.wait()
                 else:
-                    CursorWrapper(cursor, wrapper).execute(sql, params)
-                    await cursor.wait()
-                rows = cursor.fetchall()
+                    CursorWrapper(statement, wrapper).execute(sql, params)
+                    await statement.wait()
+                return statement.fetchall()
             except _StaleConnection:
-                self.discard(cursor)
-                self.discard_idle()
+                continue
             except database_error as error:
-                if cursor.connection.broken:
-                    self.discard(cursor)
-                    self.discard_idle()
-                else:
-                    # The query failed and the connection is good.
-                    self._give_back(cursor)
                 raise _django_error(self.database, error) from error
-            except BaseException:
-                # A cancel, or an error of a type adapter.
-                self._give_back(cursor)
-                raise
-            else:
-                self.release(cursor)
-                return rows
+            finally:
+                if statement.waiter is None:
+                    # The statement did not go out, so no result gives its place back.
+                    self.finished(link)
 
 
 def _django_error(database: Any, error: Exception) -> Exception:
@@ -694,7 +816,7 @@ def _new_pool(loop: WorkerLoop, alias: str) -> _Pool | None:
     settings_dict = wrapper.settings_dict
     addresses = None
     if wrapper.features.uses_server_side_binding:
-        # The server merges the parameters, which needs the extended query protocol. Rust sends plain statements.
+        # The server then merges the parameters. Rust sends statements that have their parameters.
         reason = "server_side_binding is on"
     elif not settings_dict["AUTOCOMMIT"]:
         # Each read of a thread is then in the transaction of that thread.
@@ -704,7 +826,8 @@ def _new_pool(loop: WorkerLoop, alias: str) -> _Pool | None:
         reason = "OPTIONS has a cursor_factory"
     else:
         addresses = _libpq_addresses(database)
-        reason = f"the {database.pq.__impl__} implementation of psycopg does not give its libpq functions"
+        # The pipeline mode needs libpq 14.
+        reason = f"the {database.pq.__impl__} implementation of psycopg does not give the libpq functions of Bolt"
     if addresses is None:
         logger.info("The async ORM reads of the database %r use the ORM thread pool: %s.", alias, reason)
         return None
@@ -1051,18 +1174,21 @@ def configure() -> None:
 
     Raises:
         ImproperlyConfigured: BOLT_ASYNC_ORM_ON_LOOP is not a bool,
-            DJANGO_BOLT_LOOP_CONNECTIONS is not an int of 1 or more, or
+            DJANGO_BOLT_LOOP_CONNECTIONS or DJANGO_BOLT_LOOP_PIPELINE_DEPTH
+            is not an int of 1 or more, or
             DJANGO_BOLT_LOOP_ACQUIRE_SECONDS, DJANGO_BOLT_LOOP_IDLE_SECONDS or
             DJANGO_BOLT_LOOP_LIFETIME_SECONDS is not a number that ``_seconds`` accepts.
     """
-    global enabled, _connection_limit, _acquire_seconds, _idle_seconds, _lifetime_seconds
+    global enabled, _connection_limit, _pipeline_depth, _acquire_seconds, _idle_seconds, _lifetime_seconds
     limit = _thread_count(CONNECTIONS_VARIABLE)
+    depth = _thread_count(PIPELINE_VARIABLE)
     acquire_seconds = _seconds(ACQUIRE_VARIABLE, DEFAULT_ACQUIRE_SECONDS)
     idle_seconds = _seconds(IDLE_VARIABLE, DEFAULT_IDLE_SECONDS)
     lifetime_seconds = _seconds(LIFETIME_VARIABLE, DEFAULT_LIFETIME_SECONDS)
     if not settings.configured:
         return
     _connection_limit = limit or DEFAULT_CONNECTIONS
+    _pipeline_depth = depth or DEFAULT_PIPELINE_DEPTH
     _acquire_seconds = acquire_seconds
     _idle_seconds = idle_seconds
     _lifetime_seconds = lifetime_seconds
