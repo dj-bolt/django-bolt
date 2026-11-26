@@ -511,9 +511,55 @@ Write an `@mcp.tool(guards=...)` for such an operation.
 The guards of a tool do not limit the rate of calls.
 If the route has `@rate_limit`, add an equal limit for the tool, for example in tool middleware or at a gateway.
 
+### The result of an exposed route
+
+The tool result holds the body that HTTP sends for the route.
+Bolt serializes the return value with the response handlers of the route.
+Thus the `response_model`, the return annotation and `validate_response` apply, as over HTTP.
+A field that HTTP removes from the body is not in the tool result.
+
+```python
+import msgspec
+
+
+class PublicUser(msgspec.Struct):
+    name: str
+
+
+@api.get("/users/{user_id}", response_model=PublicUser)
+async def read_user(user_id: int) -> dict:
+    return {"name": "a", "password_hash": "..."}
+
+
+api.mount_mcp(mcp, expose=[read_user])  # The tool result is {"name": "a"}.
+```
+
+| HTTP response of the route | Tool result |
+|---|---|
+| 2xx with a JSON body | `structuredContent` is the body. A body that is not an object goes in `{"result": ...}`. The text content is the HTTP body. |
+| 2xx with a `text/*` body | Text content only |
+| 2xx with no body, for example 204 | No content |
+| 3xx, 4xx or 5xx status, for example a `JSON(..., status_code=404)` or a `(404, data)` tuple | An error result with the HTTP body as its text |
+| A value that fails response validation (HTTP 500) | An error result. Bolt logs the error. With `mask_error_details` (the default), the text is `Tool 'read_user' failed.` |
+| Any other body, for example `bytes`, or a stream or a file | An error result. Bolt logs the error. |
+
+A tool result has no headers and no cookies.
+Thus Bolt does not send the headers and the cookies of the response.
+
+A route that validates its body against one `msgspec.Struct` gets that schema as the `outputSchema` of the tool.
+msgspec has no JSON Schema for some types that Bolt encodes, such as `IPv4Address` or `Path`.
+A route with such a field in its `Struct` has no `outputSchema`.
+Each other route has no `outputSchema`.
+When a tool has an `outputSchema`, a success result with a different body is an error result.
+An example is a `PlainText` return from a route with `response_model=PublicUser`.
+
 `mount_mcp()` exposes only the routes that you name.
 A handler that is not a route of the API, a handler with `File`, `Form` or `Depends` parameters, or a duplicate tool name raises `ValueError`.
 A tool call cannot resolve a dependency. Write an `@mcp.tool` for such an operation.
+A route that declares a stream or a file also raises `ValueError`.
+For example, a generator handler, a stream return annotation, a `StreamingResponse` or `FileResponse` annotation, or `response_class=EventSourceResponse`.
+`expose_routes()` with patterns skips these routes.
+A route that returns a stream or a file with no such declaration passes registration. Each call of its tool gives an error result.
 
 To change the name or the description, use `@expose_as_tool`:
 
