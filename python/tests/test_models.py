@@ -175,3 +175,19 @@ class ShortJtiRevokedToken(models.Model):
 
     class Meta:
         app_label = "django_bolt"
+
+
+class CaseInsensitiveRevokedToken(models.Model):
+    """A revocation model whose ``jti`` column compares ASCII letters without case.
+
+    The default collation of MySQL also compares text without case. The SQLite
+    collation ``NOCASE`` does this for ASCII letters only.
+    """
+
+    jti = models.CharField(max_length=255, unique=True, db_collation="NOCASE")
+    revoked_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    version = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        app_label = "django_bolt"

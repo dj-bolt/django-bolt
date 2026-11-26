@@ -247,6 +247,7 @@ def django_db_setup(django_db_blocker):
                 Article,
                 Author,
                 BlogPost,
+                CaseInsensitiveRevokedToken,
                 Comment,
                 Country,
                 Document,
@@ -269,6 +270,7 @@ def django_db_setup(django_db_blocker):
                 Release,
                 Country,
                 ShortJtiRevokedToken,
+                CaseInsensitiveRevokedToken,
             ]
             for model in models:
                 # Check if table already exists
