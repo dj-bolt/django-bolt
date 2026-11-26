@@ -32,9 +32,6 @@ from django.urls import get_script_prefix, set_script_prefix
 # process. The carries run only then. A carry copies the prefix of the caller
 # only when it is not "/", so a later client without the setting gets no change.
 carries = False
-# The script name that starts the path of a client, with no trailing slash.
-# Empty without the setting. The server or the test client that started last sets it.
-script_name = ""
 
 
 def configure() -> str | None:
@@ -44,7 +41,7 @@ def configure() -> str | None:
         The script prefix for the entries, as ``get_script_prefix()`` gives it,
         or None when the setting adds no prefix.
     """
-    global carries, script_name
+    global carries
     script_name = (settings.FORCE_SCRIPT_NAME or "").rstrip("/")
     if not script_name:
         return None
@@ -185,11 +182,13 @@ def _sync_body(content: Any, script_prefix: str) -> Any:
     # Each step runs in a context of its own, whatever thread iterates the body.
     context = copy_context()
     context.run(set_script_prefix, script_prefix)
-    iterator = content if hasattr(content, "__next__") else iter(content)
+    # Rust calls the __next__ and __iter__ attributes, not the methods of the type.
+    iterator = content if hasattr(content, "__next__") else content.__iter__()
+    step = iterator.__next__
     try:
         while True:
             try:
-                item = context.run(next, iterator)
+                item = context.run(step)
             except StopIteration:
                 return
             yield item

@@ -1195,7 +1195,8 @@ def _to_django_request(request: Request) -> HttpRequest:
         request.META["PATH_INFO"] = path_info
     django_request.path_info = path_info
     # As in Django's WSGIRequest: the script name (FORCE_SCRIPT_NAME), then the path info.
-    script_name = _script_prefix.script_name
+    # Only a process with a client or a server with the setting reads it.
+    script_name = request.META["SCRIPT_NAME"].rstrip("/") if _script_prefix.carries else ""
     django_request.path = script_name + path_info if script_name else path_info
 
     # One META dict per request. Rust builds it once (REMOTE_ADDR from the

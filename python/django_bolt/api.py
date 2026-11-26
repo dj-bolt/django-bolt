@@ -549,9 +549,8 @@ def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
     if not path.startswith("/"):
         path = "/" + path
 
-    if path.startswith(root_path):
-        return scope
-
+    # Rust gives the path under the mount. A path that starts with root_path
+    # again is a path of the app, such as /legacy/x under the mount /legacy.
     full_path = f"{root_path}{path}"
 
     raw_path_obj = scope.get("raw_path")
@@ -565,13 +564,7 @@ def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
     else:
         raw_path = path.encode("utf-8")
 
-    root_path_bytes = root_path.encode("utf-8")
-    if raw_path.startswith(root_path_bytes):
-        full_raw_path = raw_path
-    elif raw_path.startswith(b"/"):
-        full_raw_path = root_path_bytes + raw_path
-    else:
-        full_raw_path = full_path.encode("utf-8")
+    full_raw_path = root_path.encode("utf-8") + raw_path if raw_path.startswith(b"/") else full_path.encode("utf-8")
 
     new_scope = dict(scope)
     new_scope["path"] = full_path

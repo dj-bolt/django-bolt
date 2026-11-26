@@ -160,6 +160,38 @@ def test_a_request_under_force_script_name_matches_a_django_wsgi_request(
     assert json.loads(response.headers["x-django-facts"]) == expected
 
 
+class _DjangoPathMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response["x-django-path"] = request.path
+        return response
+
+
+def _django_path_api() -> BoltAPI:
+    api = BoltAPI(django_middleware=[f"{__name__}._DjangoPathMiddleware"])
+
+    @api.get("/page")
+    def page() -> dict:
+        return {}
+
+    return api
+
+
+def test_the_django_request_has_the_script_name_of_its_own_client(settings):
+    settings.FORCE_SCRIPT_NAME = "/first"
+    first = TestClient(_django_path_api())
+    settings.FORCE_SCRIPT_NAME = "/second"
+    second = TestClient(_django_path_api())
+
+    with first, second:
+        paths = [client.get("/page").headers["x-django-path"] for client in (first, second)]
+
+    assert paths == ["/first/page", "/second/page"]
+
+
 def test_without_the_setting_the_request_has_no_script_name():
     api = BoltAPI()
 
@@ -244,8 +276,9 @@ def test_the_docs_load_the_schema_through_the_script_name(settings):
     custom = BoltAPI(
         openapi_config=OpenAPIConfig(title="t", version="1", servers=[Server(url="https://api.example.com")])
     )
+    root = BoltAPI(openapi_config=OpenAPIConfig(title="t", version="1", servers=[Server(url="/")]))
 
-    for each in (api, custom):
+    for each in (api, custom, root):
 
         @each.get("/items/{item_id}")
         async def item(item_id: int) -> dict:
@@ -256,13 +289,16 @@ def test_the_docs_load_the_schema_through_the_script_name(settings):
         schema = client.get("/docs/openapi.json").json()
         page = client.get("/docs/rapidoc").text
     with TestClient(custom) as client:
-        # A server that the user sets stays.
+        # A server that the user sets stays, also the root of the host.
         custom_servers = client.get("/docs/openapi.json").json()["servers"]
+    with TestClient(root) as client:
+        root_servers = client.get("/docs/openapi.json").json()["servers"]
 
     assert schema["servers"] == [{"url": "/myapp"}]
     assert list(schema["paths"]) == ["/items/{item_id}"]
     assert 'spec-url="/myapp/docs/openapi.json"' in page
     assert custom_servers == [{"url": "https://api.example.com"}]
+    assert root_servers == [{"url": "/"}]
 
 
 def test_the_docs_of_one_api_follow_the_setting_of_each_client(settings):
@@ -403,6 +439,33 @@ def test_a_django_redirect_behind_a_mount_with_a_root_path_has_the_script_name_o
     assert redirect.status_code == 301
     assert redirect.headers["location"] == "/site/legacy/page/"
     assert page.text == "/site/legacy/page/"
+
+
+def _path_info_view(request):
+    return JsonResponse({"path": request.path, "path_info": request.path_info})
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("script_name", "mount", "request_path", "expected"),
+    [
+        # The client asks for /app/app/items, and the proxy removes /app.
+        ("/app", "/", "/app/items", {"path": "/app/app/items", "path_info": "/app/items"}),
+        # Without a script name, a path that repeats the mount path keeps it.
+        (None, "/legacy", "/legacy/legacy/items", {"path": "/legacy/legacy/items", "path_info": "/legacy/items"}),
+    ],
+    ids=["script-name", "mount-path"],
+)
+def test_a_django_mount_keeps_a_path_that_repeats_its_root_path(
+    mount_urlconf, settings, script_name, mount, request_path, expected
+):
+    settings.FORCE_SCRIPT_NAME = script_name
+    mount_urlconf([path("app/items", _path_info_view), path("legacy/items", _path_info_view)])
+    api = BoltAPI()
+    api.mount_django(mount)
+
+    with TestClient(api) as client:
+        assert client.get(request_path).json() == expected
 
 
 def _hand_written_redirect(request):
@@ -674,6 +737,33 @@ def test_a_body_of_each_iterator_kind_streams_with_the_script_prefix(settings, a
 
     stream.__annotations__["return"] = annotation
     api.get("/stream")(stream)
+
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    with TestClient(api) as client:
+        assert client.get("/stream").content == b"ab"
+
+
+class _InstanceNext:
+    """A body whose ``__next__`` is an attribute of the instance, not of the type."""
+
+    def __init__(self):
+        chunks = [b"a", b"b"]
+
+        def step() -> bytes:
+            if not chunks:
+                raise StopIteration
+            return chunks.pop(0)
+
+        self.__next__ = step
+
+
+def test_a_body_with_a_next_of_its_own_streams_with_the_script_prefix(settings):
+    # Rust calls the __next__ attribute, so the body with the script prefix does too.
+    api = BoltAPI()
+
+    @api.get("/stream")
+    def stream():
+        return StreamingResponse(_InstanceNext())
 
     settings.FORCE_SCRIPT_NAME = "/myapp"
     with TestClient(api) as client:

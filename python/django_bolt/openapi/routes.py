@@ -14,6 +14,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.urls import get_script_prefix
 
 from django_bolt import _script_prefix
+from django_bolt.openapi.config import DefaultServers
 from django_bolt.openapi.plugins import JsonRenderPlugin, YamlRenderPlugin
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.responses import HTML, JSON, PlainText
@@ -146,10 +147,10 @@ class OpenAPIRouteRegistrar:
 
         Under ``FORCE_SCRIPT_NAME``, the API is behind the script name. The
         default server ``/`` is the root of the host, so the script name
-        replaces it.
+        replaces it. A server list that the user sets stays.
         """
         schema = self._get_schema()
-        if _script_prefix.carries:
+        if _script_prefix.carries and isinstance(self.api._openapi_config.servers, DefaultServers):
             script_name = get_script_prefix().rstrip("/")
             if script_name and schema.get("servers") == [{"url": "/"}]:
                 return {**schema, "servers": [{"url": script_name}]}

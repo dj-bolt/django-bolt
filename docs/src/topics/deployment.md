@@ -321,6 +321,7 @@ These rules also apply:
 - `WebSocket.path` is the path without the sub-path.
 
 Bolt reads no request header for the sub-path.
+`TestClient` sends each path to Bolt as you give it, with no proxy. It follows a redirect to `/blog/...` as it is, and Bolt gives 404, as Django's test client does. Pass `follow_redirects=False` to check such a redirect.
 A proxy that keeps the sub-path needs no `FORCE_SCRIPT_NAME`. Mount the API under the prefix instead. See [Mount an API in the URLconf](routing.md#mount-an-api-in-the-urlconf).
 
 ## Configure database connections
