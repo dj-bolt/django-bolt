@@ -63,17 +63,25 @@ def invalid_request_detail(error: BaseException) -> str | None:
     ``list[int]``, with ``RequestValidationError``. Before accept, Bolt then
     refuses the upgrade with 400 too, with a detail of the same form:
     ``Query parameter 'ids': ...``. For another error, give None.
+
+    An error item can come from a handler, so each key is optional. An item
+    with no "msg" uses its "type", then "Invalid value".
     """
     if not isinstance(error, RequestValidationError):
         return None
     details = []
     for item in error.errors():
-        if not isinstance(item, dict) or len(item.get("loc", ())) < 2:
-            details.append(str(item.get("msg", item) if isinstance(item, dict) else item))
+        if not isinstance(item, dict):
+            details.append(str(item))
             continue
-        source, *names = item["loc"]
-        label = _SOURCE_LABELS.get(source, source)
-        details.append(f"{label} '{'.'.join(str(name) for name in names)}': {item['msg']}")
+        message = item.get("msg") or item.get("type") or "Invalid value"
+        loc = item.get("loc")
+        if not isinstance(loc, (list, tuple)) or len(loc) < 2:
+            details.append(str(message))
+            continue
+        source, *names = loc
+        label = _SOURCE_LABELS.get(source, source) if isinstance(source, str) else source
+        details.append(f"{label} '{'.'.join(str(name) for name in names)}': {message}")
     return "; ".join(details) or str(error)
 
 

@@ -444,7 +444,7 @@ Each receive method waits 5 seconds by default. Give `timeout=` to change it.
 | The handler closes the connection | `ConnectionClosed` on the next receive, with `code` and `reason` |
 | The handler refuses the handshake | `HandshakeRejected` at `async with`, with `status_code` |
 | The authentication, a guard or the Origin check refuses the handshake | `PermissionError` at `async with` |
-| A request value does not convert or fails its check (the server answers `400`) | `ValueError` at `async with`, with the detail of the server |
+| A request value does not convert or fails its check, or the handler raises `RequestValidationError` before `accept()` (the server answers `400`) | `ValueError` at `async with`, with the detail of the server |
 | The handler raises before `accept()` | That exception at `async with` |
 | The handler raises after `accept()` | That exception when the `async with` block ends |
 

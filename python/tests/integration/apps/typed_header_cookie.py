@@ -2,7 +2,8 @@
 
 Each route declares an int header and an int cookie. Valid requests send the
 converted values back. A bad value must give HTTP 422, or HTTP 400 at a
-WebSocket upgrade. A bad item of a list is a bad value too.
+WebSocket upgrade. A bad item of a list is a bad value too. A
+RequestValidationError of the handler before accept also gives 400.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from django_bolt import BoltAPI, WebSocket
+from django_bolt.exceptions import RequestValidationError
 from django_bolt.params import Cookie, Header, Query
 
 api = BoltAPI()
@@ -48,3 +50,8 @@ async def list_ws(
 ):
     await websocket.accept()
     await websocket.send_text(f"{ids} {x_ids}")
+
+
+@api.websocket("/ws/validation-error")
+async def validation_error_ws(websocket: WebSocket):
+    raise RequestValidationError([{"loc": ("query", "x"), "type": "missing"}])

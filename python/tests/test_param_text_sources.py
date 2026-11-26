@@ -8,6 +8,7 @@ accept the same text. Audit findings F1 to F5.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import math
 import sys
@@ -18,8 +19,10 @@ import msgspec
 import pytest
 
 from django_bolt import BoltAPI, WebSocket
+from django_bolt.exceptions import RequestValidationError
 from django_bolt.param_functions import Cookie, Form, Header, Query
 from django_bolt.testing import TestClient, WebSocketTestClient
+from tests.integration.apps.typed_header_cookie import api as typed_header_cookie_api
 
 UTC = datetime.UTC
 
@@ -717,3 +720,40 @@ async def test_a_websocket_list_item_of_each_source_is_refused_as_a_scalar(query
         async with WebSocketTestClient(api, "/ws/list", query_string=query, headers=headers):
             pass
     assert str(excinfo.value) == detail
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_validation_error_with_no_message_refuses_the_upgrade_at_once():
+    """The server answers 400; see test_typed_header_cookie_server_integration.py."""
+    with pytest.raises(ValueError) as excinfo:
+        async with asyncio.timeout(2), WebSocketTestClient(typed_header_cookie_api, "/ws/validation-error"):
+            pass
+    assert str(excinfo.value) == "Query parameter 'x': missing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("item", "detail"),
+    [
+        ({"loc": ("query", "x"), "type": "missing"}, "Query parameter 'x': missing"),
+        ({"loc": ("header", "x-a")}, "Header 'x-a': Invalid value"),
+        ({"loc": ("body", "a", 0), "msg": "Too big"}, "body 'a.0': Too big"),
+        ({"loc": "query", "msg": "Text location"}, "Text location"),
+        ({"loc": ([1], "x"), "msg": "List source"}, "[1] 'x': List source"),
+        ({"msg": "No location"}, "No location"),
+        ({}, "Invalid value"),
+        ("Plain text", "Plain text"),
+    ],
+)
+async def test_each_form_of_a_websocket_validation_error_gives_a_detail(item, detail):
+    socket_api = BoltAPI()
+
+    @socket_api.websocket("/ws")
+    async def refuse(websocket: WebSocket):
+        raise RequestValidationError([item])
+
+    with pytest.raises(ValueError) as excinfo:
+        async with asyncio.timeout(2), WebSocketTestClient(socket_api, "/ws"):
+            pass
+    assert str(excinfo.value) == detail
+

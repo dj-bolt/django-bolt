@@ -84,6 +84,16 @@ def test_websocket_list_item_is_refused_as_a_scalar_is(make_server_project):
         assert "Invalid request: ValueError: Header 'x-count': Invalid integer '5.0'" in body, f"body={body!r}"
 
 
+def test_websocket_validation_error_with_no_message_refuses_the_upgrade_with_400(make_server_project):
+    """An error item with no "msg" gives 400 at once, as WebSocketTestClient raises a ValueError."""
+    project = make_server_project(api_module=app_module("typed_header_cookie"))
+
+    with project.start() as server:
+        status_line, body = attempt_ws_upgrade(server.host, server.port, "/ws/validation-error")
+        assert "400" in status_line, f"status={status_line!r} body={body!r}"
+        assert "Query parameter 'x': missing" in body, f"body={body!r}"
+
+
 def test_a_cookie_is_read_as_django_reads_it(make_server_project):
     """A quoted cookie loses its quotes, and spaces around `=` do not count."""
     project = make_server_project(api_module=app_module("typed_header_cookie"))
