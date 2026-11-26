@@ -133,6 +133,11 @@ that the route refuses gets `Permission denied for tool '<name>'`, and `tools/li
 tool from that caller. A tool call cannot run middleware, so a route with `@rate_limit`,
 Python middleware or Django middleware raises `ValueError`.
 
+The tool result holds the body that HTTP sends for the route. The `response_model`, the return
+annotation and the response validation of the route apply, so a field that HTTP removes is not
+in the tool result. A route that declares a stream or a file raises `ValueError`. A route that
+returns one with no such declaration passes registration, and each call gives an error result.
+
 Exposure is **per-handler by design**: there is no "expose everything" switch, because a
 marker scattered across the codebase must never silently turn a route into an AI-callable
 tool. For deliberate bulk selection, call `expose_routes(mcp, api, include=[...], methods=(...))`
@@ -163,6 +168,32 @@ api.mount_mcp(mcp, oauth=ProtectedResource(
     token_verifier=my_verifier,  # (token: str) -> claims | None
 ))
 ```
+
+## Tracing
+
+`pip install "bolt-mcp[otel]"` installs `opentelemetry-api`. Then call `instrument(mcp)`
+before you register your own middleware:
+
+```python
+from bolt_mcp import MCP
+from bolt_mcp.otel import instrument
+
+mcp = MCP("my-server", "1.0.0")
+instrument(mcp)
+```
+
+Each `tools/call`, `resources/read` and `prompts/get` then gets one `SERVER` span, for
+example `tools/call greet`, with the attributes of the
+[OpenTelemetry semantic conventions for MCP](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/).
+The parent of the span is the `traceparent` in the request `_meta`. A span that a tool makes
+is a child of it. A failed call sets `error.type` and the `ERROR` status. For `tools/call`,
+Bolt changes a tool exception into an `isError` result first, so `error.type` is `tool_error`.
+For `resources/read` and `prompts/get`, `error.type` is the class name of the exception.
+`mcp.resource.uri` never has userinfo. The span records the tool arguments, the tool
+result, the exception text and the query values of a resource URI only when
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. Without it, each query value is
+`REDACTED`. The tool name, the prompt name and the URI path always go in the span. `bolt_mcp` does not import
+OpenTelemetry, so a server that does not call `instrument()` does not change.
 
 ## Development
 
