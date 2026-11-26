@@ -1,5 +1,5 @@
 ---
-description: Build an MCP server on a Bolt API with bolt-mcp, with tools, resources, prompts, progress, middleware, authentication and tests.
+description: Build an MCP server on a Bolt API with bolt-mcp, with tools, resources, prompts, progress, middleware, tracing, authentication and tests.
 ---
 
 # MCP servers
@@ -462,6 +462,89 @@ Bolt does not hide the message of a `JsonRpcError`.
 
 Register each middleware before `mount_mcp()`. A later registration raises `RuntimeError`.
 A middleware must be an `async def` function, else Bolt raises `TypeError`.
+
+## Trace calls with OpenTelemetry
+
+`bolt_mcp.otel.instrument()` makes one OpenTelemetry span for each `tools/call`, `resources/read` and `prompts/get`.
+Install the `otel` extra. It installs `opentelemetry-api`:
+
+```bash
+pip install "bolt-mcp[otel]"
+```
+
+Call `instrument(mcp)` before you register your own middleware:
+
+```python title="blog/api.py"
+from bolt_mcp import MCP
+from bolt_mcp.otel import instrument
+
+from django_bolt import BoltAPI
+
+api = BoltAPI()
+mcp = MCP("blog", "1.0.0")
+instrument(mcp)
+
+
+@mcp.tool
+async def get_article(article_id: int) -> dict:
+    """Return one article by its id."""
+    return {"id": article_id, "title": "Hello Bolt"}
+
+
+api.mount_mcp(mcp)
+```
+
+The spans go to the global tracer provider. Set it up with the OpenTelemetry SDK, or give `instrument(mcp, tracer_provider=...)`.
+With no tracer provider, the OpenTelemetry API makes no spans.
+
+Each span is a `SERVER` span with the name `{method} {target}`, for example `tools/call get_article`.
+The target is the tool name or the prompt name.
+A `resources/read` span has the name `resources/read`, because a URI can contain an id.
+The parent of the span is the `traceparent` and `tracestate` in the request `_meta`.
+Bolt reads them with the global propagator.
+
+The span has these attributes of the [OpenTelemetry semantic conventions for MCP](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/):
+
+| Attribute | Value |
+| --- | --- |
+| `mcp.method.name` | `tools/call`, `resources/read` or `prompts/get` |
+| `gen_ai.tool.name` | The tool name, for `tools/call` |
+| `gen_ai.operation.name` | `execute_tool`, for `tools/call` |
+| `mcp.resource.uri` | The URI, for `resources/read`, with no userinfo |
+| `gen_ai.prompt.name` | The prompt name, for `prompts/get` |
+| `error.type` | The kind of error of a failed call |
+
+A failed call sets `error.type` and the `ERROR` status:
+
+- `tools/call`: Bolt changes an exception in a tool into an `isError` result before the middleware gets it. Thus `error.type` is `tool_error`.
+- `resources/read` and `prompts/get`: `error.type` is the class name of the exception, for example `ValueError`. An unknown URI or prompt, or invalid arguments, gives `JsonRpcError`.
+- An exception in middleware that runs in the span gives its class name, for each method.
+
+`mcp.resource.uri` never has userinfo (`user:password@`).
+Bolt does not record a URI that it cannot parse.
+
+The span is the current span while the tool runs, also for a sync tool. Thus a span that a tool makes is a child of the MCP span.
+
+The span always has the tool name, the prompt name, and the scheme, host, path and query keys of a URI.
+It does not record the tool arguments, the tool result, the text of an exception or the query values of a URI.
+In `mcp.resource.uri`, each query value is `REDACTED`, and the fragment (`#...`) is removed.
+For example, `files://q3?access_token=abc&page=2` gives `files://q3?access_token=REDACTED&page=REDACTED`.
+
+To record this content, set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` before the `instrument()` call.
+The span then has `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result` as JSON.
+It also gets an `exception` event, with the message and the stack trace, for each exception in the span.
+`mcp.resource.uri` then has the URI as the client sent it, without the userinfo.
+Arguments, results, exception messages and URIs can contain personal data. Turn this on only where your traces can keep it.
+
+`instrument()` registers middleware, so the order rule of middleware applies.
+Middleware that you register after `instrument()` runs in the span. Middleware that you register before it runs out of the span.
+A second `instrument()` call on one server raises `ValueError`.
+
+These limits apply:
+
+- The parent of the span comes only from the request `_meta`. A span that is current in your own middleware does not become the parent.
+- Bolt refuses some calls before the middleware runs. Examples are a call to an unknown tool, a call that fails authentication or the guards, and a malformed request. These calls get no span, so their JSON-RPC errors do not show as error spans.
+- Bolt does not set `mcp.session.id`, `mcp.protocol.version` or `jsonrpc.request.id`, because MCP middleware does not get these values.
 
 ## Expose existing routes as tools
 
