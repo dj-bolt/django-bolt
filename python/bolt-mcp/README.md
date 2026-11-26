@@ -100,9 +100,10 @@ async def build_report(month: str, ctx: Context) -> dict:
     return {"month": month}
 ```
 
-Cancel and the end of the TTL cancel an `async def` tool. A `def` tool runs in a thread, which
-runs to its end. Only the principal that created a task can reach it. Tasks live in the memory
-of one process (`MCP(max_tasks=1000)` limits them), so `runbolt` refuses to start with
+Cancel, the end of the TTL and `SIGTERM` cancel an `async def` tool. A `def` tool runs in a
+thread, which runs to its end. Only the principal that created a task can reach it.
+`MCP(max_tasks=1000, max_tasks_per_principal=100)` limits the tasks of a mount and of one
+principal. Tasks live in the memory of one process, so `runbolt` refuses to start with
 `--processes` above 1, `--max-rss` or `--workers-lifetime` when a mount has a task tool.
 
 ## Expose existing endpoints as tools
