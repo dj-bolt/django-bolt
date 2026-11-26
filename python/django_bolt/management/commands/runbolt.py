@@ -889,7 +889,7 @@ class Command(BaseCommand):
         # Check admin
         admin_enabled = not options.get("no_admin", False)
         if admin_enabled and detect_admin_url_prefix is not None:
-            merged_api._register_admin_routes(options["host"], options["port"])
+            merged_api._register_admin_routes()
             # The root mount for an admin site behind a path parameter has no admin URL to print.
             if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():
                 admin_prefix = detect_admin_url_prefix()
@@ -995,7 +995,7 @@ class Command(BaseCommand):
 
         if admin_enabled and detect_admin_url_prefix is not None:
             # Register admin routes
-            merged_api._register_admin_routes(options["host"], options["port"])
+            merged_api._register_admin_routes()
 
             # The root mount for an admin site behind a path parameter has no admin URL to print.
             if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():

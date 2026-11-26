@@ -3961,11 +3961,11 @@ class BoltAPI:
         registrar = OpenAPIRouteRegistrar(self, middleware=middleware)
         registrar.register_routes()
 
-    def _register_admin_routes(self, host: str = "localhost", port: int = 8000) -> None:
+    def _register_admin_routes(self) -> None:
         """Register Django admin as an ASGI mount."""
 
         registrar = AdminRouteRegistrar(self)
-        registrar.register_routes(host, port)
+        registrar.register_routes()
 
     def _register_auth_backends(self) -> None:
         """
