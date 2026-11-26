@@ -897,7 +897,7 @@ class BoltAPI:
         # ``_no_route_handler`` makes it at the first call.
         self._no_route: tuple[int, Callable] | None = None
 
-        # Handler-to-API mapping for merged APIs (initialized here to avoid hasattr in hot path)
+        # The API that owns each route that mount() copied. The mount cycle check reads it.
         self._handler_api_map: dict[int, BoltAPI] = {}
 
         # Signal emission - disabled by default for performance
@@ -4138,7 +4138,6 @@ class BoltAPI:
                 middleware_meta["path"] = new_path
                 self._handler_middleware[new_handler_id] = middleware_meta
 
-            # Track which API owns this handler (for logging, global middleware, etc.).
             # A route that ``app`` mounted from another API keeps that API.
             self._handler_api_map[new_handler_id] = app._handler_api_map.get(handler_id, app)
 
@@ -4171,7 +4170,6 @@ class BoltAPI:
                 middleware_meta["path"] = new_path
                 self._handler_middleware[new_handler_id] = middleware_meta
 
-            # Track which API owns this handler (for logging, global middleware, etc.).
             # A route that ``app`` mounted from another API keeps that API.
             self._handler_api_map[new_handler_id] = app._handler_api_map.get(handler_id, app)
 

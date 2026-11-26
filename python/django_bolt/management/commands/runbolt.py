@@ -603,7 +603,6 @@ def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int, handle
     middleware of that API. A route that ``api`` mounted keeps its sub-app.
     """
     merged._handlers[new_handler_id] = handler
-    merged._handler_api_map[new_handler_id] = api._handler_api_map.get(old_handler_id, api)
     if old_handler_id in api._handler_meta:
         merged._handler_meta[new_handler_id] = api._handler_meta[old_handler_id]
     if old_handler_id in api._handler_middleware:
@@ -1429,9 +1428,6 @@ class Command(BaseCommand):
         # Preserve trailing_slash from first API (routes are pre-normalized by their original API)
         merged.trailing_slash = apis[0][1].trailing_slash
         route_map = {}  # Track conflicts
-
-        # Map handler_id -> original API instance (preserves per-API context)
-        merged._handler_api_map = {}
 
         # Track next available handler_id to avoid collisions
         next_handler_id = 0
