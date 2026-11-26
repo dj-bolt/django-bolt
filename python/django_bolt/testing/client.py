@@ -24,8 +24,8 @@ import httpx
 from httpx import Response
 
 from django_bolt import BoltAPI, _core
+from django_bolt._script_prefix import asgi_mounts, lifespan_entry, mcp_mounts
 from django_bolt._script_prefix import configure as configure_script_prefix
-from django_bolt._script_prefix import lifespan_entry, mcp_mounts
 from django_bolt._urlconf import served_api
 from django_bolt.api import (
     _routes_and_native_routes,
@@ -479,7 +479,7 @@ class TestClient(httpx.Client):
 
         # Register HTTP ASGI mounts
         if api._asgi_mounts:
-            _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
+            _core.register_test_asgi_mounts(self.app_id, asgi_mounts(api._asgi_mounts, script_prefix))
 
         # Register MCP mounts (served by the Rust rmcp core, like production)
         if api._mcp_mounts:
@@ -819,7 +819,7 @@ class AsyncTestClient(httpx.AsyncClient):
 
         # Register HTTP ASGI mounts
         if api._asgi_mounts:
-            _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
+            _core.register_test_asgi_mounts(self.app_id, asgi_mounts(api._asgi_mounts, script_prefix))
 
         # Register MCP mounts (served by the Rust rmcp core, like production)
         if api._mcp_mounts:

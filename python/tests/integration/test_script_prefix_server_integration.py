@@ -57,6 +57,7 @@ def test_runbolt_gives_the_script_name_where_user_code_runs(make_server_project,
         schema = server.get("/docs/openapi.json").json()
         static = server.get("/static/site.css")
         unstripped_static = server.get("/myapp/static/site.css").status_code
+        asgi = server.get("/asgi/page").json()
         with SimpleWebSocketClient(server.host, server.port, "/ws") as websocket:
             message = json.loads(websocket.receive_text())
 
@@ -70,7 +71,8 @@ def test_runbolt_gives_the_script_name_where_user_code_runs(make_server_project,
     assert schema["servers"] == [{"url": "/myapp"}]
     # Django puts the script name in front of a relative STATIC_URL. The proxy removes it.
     assert (static.text, unstripped_static) == ("body {}", 404)
-    assert message == {"handler": "/myapp/", "dependency": "/myapp/"}
+    assert asgi == {"prefix": "/myapp/", "root_path": "/myapp/asgi"}
+    assert message == {"handler": "/myapp/", "dependency": "/myapp/", "path": "/myapp/ws", "path_info": "/ws"}
 
 
 def _hammer(base_url: str, requests: int, concurrency: int) -> set[str]:

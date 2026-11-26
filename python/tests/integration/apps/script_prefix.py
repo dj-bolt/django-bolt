@@ -2,7 +2,7 @@
 
 Each route gives the script prefix that user code sees at one place: a
 handler, a thread hop, a dependency, a streaming body, a WebSocket handler, a
-lifespan and an error formatter. The routes under ``/dj`` run behind Django
+lifespan, an error formatter and an ASGI mount. The routes under ``/dj`` run behind Django
 middleware, on request lanes.
 """
 
@@ -119,10 +119,17 @@ async def lifespan_prefix() -> dict:
 @api.websocket("/ws")
 async def websocket(ws: WebSocket, dependency: Annotated[str, Depends(_prefix)]):
     await ws.accept()
-    await ws.send_json({"handler": _prefix(), "dependency": dependency})
+    await ws.send_json({"handler": _prefix(), "dependency": dependency, "path": ws.path, "path_info": ws.path_info})
     await ws.close()
+
+
+async def asgi_app(scope, receive, send):
+    body = json.dumps({"prefix": get_script_prefix(), "root_path": scope["root_path"]}).encode()
+    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": body})
 
 
 _add_routes(api)
 _add_routes(django_routes)
 api.mount("/dj", django_routes)
+api.mount_asgi("/asgi", asgi_app)

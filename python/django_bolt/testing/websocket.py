@@ -29,6 +29,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from django_bolt import BoltAPI, _core
+from django_bolt._script_prefix import asgi_mounts
 from django_bolt._script_prefix import configure as configure_script_prefix
 from django_bolt._urlconf import served_api
 from django_bolt.websocket import CloseCode, WebSocket, WebSocketDisconnect, WebSocketException
@@ -159,7 +160,7 @@ class WebSocketTestClient:
 
         # Register ASGI mounts so an unmatched path can fall back to one
         if self.api._asgi_mounts:
-            _core.register_test_asgi_mounts(self._app_id, list(self.api._asgi_mounts))
+            _core.register_test_asgi_mounts(self._app_id, asgi_mounts(self.api._asgi_mounts, script_prefix))
 
         # Register middleware metadata for guards/auth
         if self.api._handler_middleware:

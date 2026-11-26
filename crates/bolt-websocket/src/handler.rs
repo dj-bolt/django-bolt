@@ -151,6 +151,12 @@ pub fn requested_subprotocols<'a>(values: impl Iterator<Item = &'a str>) -> Vec<
 /// Parses and coerces query, path, header and cookie values to typed Python
 /// objects using the same type coercion as HTTP handlers.
 /// `headers` holds the request headers, with the `Cookie` lines joined.
+/// `path` starts with the script name (`FORCE_SCRIPT_NAME`), as `request.path`
+/// does, and `root_path` is the script name.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parts of a request and the settings of the app that the scope reads"
+)]
 fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
@@ -159,6 +165,7 @@ fn build_scope(
     path_params: &AHashMap<String, String>,
     route_meta: Option<&RouteMetadata>,
     max_param_length: usize,
+    script_name: Option<&str>,
 ) -> PyResult<Py<PyAny>> {
     let empty_types: &TypeHints = &EMPTY_TYPES;
     let path_types = route_meta.map_or(empty_types, |m| &m.path_types);
@@ -168,7 +175,8 @@ fn build_scope(
 
     let scope_dict = PyDict::new(py);
     scope_dict.set_item("type", "websocket")?;
-    scope_dict.set_item("path", req.path())?;
+    scope_dict.set_item("path", client_path(script_name, req.path().to_owned()))?;
+    scope_dict.set_item("root_path", client_path(script_name, String::new()))?;
 
     // Parse the query string with the HTTP parser: the last value of a repeated key wins.
     // A value that is too long or a bad typed value rejects the upgrade, as in HTTP.
@@ -915,6 +923,7 @@ pub async fn handle_websocket_upgrade(
                 path_params,
                 route_meta,
                 state.max_param_length,
+                state.script_name.as_deref(),
             )
         }
         WsTarget::AsgiMount { mount_prefix, .. } => {

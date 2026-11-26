@@ -28,7 +28,10 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import connections
 from django.db.backends.signals import connection_created
 
-from ._script_prefix import carry, carry_into
+# A hop copies the context with _script_prefix.copy_context() or makes one with
+# new_context(). They are the functions of contextvars until a server or a client
+# with FORCE_SCRIPT_NAME starts. Then the context also gets the script prefix of the caller.
+from . import _script_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -506,7 +509,7 @@ def run_on_request_lane[T](coro_fn: Callable[..., Coroutine[object, object, T]],
     open_lane_request()
     # A lane serves many requests. A new context keeps the context variables
     # of one request away from the next one, as a new asyncio task does.
-    return carry_into(contextvars.Context()).run(_drive_in_lane_mode, coro_fn, args)
+    return _script_prefix.new_context().run(_drive_in_lane_mode, coro_fn, args)
 
 
 def _drive_in_lane_mode[T](coro_fn: Callable[..., Coroutine[object, object, T]], args: tuple[object, ...]) -> T:
@@ -948,7 +951,7 @@ def run_orm_blocking[T](fn: Callable[..., T], *args: object) -> T:
     executor = getattr(AsyncToSync.executors, "current", None) or SyncToAsync.context_to_thread_executor.get(context)
     if executor is None:
         raise LaneAffinityError(_OFF_LANE_ORM_CALL)
-    future = executor.submit(contextvars.copy_context().run, carry(_call_without_parent_loop), fn, *args)
+    future = executor.submit(_script_prefix.copy_context().run, _call_without_parent_loop, fn, *args)
     started = time.perf_counter()
     result = future.result()
     waited = time.perf_counter() - started
@@ -1023,10 +1026,10 @@ async def run_in_orm_executor[**P, T](fn: Callable[P, T], *args: P.args) -> T:
     if SyncToAsync.thread_sensitive_context.get(None) is not None:
         return await sync_to_async(_call_guarded, thread_sensitive=True)(fn, *args)
 
-    ctx = contextvars.copy_context()
+    ctx = _script_prefix.copy_context()
     loop = asyncio.get_running_loop()
     executor, call = _orm_handoff()
-    return await loop.run_in_executor(executor, ctx.run, carry(call), fn, *args)
+    return await loop.run_in_executor(executor, ctx.run, call, fn, *args)
 
 
 async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
@@ -1073,8 +1076,7 @@ async def sync_to_thread[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.
         return await sync_to_async(_call_guarded, thread_sensitive=True)(fn, *args, **kwargs)
 
     loop = asyncio.get_running_loop()
-    ctx = contextvars.copy_context()
-    call = carry(_call_guarded)
+    ctx = _script_prefix.copy_context()
     if kwargs:
-        return await loop.run_in_executor(_get_default_executor(), partial(ctx.run, call, fn, *args, **kwargs))
-    return await loop.run_in_executor(_get_default_executor(), ctx.run, call, fn, *args)
+        return await loop.run_in_executor(_get_default_executor(), partial(ctx.run, _call_guarded, fn, *args, **kwargs))
+    return await loop.run_in_executor(_get_default_executor(), ctx.run, _call_guarded, fn, *args)

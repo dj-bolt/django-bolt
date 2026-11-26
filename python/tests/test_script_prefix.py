@@ -27,9 +27,14 @@ import jwt
 import pytest
 from asgiref.sync import async_to_sync, sync_to_async
 from django.contrib.auth.models import User
+from django.core.cache import caches
+from django.core.cache.backends.locmem import LocMemCache
+from django.core.exceptions import ImproperlyConfigured
 from django.core.handlers.wsgi import WSGIHandler
-from django.http import HttpResponse, JsonResponse
+from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.urls import get_script_prefix, path, reverse, set_script_prefix
+from django.utils import translation
+from django.utils.deprecation import MiddlewareMixin
 
 from django_bolt import BoltAPI, Depends, Request, StreamingResponse, WebSocket
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
@@ -86,18 +91,26 @@ def _django_facts_view(request, mission_id):
     return JsonResponse(_request_facts(request, "plain", mission_id=mission_id))
 
 
-def _django_wsgi_get(path_info: str, query: str = "") -> tuple[int, bytes]:
+def _django_wsgi_response(path_info: str, query: str = "") -> tuple[int, dict[str, str], bytes]:
     """GET through Django's own WSGIHandler, as a WSGI server behind a proxy that removed the script name."""
     environ = {"PATH_INFO": path_info, "QUERY_STRING": query, "SCRIPT_NAME": "", "SERVER_NAME": "testserver"}
     setup_testing_defaults(environ)
-    statuses: list[str] = []
+    started: list[tuple[str, list]] = []
     # The handler sets the script prefix of this thread. Give the next test its own.
     previous = get_script_prefix()
     try:
-        body = b"".join(WSGIHandler()(environ, lambda status, _headers, _exc_info=None: statuses.append(status)))
+        body = b"".join(
+            WSGIHandler()(environ, lambda status, headers, _exc_info=None: started.append((status, headers)))
+        )
     finally:
         set_script_prefix(previous)
-    return int(statuses[0].split()[0]), body
+    status, headers = started[0]
+    return int(status.split()[0]), {name.lower(): value for name, value in headers}, body
+
+
+def _django_wsgi_get(path_info: str, query: str = "") -> tuple[int, bytes]:
+    status, _headers, body = _django_wsgi_response(path_info, query)
+    return status, body
 
 
 class _DjangoFactsMiddleware:
@@ -190,6 +203,85 @@ def test_the_django_request_has_the_script_name_of_its_own_client(settings):
         paths = [client.get("/page").headers["x-django-path"] for client in (first, second)]
 
     assert paths == ["/first/page", "/second/page"]
+
+
+def _list_view(request):
+    return HttpResponse()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("script_name", ["/myapp", "/myapp/", "/myapp//", "/a/b", "/a+b.c~d", "/", "", None])
+def test_each_script_name_gives_the_request_facts_of_django_wsgi(mount_urlconf, settings, script_name):
+    api = BoltAPI(namespace="missions")
+
+    @api.get("/{mission_id}", name="detail")
+    def detail(request, mission_id: int) -> dict:
+        return {**_request_facts(request, "missions:detail", mission_id=mission_id), "prefix": get_script_prefix()}
+
+    @api.get("/list")
+    def listing() -> dict:
+        return {}
+
+    settings.FORCE_SCRIPT_NAME = script_name
+    settings.APPEND_SLASH = True
+    settings.MIDDLEWARE = ["django.middleware.common.CommonMiddleware"]
+    mount_urlconf(
+        [
+            path("missions/", api.urls),
+            path("plain/<int:mission_id>", _django_facts_view, name="plain"),
+            path("plain/list/", _list_view),
+        ]
+    )
+
+    with TestClient(api, follow_redirects=False) as client:
+        bolt = client.get("/missions/7?x=1").json()
+        # Bolt redirects to the path without the slash, Django to the path with it.
+        bolt_location = client.get("/missions/list/").headers["location"]
+    status, _headers, body = _django_wsgi_response("/plain/7", "x=1")
+    django = {
+        **json.loads(body),
+        "prefix": "/" if script_name is None else script_name if script_name.endswith("/") else script_name + "/",
+    }
+    django_location = _django_wsgi_response("/plain/list")[1]["location"]
+
+    assert status == 200
+    assert bolt == {key: value.replace("plain", "missions") for key, value in django.items()}
+    assert bolt_location + "/" == django_location.replace("plain", "missions")
+
+
+@pytest.mark.parametrize("script_name", ["/my app", "/caf\u00e9", "/a%20b", "/a?b", "/a;b", 1, b"/myapp"])
+def test_a_script_name_that_is_not_a_plain_path_is_refused_at_startup(settings, script_name):
+    # Django percent-encodes these characters in a URL. Bolt puts the script name in paths as it is.
+    settings.FORCE_SCRIPT_NAME = script_name
+
+    with pytest.raises(ImproperlyConfigured, match="FORCE_SCRIPT_NAME"):
+        TestClient(BoltAPI())
+
+
+@pytest.mark.parametrize("setting", ["STATIC_URL", "MEDIA_URL"])
+def test_files_at_the_script_name_are_refused_at_startup(settings, tmp_path, setting):
+    # The proxy removes /files, so Bolt would serve the files at "/", and that hides each route.
+    settings.FORCE_SCRIPT_NAME = "/files"
+    settings.STATIC_ROOT = settings.MEDIA_ROOT = str(tmp_path)
+    setattr(settings, setting, "/files/")
+
+    with pytest.raises(ImproperlyConfigured, match=f'{setting} "/files/" is FORCE_SCRIPT_NAME'):
+        TestClient(BoltAPI())
+
+
+def test_the_default_media_url_at_the_script_name_serves_no_media(settings):
+    # Django gives the default MEDIA_URL "" the script prefix. With no MEDIA_ROOT, Bolt serves no media.
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    settings.MEDIA_URL = ""
+    settings.MEDIA_ROOT = ""
+    api = BoltAPI()
+
+    @api.get("/page")
+    async def page() -> dict:
+        return {}
+
+    with TestClient(api) as client:
+        assert client.get("/page").json() == {}
 
 
 def test_without_the_setting_the_request_has_no_script_name():
@@ -332,6 +424,7 @@ def test_static_files_serve_at_the_path_that_the_proxy_gives(settings, tmp_path)
 
 def test_media_files_serve_at_the_path_that_the_proxy_gives(settings, tmp_path):
     (tmp_path / "photo.txt").write_text("photo")
+    (tmp_path / "page.html").write_text("<script>alert(1)</script>")
     settings.FORCE_SCRIPT_NAME = "/myapp"
     settings.MEDIA_URL = "/myapp/media/"
     settings.MEDIA_ROOT = str(tmp_path)
@@ -339,6 +432,13 @@ def test_media_files_serve_at_the_path_that_the_proxy_gives(settings, tmp_path):
     with TestClient(BoltAPI()) as client:
         assert client.get("/media/photo.txt").text == "photo"
         assert client.get("/myapp/media/photo.txt").status_code == 404
+        page = client.get("/media/page.html")
+
+    # A media file that a browser can run as script stays a download.
+    assert (page.headers["content-type"], page.headers["content-disposition"]) == (
+        "application/octet-stream",
+        "attachment",
+    )
 
 
 def test_a_mounted_api_reverses_with_the_script_name_and_serves_without_it(mount_urlconf, settings):
@@ -358,7 +458,7 @@ def test_a_mounted_api_reverses_with_the_script_name_and_serves_without_it(mount
 
 
 async def _http_scope_app(scope, receive, send):
-    body = json.dumps({"root_path": scope["root_path"], "path": scope["path"]}).encode()
+    body = json.dumps({"root_path": scope["root_path"], "path": scope["path"], "prefix": _prefix()}).encode()
     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
     await send({"type": "http.response.body", "body": body})
 
@@ -366,7 +466,8 @@ async def _http_scope_app(scope, receive, send):
 async def _websocket_scope_app(scope, receive, send):
     await receive()
     await send({"type": "websocket.accept"})
-    await send({"type": "websocket.send", "text": json.dumps({"root_path": scope["root_path"], "path": scope["path"]})})
+    facts = {"root_path": scope["root_path"], "path": scope["path"], "prefix": _prefix()}
+    await send({"type": "websocket.send", "text": json.dumps(facts)})
     await send({"type": "websocket.close"})
 
 
@@ -382,9 +483,14 @@ def test_an_asgi_app_gets_the_script_name_in_its_root_path(settings):
         mounted = client.get("/asgi/page").json()
     with TestClient(root) as client:
         at_root = client.get("/page").json()
+    settings.FORCE_SCRIPT_NAME = None
+    with TestClient(api) as client:
+        without_setting = client.get("/asgi/page").json()
 
-    assert mounted == {"root_path": "/myapp/asgi", "path": "/page"}
-    assert at_root == {"root_path": "/myapp", "path": "/page"}
+    # reverse() in the app gives the URLs of the Django project, under the script name.
+    assert mounted == {"root_path": "/myapp/asgi", "path": "/page", "prefix": "/myapp/"}
+    assert at_root == {"root_path": "/myapp", "path": "/page", "prefix": "/myapp/"}
+    assert without_setting == {"root_path": "/asgi", "path": "/page", "prefix": "/"}
 
 
 @pytest.mark.asyncio
@@ -397,7 +503,8 @@ async def test_a_websocket_asgi_app_gets_the_script_name_in_its_root_path_and_pa
     async with WebSocketTestClient(api, "/ws/room") as ws:
         scope = json.loads(await ws.receive_text())
 
-    assert scope == {"root_path": "/myapp/ws", "path": "/myapp/ws/room"}
+    assert scope == {"root_path": "/myapp/ws", "path": "/myapp/ws/room", "prefix": "/myapp/"}
+    assert _prefix() == "/"
 
 
 # --- mount_django -------------------------------------------------------------
@@ -468,21 +575,70 @@ def test_a_django_mount_keeps_a_path_that_repeats_its_root_path(
         assert client.get(request_path).json() == expected
 
 
+@pytest.mark.django_db
+@pytest.mark.parametrize("clear_root_path", [False, True])
+def test_under_the_setting_a_django_mount_routes_the_path_with_the_mount_path(mount_urlconf, settings, clear_root_path):
+    # Django's ASGIHandler takes FORCE_SCRIPT_NAME as the script name and ignores root_path.
+    settings.FORCE_SCRIPT_NAME = "/site"
+    mount_urlconf([path("legacy/page", _path_info_view), path("other", _path_info_view)])
+    api = BoltAPI()
+    api.mount_django("/legacy", clear_root_path=clear_root_path)
+
+    with TestClient(api) as client:
+        page = client.get("/legacy/page")
+        # A URL pattern without the mount path does not match.
+        other = client.get("/legacy/other")
+
+    assert page.json() == {"path": "/site/legacy/page", "path_info": "/legacy/page"}
+    assert other.status_code == 404
+
+
 def _hand_written_redirect(request):
     return HttpResponse(status=302, headers={"Location": "/other/"})
 
 
+def _redirect_inside(request):
+    return HttpResponseRedirect(reverse("inside"))
+
+
+def _redirect_outside(request):
+    return HttpResponseRedirect(reverse("outside"))
+
+
 @pytest.mark.django_db
-def test_a_root_relative_redirect_behind_a_mount_with_a_root_path_gets_the_mount_path(mount_urlconf, settings):
+@pytest.mark.parametrize("clear_root_path", [False, True])
+def test_a_django_mount_redirects_as_django_wsgi_under_the_setting(mount_urlconf, settings, clear_root_path):
+    # With FORCE_SCRIPT_NAME, Django ignores root_path. The URL patterns have the mount path.
     settings.FORCE_SCRIPT_NAME = "/site"
-    mount_urlconf([path("legacy/go", _hand_written_redirect)])
+    settings.APPEND_SLASH = True
+    settings.MIDDLEWARE = ["django.middleware.common.CommonMiddleware"]
+    mount_urlconf(
+        [
+            path("legacy/inside/", _slash_view, name="inside"),
+            path("legacy/to-inside", _redirect_inside),
+            path("legacy/to-outside", _redirect_outside),
+            path("legacy/hand", _hand_written_redirect),
+            path("accounts/login/", _slash_view, name="outside"),
+        ]
+    )
     api = BoltAPI()
-    api.mount_django("/legacy")
+    api.mount_django("/legacy", clear_root_path=clear_root_path)
+    paths = ["/legacy/inside", "/legacy/to-inside", "/legacy/to-outside", "/legacy/hand"]
 
     with TestClient(api, follow_redirects=False) as client:
-        response = client.get("/legacy/go")
+        through_bolt = {path: client.get(path).headers["location"] for path in paths}
+    django = {path: _django_wsgi_response(path)[1]["location"] for path in paths}
 
-    assert response.headers["location"] == "/site/legacy/other/"
+    assert (
+        through_bolt
+        == django
+        == {
+            "/legacy/inside": "/site/legacy/inside/",
+            "/legacy/to-inside": "/site/legacy/inside/",
+            "/legacy/to-outside": "/site/accounts/login/",
+            "/legacy/hand": "/other/",
+        }
+    )
 
 
 # --- The script prefix where user code runs ------------------------------------
@@ -842,6 +998,52 @@ async def test_a_websocket_handler_has_the_script_prefix(settings):
     assert get_script_prefix() == "/"
 
 
+def _ws_request_path(request: Request) -> str:
+    return request["path"]
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_has_the_paths_of_an_http_request(settings):
+    api = BoltAPI()
+
+    @api.websocket("/rooms/{room}")
+    async def room(websocket: WebSocket, room: str, request_path: Annotated[str, Depends(_ws_request_path)]):
+        await websocket.accept()
+        await websocket.send_json(
+            {"path": websocket.path, "path_info": websocket.path_info, "url": websocket.url, "dependency": request_path}
+        )
+        await websocket.close()
+
+    @api.get("/rooms/{room}")
+    async def page(request: Request, room: str) -> dict:
+        return {"path": request.path, "path_info": request.path_info}
+
+    facts = {}
+    for script_name in ("/myapp", None):
+        settings.FORCE_SCRIPT_NAME = script_name
+        async with WebSocketTestClient(api, "/rooms/a%20b") as ws:
+            facts[script_name] = await ws.receive_json()
+        with TestClient(api) as client:
+            http = client.get("/rooms/a%20b").json()
+        # A WebSocket has the same path and path info as an HTTP request to the same path.
+        assert {"path": facts[script_name]["path"], "path_info": facts[script_name]["path_info"]} == http
+
+    assert facts == {
+        "/myapp": {
+            "path": "/myapp/rooms/a%20b",
+            "path_info": "/rooms/a%20b",
+            "url": "/myapp/rooms/a%20b",
+            "dependency": "/myapp/rooms/a%20b",
+        },
+        None: {
+            "path": "/rooms/a%20b",
+            "path_info": "/rooms/a%20b",
+            "url": "/rooms/a%20b",
+            "dependency": "/rooms/a%20b",
+        },
+    }
+
+
 _JWT_SECRET = "script-prefix-test-secret-longer-than-32-chars"
 
 
@@ -873,10 +1075,78 @@ def test_a_user_that_loads_on_the_lane_of_the_request_has_the_script_prefix(sett
         assert client.get("/user", headers={"Authorization": f"Bearer {token}"}).json() == {"prefix": "/myapp/"}
 
 
+# --- The state of a thread ---------------------------------------------------------
+#
+# Django keeps thread state in asgiref Locals: cache backends, the active
+# language and time zone. The setting must not change what that state does.
+
+_BACKENDS: list[str] = []
+
+
+class _CountingCache(LocMemCache):
+    """A cache that counts its backends. A Redis backend opens a connection pool in each."""
+
+    def __init__(self, name, params):
+        _BACKENDS.append(name)
+        super().__init__(name, params)
+
+
+def _cached(*_args) -> object:
+    return caches["default"].get("key")
+
+
+class _CacheMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        _cached()
+        return self.get_response(request)
+
+
+def _cache_api(config: str) -> BoltAPI:
+    def formatter(error, request) -> JSON:
+        _cached()
+        return JSON({}, status_code=error.status)
+
+    kwargs = {
+        "plain": {},
+        "django_middleware": {"django_middleware": [f"{__name__}._CacheMiddleware"]},
+        "error_formatter": {"error_formatter": formatter},
+    }[config]
+    api = BoltAPI(**kwargs)
+
+    @api.get("/cached")
+    def cached() -> dict:
+        _cached()
+        return {}
+
+    return api
+
+
+@pytest.mark.parametrize(
+    ("config", "route"), [("plain", "/cached"), ("django_middleware", "/cached"), ("error_formatter", "/missing")]
+)
+def test_a_sync_request_keeps_the_cache_backend_of_its_thread(settings, config, route):
+    made = {}
+    for script_name in ("/myapp", None):
+        settings.FORCE_SCRIPT_NAME = script_name
+        # New CACHES settings give the cache handler new Locals, so no backend exists yet.
+        settings.CACHES = {"default": {"BACKEND": f"{__name__}._CountingCache", "LOCATION": config}}
+        _BACKENDS.clear()
+        with TestClient(_cache_api(config)) as client:
+            for _ in range(20):
+                client.get(route)
+        made[script_name] = len(_BACKENDS)
+
+    # A request lane gives each request a context of its own, so a backend each.
+    assert made == ({"/myapp": 20, None: 20} if config == "django_middleware" else {"/myapp": 1, None: 1})
+
+
 _HANDLER_VARIABLE: contextvars.ContextVar[str] = contextvars.ContextVar("handler_variable", default="unset")
 
 
-def test_under_the_setting_a_context_variable_of_a_sync_handler_ends_with_its_request(settings):
+def test_a_context_variable_of_a_sync_handler_stays_on_its_thread_as_without_the_setting(settings):
     api = BoltAPI()
 
     @api.get("/set/{value}")
@@ -885,12 +1155,49 @@ def test_under_the_setting_a_context_variable_of_a_sync_handler_ends_with_its_re
         _HANDLER_VARIABLE.set(value)
         return {"before": before}
 
+    seen = {}
+    for script_name, values in (("/myapp", ("a1", "b1", "c1")), (None, ("a2", "b2", "c2"))):
+        settings.FORCE_SCRIPT_NAME = script_name
+        with TestClient(api) as client:
+            # The requests of one test thread go to one worker thread, as under WSGI.
+            seen[script_name] = [client.get(f"/set/{value}").json()["before"] for value in values][1:]
+
+    assert seen == {"/myapp": ["a1", "b1"], None: ["a2", "b2"]}
+
+
+class _LanguageMiddleware(MiddlewareMixin):
+    """Set state on the request path and read it on the response path, as LocaleMiddleware does."""
+
+    def process_request(self, request):
+        _HANDLER_VARIABLE.set("middleware")
+        translation.activate("fr")
+
+    def process_response(self, request, response):
+        response["x-state"] = f"{_HANDLER_VARIABLE.get()} {translation.get_language()}"
+        translation.deactivate()
+        return response
+
+
+@pytest.mark.parametrize("handler_kind", ["sync", "async"])
+def test_sync_middleware_keeps_its_state_from_the_request_to_the_response(settings, handler_kind):
+    api = BoltAPI(django_middleware=[f"{__name__}._LanguageMiddleware"])
+
+    def state() -> dict:
+        return {"state": f"{_HANDLER_VARIABLE.get()} {translation.get_language()}"}
+
+    if handler_kind == "sync":
+        api.get("/state")(state)
+    else:
+
+        @api.get("/state")
+        async def async_state() -> dict:
+            return state()
+
     settings.FORCE_SCRIPT_NAME = "/myapp"
     with TestClient(api) as client:
-        # The requests of one test thread go to one worker thread.
-        seen = [client.get(f"/set/{value}").json()["before"] for value in ("a", "b", "c")]
+        response = client.get("/state")
 
-    assert seen == ["unset"] * 3
+    assert (response.json()["state"], response.headers["x-state"]) == ("middleware fr", "middleware fr")
 
 
 # --- No leak ----------------------------------------------------------------------

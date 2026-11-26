@@ -22,7 +22,6 @@ except ImportError:
 
 from . import _json
 from ._core import resolve_response_file
-from ._script_prefix import carry_into_body
 from .cookies import Cookie, make_delete_cookie
 
 if TYPE_CHECKING:
@@ -314,6 +313,7 @@ class StreamingResponse(CookieMixin):
                 f"not a callable. Received: {type(content).__name__}"
             )
 
+        self.content = content
         self.status_code = status_code
         self.media_type = media_type or "application/octet-stream"
         self.headers = dict(headers) if headers else {}
@@ -330,8 +330,6 @@ class StreamingResponse(CookieMixin):
             raise TypeError(
                 f"StreamingResponse content must be a generator instance. Received type: {type(content).__name__}"
             )
-        # The body runs after the handler returns. It keeps the script prefix of the request.
-        self.content = carry_into_body(content, self.is_async_generator)
 
 
 class ServerSentEvent(msgspec.Struct, frozen=True):

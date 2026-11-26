@@ -5,33 +5,41 @@ visible only in the context that set it. From asgiref 3.13, it is also
 visible only on the thread that set it. Bolt sets the prefix at two kinds of
 points:
 
-- An entry: each call from Rust into Python for a request or a WebSocket. It
-  sets the prefix of the server in a context that ends with the call: the
-  task of an async call, or a copy of the context for a sync call.
-- A carry: each move of request work to another thread or to a new context.
-  It sets the prefix of the caller there, also in a context that ends with
-  the work. It never sets a prefix that the caller does not have.
+- An entry: each call from Rust into Python for a request, a WebSocket, an MCP
+  call or an ASGI mount. A sync entry sets the prefix on its thread, and puts
+  the previous value back when the call returns. A sync call does not suspend,
+  so no other work on the thread sees the prefix. An async entry sets the
+  prefix in the task of the call.
+- A hop: each move of request work to a new context, on a pool thread or on a
+  request lane. The new context gets the prefix of the caller. A hop never
+  sets a prefix that the caller does not have.
 
-Thus a prefix is visible only to the work of a request of a server with the
-setting. The server picks the entries at startup. Without the setting, the
-code of each request is the same as before.
+An entry does not copy the context. Thus the other state of a thread, such as
+the cache backends of Django, stays on the thread, as without the setting.
+
+The server picks the entries at startup. ``configure()`` picks the hops when the
+first server or client with the setting starts. Without the setting, the code of
+each request is the same as before.
 """
 
 from __future__ import annotations
 
+import contextvars
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from contextvars import Context, copy_context
-from functools import partial, wraps
+from functools import wraps
 from typing import Any
 
 from django.conf import settings
-from django.urls import get_script_prefix, set_script_prefix
+from django.core.exceptions import ImproperlyConfigured
+from django.urls import clear_script_prefix, get_script_prefix, set_script_prefix
+from django.utils.encoding import escape_uri_path
 
-# True after a server or a test client with FORCE_SCRIPT_NAME started in this
-# process. The carries run only then. A carry copies the prefix of the caller
-# only when it is not "/", so a later client without the setting gets no change.
-carries = False
+# The context of a hop: copy_context() for a pool thread, new_context() for a
+# request lane. Until a server or a client with the setting starts, they are the
+# functions of contextvars, so each hop is the same as before.
+copy_context: Callable[[], Any] = contextvars.copy_context
+new_context: Callable[[], Any] = contextvars.Context
 
 
 def configure() -> str | None:
@@ -40,27 +48,98 @@ def configure() -> str | None:
     Returns:
         The script prefix for the entries, as ``get_script_prefix()`` gives it,
         or None when the setting adds no prefix.
+
+    Raises:
+        ImproperlyConfigured: The setting is not a str, or it has a character
+            that Django percent-encodes in a URL.
     """
-    global carries
-    script_name = (settings.FORCE_SCRIPT_NAME or "").rstrip("/")
-    if not script_name:
+    script_name = settings.FORCE_SCRIPT_NAME
+    if script_name is None:
         return None
-    carries = True
-    return script_name + "/"
+    if not isinstance(script_name, str):
+        raise ImproperlyConfigured(f"FORCE_SCRIPT_NAME must be a str or None, not {type(script_name).__name__}.")
+    if escape_uri_path(script_name) != script_name:
+        raise ImproperlyConfigured(
+            f"FORCE_SCRIPT_NAME {script_name!r} has a character that a URL path must percent-encode. "
+            "Bolt puts the script name in request paths and redirects as it is. "
+            "Use ASCII letters, digits and the characters /:@&+$,-_.!~*'()."
+        )
+    # The prefix that Django's set_script_prefix() makes of the setting.
+    script_prefix = script_name if script_name.endswith("/") else script_name + "/"
+    if script_prefix == "/":
+        return None
+    _carry_in_hops()
+    return script_prefix
+
+
+def _carry_in_hops() -> None:
+    """Give each hop of request work the script prefix of its caller, from now on."""
+    global copy_context, new_context
+    if copy_context is _copy_context_with_prefix:
+        return
+    copy_context = _copy_context_with_prefix
+    new_context = _new_context_with_prefix
+    # django_adapter imports this module through concurrency.
+    from .middleware import django_adapter  # noqa: PLC0415
+
+    django_adapter.use_script_name()
+
+
+class _PrefixedContext:
+    """A context that runs work with a script prefix, on any thread."""
+
+    __slots__ = ("_context", "_script_prefix")
+
+    def __init__(self, context: contextvars.Context, script_prefix: str) -> None:
+        self._context = context
+        self._script_prefix = script_prefix
+
+    def run(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        return self._context.run(_call, self._script_prefix, fn, *args, **kwargs)
 
 
 def _call(script_prefix: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    # The thread that runs the work sets the prefix. With asgiref 3.13, a value
+    # that another thread set is not visible here.
     set_script_prefix(script_prefix)
     return fn(*args, **kwargs)
 
 
+def _copy_context_with_prefix() -> Any:
+    context = contextvars.copy_context()
+    script_prefix = get_script_prefix()
+    return context if script_prefix == "/" else _PrefixedContext(context, script_prefix)
+
+
+def _new_context_with_prefix() -> Any:
+    script_prefix = get_script_prefix()
+    context = contextvars.Context()
+    return context if script_prefix == "/" else _PrefixedContext(context, script_prefix)
+
+
+# --- Entries ------------------------------------------------------------------
+
+
+def restore(previous: str) -> None:
+    """Put back the script prefix that ``get_script_prefix()`` gave before an entry."""
+    if previous == "/":
+        clear_script_prefix()
+    else:
+        set_script_prefix(previous)
+
+
 def sync_entry[F: Callable[..., Any]](fn: F, script_prefix: str | None) -> F:
-    """Return ``fn``, or ``fn`` that runs in a copy of the context with the script prefix."""
+    """Return ``fn``, or ``fn`` that runs with the script prefix on its thread."""
     if script_prefix is None:
         return fn
 
     def entry(*args: Any, **kwargs: Any) -> Any:
-        return copy_context().run(_call, script_prefix, fn, *args, **kwargs)
+        previous = get_script_prefix()
+        set_script_prefix(script_prefix)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            restore(previous)
 
     return entry  # type: ignore[return-value]
 
@@ -96,6 +175,27 @@ def mcp_mounts(mounts: list[dict[str, Any]], script_prefix: str | None) -> list[
     ]
 
 
+def asgi_mounts(mounts: list[tuple[str, Any]], script_prefix: str | None) -> list[tuple[str, Any]]:
+    """Return the ASGI mounts, with apps that run with the script prefix.
+
+    The app of a request runs in a task of its own, so the prefix ends with it.
+    """
+    if script_prefix is None:
+        return list(mounts)
+    return [(path, _asgi_entry(app, script_prefix)) for path, app in mounts]
+
+
+def _asgi_entry(app: Any, script_prefix: str) -> Callable[..., Any]:
+    async def entry(scope: Any, receive: Any, send: Any) -> Any:
+        set_script_prefix(script_prefix)
+        return await app(scope, receive, send)
+
+    # Rust reads this mark from the app. See BoltAPI.mount_django().
+    if getattr(app, "_bolt_http_only", False):
+        entry._bolt_http_only = True  # type: ignore[attr-defined]
+    return entry
+
+
 @contextmanager
 def lifespan_entry(script_prefix: str | None) -> Iterator[None]:
     """Give the code in the block the script prefix, as runbolt gives it to a lifespan.
@@ -111,51 +211,19 @@ def lifespan_entry(script_prefix: str | None) -> Iterator[None]:
     try:
         yield
     finally:
-        set_script_prefix(previous)
+        restore(previous)
 
 
-# --- Carries ------------------------------------------------------------------
+# --- Streaming bodies ---------------------------------------------------------
 
 
-def _caller_prefix() -> str | None:
-    """The script prefix of the caller, or None when it has none to carry."""
-    if not carries:
-        return None
-    script_prefix = get_script_prefix()
-    return None if script_prefix == "/" else script_prefix
+def stream_body(content: Any, is_async: bool, script_prefix: str) -> Any:
+    """Return the body of a streaming response that iterates ``content`` with the script prefix.
 
-
-def carry(call: Callable[..., Any]) -> Callable[..., Any]:
-    """Return ``call``, with the script prefix of the caller set first on the thread that runs it.
-
-    Read before a hop to a thread pool, on the thread of the caller. The pool
-    runs ``call`` in a copy of the context of the caller. With asgiref 3.13,
-    the copy does not show a prefix that another thread set.
+    Rust iterates a body after the entry returned: an async body in a task of
+    its own, a sync body on a new thread of its own. The body that this returns
+    iterates ``content`` as Rust does.
     """
-    script_prefix = _caller_prefix()
-    if script_prefix is None:
-        return call
-    return partial(_call, script_prefix, call)
-
-
-def carry_into(context: Context) -> Context:
-    """Set the script prefix of the caller in ``context``, a new context for the work of a request."""
-    script_prefix = _caller_prefix()
-    if script_prefix is not None:
-        context.run(set_script_prefix, script_prefix)
-    return context
-
-
-def carry_into_body(content: Any, is_async: bool) -> Any:
-    """Return the body of a streaming response with the script prefix of the caller.
-
-    Rust iterates a body after the handler returned, out of the context of
-    the request: an async body in a task of its own, a sync body on a thread
-    of its own. The body that this returns iterates ``content`` as Rust does.
-    """
-    script_prefix = _caller_prefix()
-    if script_prefix is None:
-        return content
     if is_async:
         return _async_body(content, script_prefix)
     return _sync_body(content, script_prefix)
@@ -179,8 +247,9 @@ async def _async_body(content: Any, script_prefix: str) -> Any:
 
 
 def _sync_body(content: Any, script_prefix: str) -> Any:
-    # Each step runs in a context of its own, whatever thread iterates the body.
-    context = copy_context()
+    # Each step runs in one context of the body, whatever thread iterates it.
+    # Rust gives a sync body a new thread, so the context is as new as the thread.
+    context = contextvars.copy_context()
     context.run(set_script_prefix, script_prefix)
     # As Rust does: read the __iter__ and __next__ attributes, not the methods of
     # the type, and read __next__ again on each step.

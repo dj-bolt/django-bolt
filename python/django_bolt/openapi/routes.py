@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 from django.core.exceptions import ImproperlyConfigured
 from django.urls import get_script_prefix
 
-from django_bolt import _script_prefix
 from django_bolt.openapi.config import DefaultServers
 from django_bolt.openapi.plugins import JsonRenderPlugin, YamlRenderPlugin
 from django_bolt.openapi.schema_generator import SchemaGenerator
@@ -150,7 +149,7 @@ class OpenAPIRouteRegistrar:
         replaces it. A server list that the user sets stays.
         """
         schema = self._get_schema()
-        if _script_prefix.carries and isinstance(self.api._openapi_config.servers, DefaultServers):
+        if isinstance(self.api._openapi_config.servers, DefaultServers):
             script_name = get_script_prefix().rstrip("/")
             if script_name and schema.get("servers") == [{"url": "/"}]:
                 return {**schema, "servers": [{"url": script_name}]}
@@ -158,9 +157,7 @@ class OpenAPIRouteRegistrar:
 
     def _schema_url(self, schema_url: str) -> str:
         """The URL from which a docs page loads the schema: the script name, then ``schema_url``."""
-        if _script_prefix.carries:
-            return get_script_prefix().rstrip("/") + schema_url
-        return schema_url
+        return get_script_prefix().rstrip("/") + schema_url
 
     def _register_ui_plugins(self, route_prefix: str) -> None:
         """Register UI plugin routes (Swagger UI, ReDoc, etc.)."""

@@ -4323,7 +4323,9 @@ class BoltAPI:
                 if django_scope is scope:
                     django_scope = dict(scope)
                 django_scope["root_path"] = ""
-            root_path = django_scope.get("root_path") or ""
+            # Django's ASGIHandler takes FORCE_SCRIPT_NAME in place of root_path.
+            # Then its URLs start with the script name, not with the mount path.
+            root_path = "" if django_settings.FORCE_SCRIPT_NAME else django_scope.get("root_path") or ""
 
             async def django_send(message):
                 rewritten = _rewrite_django_mount_redirect_message(message, root_path)

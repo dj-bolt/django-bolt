@@ -23,8 +23,8 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
+from django_bolt._script_prefix import asgi_mounts, mcp_mounts
 from django_bolt._script_prefix import configure as configure_script_prefix
-from django_bolt._script_prefix import mcp_mounts
 from django_bolt._urlconf import served_apis
 from django_bolt.api import (
     BoltAPI,
@@ -1087,7 +1087,7 @@ class Command(BaseCommand):
 
         # Register HTTP ASGI mounts with Rust
         if merged_api._asgi_mounts:
-            _core.register_asgi_mounts(merged_api._asgi_mounts)
+            _core.register_asgi_mounts(asgi_mounts(merged_api._asgi_mounts, script_prefix))
 
         # Register MCP mounts with Rust (rmcp protocol core)
         if merged_api._mcp_mounts:
