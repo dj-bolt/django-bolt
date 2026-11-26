@@ -180,7 +180,6 @@ class TestRouteDecoratorAPI:
             return {"message": "admin only"}
 
         # Check that metadata was compiled
-        api._handlers[0]
         handler_id = 0
         assert handler_id in api._handler_middleware
 

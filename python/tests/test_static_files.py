@@ -295,7 +295,7 @@ def test_admin_static_served_via_native_finder_fallback(settings):
     settings.DEBUG = True
 
     api = BoltAPI(django_middleware=True)
-    api._register_admin_routes("127.0.0.1", 8000)
+    api._register_admin_routes()
 
     static_config = {"url_prefix": "/static", "directories": [], "csp_header": None}
     with TestClient(api, static_files_config=static_config) as client:
