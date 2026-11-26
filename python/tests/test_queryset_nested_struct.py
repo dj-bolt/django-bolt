@@ -847,6 +847,27 @@ def test_reverse_one_to_one_with_no_row_one_level_down_gives_null():
     _assert_each_path(api, list_paths, one_paths, rows, [profile.pk for profile in profiles])
 
 
+class ArrayProfileOut(msgspec.Struct, array_like=True):
+    bio: str
+
+
+class ArrayUserWithRequiredProfile(msgspec.Struct, array_like=True):
+    username: str
+    profile: ArrayProfileOut | None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reverse_one_to_one_of_an_array_like_struct():
+    """msgspec reads an ``array_like`` Struct from attributes or from an array, but not from a dict."""
+    ada, bob = _make_users()
+    UserProfile.objects.filter(user=bob).delete()
+    rows = [["ada", ["Hi"]], ["bob", None]]
+    api, list_paths, one_paths = _routes_of(ArrayUserWithRequiredProfile, User, "username")
+    # The paths that read instances. The values() and unvalidated paths make dicts, which never give arrays.
+    instance_paths = [path for path in list_paths if path.startswith(("/page", "/instances"))]
+    _assert_each_path(api, instance_paths, one_paths, rows, [ada.pk, bob.pk])
+
+
 @pytest.mark.django_db(transaction=True)
 def test_accessor_relation_loads_with_one_query_for_each_relation(sql_statements):
     """The join uses the query name and the prefetch uses the accessor. No path reads a row at a time."""
