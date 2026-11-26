@@ -510,7 +510,7 @@ The span has these attributes of the [OpenTelemetry semantic conventions for MCP
 | `mcp.method.name` | `tools/call`, `resources/read` or `prompts/get` |
 | `gen_ai.tool.name` | The tool name, for `tools/call` |
 | `gen_ai.operation.name` | `execute_tool`, for `tools/call` |
-| `mcp.resource.uri` | The URI, for `resources/read`, with no credentials |
+| `mcp.resource.uri` | The URI, for `resources/read`, with no userinfo |
 | `gen_ai.prompt.name` | The prompt name, for `prompts/get` |
 | `error.type` | The kind of error of a failed call |
 
@@ -520,17 +520,21 @@ A failed call sets `error.type` and the `ERROR` status:
 - `resources/read` and `prompts/get`: `error.type` is the class name of the exception, for example `ValueError`. An unknown URI or prompt, or invalid arguments, gives `JsonRpcError`.
 - An exception in middleware that runs in the span gives its class name, for each method.
 
-`mcp.resource.uri` has no userinfo (`user:password@`).
-The values of the query parameters `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature` are `REDACTED`, as in the OpenTelemetry HTTP conventions.
+`mcp.resource.uri` never has userinfo (`user:password@`).
 Bolt does not record a URI that it cannot parse.
 
 The span is the current span while the tool runs, also for a sync tool. Thus a span that a tool makes is a child of the MCP span.
 
-The span does not record the tool arguments, the tool result or the text of an exception.
-To record them, set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` before the `instrument()` call.
+The span always has the tool name, the prompt name, and the scheme, host, path and query keys of a URI.
+It does not record the tool arguments, the tool result, the text of an exception or the query values of a URI.
+In `mcp.resource.uri`, each query value is `REDACTED`, and the fragment (`#...`) is removed.
+For example, `files://q3?access_token=abc&page=2` gives `files://q3?access_token=REDACTED&page=REDACTED`.
+
+To record this content, set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` before the `instrument()` call.
 The span then has `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result` as JSON.
 It also gets an `exception` event, with the message and the stack trace, for each exception in the span.
-Arguments, results and exception messages can contain personal data. Turn this on only where your traces can keep it.
+`mcp.resource.uri` then has the URI as the client sent it, without the userinfo.
+Arguments, results, exception messages and URIs can contain personal data. Turn this on only where your traces can keep it.
 
 `instrument()` registers middleware, so the order rule of middleware applies.
 Middleware that you register after `instrument()` runs in the span. Middleware that you register before it runs out of the span.

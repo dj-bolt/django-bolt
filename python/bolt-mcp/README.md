@@ -165,9 +165,10 @@ The parent of the span is the `traceparent` in the request `_meta`. A span that 
 is a child of it. A failed call sets `error.type` and the `ERROR` status. For `tools/call`,
 Bolt changes a tool exception into an `isError` result first, so `error.type` is `tool_error`.
 For `resources/read` and `prompts/get`, `error.type` is the class name of the exception.
-`mcp.resource.uri` has no userinfo and no signature values. The span records the tool
-arguments, the tool result and the exception text only when
-`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. `bolt_mcp` does not import
+`mcp.resource.uri` never has userinfo. The span records the tool arguments, the tool
+result, the exception text and the query values of a resource URI only when
+`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. Without it, each query value is
+`REDACTED`. The tool name, the prompt name and the URI path always go in the span. `bolt_mcp` does not import
 OpenTelemetry, so a server that does not call `instrument()` does not change.
 
 ## Development
