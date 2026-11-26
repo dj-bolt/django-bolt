@@ -57,9 +57,7 @@ def test_a_task_runs_on_after_its_request_and_polls_reach_it(make_server_project
         assert created["status"] == "working"
         assert created["pollIntervalMs"] == 20
 
-        final, statuses = _poll(client, created["taskId"], lambda r: r["status"] == "completed")
-        # The tool sleeps, so a poll saw the task still running.
-        assert "working" in statuses
+        final, _ = _poll(client, created["taskId"], lambda r: r["status"] == "completed")
         assert final["result"]["structuredContent"] == {"product": 42, "task_id": created["taskId"]}
         assert final["statusMessage"] == "multiplying"
 

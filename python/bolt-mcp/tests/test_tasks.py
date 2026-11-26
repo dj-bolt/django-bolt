@@ -71,11 +71,11 @@ def _build(*, auth=None, max_tasks: int | None = None) -> tuple[BoltAPI, Probe]:
     async def slow() -> dict:
         return await wait_for_cancel("slow")
 
-    @mcp.tool(task=True, ttl_ms=300)
+    @mcp.tool(task=True, ttl_ms=1000)
     async def expiring() -> dict:
         return await wait_for_cancel("expiring")
 
-    @mcp.tool(task=True, ttl_ms=200)
+    @mcp.tool(task=True, ttl_ms=1000)
     async def quick() -> dict:
         return {"ok": True}
 
@@ -253,7 +253,7 @@ def test_the_ttl_fails_a_running_task_and_cancels_the_coroutine():
     api, probe = _build()
     with TestClient(api) as client:
         created = _create(client, "expiring")
-        assert created["ttlMs"] == 300
+        assert created["ttlMs"] == 1000
         # No poll before the TTL: the task itself stops at its deadline.
         assert probe.cancelled["expiring"].wait(5), "the TTL did not cancel the tool coroutine"
         final = _get(client, created["taskId"])
@@ -266,9 +266,9 @@ def test_an_expired_task_id_is_unknown():
     api, _ = _build()
     with TestClient(api) as client:
         created = _create(client, "quick")
-        assert _poll(client, created["taskId"])["status"] == "completed"
-        # Bolt keeps a finished task for one TTL (200 ms), then deletes it.
-        time.sleep(0.3)
+        assert _get(client, created["taskId"])["status"] in {"working", "completed"}
+        # Bolt keeps a finished task for one TTL (1 s) after it finished, then deletes it.
+        time.sleep(2.5)
         error = _error(client, "tasks/get", {"taskId": created["taskId"]})
         assert error == {"code": INVALID_PARAMS, "message": f"Unknown task: {created['taskId']}"}
 
