@@ -446,11 +446,12 @@ Another client gets the tool result, as for any tool. The extension does not app
 - `ctx.sample()` raises `McpClientError`, as for each 2026-07-28 client.
 - `ctx.task_id` is the task id. It is `None` when the call is not a task.
 - `tasks/cancel` makes the task `cancelled` at once, and Bolt cancels the coroutine of the tool. A `tasks/cancel` after the end of the task has no effect. When the cancel comes before the tool started, the tool does not run.
-- A stop of the server (`SIGTERM`) cancels each running task. `runbolt` waits up to 5 seconds for the coroutines to end, so their `except` and `finally` blocks run. `SIGINT` does not wait.
+- A stop of the server (`SIGTERM`) cancels each running task. `runbolt` waits up to 5 seconds for the coroutines to end, so their `except` and `finally` blocks run. `SIGINT` does not wait. These limits apply to `async def` tools only.
 
 !!! warning "A sync tool does not stop"
     A `def` tool runs in a thread of the default thread pool. Bolt cannot stop a thread.
     After a cancel or the end of the TTL, the function runs to its end, and Bolt discards the result.
+    At a stop of the server, the process exits only after the function returns, also on `SIGINT`.
     Write a long tool as `async def` when it must stop.
 
 Bolt limits the tasks that a mount keeps in memory, running and finished:
@@ -464,9 +465,11 @@ A refused call is a tool result with `isError: true`, not a JSON-RPC error.
 
 Only the caller that created a task can read, answer or cancel it.
 Bolt compares the principal of each `tasks/*` request with the principal of the `tools/call`.
-The principal is the user id and the name of the authentication backend. Thus one `sub` from two JWT backends is two principals.
+The principal is the user id and the type of the authentication backend: `jwt`, `api_key` or `session`.
+Two JWT backends on one mount have the same type. Thus one `sub` from two JWT backends is one principal, and each caller can read and cancel the tasks of the other.
+Do not put two JWT issuers that give the same `sub` to different users on one task mount.
 Another caller gets `-32602` with `Unknown task`, as for an id that does not exist.
-Callers without a user id share one principal: all callers without authentication are one, and all tokens without `sub` from one backend are one.
+Callers without a user id share one principal: all callers without authentication are one, and all JWT tokens without `sub` are one.
 The limit per principal does not keep them apart.
 On a mount without `auth=`, the task id is the only protection. It is a random UUID, so do not show it to other users.
 

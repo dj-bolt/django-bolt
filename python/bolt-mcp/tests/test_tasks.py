@@ -416,7 +416,7 @@ def test_cancel_wakes_a_task_that_waits_for_input():
         assert probe.cancelled["ask"].wait(5)
 
 
-def test_an_elicit_that_the_tool_gave_up_on_leaves_input_required():
+def test_an_elicit_that_the_tool_gave_up_on_returns_the_task_to_working():
     api, probe = _build()
     with TestClient(api) as client:
         task_id = _create(client, "impatient", capabilities=TASK_ELICIT_CAPS)["taskId"]
