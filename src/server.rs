@@ -4,9 +4,9 @@ use actix_web::{
 };
 use ahash::AHashMap;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList, PyTuple};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -25,8 +25,8 @@ use bolt_core::settings::{
     improperly_configured,
 };
 use bolt_core::state::{
-    AppState, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, ROUTE_METADATA_TEMP, ScopeConfig, ServeMode,
-    TASK_LOCALS, find_websocket_mount,
+    AppState, GLOBAL_ASGI_MOUNTS, GLOBAL_ROUTER, ROUTE_METADATA_TEMP, ScopeConfig, ServeDir,
+    ServeMode, TASK_LOCALS, find_websocket_mount,
 };
 use bolt_core::static_files::{handle_file, load_finder_roots};
 use bolt_core::streaming::StreamConfig;
@@ -57,6 +57,51 @@ fn settings_path_to_string(obj: &Bound<'_, PyAny>) -> Option<String> {
         .ok()
 }
 
+/// A configured directory before startup resolves it: the URL prefix with a
+/// trailing `/` (only a `(prefix, path)` entry has one) and the path.
+type ConfiguredDir = (Option<String>, String);
+
+/// Read one entry of `STATICFILES_DIRS`, as Django's `FileSystemFinder` does.
+///
+/// An entry is a path, or a `(prefix, path)` pair (a tuple or a list). Gives
+/// the URL prefix with a trailing `/`, and the path. An empty prefix is no
+/// prefix, as in Django. Gives `None` for an empty path and for an entry of
+/// another shape; such an entry gets a warning.
+fn staticfiles_dir_entry(entry: &Bound<'_, PyAny>) -> Option<ConfiguredDir> {
+    let pair = entry.is_instance_of::<PyTuple>() || entry.is_instance_of::<PyList>();
+    let (prefix, path) = if pair {
+        match entry.extract::<(String, Bound<'_, PyAny>)>() {
+            Ok((prefix, path)) => (prefix, path),
+            Err(_) => {
+                warn_invalid_staticfiles_dir(entry);
+                return None;
+            }
+        }
+    } else {
+        (String::new(), entry.clone())
+    };
+    let Some(dir) = settings_path_to_string(&path) else {
+        warn_invalid_staticfiles_dir(entry);
+        return None;
+    };
+    if dir.is_empty() || dir == "None" {
+        return None;
+    }
+    let prefix = (!prefix.is_empty()).then(|| format!("{prefix}/"));
+    Some((prefix, dir))
+}
+
+fn warn_invalid_staticfiles_dir(entry: &Bound<'_, PyAny>) {
+    let shown = entry
+        .repr()
+        .map(|repr| repr.to_string())
+        .unwrap_or_else(|_| "<entry>".to_string());
+    eprintln!(
+        "[django-bolt] Warning: Static files: STATICFILES_DIRS entry {shown} is not a path \
+         or a (prefix, path) pair. Bolt does not use it."
+    );
+}
+
 /// Canonicalize the configured serve directories once, at startup.
 ///
 /// The request hot path joins the user-supplied relative path onto these
@@ -64,13 +109,16 @@ fn settings_path_to_string(obj: &Bound<'_, PyAny>) -> Option<String> {
 /// Canonicalizing the root here (rather than per request) removes a
 /// multi-syscall `realpath(3)` from every single static/media request.
 ///
-/// A directory that doesn't exist or can't be resolved is dropped with a
-/// warning — same effect as the old per-request `is_dir()` filter, just
-/// evaluated once.
-fn canonicalize_serve_dirs(dirs: &[String], url_prefix: &str, label: &str) -> Vec<PathBuf> {
+/// Each directory keeps its URL prefix, if it has one. Bolt does not use a
+/// directory that does not exist or that it cannot resolve. It prints a
+/// warning with the path of that directory, not with its prefix.
+fn canonicalize_serve_dirs(dirs: &[ConfiguredDir], url_prefix: &str, label: &str) -> Vec<ServeDir> {
     dirs.iter()
-        .filter_map(|dir| match Path::new(dir).canonicalize() {
-            Ok(canonical) if canonical.is_dir() => Some(canonical),
+        .filter_map(|(prefix, dir)| match Path::new(dir).canonicalize() {
+            Ok(root) if root.is_dir() => Some(ServeDir {
+                prefix: prefix.clone(),
+                root,
+            }),
             Ok(_) => {
                 eprintln!(
                     "[django-bolt] Warning: {}: not a directory for {}: {}",
@@ -291,7 +339,7 @@ fn read_cors_and_file_scopes(
     // STATIC_URL: URL prefix for static files (e.g., "/static/")
     // STATIC_ROOT: Directory where collectstatic gathers files
     // STATICFILES_DIRS: Additional directories to search for static files
-    let static_data = (|| -> PyResult<Option<(String, Vec<String>)>> {
+    let static_data = (|| -> PyResult<Option<(String, Vec<ConfiguredDir>)>> {
         // Get STATIC_URL (required for static serving)
         let Some(static_url) = settings.optional_str("STATIC_URL")? else {
             return Ok(None); // No static URL configured
@@ -301,7 +349,9 @@ fn read_cors_and_file_scopes(
             return Ok(None);
         };
 
-        let mut directories: Vec<String> = Vec::new();
+        // Each directory with its URL prefix: only a `(prefix, path)` entry
+        // of STATICFILES_DIRS has one.
+        let mut directories: Vec<ConfiguredDir> = Vec::new();
 
         // Get STATIC_ROOT (primary location for collected static files).
         // Defaults to None in Django when not configured -- skip None so we
@@ -311,19 +361,18 @@ fn read_cors_and_file_scopes(
             && let Some(root_str) = settings_path_to_string(&static_root)
             && !root_str.is_empty()
         {
-            directories.push(root_str);
+            directories.push((None, root_str));
         }
 
         // Get STATICFILES_DIRS (additional directories). Convert element-wise
         // rather than `extract::<Vec<String>>`, which would fail the whole
-        // list on the first Path entry.
+        // list on the first Path entry. A `(prefix, path)` entry serves its
+        // files under `prefix/`, as Django's FileSystemFinder does.
         if let Some(static_dirs) = settings.get("STATICFILES_DIRS")?
             && let Ok(iter) = static_dirs.try_iter()
         {
             for entry in iter.flatten() {
-                if let Some(dir) = settings_path_to_string(&entry)
-                    && !dir.is_empty()
-                    && dir != "None"
+                if let Some(dir) = staticfiles_dir_entry(&entry)
                     && !directories.contains(&dir)
                 {
                     directories.push(dir);
@@ -515,8 +564,7 @@ fn read_cors_and_file_scopes(
 
     // Build media files configuration (single directory: MEDIA_ROOT).
     let media_files_config = media_data.and_then(|(url_prefix, directory)| {
-        let valid_dirs =
-            canonicalize_serve_dirs(std::slice::from_ref(&directory), &url_prefix, "Media files");
+        let valid_dirs = canonicalize_serve_dirs(&[(None, directory)], &url_prefix, "Media files");
         if valid_dirs.is_empty() {
             // canonicalize_serve_dirs already warned with the specific path.
             None

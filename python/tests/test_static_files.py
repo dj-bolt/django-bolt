@@ -1063,3 +1063,130 @@ class PlainPathFinder(BaseFinder):
 
     def list(self, ignore_patterns):
         return []
+
+
+class TestPrefixedStaticfilesDirs:
+    """A (prefix, path) entry of STATICFILES_DIRS serves its files under `prefix/` (#944)."""
+
+    @pytest.fixture
+    def vendor(self, settings, tmp_path):
+        root = tmp_path / "assets" / "vendor"
+        (root / "css").mkdir(parents=True)
+        (root / "app.css").write_text("APP_CSS")
+        (root / "css" / "site.css").write_text("SITE_CSS")
+        (tmp_path / "assets" / "secret.txt").write_text("SECRET_CONTENT")
+        # DEBUG is off, so only the fast path serves files: no finders fallback.
+        settings.DEBUG = False
+        settings.STATIC_ROOT = None
+        settings.STATIC_URL = "/static/"
+        settings.STATICFILES_DIRS = [("vendor", root)]
+        return root
+
+    def test_file_is_served_under_the_prefix(self, vendor):
+        with TestClient(BoltAPI()) as client:
+            response = client.get("/static/vendor/app.css")
+            nested = client.get("/static/vendor/css/site.css")
+        assert response.status_code == 200
+        assert response.content == b"APP_CSS"
+        assert response.headers["content-type"].startswith("text/css")
+        assert nested.status_code == 200
+        assert nested.content == b"SITE_CSS"
+
+    def test_file_is_not_served_without_the_prefix(self, vendor):
+        with TestClient(BoltAPI()) as client:
+            assert client.get("/static/app.css").status_code == 404
+            assert client.get("/static/vendorapp.css").status_code == 404
+            assert client.get("/static/other/app.css").status_code == 404
+
+    def test_missing_file_under_the_prefix_gives_404(self, vendor):
+        with TestClient(BoltAPI()) as client:
+            assert client.get("/static/vendor/missing.css").status_code == 404
+            assert client.get("/static/vendor").status_code == 404
+            assert client.get("/static/vendor/").status_code == 404
+            assert client.get("/static/vendor/css").status_code == 404
+
+    def test_traversal_under_the_prefix_is_refused(self, vendor):
+        secret = vendor.parent / "secret.txt"
+        try:
+            (vendor / "leak.txt").symlink_to(secret)
+        except OSError:
+            pytest.skip("Symlink creation not supported on this system")
+        with TestClient(BoltAPI()) as client:
+            responses = [
+                client.get("/static/vendor/../secret.txt"),
+                client.get("/static/vendor/..%2fsecret.txt"),
+                client.get("/static/vendor/css/../../secret.txt"),
+                client.get("/static/vendor/leak.txt"),
+                client.get(f"/static/vendor/{secret}"),
+            ]
+        for response in responses:
+            assert response.status_code in (400, 404)
+            assert b"SECRET_CONTENT" not in response.content
+
+    def test_prefixed_and_plain_entries_of_one_directory(self, settings, vendor):
+        settings.STATICFILES_DIRS = [("vendor", vendor), str(vendor), ("lib/v1", str(vendor))]
+        with TestClient(BoltAPI()) as client:
+            assert client.get("/static/vendor/app.css").content == b"APP_CSS"
+            assert client.get("/static/app.css").content == b"APP_CSS"
+            assert client.get("/static/lib/v1/app.css").content == b"APP_CSS"
+            assert client.get("/static/lib/app.css").status_code == 404
+
+    def test_entries_are_searched_in_order(self, settings, vendor, tmp_path):
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "app.css").write_text("OTHER_CSS")
+        settings.STATICFILES_DIRS = [("vendor", other), ("vendor", vendor)]
+        with TestClient(BoltAPI()) as client:
+            assert client.get("/static/vendor/app.css").content == b"OTHER_CSS"
+            assert client.get("/static/vendor/css/site.css").content == b"SITE_CSS"
+
+    def test_prefixed_entry_prints_no_warning(self, vendor, capfd):
+        with TestClient(BoltAPI()) as client:
+            client.get("/static/vendor/app.css")
+        err = capfd.readouterr().err
+        assert "cannot resolve directory" not in err
+        assert "vendor" not in err
+
+    def test_missing_prefixed_directory_names_only_its_path(self, settings, tmp_path, capfd):
+        settings.DEBUG = False
+        settings.STATIC_URL = "/static/"
+        settings.STATICFILES_DIRS = [("vendor", tmp_path / "absent")]
+        with TestClient(BoltAPI()):
+            pass
+        err = capfd.readouterr().err
+        assert f"cannot resolve directory for /static: {tmp_path / 'absent'} (" in err
+        assert "PosixPath" not in err
+        assert "('vendor'" not in err
+
+    def test_empty_prefix_serves_at_the_root(self, settings, vendor):
+        # Django reads an empty prefix as no prefix.
+        settings.STATICFILES_DIRS = [("", vendor)]
+        with TestClient(BoltAPI()) as client:
+            assert client.get("/static/app.css").content == b"APP_CSS"
+
+    def test_entry_of_another_shape_gets_a_warning(self, settings, vendor, capfd):
+        settings.STATICFILES_DIRS = [("vendor", str(vendor), "extra"), (1, str(vendor)), ("vendor", vendor)]
+        with TestClient(BoltAPI()) as client:
+            served = client.get("/static/vendor/app.css")
+        err = capfd.readouterr().err
+        assert served.content == b"APP_CSS"
+        assert "STATICFILES_DIRS entry ('vendor'" in err
+        assert "STATICFILES_DIRS entry (1, " in err
+        assert err.count("is not a path or a (prefix, path) pair") == 2
+
+    @pytest.mark.parametrize("debug", [False, True])
+    def test_symlink_keeps_the_content_type_of_the_requested_name(self, settings, vendor, debug):
+        # The finders fallback keeps the requested name (#933). The fast path must do the same.
+        settings.DEBUG = debug
+        (vendor / "payload.txt").write_text("body{}")
+        try:
+            (vendor / "style.css").symlink_to(vendor / "payload.txt")
+        except OSError:
+            pytest.skip("Symlink creation not supported on this system")
+        settings.STATICFILES_DIRS = [("vendor", vendor), vendor]
+        with TestClient(BoltAPI()) as client:
+            for path in ("/static/vendor/style.css", "/static/style.css"):
+                response = client.get(path)
+                assert response.status_code == 200
+                assert response.content == b"body{}"
+                assert response.headers["content-type"].startswith("text/css")
