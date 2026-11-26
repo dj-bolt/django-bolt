@@ -225,7 +225,7 @@ class Article(msgspec.Struct):
 
 A type with its own component, such as a struct or an enum, gets a `$ref` to the component.
 The `msgspec.Meta` values go next to the `$ref`, as OpenAPI 3.1 allows. The component does not change.
-This applies to a field, to a return annotation such as `-> Annotated[Author, msgspec.Meta(description="The author.")]`, and to the items of a list:
+This applies to a field, to a return annotation such as `-> Annotated[Author, msgspec.Meta(description="The author.")]`, to a request body such as `body: Annotated[Author, msgspec.Meta(...)]`, and to the items of a list:
 
 ```json
 {"$ref": "#/components/schemas/Author", "description": "The author."}
