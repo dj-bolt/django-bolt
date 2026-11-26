@@ -498,6 +498,7 @@ dependencies = [
  "log",
  "matchit",
  "memchr",
+ "mime_guess",
  "once_cell",
  "parking_lot",
  "proptest",

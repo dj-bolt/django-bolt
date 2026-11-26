@@ -77,15 +77,20 @@ Bolt serves `GET` and `HEAD`. Media responses do not appear in the access log.
 ## Files that can run script are downloads
 
 A user can upload an `.html` or `.svg` file with JavaScript in it. If a browser shows that file on your domain, the script runs with the cookies of your site.
-Thus Bolt sends each media file with one of these extensions as a download:
+Thus Bolt sends each media file as a download when its content type can run script.
+Bolt gets the content type from the file name, as for any file. These types are downloads:
 
-| Kind | Extensions |
-| --- | --- |
-| HTML | `html`, `htm`, `xhtml`, `xhtm`, `shtml`, `shtm`, `htc`, `hta` |
-| SVG | `svg`, `svgz` |
-| XML and XSLT | `xml`, `xsl`, `xslt` |
-| JavaScript | `js`, `mjs`, `cjs` |
-| WebAssembly | `wasm` |
+| Kind | Content types | Example extensions |
+| --- | --- | --- |
+| HTML | `text/html` | `html`, `htm`, `shtml` |
+| XML | `text/xml`, `application/xml`, each `+xml` type | `xml`, `xsl`, `xht`, `xhtml`, `svg`, `rss`, `atom`, `mathml` |
+| JavaScript | `text/javascript`, `application/javascript` and the other JavaScript types | `js`, `mjs`, `es`, `jsm` |
+| WebAssembly | `application/wasm` | `wasm` |
+| Internet Explorer HTML | `text/x-component`, `application/hta` | `htc`, `hta` |
+
+A browser runs the XHTML `<script>` elements of each XML document, so each XML type is a download.
+The XML and JavaScript types are the types of the [WHATWG MIME Sniffing standard](https://mimesniff.spec.whatwg.org/#mime-type-groups).
+The case of the extension has no effect, and only the last extension counts. Thus `photo.png.xht` is a download.
 
 ```bash
 curl -I localhost:8000/media/attachments/page.html
@@ -98,7 +103,10 @@ content-disposition: attachment
 x-content-type-options: nosniff
 ```
 
-Other files, such as `.png`, `.pdf`, `.txt` and `.css`, keep their own content type and show in the browser.
+A range request (`206`), a `HEAD` request and a `304` response get the same headers.
+A file with no extension, or with an extension that Bolt does not know, gets `application/octet-stream`, so a browser saves it too.
+Other files, such as `.png`, `.pdf`, `.txt` and `.css`, keep their own content type. `X-Content-Type-Options: nosniff` stops a browser that reads a `.txt` file as HTML.
+Static files keep their own content type, because they are the files of your site.
 
 Bolt also applies the rules of static files to media:
 
@@ -173,28 +181,31 @@ Bolt can serve media in production. A reverse proxy, a CDN or an object store is
 - A large download keeps a connection of your API server open.
 - A separate domain for user files keeps the files away from the cookies of your site.
 
-When nginx serves `MEDIA_ROOT`, the rules of Bolt do not apply. Add them yourself. The first block refuses hidden files, such as `/media/.env`:
+When nginx serves `MEDIA_ROOT`, the rules of Bolt do not apply. Add them yourself.
+The `map` reads the content type that nginx sends, so it covers each extension of `mime.types`.
+The first `location` refuses hidden files, such as `/media/.env`:
 
 ```nginx
-location ~ ^/media/(.*/)?\. {
-    return 404;
+map $sent_http_content_type $media_disposition {
+    default "";
+    "~*^(text/html|text/xml|application/xml|[^;]+\+xml|[^;]*(java|ecma)script|application/wasm|text/x-component|application/hta)\s*(;|$)" attachment;
 }
 
-location /media/ {
-    disable_symlinks on;
-    alias /srv/blog/media/;
-    add_header X-Content-Type-Options nosniff;
-}
+server {
+    location ~ ^/media/(.*/)?\. {
+        return 404;
+    }
 
-location ~* ^/media/(.+\.(?:html?|xhtml?|shtml?|htc|hta|svgz?|xml|xslt?|m?js|cjs|wasm))$ {
-    disable_symlinks on;
-    alias /srv/blog/media/$1;
-    types { }
-    default_type application/octet-stream;
-    add_header Content-Disposition attachment;
-    add_header X-Content-Type-Options nosniff;
+    location /media/ {
+        disable_symlinks on;
+        alias /srv/blog/media/;
+        add_header Content-Disposition $media_disposition always;
+        add_header X-Content-Type-Options nosniff always;
+    }
 }
 ```
+
+nginx does not add a header with an empty value. Thus other files show in the browser.
 
 ## See also
 
