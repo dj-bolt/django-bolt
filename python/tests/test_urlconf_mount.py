@@ -7,6 +7,7 @@ mounted API at the path that Django's ``reverse()`` gives for it.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import itertools
 import json
 import re
@@ -36,13 +37,13 @@ from django.urls import (
 )
 from django.utils.translation import gettext_lazy
 
+import django_bolt.urls
 from django_bolt import BoltAPI, WebSocket, _core
-from django_bolt._urlconf import REVERSE_ONLY_URLCONF, UrlconfMount, join_mount_path, served_apis, urlconf_mounts
+from django_bolt._urlconf import UrlconfMount, join_mount_path, served_apis, urlconf_mounts
 from django_bolt.management.commands.runbolt import Command
 from django_bolt.middleware import rate_limit
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.testing import TestClient, WebSocketTestClient
-from django_bolt.urls import _LazyUrlpatterns
 
 _names = itertools.count()
 
@@ -214,7 +215,7 @@ def test_a_str_parameter_in_the_prefix_is_a_bolt_parameter(make_urlconf, paramet
         ),
         pytest.param(
             lambda api: [re_path(r"^missions/", api.urls)],
-            "Mount the API with path(), not with re_path()",
+            "Use path() with a static prefix, not re_path()",
             id="re-path",
         ),
         pytest.param(
@@ -232,14 +233,31 @@ def test_a_str_parameter_in_the_prefix_is_a_bolt_parameter(make_urlconf, paramet
             "keyword arguments ['source']",
             id="kwargs",
         ),
+        pytest.param(
+            lambda api: [path("", api.urls, {"source": "urlconf"})], "keyword arguments ['source']", id="kwargs-at-root"
+        ),
         pytest.param(lambda api: [path("x{y}/", api.urls)], "Remove the braces", id="braces"),
+        pytest.param(
+            lambda api: [path("<a>-<b>/", api.urls)],
+            "The Bolt router allows one parameter in a path segment, and '{a}-{b}' has more",
+            id="two-parameters-in-a-segment",
+        ),
         pytest.param(lambda api: [path(gettext_lazy("missions/"), api.urls)], "is translated", id="translated"),
     ],
 )
 def test_a_prefix_that_bolt_cannot_serve_is_refused(make_urlconf, patterns, message):
     urlconf = make_urlconf(patterns(_api()))
 
-    with pytest.raises(ImproperlyConfigured, match=f"under .*{re.escape(message)}"):
+    with pytest.raises(ImproperlyConfigured, match=f"The URLconf mounts a BoltAPI at .*{re.escape(message)}"):
+        urlconf_mounts(urlconf)
+
+
+def test_a_refused_prefix_names_each_urlconf_entry_above_the_api(make_urlconf):
+    api = _api()
+    urlconf = make_urlconf([path("outer/", include([re_path(r"^v1/", include([path("", api.urls)]))]))])
+
+    entries = "path('outer/', include(...)) > re_path('^v1/', include(...)) > path('', api.urls)"
+    with pytest.raises(ImproperlyConfigured, match=re.escape(f"The URLconf mounts a BoltAPI at {entries}.")):
         urlconf_mounts(urlconf)
 
 
@@ -247,7 +265,9 @@ def test_an_i18n_prefix_is_refused(make_urlconf, settings):
     settings.USE_I18N = True
     urlconf = make_urlconf(i18n_patterns(path("missions/", _api().urls)))
 
-    with pytest.raises(ImproperlyConfigured, match="not with re_path\\(\\) or i18n_patterns\\(\\)"):
+    with pytest.raises(
+        ImproperlyConfigured, match=re.escape("The prefix of i18n_patterns() changes with the language")
+    ):
         urlconf_mounts(urlconf)
 
 
@@ -573,26 +593,161 @@ async def mounted_detail(mission_id: int) -> dict:
     return {"id": mission_id}
 
 
-def _reverse_only_module() -> types.ModuleType:
-    """A new module that works as ``django_bolt.urls``, with its own lazy patterns."""
-    module = types.ModuleType(REVERSE_ONLY_URLCONF)
-    module.urlpatterns = _LazyUrlpatterns()
-    return module
+@pytest.fixture
+def fresh_bolt_urls():
+    """Import ``django_bolt.urls`` again, so that its patterns read the settings of the test."""
+    yield importlib.reload(django_bolt.urls)
+    importlib.reload(django_bolt.urls)
 
 
-def test_django_bolt_urls_leaves_out_an_api_that_the_urlconf_mounts(mount_urlconf, settings):
+def test_django_bolt_urls_leaves_out_an_api_that_the_urlconf_mounts(fresh_bolt_urls, mount_urlconf, settings):
     settings.BOLT_API = [f"{__name__}:UNMOUNTED", f"{__name__}:MOUNTED"]
-    mount_urlconf([path("", include(_reverse_only_module())), path("missions/", MOUNTED.urls)])
+    mount_urlconf([path("", include("django_bolt.urls")), path("missions/", MOUNTED.urls)])
 
     assert reverse("own_detail", kwargs={"mission_id": 1}) == "/own/1"
     assert reverse("mounted:detail", kwargs={"mission_id": 1}) == "/missions/1"
 
 
-def test_django_bolt_urls_under_a_prefix_is_refused(mount_urlconf):
-    mount_urlconf([path("api/", include(_reverse_only_module()))])
+@pytest.mark.parametrize(
+    ("patterns", "url"),
+    [
+        pytest.param(lambda: [path("api/", include("django_bolt.urls"))], "/api/own/1", id="prefix"),
+        pytest.param(
+            lambda: [path("v1/", include([path("api/", include("django_bolt.urls"))]))], "/v1/api/own/1", id="nested"
+        ),
+        pytest.param(lambda: [re_path(r"^", include("django_bolt.urls"))], "/own/1", id="re-path-caret"),
+        # Bolt ignores the keyword arguments of this include, as before.
+        pytest.param(lambda: [path("api/", include("django_bolt.urls"), {"flag": 1})], "/api/own/1", id="kwargs"),
+    ],
+)
+def test_the_apis_of_django_bolt_urls_serve_at_the_reversed_path(
+    fresh_bolt_urls, mount_urlconf, settings, patterns, url
+):
+    settings.BOLT_API = [f"{__name__}:UNMOUNTED"]
+    mount_urlconf(patterns())
 
-    with pytest.raises(ImproperlyConfigured, match="includes django_bolt.urls under 'api/'"):
+    assert reverse("own_detail", kwargs={"mission_id": 1}) == url
+    with TestClient(UNMOUNTED) as client:
+        assert client.get(url).json() == {"id": 1}
+        if url != "/own/1":
+            assert client.get("/own/1").status_code == 404
+
+
+def test_runbolt_serves_the_apis_of_django_bolt_urls_under_its_prefixes(fresh_bolt_urls, mount_urlconf, settings):
+    settings.BOLT_API = [f"{__name__}:UNMOUNTED", f"{__name__}:MOUNTED"]
+    mount_urlconf(
+        [
+            path("", include("django_bolt.urls")),
+            path("api/", include("django_bolt.urls")),
+            path("missions/", MOUNTED.urls),
+        ]
+    )
+
+    merged = Command().merge_apis(served_apis(Command().autodiscover_apis()))
+
+    with TestClient(merged) as client:
+        assert client.get("/own/1").json() == {"id": 1}
+        assert client.get("/api/own/1").json() == {"id": 1}
+        # An API that api.urls mounts serves under its own prefix only.
+        assert client.get("/missions/2").json() == {"id": 2}
+        assert client.get("/api/2").status_code == 404
+
+
+def test_an_api_that_django_bolt_urls_does_not_name_serves_its_own_paths(fresh_bolt_urls, mount_urlconf, settings):
+    settings.BOLT_API = [f"{__name__}:UNMOUNTED"]
+    mount_urlconf([path("api/", include("django_bolt.urls"))])
+
+    with TestClient(_api()) as client:
+        assert client.get("/42").json() == {"id": 42}
+
+
+def test_an_error_of_autodiscovery_in_django_bolt_urls_is_not_hidden(
+    fresh_bolt_urls, mount_urlconf, settings, tmp_path, monkeypatch
+):
+    # Django reads a urlpatterns attribute with a default, which would hide an AttributeError.
+    (tmp_path / "attribute_error_api.py").write_text("raise AttributeError('a typo in the api module')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "attribute_error_api", raising=False)
+    settings.BOLT_API = ["attribute_error_api:api"]
+    mount_urlconf([path("", include("django_bolt.urls"))])
+
+    with pytest.raises(AttributeError, match="a typo in the api module"):
+        reverse("own_detail", kwargs={"mission_id": 1})
+
+
+@pytest.mark.parametrize(
+    ("patterns", "entry", "message"),
+    [
+        pytest.param(
+            lambda: [re_path(r"^api/", include("django_bolt.urls"))],
+            "re_path('^api/', include('django_bolt.urls'))",
+            "Use path() with a static prefix, not re_path().",
+            id="re-path",
+        ),
+        pytest.param(
+            lambda: i18n_patterns(path("", include("django_bolt.urls")), prefix_default_language=False),
+            "i18n_patterns(include(...)) > path('', include('django_bolt.urls'))",
+            "The prefix of i18n_patterns() changes with the language",
+            id="i18n",
+        ),
+    ],
+)
+def test_a_prefix_of_django_bolt_urls_that_bolt_cannot_serve_names_the_entry(
+    fresh_bolt_urls, mount_urlconf, settings, patterns, entry, message
+):
+    settings.USE_I18N = True
+    mount_urlconf(patterns())
+
+    with pytest.raises(ImproperlyConfigured, match=re.escape(f"includes django_bolt.urls at {entry}.")) as raised:
         TestClient(_api())
+    assert message in str(raised.value)
+    # The fix does not keep the regex: no path('^api/', ...).
+    assert not re.search(r"(?<!re_)path\('\^", str(raised.value))
+
+
+@pytest.fixture
+def urlconf_file(tmp_path, monkeypatch, settings):
+    """Return a function that writes a URLconf file and makes it the ROOT_URLCONF.
+
+    Django imports the file at the first reverse(), as it imports the URLconf of a project.
+    """
+    monkeypatch.syspath_prepend(str(tmp_path))
+    created: list[str] = []
+
+    def make(source: str) -> None:
+        name = f"urlconf_file_{next(_names)}"
+        (tmp_path / f"{name}.py").write_text(source)
+        created.append(name)
+        settings.ROOT_URLCONF = name
+
+    yield make
+    for name in created:
+        sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "[*bolt_urls.urlpatterns, path('missions/', MOUNTED.urls)]",
+        "[path('missions/', MOUNTED.urls)] + bolt_urls.urlpatterns",
+        "bolt_urls.urlpatterns + [path('missions/', MOUNTED.urls)]",
+    ],
+)
+def test_a_urlconf_can_copy_the_patterns_of_django_bolt_urls(fresh_bolt_urls, urlconf_file, settings, expression):
+    settings.BOLT_API = [f"{__name__}:UNMOUNTED", f"{__name__}:MOUNTED"]
+    urlconf_file(
+        "from django.urls import path\n"
+        "import django_bolt.urls as bolt_urls\n"
+        f"from {__name__} import MOUNTED\n"
+        f"urlpatterns = {expression}\n"
+    )
+
+    assert reverse("own_detail", kwargs={"mission_id": 1}) == "/own/1"
+    assert reverse("mounted:detail", kwargs={"mission_id": 2}) == "/missions/2"
+    with TestClient(UNMOUNTED) as client:
+        assert client.get("/own/1").json() == {"id": 1}
+    with TestClient(MOUNTED) as client:
+        assert client.get("/missions/2").json() == {"id": 2}
 
 
 # --- Other route kinds ------------------------------------------------------
@@ -936,13 +1091,9 @@ def test_one_prefix_in_two_namespaces_serves_the_routes_once(mount_urlconf):
 
 
 @pytest.fixture
-def reverse_only_root(settings):
-    """Make a module that works as ``django_bolt.urls`` the ROOT_URLCONF."""
-    name = f"tests._reverse_only_root_{next(_names)}"
-    sys.modules[name] = _reverse_only_module()
-    settings.ROOT_URLCONF = name
-    yield
-    sys.modules.pop(name, None)
+def reverse_only_root(fresh_bolt_urls, settings):
+    """Make ``django_bolt.urls`` the ROOT_URLCONF."""
+    settings.ROOT_URLCONF = "django_bolt.urls"
 
 
 def test_django_bolt_urls_as_the_root_urlconf_reverses_and_serves(reverse_only_root, settings):

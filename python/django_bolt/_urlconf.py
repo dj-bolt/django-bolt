@@ -10,6 +10,7 @@ then the prefix, then the route path without its leading slash.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -17,14 +18,16 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.urls import URLResolver, get_resolver, include, path
 from django.urls.converters import StringConverter
-from django.urls.resolvers import RegexPattern, RoutePattern
+from django.urls.resolvers import LocalePrefixPattern, RegexPattern, RoutePattern
 from django.utils.functional import Promise
 
 if TYPE_CHECKING:
     from django_bolt.api import BoltAPI
+    from django_bolt.management.commands.runbolt import Command
 
 # The module that gives reverse-only names to the APIs that the URLconf does not mount.
 REVERSE_ONLY_URLCONF = "django_bolt.urls"
+_INCLUDE_REVERSE_ONLY = f"include({REVERSE_ONLY_URLCONF!r})"
 
 # A parameter of a Django route, as Django's RoutePattern parses it.
 _ROUTE_PARAMETER = re.compile(r"<(?:(?P<converter>[^>:]+):)?(?P<parameter>[^>]+)>")
@@ -122,6 +125,50 @@ class ApiURLConf:
         return f"<ApiURLConf of {self.api!r}>"
 
 
+class ReverseOnlyURLConf(Sequence):
+    """The URLconf in ``django_bolt.urls``: the names of the APIs that no ``api.urls`` mounts.
+
+    ``django_bolt.urls.urlpatterns`` is a list with one include of this object.
+    Thus a URLconf can copy that list or join it to another list. Django reads
+    the patterns of this object after it imports the whole URLconf, so the
+    URLconf can mount an API with ``api.urls`` before or after the include.
+
+    The object is its own list of patterns. Django reads a ``urlpatterns``
+    attribute with a default, and that would hide an ``AttributeError`` of
+    autodiscovery as a URLconf with no patterns.
+    """
+
+    __slots__ = ("_apis", "_command", "_patterns")
+
+    def __init__(self, command: Callable[[], Command]) -> None:
+        # runbolt's Command finds and merges the APIs. runbolt imports this module, so the class is an argument.
+        self._command = command
+        self._apis: list[tuple[str, BoltAPI]] | None = None
+        self._patterns: list[Any] | None = None
+
+    def apis(self) -> list[tuple[str, BoltAPI]]:
+        """Return the APIs that ``runbolt`` finds and that no ``api.urls`` of ``ROOT_URLCONF`` mounts."""
+        if self._apis is None:
+            mounted = {id(mount.api) for mount in _walk_root().mounts}
+            self._apis = [(label, api) for label, api in self._command().autodiscover_apis() if id(api) not in mounted]
+        return self._apis
+
+    def _load(self) -> list[Any]:
+        if self._patterns is None:
+            apis = self.apis()
+            self._patterns = build_urlpatterns(self._command().merge_apis(apis)) if apis else []
+        return self._patterns
+
+    def __getitem__(self, index: Any) -> Any:
+        return self._load()[index]
+
+    def __len__(self) -> int:
+        return len(self._load())
+
+    def __repr__(self) -> str:
+        return f"<ReverseOnlyURLConf of {REVERSE_ONLY_URLCONF}>"
+
+
 @dataclass(frozen=True, slots=True)
 class UrlconfMount:
     """One place where the URLconf mounts a ``BoltAPI``.
@@ -135,6 +182,18 @@ class UrlconfMount:
     api: BoltAPI
     prefix: str
     namespace: str
+
+
+class _Walk:
+    """What one walk of a URLconf finds."""
+
+    __slots__ = ("mounts", "reverse_only", "reverse_only_prefixes")
+
+    def __init__(self) -> None:
+        self.mounts: list[UrlconfMount] = []
+        # The include of django_bolt.urls, and its prefixes in URLconf order, each one time.
+        self.reverse_only: ReverseOnlyURLConf | None = None
+        self.reverse_only_prefixes: list[str] = []
 
 
 def join_mount_path(prefix: str, route_path: str) -> str:
@@ -154,21 +213,27 @@ def urlconf_mounts(urlconf: str | None = None) -> list[UrlconfMount]:
     ``urlconf`` defaults to ``ROOT_URLCONF``.
 
     Raises:
-        ImproperlyConfigured: A prefix above a mounted API is not a static
-            ``path()`` route that ends with a slash, or it has a parameter
-            that is not a ``str`` parameter. Also when ``django_bolt.urls``
-            is under a prefix: Bolt serves those routes at their own paths.
+        ImproperlyConfigured: A prefix above a mounted API or above
+            ``django_bolt.urls`` is not a static ``path()`` route that ends
+            with a slash, or it has a parameter that Bolt cannot serve.
     """
-    resolver = get_resolver(urlconf)
-    # django_bolt.urls as the root mounts no API. Its patterns need this walk, so do not read them.
-    if getattr(resolver.urlconf_module, "__name__", None) == REVERSE_ONLY_URLCONF:
-        return []
-    mounts: list[UrlconfMount] = []
-    _collect(resolver.url_patterns, (), mounts)
-    return mounts
+    return _walk(urlconf).mounts
 
 
-def _collect(patterns: Any, parents: tuple[URLResolver, ...], mounts: list[UrlconfMount]) -> None:
+def _walk(urlconf: str | None) -> _Walk:
+    walk = _Walk()
+    _collect(get_resolver(urlconf).url_patterns, (), walk)
+    return walk
+
+
+def _walk_root() -> _Walk:
+    """Walk ``ROOT_URLCONF``. A project with no ``ROOT_URLCONF`` mounts nothing."""
+    if not settings.configured or not getattr(settings, "ROOT_URLCONF", None):
+        return _Walk()
+    return _walk(None)
+
+
+def _collect(patterns: Any, parents: tuple[URLResolver, ...], walk: _Walk) -> None:
     for entry in patterns:
         if not isinstance(entry, URLResolver):
             continue
@@ -176,46 +241,85 @@ def _collect(patterns: Any, parents: tuple[URLResolver, ...], mounts: list[Urlco
         module = entry.urlconf_module
         if isinstance(module, ApiURLConf):
             namespace = ":".join(resolver.namespace for resolver in chain if resolver.namespace)
-            mounts.append(UrlconfMount(module.api, _bolt_prefix(chain), namespace))
-        elif getattr(module, "__name__", None) == REVERSE_ONLY_URLCONF:
-            _refuse_reverse_only_prefix(chain)
+            where = f"The URLconf mounts a BoltAPI at {_describe(chain, 'api.urls')}."
+            walk.mounts.append(UrlconfMount(module.api, _bolt_prefix(chain, where, refuse_kwargs=True), namespace))
+        elif isinstance(module, ReverseOnlyURLConf):
+            # The last entry of the chain is in django_bolt.urls itself, so the message names its parents.
+            where = f"The URLconf includes {REVERSE_ONLY_URLCONF} at {_describe(parents, _INCLUDE_REVERSE_ONLY)}."
+            # Bolt ignored the keyword arguments of this include before, so it does not refuse them.
+            prefix = _bolt_prefix(chain, where, refuse_kwargs=False)
+            if walk.reverse_only is None:
+                walk.reverse_only = module
+            if prefix not in walk.reverse_only_prefixes:
+                walk.reverse_only_prefixes.append(prefix)
         else:
-            _collect(entry.url_patterns, chain, mounts)
+            _collect(entry.url_patterns, chain, walk)
 
 
-def _describe(chain: tuple[URLResolver, ...]) -> str:
-    """The Django route of ``chain``, for an error message."""
-    return "".join(str(resolver.pattern) for resolver in chain)
+def _entry(pattern: Any, target: str) -> str:
+    """One URLconf entry as the URLconf writes it, for example ``path('org/', include(...))``."""
+    if isinstance(pattern, LocalePrefixPattern):
+        return f"i18n_patterns({target})"
+    if isinstance(pattern, RoutePattern):
+        return f"path({str(pattern)!r}, {target})"
+    if isinstance(pattern, RegexPattern):
+        return f"re_path({str(pattern)!r}, {target})"
+    return f"{type(pattern).__name__}({str(pattern)!r}, {target})"
 
 
-def _bolt_prefix(chain: tuple[URLResolver, ...]) -> str:
-    """Return the prefix of the resolvers in ``chain`` in Bolt path syntax."""
-    route = _describe(chain)
-    where = f"The URLconf mounts a BoltAPI under {route!r}."
+def _describe(chain: tuple[URLResolver, ...], target: str) -> str:
+    """Name the URLconf entries of ``chain``, for example ``path('org/', include(...)) > path('', api.urls)``."""
+    if not chain:
+        return target
+    *outer, last = chain
+    return " > ".join([*(_entry(resolver.pattern, "include(...)") for resolver in outer), _entry(last.pattern, target)])
+
+
+def _is_empty(pattern: Any) -> bool:
+    """Whether ``pattern`` adds nothing to the path: ``path("")``, ``re_path("")`` or ``re_path("^")``."""
+    if isinstance(pattern, RoutePattern):
+        return str(pattern) == ""
+    return isinstance(pattern, RegexPattern) and str(pattern) in ("", "^")
+
+
+def _bolt_prefix(chain: tuple[URLResolver, ...], where: str, *, refuse_kwargs: bool) -> str:
+    """Return the prefix of the resolvers in ``chain`` in Bolt path syntax.
+
+    ``refuse_kwargs`` refuses the keyword arguments of an include. A Bolt handler does not receive them.
+    """
+    routes: list[str] = []
     parts: list[str] = []
     for resolver in chain:
         pattern = resolver.pattern
-        if not isinstance(pattern, RoutePattern):
-            raise ImproperlyConfigured(
-                f"{where} Bolt serves an API at one static path, so it cannot use the prefix "
-                f"{str(pattern)!r}. Mount the API with path(), not with re_path() or i18n_patterns()."
-            )
-        if isinstance(pattern._route, Promise):
-            raise ImproperlyConfigured(
-                f"{where} The prefix {str(pattern)!r} is translated. Bolt serves an API at one path. "
-                "Use a prefix that is not translated."
-            )
-        if resolver.default_kwargs:
+        if refuse_kwargs and resolver.default_kwargs:
             raise ImproperlyConfigured(
                 f"{where} The include gives the keyword arguments {sorted(resolver.default_kwargs)!r}. "
                 "A Bolt handler does not receive them. Remove them from the include."
             )
+        if isinstance(pattern, LocalePrefixPattern):
+            raise ImproperlyConfigured(
+                f"{where} The prefix of i18n_patterns() changes with the language, and Bolt serves "
+                "routes at static paths. Move the entry out of i18n_patterns()."
+            )
+        if _is_empty(pattern):
+            continue
+        if not isinstance(pattern, RoutePattern):
+            raise ImproperlyConfigured(
+                f"{where} Bolt serves routes at static paths, so it cannot use the prefix {str(pattern)!r}. "
+                "Use path() with a static prefix, not re_path()."
+            )
+        if isinstance(pattern._route, Promise):
+            raise ImproperlyConfigured(
+                f"{where} The prefix {str(pattern)!r} is translated. Bolt serves routes at static paths. "
+                "Use a prefix that is not translated."
+            )
+        routes.append(str(pattern))
         parts.append(_bolt_route(str(pattern), pattern, where))
     prefix = "".join(parts)
     if prefix and not prefix.endswith("/"):
         raise ImproperlyConfigured(
-            f"{where} End the prefix with a slash, for example {route + '/'!r}. "
-            "Django joins the prefix and the route paths of the API as text."
+            f"{where} End the prefix with a slash, for example {''.join(routes) + '/'!r}. "
+            "Django joins the prefix and the route paths as text."
         )
     if prefix.startswith("/") or "//" in prefix:
         raise ImproperlyConfigured(
@@ -242,41 +346,31 @@ def _bolt_route(route: str, pattern: RoutePattern, where: str) -> str:
             )
         return "{" + name + "}"
 
-    return _ROUTE_PARAMETER.sub(convert, route)
+    bolt_route = _ROUTE_PARAMETER.sub(convert, route)
+    for segment in bolt_route.split("/"):
+        if segment.count("{") > 1:
+            raise ImproperlyConfigured(
+                f"{where} The Bolt router allows one parameter in a path segment, and {segment!r} has more. "
+                "Put each parameter in its own segment."
+            )
+    return bolt_route
 
 
-def _is_empty(pattern: Any) -> bool:
-    if isinstance(pattern, RoutePattern):
-        return str(pattern) == ""
-    return isinstance(pattern, RegexPattern) and str(pattern) in ("", "^")
-
-
-def _refuse_reverse_only_prefix(chain: tuple[URLResolver, ...]) -> None:
-    """Refuse ``include("django_bolt.urls")`` under a prefix.
-
-    Those names reverse to paths that Bolt does not serve under the prefix.
-    """
-    if all(_is_empty(resolver.pattern) for resolver in chain):
-        return
-    route = _describe(chain)
-    raise ImproperlyConfigured(
-        f"The URLconf includes {REVERSE_ONLY_URLCONF} under {route!r}. Bolt serves those routes at their "
-        "own paths, so reverse() would give paths that Bolt does not serve. "
-        f'Include {REVERSE_ONLY_URLCONF} with path(""), or mount each API with path({route!r}, api.urls).'
-    )
-
-
-def _prefixes_by_api() -> dict[int, tuple[BoltAPI, list[str]]]:
-    """Group the prefixes of the mounts of ``ROOT_URLCONF`` by API, in URLconf order."""
+def _prefixes_by_api(walk: _Walk) -> dict[int, tuple[BoltAPI, list[str]]]:
+    """Group the prefixes of the ``api.urls`` mounts by API, in URLconf order."""
     grouped: dict[int, tuple[BoltAPI, list[str]]] = {}
-    if not settings.configured or not getattr(settings, "ROOT_URLCONF", None):
-        return grouped
-    for mount in urlconf_mounts():
+    for mount in walk.mounts:
         prefixes = grouped.setdefault(id(mount.api), (mount.api, []))[1]
         # One prefix in two namespaces reverses two ways, but serves one time.
         if mount.prefix not in prefixes:
             prefixes.append(mount.prefix)
     return grouped
+
+
+def _reverse_only_prefixes(walk: _Walk) -> list[str] | None:
+    """The prefixes of ``django_bolt.urls``, or None when its APIs serve at their own paths."""
+    prefixes = walk.reverse_only_prefixes
+    return None if prefixes in ([], [""]) else prefixes
 
 
 def _serve(api: BoltAPI, prefixes: list[str]) -> BoltAPI:
@@ -287,25 +381,47 @@ def _serve(api: BoltAPI, prefixes: list[str]) -> BoltAPI:
 def served_api(api: BoltAPI) -> BoltAPI:
     """Return the API that serves the routes of ``api`` as ``runbolt`` does.
 
-    It is ``api`` when ``ROOT_URLCONF`` does not mount it. Otherwise it is an
-    API that serves the routes of ``api`` under each prefix of its mounts.
+    It is an API that serves the routes of ``api`` under each prefix of its
+    ``api.urls`` mounts. When no ``api.urls`` mounts ``api`` and
+    ``django_bolt.urls`` names it, it serves under the prefixes of that include.
+    Otherwise it is ``api``.
     """
-    entry = _prefixes_by_api().get(id(api))
-    return api if entry is None else _serve(api, entry[1])
+    walk = _walk_root()
+    entry = _prefixes_by_api(walk).get(id(api))
+    if entry is not None:
+        return _serve(api, entry[1])
+    moved = _reverse_only_prefixes(walk)
+    # Autodiscovery runs only when django_bolt.urls has a prefix, to know if it names the API.
+    if (
+        moved is not None
+        and walk.reverse_only is not None
+        and any(named is api for _label, named in walk.reverse_only.apis())
+    ):
+        return _serve(api, moved)
+    return api
 
 
 def served_apis(apis: list[tuple[str, BoltAPI]]) -> list[tuple[str, BoltAPI]]:
     """Return ``(label, api)`` for each API that ``runbolt`` serves.
 
-    ``apis`` are the APIs that autodiscovery found. An API that ``ROOT_URLCONF``
-    mounts serves under its prefixes only, also when autodiscovery found it.
+    ``apis`` are the APIs that autodiscovery found. An API that an
+    ``api.urls`` of ``ROOT_URLCONF`` mounts serves under its prefixes only, also
+    when autodiscovery found it. The other APIs are the APIs that
+    ``django_bolt.urls`` names, so they serve under the prefixes of its include.
     The mounted APIs that autodiscovery did not find come last, in URLconf order.
     """
-    grouped = _prefixes_by_api()
+    walk = _walk_root()
+    grouped = _prefixes_by_api(walk)
+    moved = _reverse_only_prefixes(walk)
     served = []
     for label, api in apis:
         entry = grouped.pop(id(api), None)
-        served.append((label, api if entry is None else _serve(api, entry[1])))
+        if entry is not None:
+            served.append((label, _serve(api, entry[1])))
+        elif moved is not None:
+            served.append((label, _serve(api, moved)))
+        else:
+            served.append((label, api))
     for api, prefixes in grouped.values():
         served.append((f"path({prefixes[0]!r}, api.urls)", _serve(api, prefixes)))
     return served

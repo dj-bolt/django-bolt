@@ -22,51 +22,23 @@ Namespaces are opt-in, like Django's ``app_name``: pass ``namespace=`` to a
 ``BoltAPI`` and its routes reverse as ``reverse("<namespace>:<name>")``.
 
 An API that the URLconf mounts with ``path("prefix/", api.urls)`` gets its
-names from that mount, so this module leaves it out. Bolt serves these routes
-at their own paths, so include this module with an empty prefix only.
+names from that mount, so this module leaves it out. An include of this
+module under a prefix, such as ``path("api/", include("django_bolt.urls"))``,
+moves the routes that it names under that prefix, so that ``reverse()``
+gives the served paths.
+
+``urlpatterns`` is a list with one include. Django reads the patterns in it
+after it imports the whole URLconf, because the patterns depend on the
+``api.urls`` mounts of the URLconf.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any
+from django.urls import path
 
-from django_bolt._urlconf import build_urlpatterns, urlconf_mounts
+from django_bolt._urlconf import ReverseOnlyURLConf, build_urlpatterns
 from django_bolt.management.commands.runbolt import Command as _Runbolt
 
 __all__ = ["build_urlpatterns", "urlpatterns"]
 
-
-def _discover_urlpatterns() -> list:
-    """Autodiscover Bolt APIs as ``runbolt`` does, then build the patterns of the APIs that the URLconf does not mount."""
-    mounted = {id(mount.api) for mount in urlconf_mounts()}
-    command = _Runbolt()
-    apis = [(label, api) for label, api in command.autodiscover_apis() if id(api) not in mounted]
-    if not apis:
-        return []
-    return build_urlpatterns(command.merge_apis(apis))
-
-
-class _LazyUrlpatterns(Sequence):
-    """The reverse-only patterns, built at the first read.
-
-    Django reads them after it imports the whole URLconf. The URLconf can thus
-    mount an API with ``api.urls`` after the include of this module.
-    """
-
-    def __init__(self) -> None:
-        self._patterns: list | None = None
-
-    def _load(self) -> list:
-        if self._patterns is None:
-            self._patterns = _discover_urlpatterns()
-        return self._patterns
-
-    def __getitem__(self, index: Any) -> Any:
-        return self._load()[index]
-
-    def __len__(self) -> int:
-        return len(self._load())
-
-
-urlpatterns = _LazyUrlpatterns()
+urlpatterns = [path("", (ReverseOnlyURLConf(_Runbolt), None, None))]
