@@ -21,7 +21,7 @@ from .helpers import postgres_settings
 
 pytestmark = [pytest.mark.server_integration, pytest.mark.postgres]
 
-# The ``django_bolt.async_orm`` logger tells how a loop sends its queries. The file is in the project directory.
+# The ``django_bolt.async_orm`` logger tells where the reads of a database run. The file is in the project directory.
 LOOP_LOG = """
 LOGGING = {
     "version": 1,
@@ -32,7 +32,7 @@ LOGGING = {
 """
 
 
-def test_a_server_reads_on_the_event_loop_with_queries_from_rust(make_server_project, postgres_database):
+def test_a_server_reads_on_the_event_loop(make_server_project, postgres_database):
     project = make_server_project(
         api_module=app_module("loop_orm"),
         settings_extra=postgres_settings(postgres_database) + "\nBOLT_ASYNC_ORM_ON_LOOP = True\n" + LOOP_LOG,
@@ -56,5 +56,5 @@ def test_a_server_reads_on_the_event_loop_with_queries_from_rust(make_server_pro
     expected = [(200, {"username": USERNAMES[index % 3], "is_active": True}) for index in range(200)]
     assert results == expected
     assert project.path("loop.log").read_text().splitlines() == [
-        "The loop connections to the database 'default' send their queries from Rust."
+        "The async ORM reads of the database 'default' run on the event loop."
     ]

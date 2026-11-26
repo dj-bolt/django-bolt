@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connection, models
+from django.db.models import QuerySet
 from django.test import override_settings
 
 from django_bolt import BoltAPI, concurrency
@@ -91,7 +92,8 @@ def test_an_invalid_connection_count_stops_the_server_at_startup(monkeypatch, va
         TestClient(_api())
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "soon", "nan", "inf"])
+# A timer cannot wait for 1e19 seconds. Without the check at startup, each read would fail.
+@pytest.mark.parametrize("value", ["0", "-1", "soon", "nan", "inf", "1e19"])
 @pytest.mark.parametrize("name", ["ACQUIRE", "IDLE", "LIFETIME"])
 def test_an_invalid_time_stops_the_server_at_startup(monkeypatch, name, value):
     variable = f"DJANGO_BOLT_LOOP_{name}_SECONDS"
@@ -110,3 +112,14 @@ def test_a_setting_that_is_not_a_bool_stops_the_server_at_startup(value):
         TestClient(_api())
     # The next server starts with the setting off.
     concurrency.check_pool_environment()
+
+
+def test_a_server_with_the_setting_off_keeps_the_queryset_method_of_another_library(monkeypatch):
+    async def aget_of_a_library(self: Any, *args: Any, **kwargs: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(QuerySet, "aget", aget_of_a_library)
+    with TestClient(_api()):
+        kept = QuerySet.__dict__["aget"]
+
+    assert kept is aget_of_a_library

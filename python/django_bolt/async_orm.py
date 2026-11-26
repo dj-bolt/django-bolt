@@ -9,17 +9,18 @@ The flow of one read:
 
 1. Django compiles the QuerySet to SQL on the event loop thread. The compile
    step is CPU work and sends nothing to the database.
-2. Rust sends the SQL on a connection that psycopg opened, and reads the
-   result: see ``_RustCursor``. The event loop runs other requests while the
-   database works.
+2. Rust sends the SQL on a loop connection, and reads the result: see
+   ``_RustCursor``. The event loop runs other requests while the database
+   works.
 3. Django's own iterable class builds the result from the rows. Thus the
    field conversion and the model instances are those of the sync ORM.
 
-A loop connection is not the connection of Django. It copies the type
-adapters and the session settings of a Django connection to the same
-database, so the same query gives the same rows. It does not see an open
-transaction. Each read that needs the connection of Django uses Django's own
-method, which runs on a thread: see ``_pool_for``.
+Django opens each loop connection: see ``_connect``. The connection thus has
+the parameters, the session state and the type adapters of each Django
+connection to the same database, and the same query gives the same rows. No
+thread has a loop connection, so it does not see the open transaction of a
+thread. Each read that the loop cannot run as the sync ORM runs it uses
+Django's own method, which runs on a thread: see ``_pool_for``.
 """
 
 from __future__ import annotations
@@ -28,17 +29,15 @@ import asyncio
 import collections
 import ctypes
 import logging
-import math
 import os
 import sys
 import threading
-from typing import Any, NamedTuple
+from typing import Any
 
-from asgiref.sync import SyncToAsync
+from asgiref.sync import AsyncToSync, SyncToAsync
 from django.conf import settings
 from django.core.exceptions import EmptyResultSet, ImproperlyConfigured, SynchronousOnlyOperation
 from django.db import connections
-from django.db.backends.base.operations import BaseDatabaseOperations
 from django.db.backends.utils import CursorDebugWrapper, CursorWrapper
 from django.db.models.query import MAX_GET_RESULTS, QuerySet
 from django.db.utils import (
@@ -93,6 +92,15 @@ _django_aget = QuerySet.aget
 _django_afirst = QuerySet.afirst
 _django_alast = QuerySet.alast
 _django_aexists = QuerySet.aexists
+_django_fetch_all = QuerySet._fetch_all
+_django_get = QuerySet.get
+_django_first = QuerySet.first
+_django_last = QuerySet.last
+_django_exists = QuerySet.exists
+
+# The module of the iterable classes of Django. Another iterable class can
+# query while it builds the rows, which only a thread can do.
+_ITERABLES_MODULE = QuerySet.__module__
 
 _thread_sensitive_context = SyncToAsync.thread_sensitive_context
 _MISSING: Any = object()
@@ -118,49 +126,33 @@ _idle_seconds = DEFAULT_IDLE_SECONDS
 # A connection older than this time closes before its next use.
 _lifetime_seconds = DEFAULT_LIFETIME_SECONDS
 
-# alias -> what a loop connection copies from a Django connection.
-_templates: dict[str, _Template] = {}
+# The models whose rows only a thread can build: see ``_fetch_all``.
+_models_on_threads: set[type] = set()
 
 # The loops that have a pool, for ``close_connections``.
 _loops: list[WorkerLoop] = []
 _loops_lock = threading.Lock()
 
 
-class _Template(NamedTuple):
-    """The state of one Django connection that each loop connection to the same database copies."""
+def _connect(wrapper_class: type, settings_dict: dict[str, Any], alias: str) -> tuple[Any, Any]:
+    """Open one connection as Django opens it, and return its wrapper and a cursor. Runs on an ORM pool thread.
 
-    adapters: Any
-    session_sql: str
-    session_values: tuple[str, ...]
-    pg_version: int
-    # The wrappers that the connection had when it opened, as a ``connection_created`` receiver installs them.
-    execute_wrappers: tuple[Any, ...]
-
-
-def _read_template(alias: str) -> _Template:
-    """Read the template from the Django connection of the calling thread. Runs on an ORM pool thread.
-
-    Django opens that connection in its usual way: the connection parameters,
-    the time zone and the role of the settings, then each ``connection_created``
-    receiver. ``pg_settings`` lists each setting that this session changed.
+    Django connects with the parameters of the settings, sets the role and
+    the time zone, and calls each ``connection_created`` receiver. The
+    connection thus has the session state and the type adapters of each
+    Django connection. The wrapper is not in ``django.db.connections``, so no
+    thread has this connection.
     """
-    wrapper = connections[alias]
-    was_open = wrapper.connection is not None
+    own = wrapper_class(settings_dict, alias)
     try:
-        with wrapper.cursor() as cursor:
-            cursor.execute("SELECT name, setting FROM pg_settings WHERE source = 'session'")
-            session = cursor.fetchall()
-        return _Template(
-            adapters=wrapper.Database.adapt.AdaptersMap(wrapper.connection.adapters),
-            session_sql="SELECT " + ", ".join(["set_config(%s, %s, false)"] * len(session)) if session else "",
-            session_values=tuple(value for pair in session for value in pair),
-            pg_version=wrapper.pg_version,
-            execute_wrappers=tuple(wrapper.execute_wrappers),
-        )
-    finally:
-        # With each read on the loop, this thread can get no more work. It must not keep a connection open.
-        if not was_open:
-            wrapper.close()
+        own.ensure_connection()
+        cursor = own.create_cursor()
+        # The cached value. The event loop cannot read it from the server.
+        own.pg_version  # noqa: B018
+    except BaseException:
+        own.close()
+        raise
+    return own, cursor
 
 
 def _libpq_addresses(database: Any) -> dict[str, int] | None:
@@ -203,15 +195,15 @@ def _deliver(cursor: _RustCursor, result: tuple[int, Any, Any]) -> None:
 
 
 class _RustCursor:
-    """A loop connection whose queries Rust sends: see ``src/pg.rs``.
+    """A loop connection, with its queries sent from Rust: see ``src/pg.rs``.
 
-    psycopg owns the connection. Its client cursor merges the parameters into
-    the statement, and its loaders make the Python values, as for a query of
-    Django. Rust sends the statement and reads the result on the Tokio
-    reactor. No Python code runs while the query waits for the database.
+    psycopg owns the connection. The cursor of Django merges the parameters
+    into the statement, and its loaders make the Python values, as for a
+    query of the sync ORM. Rust sends the statement and reads the result on
+    the Tokio reactor. No Python code runs while the query waits for the
+    database.
 
-    The pool uses this object as it uses a psycopg cursor: ``execute``,
-    ``fetchall`` and ``connection``.
+    ``CursorWrapper`` of Django uses this object as a cursor: ``execute``.
     """
 
     __slots__ = (
@@ -237,7 +229,7 @@ class _RustCursor:
         self.database = database
         self.encoding = connection.info.encoding
         self.mogrify = cursor.mogrify
-        self.transformer = database.adapt.Transformer(connection)
+        self.transformer = database.adapt.Transformer(cursor)
         # The column types that the loaders of ``transformer`` are for.
         self.oids: tuple[int, ...] | None = None
         self.create_future = loop.create_future
@@ -255,12 +247,27 @@ class _RustCursor:
         # ``last_executed_query`` of Django reads ``cursor._query.query`` for the debug log.
         return self
 
-    async def execute(self, sql: Any, params: Any = None) -> None:
+    def execute(self, sql: Any, params: Any = None) -> None:
+        """Send the statement. ``CursorWrapper.execute`` of Django calls this method, as for a cursor of psycopg.
+
+        The method does not wait: ``wait`` gives the outcome. Code around
+        ``CursorWrapper.execute`` thus gets the statement, and an error of
+        its parameters, but no query time and no error of the database.
+        """
         self.result = None
+        # Not the statement of the query before: Django logs ``query`` when this statement has an error.
+        self.query = None
         query = self.query = self.mogrify(sql, params).encode(self.encoding)
-        waiter = self.waiter = self.create_future()
+        self.waiter = self.create_future()
         self.native.query(query, self)
         self.pending = True
+
+    async def wait(self) -> None:
+        """Wait for the statement that ``execute`` sent, and raise its error."""
+        waiter = self.waiter
+        if waiter is None:
+            # The code around ``CursorWrapper.execute`` did not call it. A cursor of psycopg then has no result.
+            raise self.database.ProgrammingError("no result available")
         try:
             kind, first, second = await waiter
         except asyncio.CancelledError:
@@ -284,7 +291,7 @@ class _RustCursor:
             raise database.ProgrammingError("COPY cannot be used with this method; use copy() instead")
         raise database.InternalError(f"unexpected result status from query: {status.name}")
 
-    async def fetchall(self) -> list[tuple[Any, ...]]:
+    def fetchall(self) -> list[tuple[Any, ...]]:
         result = self.result
         if type(result) is not tuple:
             if result is None:
@@ -334,29 +341,19 @@ class _RustCursor:
         self.connection.pgconn.finish()
 
 
-def _close(cursor: Any) -> None:
-    """Close the connection of ``cursor``. This call does not wait, so a cancelled task can make it."""
-    if type(cursor) is _RustCursor:
-        cursor.close()
-    else:
-        cursor.connection.pgconn.finish()
-
-
 class _Pool:
     """The connections of one event loop to one database.
 
     Only the thread of the loop uses a pool, with one exception:
     ``close_connections`` runs on another thread when no request runs.
 
-    The pool holds cursors. One cursor serves each query of its connection,
-    which is cheaper than a new cursor for each query. A cursor is a
-    ``_RustCursor`` when ``addresses`` is not None. If not, it is an async
-    cursor of psycopg, and the event loop watches the socket.
+    The pool holds cursors: one ``_RustCursor`` for each connection.
 
     The pool follows the pool of sqlx. A read takes a free connection. With
     no free connection, the pool opens one, up to the limit. At the limit, the
-    read waits in a queue, and fails after the acquire time. A connection
-    closes after the idle time, or when it is older than the lifetime.
+    read waits in a queue, and fails after the acquire time. A connection that
+    comes back goes to the read that waited longest. A connection closes
+    after the idle time, or when it is older than the lifetime.
 
     Two things differ from sqlx. sqlx tests a connection with a ping before
     each use, which adds a round trip to each query. This pool sends a query
@@ -377,80 +374,107 @@ class _Pool:
         "idle",
         "idle_since",
         "opened",
+        "pg_version",
         "preparing",
         "reaper",
-        "template",
+        "settings_dict",
         "waiters",
         "waiting_since",
+        "wrapped",
+        "wrapper_class",
     )
 
-    def __init__(self, alias: str, database: Any, addresses: dict[str, int] | None) -> None:
+    def __init__(
+        self, alias: str, database: Any, addresses: dict[str, int], wrapper_class: type, settings_dict: dict[str, Any]
+    ) -> None:
         self.alias = alias
         self.database = database
-        # The libpq functions for ``_RustCursor``, or None when psycopg sends the queries.
+        # The libpq functions that Rust calls.
         self.addresses = addresses
+        # ``_connect`` opens each connection with this class and these settings.
+        self.wrapper_class = wrapper_class
+        self.settings_dict = settings_dict
         # The cursors of cancelled queries that Rust did not end yet.
         self.cancelled: set[_RustCursor] = set()
-        self.idle: collections.deque[Any] = collections.deque()
+        self.idle: collections.deque[_RustCursor] = collections.deque()
         # The loop time at which each idle cursor came back, in the order of ``idle``.
         self.idle_since: collections.deque[float] = collections.deque()
         # The timer that closes idle connections, or None when no connection is idle.
         self.reaper: asyncio.TimerHandle | None = None
-        self.waiters: collections.deque[asyncio.Future[None]] = collections.deque()
+        # A waiter gets a cursor, or None when it must open a connection.
+        # While a read waits, ``idle`` is empty and ``opened`` is the limit.
+        self.waiters: collections.deque[asyncio.Future[_RustCursor | None]] = collections.deque()
         # The loop time at which each waiter started to wait, in the order of ``waiters``.
         self.waiting_since: collections.deque[float] = collections.deque()
         # The timer that fails the waiters that waited for the acquire time, or None.
         self.expirer: asyncio.TimerHandle | None = None
         # cursor -> the loop time at which its connection opened.
-        self.born: dict[Any, float] = {}
+        self.born: dict[_RustCursor, float] = {}
+        # The connections that are open, plus those that a read opens now.
         self.opened = 0
         self.closed = False
-        # None until ``prepare`` runs.
-        self.template: _Template | None = None
+        # The server version, or None until the first connection opens.
+        self.pg_version: int | None = None
+        # True when a ``connection_created`` receiver installs an execute wrapper: see ``_pool_of``.
+        self.wrapped = False
         # Reads that start together wait for one ``prepare``.
         self.preparing = asyncio.Lock()
 
     async def prepare(self) -> None:
-        """Read the template of the database. The first read of the pool calls this before it compiles."""
-        alias = self.alias
-        async with self.preparing:
-            template = _templates.get(alias)
-            if template is None:
-                template = _templates[alias] = await run_in_orm_executor(_read_template, alias)
-        self.template = template
+        """Open the first connection. The first read of the pool calls this before it compiles.
 
-    async def acquire(self) -> Any:
+        The connection gives the server version. It also shows if a receiver
+        installs an execute wrapper on each connection.
+        """
+        async with self.preparing:
+            if self.pg_version is None:
+                self.release(await self.acquire())
+        if self.wrapped:
+            self.close()
+
+    async def acquire(self) -> _RustCursor:
         """Return a cursor that no other query uses. Wait when each connection is in use."""
         loop = asyncio.get_running_loop()
-        while True:
-            if self.idle:
-                self.idle_since.pop()
-                cursor = self.idle.pop()
-                if loop.time() - self.born[cursor] <= _lifetime_seconds:
-                    return cursor
-                self.discard(cursor)
-                continue
-            if self.opened < _connection_limit:
-                self.opened += 1
-                try:
-                    cursor = await self._open()
-                except BaseException:
-                    self._closed_one()
-                    raise
-                self.born[cursor] = loop.time()
+        idle = self.idle
+        while idle:
+            self.idle_since.pop()
+            cursor = idle.pop()
+            if loop.time() - self.born[cursor] <= _lifetime_seconds:
                 return cursor
-            waiter = loop.create_future()
-            self.waiters.append(waiter)
-            self.waiting_since.append(loop.time())
-            if self.expirer is None:
-                self.expirer = loop.call_later(_acquire_seconds, self._expire_waiters, loop)
-            try:
-                await waiter
-            except asyncio.CancelledError:
-                # A waiter that got its turn and then stops gives the turn to the next one.
-                if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
-                    self._wake()
-                raise
+            self.discard(cursor)
+        if self.opened < _connection_limit:
+            self.opened += 1
+            return await self._open(loop)
+        waiter: asyncio.Future[_RustCursor | None] = loop.create_future()
+        self.waiters.append(waiter)
+        self.waiting_since.append(loop.time())
+        if self.expirer is None:
+            self.expirer = loop.call_later(_acquire_seconds, self._expire_waiters, loop)
+        try:
+            cursor = await waiter
+        except asyncio.CancelledError:
+            # A read that got its turn and then stops gives the turn to the next read.
+            if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
+                taken = waiter.result()
+                if taken is None:
+                    self._closed_one()
+                else:
+                    self.release(taken)
+            raise
+        if cursor is None:
+            return await self._open(loop)
+        return cursor
+
+    def _next_waiter(self) -> asyncio.Future[_RustCursor | None] | None:
+        """Take the read that waited longest out of the queue."""
+        waiters = self.waiters
+        waiting_since = self.waiting_since
+        while waiters:
+            waiter = waiters.popleft()
+            waiting_since.popleft()
+            if not waiter.done():
+                return waiter
+        return None
 
     def _expire_waiters(self, loop: asyncio.AbstractEventLoop) -> None:
         """Fail each waiter that waited for the acquire time. The oldest is first in ``waiters``."""
@@ -469,37 +493,59 @@ class _Pool:
                 )
         self.expirer = loop.call_later(waiting_since[0] - expired, self._expire_waiters, loop) if waiters else None
 
-    async def _open(self) -> Any:
-        template = self.template
-        wrapper = connections[self.alias]
-        database = self.database
-        addresses = self.addresses
-        params = wrapper.get_connection_params()
-        server_side = wrapper.features.uses_server_side_binding
-        params["cursor_factory"] = database.AsyncCursor if server_side else database.AsyncClientCursor
-        params["context"] = template.adapters
-        connection = await database.AsyncConnection.connect(**params, autocommit=True)
+    async def _open(self, loop: asyncio.AbstractEventLoop) -> _RustCursor:
+        """Open one connection. ``opened`` counts it already."""
+        # The connect runs to its end on its thread, also when this read stops.
+        opening = asyncio.ensure_future(
+            run_in_orm_executor(_connect, self.wrapper_class, self.settings_dict, self.alias)
+        )
         try:
-            cursor = connection.cursor()
-            if template.session_sql:
-                await cursor.execute(template.session_sql, template.session_values)
-            if addresses is not None:
-                cursor = _RustCursor(database, cursor, addresses, asyncio.get_running_loop())
-        except BaseException:
-            connection.pgconn.finish()
+            own, django_cursor = await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            opening.add_done_callback(self._close_unused)
             raise
+        except BaseException:
+            self._closed_one()
+            raise
+        try:
+            cursor = _RustCursor(self.database, django_cursor, self.addresses, loop)
+        except BaseException:
+            own.connection.pgconn.finish()
+            self._closed_one()
+            raise
+        self.pg_version = own.pg_version
+        if own.execute_wrappers and not self.wrapped:
+            self.wrapped = True
+            logger.info(
+                "The async ORM reads of the database %r use the ORM thread pool: "
+                "a connection_created receiver installs an execute wrapper.",
+                self.alias,
+            )
+        self.born[cursor] = loop.time()
         return cursor
 
-    def release(self, cursor: Any) -> None:
-        if self.closed:
+    def _close_unused(self, opening: asyncio.Future[tuple[Any, Any]]) -> None:
+        """Close a connection that opened after its read stopped."""
+        if not opening.cancelled() and opening.exception() is None:
+            own, _django_cursor = opening.result()
+            own.connection.pgconn.finish()
+        self._closed_one()
+
+    def release(self, cursor: _RustCursor) -> None:
+        loop = asyncio.get_running_loop()
+        if self.closed or loop.time() - self.born[cursor] > _lifetime_seconds:
             self.discard(cursor)
             return
-        loop = asyncio.get_running_loop()
+        waiter = self._next_waiter()
+        if waiter is not None:
+            # The read that waited longest gets the connection. A read that
+            # starts now cannot take it first.
+            waiter.set_result(cursor)
+            return
         self.idle.append(cursor)
         self.idle_since.append(loop.time())
         if self.reaper is None:
             self.reaper = loop.call_later(_idle_seconds, self._close_idle, loop)
-        self._wake()
 
     def _close_idle(self, loop: asyncio.AbstractEventLoop) -> None:
         """Close each connection that was idle for the idle time. The oldest is first in ``idle``."""
@@ -511,31 +557,28 @@ class _Pool:
             self.discard(idle.popleft())
         self.reaper = loop.call_later(idle_since[0] - expired, self._close_idle, loop) if idle else None
 
-    def _give_back(self, cursor: Any) -> None:
+    def _give_back(self, cursor: _RustCursor) -> None:
         """Take ``cursor`` back after a query that did not complete.
 
-        psycopg cancels the query of a cancelled task and reads its end, so
-        the connection is idle again. A connection that is not idle still
-        runs a query, and the next query on it would fail.
-
-        A ``_RustCursor`` asks the server to cancel the query and does not
-        wait. Its connection comes back here when Rust read the end of the query.
+        A cancelled query asked the server to cancel it, and did not wait. Its
+        connection comes back here when Rust read the end of the query. A
+        connection that is not idle then still runs a query, and the next
+        query on it would fail.
         """
-        if type(cursor) is _RustCursor:
-            if cursor.pending:
-                self.cancelled.add(cursor)
-                cursor.on_result = self._give_back
-                return
-            self.cancelled.discard(cursor)
+        if cursor.pending:
+            self.cancelled.add(cursor)
+            cursor.on_result = self._give_back
+            return
+        self.cancelled.discard(cursor)
         if cursor.connection.pgconn.transaction_status == self.database.pq.TransactionStatus.IDLE:
             self.release(cursor)
         else:
             self.discard(cursor)
 
-    def discard(self, cursor: Any) -> None:
-        """Close the connection of ``cursor``."""
+    def discard(self, cursor: _RustCursor) -> None:
+        """Close the connection of ``cursor``. This call does not wait, so a cancelled task can make it."""
         del self.born[cursor]
-        _close(cursor)
+        cursor.close()
         self._closed_one()
 
     def discard_idle(self) -> None:
@@ -559,21 +602,21 @@ class _Pool:
                 setattr(self, name, None)
 
     def _closed_one(self) -> None:
-        self.opened -= 1
-        self._wake()
-
-    def _wake(self) -> None:
-        waiters = self.waiters
-        waiting_since = self.waiting_since
-        while waiters:
-            waiter = waiters.popleft()
-            waiting_since.popleft()
-            if not waiter.done():
-                waiter.set_result(None)
-                return
+        """A connection closed, or did not open. The read that waited longest opens one in its place."""
+        waiter = self._next_waiter()
+        if waiter is None:
+            self.opened -= 1
+        else:
+            waiter.set_result(None)
 
     async def fetch(self, wrapper: Any, sql: str, params: Any) -> list[tuple[Any, ...]]:
-        """Run one read and return its rows. ``wrapper`` is the connection wrapper of Django for this thread.
+        """Run one read and return its rows. ``wrapper`` is the connection wrapper of Django for this request.
+
+        The statement goes through ``CursorWrapper.execute`` of Django, so a
+        tool that replaces that method gets each statement of the loop: see
+        ``_RustCursor.execute``. With
+        ``wrapper.queries_logged``, ``connection.queries`` and the
+        ``django.db.backends`` logger get the query, as with the cursor of Django.
 
         A database restart ends each connection of the pool. The query then
         fails on a dead connection, before the database runs it. The pool
@@ -582,16 +625,17 @@ class _Pool:
         """
         database_error = self.database.Error
         for first_try in (True, False):
-            try:
-                cursor = await self.acquire()
-            except database_error as error:
-                raise _django_error(self.database, error) from error
+            cursor = await self.acquire()
+            cursor.waiter = None
             try:
                 if wrapper.queries_logged:
-                    await _execute_logged(cursor, wrapper, sql, params)
+                    with CursorDebugWrapper(cursor, wrapper).debug_sql(sql, params, use_last_executed_query=True):
+                        CursorWrapper(cursor, wrapper).execute(sql, params)
+                        await cursor.wait()
                 else:
-                    await _execute(cursor, wrapper, sql, params)
-                rows = await cursor.fetchall()
+                    CursorWrapper(cursor, wrapper).execute(sql, params)
+                    await cursor.wait()
+                rows = cursor.fetchall()
             except database_error as error:
                 if not cursor.connection.broken:
                     # The query failed and the connection is good.
@@ -611,42 +655,6 @@ class _Pool:
         raise AssertionError("unreachable")  # pragma: no cover
 
 
-async def _execute(cursor: Any, wrapper: Any, sql: str, params: Any) -> None:
-    """Send one statement through the cursor wrapper of Django.
-
-    ``CursorWrapper.execute`` calls each wrapper of ``connection.execute_wrapper``
-    and then ``execute`` of the cursor. Thus the wrappers, and a tool that
-    replaces ``CursorWrapper.execute``, get each statement of the loop. With
-    an async cursor, the call gives a coroutine and sends nothing. The
-    database gets the statement here, after the wrappers return. A wrapper
-    that measures the time of its ``execute`` call thus measures no query time.
-    """
-    pending = CursorWrapper(cursor, wrapper).execute(sql, params)
-    if not asyncio.iscoroutine(pending):
-        # With the cursor of Django, the read of the rows then fails with this error.
-        raise ProgrammingError("A wrapper of connection.execute_wrapper() did not call execute. The query has no rows.")
-    await pending
-
-
-async def _execute_logged(cursor: Any, wrapper: Any, sql: str, params: Any) -> None:
-    """``_execute`` with ``connection.queries`` and the ``django.db.backends`` logger, as with the cursor of Django."""
-    debug = CursorDebugWrapper(cursor, wrapper)
-    if not wrapper.features.uses_server_side_binding:
-        with debug.debug_sql(sql, params, use_last_executed_query=True):
-            await _execute(cursor, wrapper, sql, params)
-        return
-    # With server_side_binding, Django merges the parameters for the log with
-    # a cursor of its own connection. The event loop cannot open that
-    # connection. A client cursor of the loop connection gives the same text.
-    database = wrapper.Database
-    try:
-        text = database.AsyncClientCursor(cursor.connection).mogrify(sql, params)
-    except database.errors.DataError:
-        text = BaseDatabaseOperations.last_executed_query(wrapper.ops, cursor, sql, params)
-    with debug.debug_sql(text, params):
-        await _execute(cursor, wrapper, sql, params)
-
-
 def _django_error(database: Any, error: Exception) -> Exception:
     """Return the ``django.db`` error for a psycopg error, as ``DatabaseErrorWrapper`` does."""
     for django_type in _DJANGO_ERRORS:
@@ -656,28 +664,32 @@ def _django_error(database: Any, error: Exception) -> Exception:
 
 
 def _new_pool(loop: WorkerLoop, alias: str) -> _Pool | None:
-    """Make the pool of ``loop`` for ``alias``, or return None for a database that Bolt does not support."""
+    """Make the pool of ``loop`` for ``alias``, or return None for a database whose reads stay on threads."""
     wrapper = connections[alias]
     database = wrapper.Database
     # psycopg 2 has no async connection.
     if type(wrapper).__module__ != _BACKEND_MODULE or getattr(database, "AsyncClientCursor", None) is None:
         return None
+    settings_dict = wrapper.settings_dict
+    addresses = None
     if wrapper.features.uses_server_side_binding:
-        # The server merges the parameters, which needs the extended query protocol of psycopg.
-        addresses = None
-        logger.info("The loop connections to the database %r use psycopg: server_side_binding is on.", alias)
+        # The server merges the parameters, which needs the extended query protocol. Rust sends plain statements.
+        reason = "server_side_binding is on"
+    elif not settings_dict["AUTOCOMMIT"]:
+        # Each read of a thread is then in the transaction of that thread.
+        reason = "AUTOCOMMIT is off"
     else:
         addresses = _libpq_addresses(database)
-        if addresses is None:
-            logger.warning(
-                "The loop connections to the database %r use psycopg, which is slower than Rust. "
-                "The %s implementation of psycopg does not give its libpq functions.",
-                alias,
-                database.pq.__impl__,
-            )
-        else:
-            logger.info("The loop connections to the database %r send their queries from Rust.", alias)
-    pool = _Pool(alias, database, addresses)
+        reason = f"the {database.pq.__impl__} implementation of psycopg does not give its libpq functions"
+    if addresses is None:
+        logger.info("The async ORM reads of the database %r use the ORM thread pool: %s.", alias, reason)
+        return None
+    options = settings_dict["OPTIONS"]
+    if "pool" in options:
+        # The connection pool of Django wants each connection back. A loop connection closes.
+        settings_dict = {**settings_dict, "OPTIONS": {key: value for key, value in options.items() if key != "pool"}}
+    pool = _Pool(alias, database, addresses, type(wrapper), settings_dict)
+    logger.info("The async ORM reads of the database %r run on the event loop.", alias)
     with _loops_lock:
         if loop not in _loops:
             _loops.append(loop)
@@ -692,11 +704,10 @@ def _pool_for(queryset: QuerySet) -> _Pool | None:
 
     - The loop is not the loop of a Bolt worker. A pool lives as long as its loop.
     - The QuerySet has ``prefetch_related``. The prefetch queries are sync code.
-    - The request has Django middleware. Its lane keeps state for the
-      request, such as the schema of a tenant.
-    - The database is not PostgreSQL with psycopg 3 and Django's backend.
-    - The connection of the thread is in a transaction. The test client gives
-      the handlers such a connection, and only it has the rows of the test.
+    - The class of the QuerySet has its own ``_fetch_all``, or the QuerySet
+      has an iterable class that is not of Django. Such code can query.
+    - The code that builds a row of this model queried before: see ``_fetch_all``.
+    - Each condition of ``_pool_of``.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -706,46 +717,70 @@ def _pool_for(queryset: QuerySet) -> _Pool | None:
         return None
     if queryset._prefetch_related_lookups:
         return None
+    if type(queryset)._fetch_all is not _django_fetch_all or queryset._iterable_class.__module__ != _ITERABLES_MODULE:
+        return None
+    if queryset.model in _models_on_threads:
+        return None
     return _pool_of(loop, queryset.db)
 
 
 def _pool_of(loop: WorkerLoop, alias: str) -> _Pool | None:
-    """The part of ``_pool_for`` that does not need the QuerySet."""
+    """The part of ``_pool_for`` that does not need the QuerySet.
+
+    A read uses a thread in these conditions:
+
+    - The request has Django middleware. Its lane keeps state for the
+      request, such as the schema of a tenant.
+    - Sync code called the coroutine with ``async_to_sync``. Django's method
+      then runs on the thread of that code, with its transaction.
+    - The database is not PostgreSQL with psycopg 3, Django's backend,
+      client-side parameters and ``AUTOCOMMIT``.
+    - The connection of the thread is in a transaction. The test client gives
+      the handlers such a connection, and only it has the rows of the test.
+    - The connection has an execute wrapper. A wrapper is sync code around the
+      query: it measures the time of the query and gets its error. On the
+      event loop, the wrapper would return before the query runs.
+    """
     if in_lane_mode() or _thread_sensitive_context.get(None) is not None:
+        return None
+    if getattr(AsyncToSync.executors, "current", None) is not None:
         return None
     pools = loop._query_pools
     pool = pools.get(alias, _MISSING)
     if pool is _MISSING:
         pool = pools[alias] = _new_pool(loop, alias)
-    if pool is None:
+    if pool is None or pool.wrapped:
         return None
-    if connections[alias].in_atomic_block:
+    wrapper = connections[alias]
+    if wrapper.in_atomic_block or wrapper.execute_wrappers:
         return None
     return pool
 
 
-async def _prepare(pool: _Pool, wrapper: Any) -> None:
+async def _prepare(pool: _Pool, wrapper: Any) -> bool:
     """Prepare the connection wrapper of this request for a read of ``pool``.
 
     On an event loop thread, Django keeps one connection wrapper for each
     request, so each read prepares the wrapper of its request.
+
+    Returns False when the first connection of the pool shows that the reads
+    must use threads: see ``_Pool.prepare``.
     """
-    if pool.template is None:
+    if pool.pg_version is None:
         await pool.prepare()
-    template = pool.template
+    if pool.wrapped:
+        return False
     # The compile step reads the server version for some expressions. Without
     # this value, the wrapper would open a sync connection to read it.
-    wrapper.__dict__.setdefault("pg_version", template.pg_version)
-    if template.execute_wrappers:
-        installed = wrapper.execute_wrappers
-        installed.extend(added for added in template.execute_wrappers if added not in installed)
+    wrapper.__dict__.setdefault("pg_version", pool.pg_version)
+    return True
 
 
 async def fetch(alias: str, sql: str, params: Any) -> list[tuple[Any, ...]] | None:
     """Run one read statement of the framework on the event loop, and return its rows.
 
     Returns None for a read that must use the ORM thread pool (see
-    ``_pool_for``). Call this function only when ``enabled`` is true.
+    ``_pool_of``). Call this function only when ``enabled`` is true.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -757,18 +792,21 @@ async def fetch(alias: str, sql: str, params: Any) -> list[tuple[Any, ...]] | No
     if pool is None:
         return None
     wrapper = connections[alias]
-    await _prepare(pool, wrapper)
+    if not await _prepare(pool, wrapper):
+        return None
     return await pool.fetch(wrapper, sql, params)
 
 
 async def _rows(pool: _Pool, compiler: Any) -> Any:
     """Compile the query of ``compiler`` and return its rows from the database.
 
-    Returns None when an expression needed the database to compile. The thread
-    path gives such an expression a connection.
+    Returns None when the read must use a thread: the pool found that after
+    its first connection, or an expression needed the database to compile.
+    The thread path gives such an expression a connection.
     """
     wrapper = compiler.connection
-    await _prepare(pool, wrapper)
+    if not await _prepare(pool, wrapper):
+        return None
     try:
         sql, params = compiler.as_sql()
     except EmptyResultSet:
@@ -776,7 +814,14 @@ async def _rows(pool: _Pool, compiler: Any) -> Any:
         return ()
     except SynchronousOnlyOperation:
         return None
-    return await pool.fetch(wrapper, sql, params) if sql else ()
+    if not sql:
+        return ()
+    rows = await pool.fetch(wrapper, sql, params)
+    if compiler.has_extra_select:
+        # ``execute_sql`` removes the columns that the query selects only to order the rows.
+        count = compiler.col_count
+        rows = [row[:count] for row in rows]
+    return rows
 
 
 async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
@@ -794,8 +839,16 @@ async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
     query.get_compiler = lambda *_args, **_kwargs: compiler
     try:
         queryset._result_cache = list(queryset._iterable_class(queryset))
+        return
+    except SynchronousOnlyOperation:
+        # The code that builds a row queried: a ``from_db`` method, a field
+        # converter or a signal receiver. Only a thread can run it. The
+        # thread reads the rows again, and each later read of this model
+        # starts on a thread.
+        _models_on_threads.add(queryset.model)
     finally:
         del query.get_compiler
+    await SyncToAsync(queryset._fetch_all)()
 
 
 async def load(queryset: QuerySet) -> bool:
@@ -805,7 +858,8 @@ async def load(queryset: QuerySet) -> bool:
     ``_pool_for``). The caller then loads the QuerySet there. Call this
     function only when ``enabled`` is true.
     """
-    pool = _pool_for(queryset)
+    # A QuerySet that has its rows has no query to send. The handler can have changed the rows.
+    pool = _pool_for(queryset) if queryset._result_cache is None else None
     if pool is None:
         return False
     await _fetch_all(queryset, pool)
@@ -830,7 +884,7 @@ def _aiter(self: QuerySet) -> Any:
 
 async def _aget(self: QuerySet, *args: Any, **kwargs: Any) -> Any:
     """``QuerySet.aget``. The lines after the pool are those of ``QuerySet.get``, with the fetch awaited."""
-    if self.query.combinator and (args or kwargs):
+    if (self.query.combinator and (args or kwargs)) or type(self).get is not _django_get:
         return await _django_aget(self, *args, **kwargs)
     pool = _pool_for(self)
     if pool is None:
@@ -860,7 +914,7 @@ def _seconds(name: str, default: float) -> float:
     Read a time in seconds from the environment variable ``name``.
 
     Raises:
-        ImproperlyConfigured: The value is not a number more than 0.
+        ImproperlyConfigured: The value is not a number more than 0, or a timer cannot wait that long.
     """
     raw = os.environ.get(name, "")
     if not raw.strip():
@@ -869,8 +923,10 @@ def _seconds(name: str, default: float) -> float:
         seconds = float(raw)
     except ValueError:
         seconds = 0.0
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise ImproperlyConfigured(f"{name} must be a number more than 0, got {raw!r}.")
+    if not 0 < seconds <= threading.TIMEOUT_MAX:
+        raise ImproperlyConfigured(
+            f"{name} must be a number more than 0 and at most {threading.TIMEOUT_MAX:g}, got {raw!r}."
+        )
     return seconds
 
 
@@ -926,7 +982,7 @@ async def _first_row(queryset: QuerySet, method: str, pool: _Pool) -> Any:
 async def _afirst(self: QuerySet) -> Any:
     """``QuerySet.afirst``."""
     # A QuerySet that has its rows answers from them, and has no query to move to the loop.
-    pool = _pool_for(self) if self._result_cache is None else None
+    pool = _pool_for(self) if self._result_cache is None and type(self).first is _django_first else None
     if pool is None:
         return await _django_afirst(self)
     return await _first_row(self, "first", pool)
@@ -934,7 +990,7 @@ async def _afirst(self: QuerySet) -> Any:
 
 async def _alast(self: QuerySet) -> Any:
     """``QuerySet.alast``."""
-    pool = _pool_for(self)
+    pool = _pool_for(self) if type(self).last is _django_last else None
     if pool is None:
         return await _django_alast(self)
     return await _first_row(self, "last", pool)
@@ -944,7 +1000,7 @@ async def _aexists(self: QuerySet) -> bool:
     """``QuerySet.aexists``: the lines of ``QuerySet.exists`` and ``Query.has_results``, with the query awaited."""
     if self._result_cache is not None:
         return bool(self._result_cache)
-    pool = _pool_for(self)
+    pool = _pool_for(self) if type(self).exists is _django_exists else None
     if pool is None:
         return await _django_aexists(self)
     rows = await _rows(pool, self.query.exists().get_compiler(using=self.db))
@@ -957,13 +1013,13 @@ def configure() -> None:
     """Read the setting and the limits of the pools. The server calls this function at startup.
 
     With the setting on, ``QuerySet`` gets the methods of this module.
-    With the setting off, it gets Django's methods back.
+    With the setting off, it gets Django's methods back in their place.
 
     Raises:
         ImproperlyConfigured: BOLT_ASYNC_ORM_ON_LOOP is not a bool,
             DJANGO_BOLT_LOOP_CONNECTIONS is not an int of 1 or more, or
             DJANGO_BOLT_LOOP_ACQUIRE_SECONDS, DJANGO_BOLT_LOOP_IDLE_SECONDS or
-            DJANGO_BOLT_LOOP_LIFETIME_SECONDS is not a number more than 0.
+            DJANGO_BOLT_LOOP_LIFETIME_SECONDS is not a number that ``_seconds`` accepts.
     """
     global enabled, _connection_limit, _acquire_seconds, _idle_seconds, _lifetime_seconds
     limit = _thread_count(CONNECTIONS_VARIABLE)
@@ -976,8 +1032,8 @@ def configure() -> None:
     _acquire_seconds = acquire_seconds
     _idle_seconds = idle_seconds
     _lifetime_seconds = lifetime_seconds
-    # The settings of a database can change between two servers of one process, as in tests.
-    _templates.clear()
+    # The code of a model can change between two servers of one process, as in tests.
+    _models_on_threads.clear()
     setting = getattr(settings, SETTING, False)
     if type(setting) is not bool:
         raise ImproperlyConfigured(f"{SETTING} must be a bool, got {type(setting).__name__} {setting!r}.")
@@ -986,11 +1042,18 @@ def configure() -> None:
         logger.warning("%s has no effect on Windows. The async ORM uses the ORM thread pool.", SETTING)
         setting = False
     enabled = setting
-    QuerySet.__aiter__ = _aiter if enabled else _django_aiter
-    QuerySet.aget = _aget if enabled else _django_aget
-    QuerySet.afirst = _afirst if enabled else _django_afirst
-    QuerySet.alast = _alast if enabled else _django_alast
-    QuerySet.aexists = _aexists if enabled else _django_aexists
+    for name, method, django_method in (
+        ("__aiter__", _aiter, _django_aiter),
+        ("aget", _aget, _django_aget),
+        ("afirst", _afirst, _django_afirst),
+        ("alast", _alast, _django_alast),
+        ("aexists", _aexists, _django_aexists),
+    ):
+        if enabled:
+            setattr(QuerySet, name, method)
+        elif QuerySet.__dict__[name] is method:
+            # Only the method of this module goes away. Another library can have its own method here.
+            setattr(QuerySet, name, django_method)
 
 
 def close_connections() -> None:

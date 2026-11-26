@@ -8,9 +8,6 @@ result of the sync ORM.
 Each test adds one database to Django: a new PostgreSQL database with the
 tables of the test models. ``default`` stays the SQLite database.
 
-Each ``on_loop`` test runs two times, one time for each way to send a query:
-Rust on the connection of psycopg, and the async cursor of psycopg.
-
 Set ``DJANGO_BOLT_TEST_POSTGRES_DSN`` to run them. Without the variable, they skip.
 """
 
@@ -33,13 +30,17 @@ from typing import Any, NamedTuple
 import msgspec
 import psycopg
 import pytest
+from asgiref.sync import async_to_sync, sync_to_async
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
 from django.db import connections, models, transaction
 from django.db.backends.signals import connection_created
-from django.db.models import Count, Func, IntegerField
+from django.db.backends.utils import CursorWrapper
+from django.db.models import Count, Func, IntegerField, QuerySet
 from django.db.models.expressions import RawSQL
+from django.db.models.query import ModelIterable
+from django.db.models.signals import post_init
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils.deprecation import MiddlewareMixin
@@ -274,22 +275,10 @@ class _SlowLink:
             link.close()
 
 
-RUST = "rust"
-PSYCOPG = "psycopg"
-# The database options that select each way to send a query. With
-# ``server_side_binding``, psycopg must send the query: see ``async_orm._new_pool``.
-TRANSPORT_OPTIONS: dict[str, dict[str, Any]] = {RUST: {}, PSYCOPG: {"server_side_binding": True}}
-
-
-@pytest.fixture(params=sorted(TRANSPORT_OPTIONS))
-def transport(request) -> str:
-    return request.param
-
-
-@pytest.fixture
-def on_loop(transport, postgres_database, monkeypatch, django_db_blocker):
-    """Add the database and turn the setting on for the servers of the test."""
-    for database in _add_database(postgres_database, monkeypatch, django_db_blocker, TRANSPORT_OPTIONS[transport]):
+@contextlib.contextmanager
+def _setting_on(postgres_database, monkeypatch, django_db_blocker, options: dict[str, Any]) -> Any:
+    """Add the database, with ``options`` in its ``OPTIONS``, and turn the setting on for the servers of the test."""
+    for database in _add_database(postgres_database, monkeypatch, django_db_blocker, options):
         with override_settings(BOLT_ASYNC_ORM_ON_LOOP=True):
             yield database
         # A server that starts with the setting off gives Django its own methods back.
@@ -297,17 +286,29 @@ def on_loop(transport, postgres_database, monkeypatch, django_db_blocker):
 
 
 @pytest.fixture
-def on_loop_through_a_slow_link(transport, postgres_database, monkeypatch, django_db_blocker):
+def on_loop(request, postgres_database, monkeypatch, django_db_blocker):
+    """The database of the test, with the setting on. An indirect parameter gives the ``OPTIONS`` of the database."""
+    options = getattr(request, "param", {})
+    with _setting_on(postgres_database, monkeypatch, django_db_blocker, options) as database:
+        yield database
+
+
+@pytest.fixture
+def on_loop_through_a_slow_link(postgres_database, monkeypatch, django_db_blocker):
     """``on_loop``, with the database behind a ``_SlowLink``."""
     link = _SlowLink(postgres_database)
     behind = {**postgres_database, "host": "127.0.0.1", "port": str(link.port)}
     try:
-        for database in _add_database(behind, monkeypatch, django_db_blocker, TRANSPORT_OPTIONS[transport]):
-            with override_settings(BOLT_ASYNC_ORM_ON_LOOP=True):
-                yield database
-            concurrency.check_pool_environment()
+        with _setting_on(behind, monkeypatch, django_db_blocker, {}) as database:
+            yield database
     finally:
         link.close()
+
+
+def _with_the_setting_off(api: Callable[[], BoltAPI], path: str) -> Any:
+    """The response of ``path`` from a server that reads on the ORM thread pool."""
+    with override_settings(BOLT_ASYNC_ORM_ON_LOOP=False), TestClient(api()) as client:
+        return client.get(path).json()
 
 
 def _post(post: BlogPost) -> dict[str, Any]:
@@ -361,6 +362,8 @@ QUERIES: dict[str, tuple[Callable[[], Any], Callable[[Any], Any]]] = {
     ),
     "empty_in": (lambda: _posts().filter(id__in=[]), _post),
     "none": (lambda: _posts().none(), _post),
+    # Django selects ``id`` to order the rows, and removes it from each row.
+    "distinct_with_another_order": (lambda: _posts().values_list("title").order_by("id").distinct(), list),
     "datetimes": (lambda: _posts().values_list("created_at", flat=True).order_by("id"), lambda at: at.isoformat()),
 }
 
@@ -393,6 +396,7 @@ ONE_ROW_QUERIES: dict[str, Callable[[], Any]] = {
     "no_rows": lambda: _posts().filter(title="No such post"),
     "values": lambda: _posts().order_by("id").values("id", "title"),
     "values_list": lambda: _posts().order_by("-id").values_list("title", flat=True),
+    "distinct_with_another_order": lambda: _posts().values_list("title").order_by("id").distinct(),
     # ``last`` cannot reverse a slice.
     "sliced": lambda: _posts().order_by("id")[1:3],
     "slice_after_the_rows": lambda: _posts().order_by("id")[5:6],
@@ -594,10 +598,145 @@ def _returned_queryset_routes(api: BoltAPI) -> None:
 RETURNED = ("struct", "renamed", "nested", "serializer", "computed", "values", "no-rows", "unknown-field")
 
 
+def _skip_the_query(execute: Any, sql: str, params: Any, many: bool, context: Any) -> None:
+    """A wrapper that does not call ``execute``."""
+
+
+# The calls of the methods that the classes of ``_own_method_class`` replace.
+own_method_calls: list[str] = []
+
+
+def _own_method_class(method: str) -> type[QuerySet]:
+    """A QuerySet class with its own ``method``, as a cache library or a soft-delete library has."""
+
+    def recorded(self: QuerySet, *args: Any, **kwargs: Any) -> Any:
+        result = getattr(QuerySet, method)(self, *args, **kwargs)
+        # The lines after the call of Django are part of the method too.
+        own_method_calls.append(method)
+        return result
+
+    return type("OwnMethodQuerySet", (QuerySet,), {method: recorded})
+
+
+# The sync method that a class replaces -> the async call that runs it with the setting off.
+OWN_METHODS: dict[str, Callable[[QuerySet], Any]] = {
+    "_fetch_all": lambda authors: _names(authors),
+    "get": lambda authors: authors.aget(),
+    "first": lambda authors: authors.afirst(),
+    "last": lambda authors: authors.alast(),
+    "exists": lambda authors: authors.aexists(),
+}
+
+
+async def _names(authors: QuerySet) -> list[str]:
+    return [author.name async for author in authors]
+
+
+class QueryingIterable(ModelIterable):
+    """An iterable class that sends one more query, as django-polymorphic does for the real class of each row."""
+
+    def __iter__(self) -> Any:
+        names = dict(Author.objects.using(self.queryset.db).values_list("id", "name"))
+        for author in super().__iter__():
+            author.looked_up = names[author.id]
+            yield author
+
+
+class CloningIterable(ModelIterable):
+    """An iterable class that reads a filtered copy of its own QuerySet."""
+
+    def __iter__(self) -> Any:
+        authors = list(super().__iter__())
+        others = self.queryset.filter(name="Bob")
+        others._iterable_class = ModelIterable
+        names = [author.name for author in others]
+        for author in authors:
+            author.looked_up = names
+            yield author
+
+
+ITERABLE_CLASSES = {"querying": QueryingIterable, "cloning": CloningIterable}
+
+
 def _api() -> BoltAPI:
     api = BoltAPI()
     _probe_threads_route(api)
     _returned_queryset_routes(api)
+
+    @api.get("/own-method/{method}")
+    async def own_method(method: str):
+        authors = _own_method_class(method)(model=Author, using=ALIAS).filter(name="Ada")
+        own_method_calls.clear()
+        await OWN_METHODS[method](authors)
+        return {"calls": own_method_calls}
+
+    @api.get("/iterable-class/{name}")
+    async def iterable_class(name: str):
+        authors = Author.objects.using(ALIAS).filter(name="Ada")
+        authors._iterable_class = ITERABLE_CLASSES[name]
+        return [author.looked_up async for author in authors]
+
+    @api.get("/thread-transaction")
+    async def thread_transaction():
+        def work() -> list[str]:
+            with transaction.atomic(using=ALIAS):
+                Author.objects.using(ALIAS).create(name="Uncommitted", email="new@example.com")
+                # Sync code that calls async code, as a sync view that calls an async helper.
+                names = async_to_sync(_names)(Author.objects.using(ALIAS).filter(name="Uncommitted"))
+                transaction.set_rollback(True, using=ALIAS)
+            return names
+
+        return await sync_to_async(work)()
+
+    @api.get("/returned-with-its-rows")
+    async def returned_with_its_rows():
+        probes = _probes().order_by("id").values("label")
+        for row in [row async for row in probes]:
+            row["label"] = row["label"].upper()
+        return probes
+
+    @api.get("/query-log-of-a-statement-with-no-sql")
+    async def query_log_of_a_statement_with_no_sql():
+        assert [name async for name in _ada()] == ["Ada"]
+        try:
+            # PostgreSQL text has no NUL character, so psycopg cannot build the statement.
+            await Author.objects.using(ALIAS).filter(name="a\x00b").aexists()
+        except Exception as error:
+            return {"error": type(error).__qualname__, "sql": connections[ALIAS].queries[-1]["sql"]}
+        return {"error": None}
+
+    @api.get("/current-user")
+    async def current_user():
+        probe = await _probes().annotate(who=RawSQL("current_user", [])).aget(label="a")
+        return {"who": probe.who}
+
+    @api.get("/greedy-and-other")
+    async def greedy_and_other():
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+
+        async def greedy() -> None:
+            # One read after the other with no pause, as a loop of ``aget`` calls in a handler.
+            while loop.time() - start < 1:
+                await _backend_pid(nap=0.02)
+
+        async def other() -> float:
+            # The greedy task holds the one connection now.
+            await asyncio.sleep(0.1)
+            await _backend_pid(nap=0)
+            return loop.time() - start
+
+        _none, waited = await asyncio.gather(greedy(), other())
+        return {"other_read_in_time": waited < 0.5}
+
+    @api.get("/cancelled-open")
+    async def cancelled_open():
+        try:
+            # The first read of a loop opens a connection, which takes more time than this.
+            await asyncio.wait_for(_backend_pid(), timeout=0.001)
+        except TimeoutError:
+            return {"cancelled": True, "after": [name async for name in _ada()]}
+        return {"cancelled": False}
 
     @api.get("/compiled/{name}")
     async def compiled(name: str):
@@ -816,11 +955,19 @@ def _api() -> BoltAPI:
     async def session():
         probe = await (
             LoopProbe.objects.using(ALIAS)
-            .annotate(statement_timeout=RawSQL("current_setting('statement_timeout')", []))
+            .annotate(
+                statement_timeout=RawSQL("current_setting('statement_timeout')", []),
+                tenant=RawSQL("current_setting('app.tenant', true)", []),
+            )
             .aget(label="a")
         )
         published = [flag async for flag in _posts().values_list("published", flat=True).order_by("id")]
-        return {"statement_timeout": probe.statement_timeout, "published": published, "built_on": probe.built_on}
+        return {
+            "statement_timeout": probe.statement_timeout,
+            "tenant": probe.tenant,
+            "published": published,
+            "built_on": probe.built_on,
+        }
 
     @api.get("/authors")
     async def authors():
@@ -940,65 +1087,60 @@ def test_debug_logs_a_read_of_the_loop_as_django_logs_a_query(on_loop, caplog):
     assert records[0].duration > 0
 
 
-def test_a_wrapper_of_execute_wrapper_gets_each_read(on_loop):
-    with TestClient(_api()) as client:
-        wrapped = client.get("/wrapped").json()
-
-    assert wrapped["names"] == ["Ada"]
-    (seen,) = wrapped["seen"]
-    assert seen["sql"].endswith('WHERE "django_bolt_author"."name" = %s')
-    assert seen == {"sql": seen["sql"], "params": ["Ada"], "many": False, "alias": ALIAS, "cursor": "CursorWrapper"}
-
-
-def _skip_the_query(execute: Any, sql: str, params: Any, many: bool, context: Any) -> None:
-    """A wrapper that does not call ``execute``."""
-
-
-def test_a_wrapper_that_sends_nothing_gives_the_error_of_django(on_loop):
-    with pytest.raises(Exception) as sync_error, connections[ALIAS].execute_wrapper(_skip_the_query):  # noqa: PT011
-        list(_ada())
-    expected = {"module": type(sync_error.value).__module__, "error": type(sync_error.value).__qualname__}
+@pytest.mark.parametrize("path", ["/wrapped", "/skipped", "/blocked"])
+def test_a_wrapper_that_a_handler_installs_has_the_effect_of_the_thread_path(on_loop, path):
+    """The wrapper is on the connection of the event loop thread. A thread that reads has its own connection."""
+    expected = _with_the_setting_off(_api, path)
 
     with TestClient(_api()) as client:
-        skipped = client.get("/skipped").json()
+        response = client.get(path)
         after = client.get("/authors")
 
-    assert skipped == expected == {"module": "django.db.utils", "error": "ProgrammingError"}
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
     assert after.json() == ["Ada", "Bob", "Cy"]
 
 
-def test_a_wrapper_that_raises_stops_the_read(on_loop):
-    with TestClient(_api()) as client:
-        blocked = client.get("/blocked").json()
-        after = client.get("/authors")
-
-    assert blocked == {"error": "RuntimeError", "message": "No queries in this block."}
-    assert after.json() == ["Ada", "Bob", "Cy"]
-
-
-def test_a_wrapper_that_a_connection_created_receiver_installs_gets_each_read(on_loop):
-    """A tool installs its wrapper on each new connection of Django. The loop connections copy that state."""
-    statements = []
+def test_a_wrapper_that_a_connection_created_receiver_installs_gets_the_query_and_its_error(on_loop, caplog):
+    """A tool installs its wrapper on each new connection of Django. A wrapper is sync code around the query."""
+    seen = []
 
     def record(execute: Any, sql: str, params: Any, many: bool, context: Any) -> Any:
-        statements.append(sql)
-        return execute(sql, params, many, context)
+        try:
+            return execute(sql, params, many, context)
+        except Exception as error:
+            seen.append(type(error).__qualname__)
+            raise
+        finally:
+            seen.append(sql)
 
     def install(sender: Any, connection: Any, **kwargs: Any) -> None:
         if connection.alias == ALIAS:
             connection.execute_wrappers.append(record)
 
+    caplog.set_level(logging.INFO, logger="django_bolt.async_orm")
     connection_created.connect(install)
     try:
         with TestClient(_api()) as client:
-            assert client.get("/authors").status_code == 200
-            statements.clear()
-            assert client.get("/get/one").status_code == 200
+            threads = client.get("/threads").json()
+            seen.clear()
+            error = client.get("/division-by-zero").json()
+            connections[ALIAS].close()
+            # The loop connection that showed the wrapper is closed.
+            on_loop.wait_for_backends(0)
     finally:
         connection_created.disconnect(install)
 
-    assert len(statements) == 1, statements
-    assert statements[0].startswith('SELECT "django_bolt_blogpost"."id"')
+    assert _built_on_orm_threads(threads), threads
+    assert error == {"module": "django.db.utils", "error": "DataError"}
+    assert len(seen) == 2, seen
+    assert seen[0] == "DataError"
+    assert seen[1].startswith('SELECT "django_bolt_author"."id"')
+    assert _loop_log(caplog) == [
+        f"The async ORM reads of the database {ALIAS!r} run on the event loop.",
+        f"The async ORM reads of the database {ALIAS!r} use the ORM thread pool: "
+        "a connection_created receiver installs an execute wrapper.",
+    ]
 
 
 def test_a_read_on_another_event_loop_uses_the_orm_pool(on_loop):
@@ -1183,8 +1325,8 @@ def test_two_queries_of_one_request_run_on_two_connections(on_loop):
     assert first != second
 
 
-def test_reads_that_start_together_open_one_django_connection(on_loop):
-    """The first read of a loop copies the state of a Django connection. One copy serves each loop connection."""
+def test_two_reads_that_start_together_open_two_connections(on_loop):
+    """The first read of a loop opens one connection before it compiles. One of the two reads then uses it."""
     opened = []
 
     def count(sender: Any, connection: Any, **kwargs: Any) -> None:
@@ -1200,7 +1342,8 @@ def test_reads_that_start_together_open_one_django_connection(on_loop):
         connection_created.disconnect(count)
 
     assert first != second
-    assert len(opened) == 1, opened
+    assert len(opened) == 2, opened
+    assert all(name.startswith(ORM_THREAD) for name in opened), opened
 
 
 def test_a_loop_opens_ten_connections_by_default(on_loop):
@@ -1303,13 +1446,15 @@ class _YesNo(psycopg.adapt.Loader):
 
 
 def test_a_loop_connection_has_the_session_settings_and_the_adapters_of_a_django_connection(on_loop):
-    """A ``connection_created`` receiver prepares each connection of Django. The loop connections must match."""
+    """A ``connection_created`` receiver prepares each connection of Django. Django opens the loop connections too."""
 
     def prepare(sender: Any, connection: Any, **kwargs: Any) -> None:
         if connection.alias != ALIAS:
             return
         with connection.cursor() as cursor:
             cursor.execute("SET statement_timeout = 4321")
+            # A setting of the application, as a row-level-security policy reads it.
+            cursor.execute("SET app.tenant = 'acme'")
         connection.connection.adapters.register_loader("bool", _YesNo)
 
     connection_created.connect(prepare)
@@ -1322,7 +1467,12 @@ def test_a_loop_connection_has_the_session_settings_and_the_adapters_of_a_django
         # The connection of the test opened before the receiver. The next read opens a new one.
         connections[ALIAS].close()
 
-    assert session == {"statement_timeout": "4321ms", "published": ["yes", "no", "yes"], "built_on": handler}
+    assert session == {
+        "statement_timeout": "4321ms",
+        "tenant": "acme",
+        "published": ["yes", "no", "yes"],
+        "built_on": handler,
+    }
 
 
 def test_a_handler_reads_the_uncommitted_rows_of_the_test(on_loop):
@@ -1483,17 +1633,160 @@ def _loop_log(caplog) -> list[str]:
     return [record.getMessage() for record in caplog.records if record.name == "django_bolt.async_orm"]
 
 
-def test_a_log_line_tells_how_a_loop_sends_its_queries(on_loop, transport, caplog):
+def test_a_log_line_tells_where_the_reads_of_a_database_run(on_loop, caplog):
     caplog.set_level(logging.INFO, logger="django_bolt.async_orm")
     with TestClient(_api()) as client:
         assert client.get("/authors").status_code == 200
         assert client.get("/authors").status_code == 200
 
-    expected = {
-        RUST: f"The loop connections to the database {ALIAS!r} send their queries from Rust.",
-        PSYCOPG: f"The loop connections to the database {ALIAS!r} use psycopg: server_side_binding is on.",
-    }
-    assert _loop_log(caplog) == [expected[transport]]
+    assert _loop_log(caplog) == [f"The async ORM reads of the database {ALIAS!r} run on the event loop."]
+
+
+@pytest.mark.parametrize("on_loop", [{"server_side_binding": True}], indirect=True, ids=["server_side_binding"])
+def test_a_database_with_server_side_binding_reads_on_the_orm_pool(on_loop, caplog):
+    """The server merges the parameters. Rust sends only a statement with its parameters in it."""
+    caplog.set_level(logging.INFO, logger="django_bolt.async_orm")
+    with TestClient(_api()) as client:
+        threads = client.get("/threads").json()
+
+    assert _built_on_orm_threads(threads), threads
+    assert _loop_log(caplog) == [
+        f"The async ORM reads of the database {ALIAS!r} use the ORM thread pool: server_side_binding is on."
+    ]
+
+
+def test_a_database_with_autocommit_off_reads_on_the_orm_pool(on_loop, monkeypatch, caplog):
+    """Each read of a thread is then in the transaction of that thread."""
+    monkeypatch.setitem(connections.settings[ALIAS], "AUTOCOMMIT", False)
+    caplog.set_level(logging.INFO, logger="django_bolt.async_orm")
+    with TestClient(_api()) as client:
+        threads = client.get("/threads").json()
+
+    assert _built_on_orm_threads(threads), threads
+    assert _loop_log(caplog) == [
+        f"The async ORM reads of the database {ALIAS!r} use the ORM thread pool: AUTOCOMMIT is off."
+    ]
+
+
+@pytest.fixture
+def assumed_role(postgres_database):
+    """A role with no login, which a connection takes with ``SET ROLE``."""
+    role = psycopg.sql.Identifier(f"bolt_role_{secrets.token_hex(4)}")
+    with psycopg.connect(**postgres_database, autocommit=True) as admin:
+        admin.execute(psycopg.sql.SQL("CREATE ROLE {}").format(role))
+        admin.execute(psycopg.sql.SQL("GRANT ALL ON SCHEMA public TO {}").format(role))
+    yield role.as_string()
+    with psycopg.connect(**postgres_database, autocommit=True) as admin:
+        admin.execute(psycopg.sql.SQL("DROP OWNED BY {}").format(role))
+        admin.execute(psycopg.sql.SQL("DROP ROLE {}").format(role))
+
+
+def test_a_loop_connection_has_the_role_of_assume_role(assumed_role, postgres_database, monkeypatch, django_db_blocker):
+    """The role sets what a query can read. A read on the event loop must not have more access than a thread has."""
+    role = assumed_role.strip('"')
+    with _setting_on(postgres_database, monkeypatch, django_db_blocker, {"assume_role": role}):
+        on_a_thread = _probes().annotate(who=RawSQL("current_user", [])).get(label="a").who
+        with TestClient(_api()) as client:
+            on_the_loop = client.get("/current-user").json()
+
+    assert on_a_thread == role
+    assert on_the_loop == {"who": role}
+
+
+@pytest.mark.parametrize("method", sorted(OWN_METHODS))
+def test_a_queryset_class_with_its_own_method_runs_it(on_loop, method):
+    expected = _with_the_setting_off(_api, f"/own-method/{method}")
+    assert expected == {"calls": [method]}
+
+    with TestClient(_api()) as client:
+        response = client.get(f"/own-method/{method}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+@pytest.mark.parametrize("name", sorted(ITERABLE_CLASSES))
+def test_an_iterable_class_that_is_not_of_django_runs_on_a_thread(on_loop, name):
+    """Such a class can query while it builds the rows. Only a thread can run it."""
+    expected = _with_the_setting_off(_api, f"/iterable-class/{name}")
+    assert expected == {"querying": ["Ada"], "cloning": [[]]}[name]
+
+    with TestClient(_api()) as client:
+        response = client.get(f"/iterable-class/{name}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+def test_a_model_whose_rows_need_a_query_reads_on_a_thread(on_loop):
+    """A receiver, a ``from_db`` method or a field converter can query for each row. The event loop cannot."""
+    built = []
+
+    def count_authors(sender: Any, instance: Any, **kwargs: Any) -> None:
+        built.append(threading.current_thread().name)
+        instance.authors = Author.objects.using(ALIAS).count()
+
+    post_init.connect(count_authors, sender=LoopProbe)
+    try:
+        with TestClient(_api()) as client:
+            first = client.get("/threads")
+            builds_of_the_first_request = len(built)
+            built.clear()
+            second = client.get("/threads")
+    finally:
+        post_init.disconnect(count_authors, sender=LoopProbe)
+
+    assert first.status_code == 200, first.text
+    assert _built_on_orm_threads(first.json()), first.json()
+    assert _built_on_orm_threads(second.json()), second.json()
+    # ``/threads`` builds two rows and then one row. The first read started on the event loop and stopped at
+    # its first row. A read of this model then starts on a thread.
+    assert builds_of_the_first_request == 4
+    assert len(built) == 3
+    assert all(name.startswith(ORM_THREAD) for name in built), built
+
+
+def test_a_read_that_waits_gets_the_next_free_connection(on_loop, monkeypatch):
+    """A task that reads again at once must not take the connection before the read that waits for it."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    with TestClient(_api()) as client:
+        response = client.get("/greedy-and-other")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"other_read_in_time": True}
+
+
+def test_a_read_that_waits_opens_a_connection_when_the_one_in_use_closes(on_loop, monkeypatch):
+    """The one connection is too old when its read gives it back, so it closes. Its place goes to the read that waits."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_LIFETIME_SECONDS", "0.01")
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_ACQUIRE_SECONDS", "3")
+    with TestClient(_api(), raise_server_exceptions=False) as client:
+        response = client.get("/two-at-once")
+
+    assert response.status_code == 200, response.text
+    first, second = response.json()
+    assert first != second
+
+
+def test_a_read_that_stops_while_its_connection_opens_leaves_no_connection(on_loop):
+    with TestClient(_api()) as client:
+        response = client.get("/cancelled-open")
+    connections[ALIAS].close()
+
+    assert response.json() == {"cancelled": True, "after": ["Ada"]}
+    on_loop.wait_for_backends(0)
+
+
+@pytest.mark.parametrize("on_loop", [{"pool": {"min_size": 1, "max_size": 2}}], indirect=True, ids=["django_pool"])
+def test_a_database_with_the_connection_pool_of_django_reads_on_the_event_loop(on_loop):
+    """A loop connection is not a connection of that pool: the pool wants each connection back."""
+    with TestClient(_api()) as client:
+        threads = client.get("/threads").json()
+        many = client.get("/many-at-once/4").json()
+
+    assert not _built_on_orm_threads(threads), threads
+    assert many == {"connections": 4}
 
 
 def _check_large_result(size: str) -> None:
@@ -1605,3 +1898,77 @@ def test_a_connection_that_dies_during_a_query_fails_no_request(on_loop):
 
     assert response.status_code == 200, response.text
     assert response.json()["pid"] != before
+
+
+def test_a_read_that_sync_code_runs_in_its_transaction_has_the_rows_of_the_transaction(on_loop):
+    """``async_to_sync`` runs the coroutine on the event loop, and the thread that called it has the transaction."""
+    expected = _with_the_setting_off(_api, "/thread-transaction")
+    assert expected == ["Uncommitted"]
+
+    with TestClient(_api()) as client:
+        response = client.get("/thread-transaction")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+def test_a_returned_queryset_that_has_its_rows_sends_no_query(on_loop):
+    """The handler read the rows and changed them. The response has the rows of the handler."""
+    with TestClient(_api()) as client:
+        response = client.get("/returned-with-its-rows")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [{"label": "A"}, {"label": "B"}]
+
+
+def test_debug_logs_a_statement_that_psycopg_cannot_build_as_django_logs_it(on_loop):
+    """Each connection keeps its last statement. The log must not show the statement of an earlier query."""
+    with override_settings(DEBUG=True):
+        with CaptureQueriesContext(connections[ALIAS]) as captured, pytest.raises(Exception) as sync_error:  # noqa: PT011
+            Author.objects.using(ALIAS).filter(name="a\x00b").exists()
+        expected = {"error": type(sync_error.value).__qualname__, "sql": captured[-1]["sql"]}
+        assert expected["error"] == "DataError"
+        assert expected["sql"].startswith("QUERY = ")
+
+        with TestClient(_api()) as client:
+            response = client.get("/query-log-of-a-statement-with-no-sql")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+def test_a_tool_that_replaces_the_execute_of_the_cursor_wrapper_gets_each_statement(on_loop, monkeypatch):
+    """An APM tool replaces ``CursorWrapper.execute``. Django does not read what that method returns."""
+    statements = []
+    django_execute = CursorWrapper.execute
+
+    def traced(self: CursorWrapper, sql: str, params: Any = None) -> None:
+        statements.append(sql)
+        django_execute(self, sql, params)
+
+    with TestClient(_api()) as client:
+        assert client.get("/authors").status_code == 200
+        with monkeypatch.context() as patch:
+            patch.setattr(CursorWrapper, "execute", traced)
+            threads = client.get("/threads")
+
+    assert threads.status_code == 200, threads.text
+    assert not _built_on_orm_threads(threads.json()), threads.json()
+    assert len(statements) == 2, statements
+    assert all(statement.startswith('SELECT "django_bolt_loopprobe"."id"') for statement in statements)
+
+
+def test_a_tool_that_sends_no_statement_gives_an_error_and_not_the_rows_of_an_earlier_read(on_loop, monkeypatch):
+    def blocked(self: CursorWrapper, sql: str, params: Any = None) -> None:
+        """A replacement of ``CursorWrapper.execute`` that does not call it."""
+
+    with TestClient(_api()) as client:
+        # The one connection of the loop has the result of this read.
+        assert client.get("/authors").json() == ["Ada", "Bob", "Cy"]
+        with monkeypatch.context() as patch:
+            patch.setattr(CursorWrapper, "execute", blocked)
+            response = client.get("/connect-error")
+        after = client.get("/authors")
+
+    assert response.json() == {"module": "django.db.utils", "error": "ProgrammingError"}
+    assert after.json() == ["Ada", "Bob", "Cy"]
