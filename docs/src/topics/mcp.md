@@ -915,10 +915,10 @@ An earlier client uses a session, and the `MCP()` options set how Bolt serves it
 | Stateless | `MCP("blog", stateless=True)` | No | No | Yes |
 
 - **Stateful** keeps each session in the memory of one process. Run `runbolt --processes 1`, or a load balancer that sends a session to the same process.
-
-A tool with `task=True` needs one process in each mode. See [Run a long tool as a task](#run-a-long-tool-as-a-task).
 - **JSON response** answers a request with one `application/json` object. A tool that sends notifications still gets an event stream.
 - **Stateless** answers each request with an event stream, and has no `GET` stream.
+
+A tool with `task=True` needs one process in each mode. See [Run a long tool as a task](#run-a-long-tool-as-a-task).
 
 Set the public host names of the server with `allowed_hosts`.
 The check protects a local server from DNS rebinding:
