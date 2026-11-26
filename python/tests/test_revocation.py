@@ -9,11 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import jwt
 import pytest
 from django.core.cache import caches
+from django.core.cache.backends.db import DatabaseCache
 from django.core.cache.backends.locmem import LocMemCache
 from django.core.cache.backends.memcached import BaseMemcachedCache
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
-from django.db import IntegrityError
+from django.db import IntegrityError, connection
 
 from django_bolt import BoltAPI
 from django_bolt.auth import JWTAuthentication, JWTAuthViews, TokenRotationError, rotate_refresh_token
@@ -1092,3 +1093,111 @@ def test_rotation_of_a_refresh_token_with_a_claim_that_the_store_cannot_keep_rai
 
     with pytest.raises(TokenRotationError):
         asyncio.run(rotate_refresh_token(claims, store=store, secret=_SECRET, rotate=rotate))
+
+
+# ---------------------------------------------------------------------------
+# DjangoCacheRevocation on a DatabaseCache (#940)
+# ---------------------------------------------------------------------------
+
+_DB_CACHE_TABLE = "bolt_revocation_cache"
+
+
+@pytest.fixture
+def db_cache_store(settings, transactional_db):
+    """Build a ``DjangoCacheRevocation`` on a ``DatabaseCache`` with its own table."""
+    settings.CACHES = {
+        **settings.CACHES,
+        "revocation-db": {"BACKEND": "django.core.cache.backends.db.DatabaseCache", "LOCATION": _DB_CACHE_TABLE},
+    }
+    call_command("createcachetable", _DB_CACHE_TABLE, verbosity=0)
+    yield DjangoCacheRevocation(cache_alias="revocation-db")
+    # The flush of transactional_db does not empty a table that has no model.
+    with connection.cursor() as cursor:
+        cursor.execute(f"DROP TABLE {connection.ops.quote_name(_DB_CACHE_TABLE)}")
+
+
+def test_cache_store_on_a_database_cache_checks_tokens_over_http(db_cache_store):
+    """A request with a token gets a 200, and a 401 after logout. It is not a 500."""
+    api = BoltAPI()
+    auth = JWTAuthentication(secret=_SECRET, revocation_store=db_cache_store)
+
+    @api.get("/protected", auth=[auth])
+    async def protected():
+        return {"ok": True}
+
+    @api.post("/logout", auth=[auth])
+    async def logout(request):
+        claims = request["context"]["auth_claims"]
+        await db_cache_store.revoke(claims["jti"], exp=claims["exp"])
+        return {"ok": True}
+
+    token = {"Authorization": f"Bearer {_signed('access', 'db-cache-jti')}"}
+    other = {"Authorization": f"Bearer {_signed('access', 'db-cache-other')}"}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        assert client.get("/protected", headers=token).status_code == 200
+        assert client.post("/logout", headers=token).status_code == 200
+        assert client.get("/protected", headers=token).status_code == 401
+        assert client.get("/protected", headers=other).status_code == 200
+
+
+def test_cache_store_on_a_database_cache_keeps_tokens_families_and_versions(db_cache_store):
+    """Each store method that the database cache supports runs on the event loop."""
+
+    async def run():
+        await db_cache_store.revoke("a", exp=int(time.time()) + FUTURE)
+        await db_cache_store.revoke_family("f", exp=int(time.time()) + FUTURE)
+        return (
+            await db_cache_store.is_revoked("a"),
+            await db_cache_store.is_revoked("b"),
+            await db_cache_store.is_family_revoked("f"),
+            await db_cache_store.is_family_revoked("g"),
+            await db_cache_store.get_user_version("u"),
+        )
+
+    assert asyncio.run(run()) == (True, False, True, False, 0)
+
+
+class IncrDatabaseCache(DatabaseCache):
+    """A database cache with its own ``incr``. Each call still runs a query."""
+
+    def incr(self, key, delta=1, version=None):
+        return super().incr(key, delta, version)
+
+
+def test_cache_store_refuses_rotation_on_a_subclass_of_the_database_cache(settings):
+    """A subclass with its own ``incr`` gets the clear error, not ``SynchronousOnlyOperation``."""
+    settings.CACHES = {
+        **settings.CACHES,
+        "incr-db": {"BACKEND": "tests.test_revocation.IncrDatabaseCache", "LOCATION": _DB_CACHE_TABLE},
+    }
+    store = DjangoCacheRevocation(cache_alias="incr-db")
+
+    with pytest.raises(NotImplementedError, match="atomic add/incr"):
+        asyncio.run(store.consume("a", exp=int(time.time()) + FUTURE))
+    with pytest.raises(NotImplementedError, match="atomic add/incr"):
+        asyncio.run(store.bump_user_version("u"))
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda store: store.is_revoked("a"),
+        lambda store: store.revoke("a", exp=int(time.time()) + FUTURE),
+        lambda store: store.consume("a", exp=int(time.time()) + FUTURE),
+        lambda store: store.is_family_revoked("f"),
+        lambda store: store.revoke_family("f", exp=int(time.time()) + FUTURE),
+        lambda store: store.get_user_version("u"),
+        lambda store: store.bump_user_version("u"),
+    ],
+    ids=["is_revoked", "revoke", "consume", "is_family_revoked", "revoke_family", "get_user_version", "bump"],
+)
+def test_cache_store_on_an_in_memory_cache_does_not_leave_the_event_loop_thread(cache_store, call):
+    """A local-memory call ends at the first step of its coroutine, so it has no thread hop.
+
+    ``is_revoked`` runs for each authenticated request. A hop to a thread pool costs much more.
+    """
+    coro = call(cache_store())
+
+    with pytest.raises(StopIteration):
+        coro.send(None)
