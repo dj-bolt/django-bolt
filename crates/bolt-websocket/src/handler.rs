@@ -20,8 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use bolt_core::metadata::RouteMetadata;
 use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
-use bolt_core::middleware::client_ip::{TrustedProxies, resolve_scheme};
+use bolt_core::middleware::client_ip::resolve_scheme;
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
+use bolt_core::request::client_path;
 use bolt_core::request_pipeline::{
     EMPTY_TYPES, header_str, insert_header_line, query_sequences, set_declared_item,
     set_param_item, set_query_sequences,
@@ -150,6 +151,12 @@ pub fn requested_subprotocols<'a>(values: impl Iterator<Item = &'a str>) -> Vec<
 /// Parses and coerces query, path, header and cookie values to typed Python
 /// objects using the same type coercion as HTTP handlers.
 /// `headers` holds the request headers, with the `Cookie` lines joined.
+/// `path` starts with the script name (`FORCE_SCRIPT_NAME`), as `request.path`
+/// does, and `root_path` is the script name.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parts of a request and the settings of the app that the scope reads"
+)]
 fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
@@ -158,6 +165,7 @@ fn build_scope(
     path_params: &AHashMap<String, String>,
     route_meta: Option<&RouteMetadata>,
     max_param_length: usize,
+    script_name: Option<&str>,
 ) -> PyResult<Py<PyAny>> {
     let empty_types: &TypeHints = &EMPTY_TYPES;
     let path_types = route_meta.map_or(empty_types, |m| &m.path_types);
@@ -167,7 +175,8 @@ fn build_scope(
 
     let scope_dict = PyDict::new(py);
     scope_dict.set_item("type", "websocket")?;
-    scope_dict.set_item("path", req.path())?;
+    scope_dict.set_item("path", client_path(script_name, req.path().to_owned()))?;
+    scope_dict.set_item("root_path", client_path(script_name, String::new()))?;
 
     // Parse the query string with the HTTP parser: the last value of a repeated key wins.
     // A value that is too long or a bad typed value rejects the upgrade, as in HTTP.
@@ -274,15 +283,21 @@ enum Handshake {
 /// reads. This one follows the ASGI specification instead.
 ///
 /// `path` keeps the mount prefix, and `root_path` reports it, as the
-/// specification requires. `path` is percent-decoded. `raw_path` keeps the
-/// request bytes. A router such as `channels.routing.URLRouter`
+/// specification requires. Both start with the script name
+/// (`FORCE_SCRIPT_NAME`), which the proxy removed. `path` is
+/// percent-decoded. `raw_path` keeps the request bytes. A router such as `channels.routing.URLRouter`
 /// strips `root_path` itself. A scope with the prefix already removed makes
 /// such a router strip it twice and match nothing.
 ///
 /// Takes parts, not an `HttpRequest`, so the `TestClient` backend builds the
 /// same scope as the server.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parts of a request: the server and the TestClient backend give them"
+)]
 pub fn build_asgi_scope_from_parts<'a, I>(
     py: Python<'_>,
+    script_name: Option<&str>,
     mount_prefix: &str,
     request_path: &str,
     query_string: &[u8],
@@ -303,16 +318,21 @@ where
     scope.set_item("type", "websocket")?;
     scope.set_item("scheme", if secure { "wss" } else { "ws" })?;
 
+    let request_path = client_path(script_name, request_path.to_owned());
     scope.set_item("raw_path", PyBytes::new(py, request_path.as_bytes()))?;
     let path =
         String::from_utf8_lossy(&urlencoding::decode_binary(request_path.as_bytes())).into_owned();
     scope.set_item("path", path)?;
     scope.set_item("query_string", PyBytes::new(py, query_string))?;
-    if mount_prefix == "/" {
-        scope.set_item("root_path", "")?;
+    let mount_prefix = if mount_prefix == "/" {
+        ""
     } else {
-        scope.set_item("root_path", mount_prefix)?;
-    }
+        mount_prefix
+    };
+    scope.set_item(
+        "root_path",
+        client_path(script_name, mount_prefix.to_owned()),
+    )?;
 
     let header_list = PyList::empty(py);
     let mut protocol_values = Vec::new();
@@ -337,14 +357,14 @@ fn build_asgi_scope(
     py: Python<'_>,
     req: &HttpRequest,
     mount_prefix: &str,
-    trusted_proxies: &TrustedProxies,
+    state: &AppState,
 ) -> PyResult<Py<PyAny>> {
     // Only a trusted proxy sets the scheme with `X-Forwarded-Proto`.
     let secure = resolve_scheme(
         req.headers(),
         req.peer_addr().map(|address| address.ip()),
         req.app_config().secure(),
-        trusted_proxies,
+        &state.trusted_proxies,
     ) == "https";
     let headers = req
         .headers()
@@ -353,6 +373,7 @@ fn build_asgi_scope(
 
     build_asgi_scope_from_parts(
         py,
+        state.script_name.as_deref(),
         mount_prefix,
         req.path(),
         req.query_string().as_bytes(),
@@ -902,10 +923,11 @@ pub async fn handle_websocket_upgrade(
                 path_params,
                 route_meta,
                 state.max_param_length,
+                state.script_name.as_deref(),
             )
         }
         WsTarget::AsgiMount { mount_prefix, .. } => {
-            build_asgi_scope(py, &req, mount_prefix, &state.trusted_proxies)
+            build_asgi_scope(py, &req, mount_prefix, &state)
         }
     }) {
         Ok(s) => s,

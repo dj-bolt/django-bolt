@@ -29,6 +29,8 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from django_bolt import BoltAPI, _core
+from django_bolt._script_prefix import asgi_mounts
+from django_bolt._script_prefix import configure as configure_script_prefix
 from django_bolt._urlconf import served_api
 from django_bolt.websocket import CloseCode, WebSocket, WebSocketDisconnect, WebSocketException
 from django_bolt.websocket.close_codes import check_close_frame
@@ -136,6 +138,8 @@ class WebSocketTestClient:
         if self._app_id is not None:
             return self._app_id
 
+        # FORCE_SCRIPT_NAME: the handler and its dependencies run with the script prefix, as in runbolt.
+        script_prefix = configure_script_prefix()
         # Create a test app instance for this WebSocket test with CORS config
         # This ensures WebSocket origin validation uses same config as HTTP
         self._app_id = _core.create_test_app(
@@ -145,22 +149,18 @@ class WebSocketTestClient:
             None,
             self.api._rust_compression_config(),
             _rate_limiters(self._rate_limit_api),
-            error_renderer=self.api._rust_error_renderer(),
+            error_renderer=self.api._rust_error_renderer(script_prefix),
         )
 
         # Register WebSocket routes with pre-compiled injectors (same as production)
-        ws_routes = []
-        for path, handler_id, handler in self.api._websocket_routes:
-            # Get pre-compiled injector from handler metadata (same as runbolt.py)
-            meta = self.api._handler_meta.get(handler_id, {})
-            injector = meta.get("injector")
-            ws_routes.append((path, handler_id, handler, injector))
+        ws_routes = self.api._rust_websocket_routes(script_prefix)
+        self._injectors = {handler_id: injector for _path, handler_id, _handler, injector in ws_routes}
         if ws_routes:
             _core.register_test_websocket_routes(self._app_id, ws_routes)
 
         # Register ASGI mounts so an unmatched path can fall back to one
         if self.api._asgi_mounts:
-            _core.register_test_asgi_mounts(self._app_id, list(self.api._asgi_mounts))
+            _core.register_test_asgi_mounts(self._app_id, asgi_mounts(self.api._asgi_mounts, script_prefix))
 
         # Register middleware metadata for guards/auth
         if self.api._handler_middleware:
@@ -353,15 +353,12 @@ class WebSocketTestClient:
         # Use production code path for parameter injection
         # This ensures tests actually verify the injector implementation
 
-        # Each WebSocket route has a pre-compiled injector in its metadata (same as Rust uses)
-        meta = self.api._handler_meta[handler_id]
-
         # Build request dict from scope (same as Rust's build_websocket_request call)
         request = build_websocket_request(scope)
 
-        # Call the pre-compiled injector to get (args, kwargs). The server
-        # calls it with no await, so this client does the same.
-        args, kwargs = meta["injector"](request)
+        # Call the pre-compiled injector of the route to get (args, kwargs), as
+        # Rust does. The server calls it with no await, so this client does the same.
+        args, kwargs = self._injectors[handler_id](request)
 
         # Prepend websocket to args (same as Rust does)
         args = [ws] + list(args)

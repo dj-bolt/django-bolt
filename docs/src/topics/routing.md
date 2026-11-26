@@ -386,6 +386,7 @@ Bolt joins the prefix and the route path as Django does. Thus the root route `"/
 An API that the URLconf mounts and that `runbolt` also finds serves one time, under its prefixes. An API that the URLconf mounts is served also when `runbolt` does not find it.
 `TestClient(api)` serves an API that the URLconf mounts under its prefixes too. Thus it imports `ROOT_URLCONF`.
 A URLconf that does not import makes `TestClient` raise. It also makes the system checks of `runbolt` fail.
+Behind a proxy that removes a sub-path, `reverse()` also puts `FORCE_SCRIPT_NAME` first. See [Serve under a sub-path](deployment.md#serve-under-a-sub-path).
 
 ### Reverse through namespaces
 

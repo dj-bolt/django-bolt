@@ -5,7 +5,7 @@ use pyo3::types::{PyBytes, PyDict, PyString};
 use ahash::AHashMap;
 use std::borrow::Cow;
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// `django_bolt.auth.anonymous.new_anonymous_user`, imported on the first read of an unset `request.user`.
 static NEW_ANONYMOUS_USER: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -46,6 +46,9 @@ pub struct PyRequest {
     /// HTTP method. Borrowed static for the fixed routable set (no per-request
     /// alloc); owned only for unusual methods on test paths.
     pub method: Cow<'static, str>,
+    /// The path of the client: the script name with no trailing slash, then
+    /// the path info. Build it with `client_path`. Without a script name, it
+    /// is the path info.
     pub path: String,
     pub body: Vec<u8>,
     /// Path parameters - None when no path params (saves 1 PyDict alloc per request)
@@ -95,9 +98,38 @@ pub struct PyRequest {
     /// The ResponseWireV1 of a response that Rust gave before the handler.
     /// The middleware chain returns it, and the handler does not run.
     pub rust_answer: Option<Py<PyAny>>,
+    /// `FORCE_SCRIPT_NAME` of the app, as the setting gives it. None when it
+    /// is not set. The proxy removed it from the path that the router matched.
+    pub script_name: Option<Arc<str>>,
+}
+
+/// The script name as the path of the client starts with it: with no trailing slash.
+#[inline]
+fn script_name_in_path(script_name: Option<&str>) -> &str {
+    script_name.map_or("", |name| name.trim_end_matches('/'))
+}
+
+/// The path of the client for `path_info`: the script name with no trailing
+/// slash, then the path info, as Django's `WSGIRequest.path`.
+pub fn client_path(script_name: Option<&str>, path_info: String) -> String {
+    let script_name = script_name_in_path(script_name);
+    if script_name.is_empty() {
+        return path_info;
+    }
+    let mut path = String::with_capacity(script_name.len() + path_info.len());
+    path.push_str(script_name);
+    path.push_str(&path_info);
+    path
 }
 
 impl PyRequest {
+    /// The path without the script name. The router matched this path.
+    #[inline]
+    fn path_info_str(&self) -> &str {
+        let script_name = script_name_in_path(self.script_name.as_deref());
+        self.path.strip_prefix(script_name).unwrap_or(&self.path)
+    }
+
     /// The scheme of the request: "http" or "https". A request with no
     /// resolved scheme is "http", because Bolt does not end TLS.
     #[inline]
@@ -127,10 +159,18 @@ impl PyRequest {
         &self.method
     }
 
+    /// The path of the client: the script name, then the path info (Django-compatible).
     #[getter]
     #[inline]
     fn path(&self) -> &str {
         &self.path
+    }
+
+    /// The path without the script name (Django-compatible). The router matched it.
+    #[getter]
+    #[inline]
+    fn path_info(&self) -> &str {
+        self.path_info_str()
     }
 
     #[getter]
@@ -324,7 +364,8 @@ impl PyRequest {
     ///
     /// This provides a Django HttpRequest-compatible META dict containing:
     /// - REQUEST_METHOD: HTTP method
-    /// - PATH_INFO: Request path
+    /// - PATH_INFO: Request path without the script name
+    /// - SCRIPT_NAME: `FORCE_SCRIPT_NAME`, or empty
     /// - QUERY_STRING: Query string
     /// - HTTP_*: Headers converted to META format (e.g., host -> HTTP_HOST)
     /// - CONTENT_TYPE: Content-Type header (without HTTP_ prefix)
@@ -361,7 +402,7 @@ impl PyRequest {
 
         // Standard META keys (Django HttpRequest compatible)
         meta.set_item("REQUEST_METHOD", self.method.as_ref())?;
-        meta.set_item("PATH_INFO", &self.path)?;
+        meta.set_item("PATH_INFO", self.path_info_str())?;
 
         // QUERY_STRING is still encoded, as in Django. A decoded `&` or `=`
         // would change the parameters that Django middleware parses from it.
@@ -386,8 +427,8 @@ impl PyRequest {
         meta.set_item("REMOTE_ADDR", &remote_addr)?;
         meta.set_item("REMOTE_HOST", &remote_addr)?;
 
-        // SCRIPT_NAME is usually empty for Django apps
-        meta.set_item("SCRIPT_NAME", "")?;
+        // As Django's WSGIRequest: `FORCE_SCRIPT_NAME` as the setting gives it.
+        meta.set_item("SCRIPT_NAME", self.script_name.as_deref().unwrap_or(""))?;
 
         // Convert headers to HTTP_* format
         // Header keys are already lowercase (normalized by http crate)
@@ -609,5 +650,30 @@ impl PyRequest {
                 name
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_path_puts_the_script_name_without_its_trailing_slash_first() {
+        assert_eq!(
+            client_path(Some("/myapp"), "/items/1".into()),
+            "/myapp/items/1"
+        );
+        assert_eq!(
+            client_path(Some("/myapp/"), "/items/1".into()),
+            "/myapp/items/1"
+        );
+        assert_eq!(client_path(Some("/a/b//"), "/".into()), "/a/b/");
+    }
+
+    #[test]
+    fn client_path_keeps_the_path_info_without_a_script_name() {
+        assert_eq!(client_path(None, "/items/1".into()), "/items/1");
+        assert_eq!(client_path(Some(""), "/items/1".into()), "/items/1");
+        assert_eq!(client_path(Some("/"), "/items/1".into()), "/items/1");
     }
 }
