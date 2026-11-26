@@ -180,8 +180,29 @@ async def get_current_author() -> dict:
 
 `GET /authors/me` calls `get_current_author`. `GET /authors/ana` calls `get_author`.
 
-Two routes with the same method and path stop the startup with `ValueError`.
-Two routes that are different only in a parameter name, such as `/articles/{slug}` and `/articles/{article_id}`, also stop the startup.
+### Routes that stop the startup
+
+The router refuses a route that can never get a request.
+The test clients then raise `ValueError`, and `runbolt` stops with `CommandError`.
+The message gives the method and the path of the route.
+For a WebSocket route, the method is `WEBSOCKET`.
+The path is the full path, with the prefix, the mount path and the trailing slash mode applied.
+
+- **The same method and path.** Two `GET /items/{id}` routes give `GET /items/{id} is already registered`.
+  With `trailing_slash="strip"`, `/tags` and `/tags/` are the same path.
+  A WebSocket path has no trailing slash, so `/live` and `/live/` are the same WebSocket path.
+  Remove one of the routes.
+- **Two parameters at one position.** `/files/{file_id}` and `/files/{file_path:path}` give `GET /files/{file_path:path} conflicts with GET /files/{file_id}`.
+  The same applies to `/articles/{slug}` and `/articles/{article_id}`, and to two `{name:path}` parameters.
+  The router cannot select one of the two for `/files/abc`.
+  Keep one route and read the value in its handler.
+  Or add a fixed segment before the parameter in one path, for example `/files/by-path/{file_path:path}`.
+- **A `{name:path}` parameter before the end.** `/files/{p:path}/meta` gives `has a {name:path} parameter before the end of the path`.
+  Move the parameter to the end of the path.
+- **Two parameters in one segment.** `/files/{name}-{version}` gives `has two parameters in one segment`.
+  Use one parameter for the segment, and split the value in the handler.
+- **A parameter with no name, or a brace with no pair.** `/files/{}` and `/files/{id` give `has a parameter with no name, or a brace with no pair`.
+  Write each parameter as `{name}` or `{name:type}`.
 
 ## Add a prefix to each route
 

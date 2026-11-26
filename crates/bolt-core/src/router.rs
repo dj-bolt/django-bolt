@@ -1,5 +1,5 @@
 use ahash::{AHashMap, AHashSet};
-use matchit::{Match, Params, Router as MatchRouter};
+use matchit::{InsertError, Match, Params, Router as MatchRouter};
 use pyo3::prelude::*;
 use std::borrow::Cow;
 
@@ -102,38 +102,28 @@ pub fn convert_path(path: &str) -> String {
         if ch == '{' {
             result.push(ch);
             let mut param = String::new();
+            let mut closed = false;
 
             // Collect parameter name and optional type
             while let Some(&next_ch) = chars.peek() {
                 if next_ch == '}' {
                     chars.next(); // consume '}'
+                    closed = true;
                     break;
                 }
                 param.push(chars.next().unwrap());
             }
 
-            // Check if it has :path suffix
-            if let Some(colon_pos) = param.find(':') {
-                let name = &param[..colon_pos];
-                let type_ = &param[colon_pos + 1..];
-
-                if type_ == "path" {
-                    // Convert {name:path} to {*name} (catch-all)
-                    // matchit requires catch-all to be inside braces: {*param}
-                    result.push('*');
-                    result.push_str(name);
-                    result.push('}');
-                    continue;
-                }
+            // Keep the name. {name:path} becomes the matchit catch-all {*name}.
+            let (name, type_) = param.split_once(':').unwrap_or((&param, ""));
+            if type_ == "path" {
+                result.push('*');
             }
-
-            // Regular parameter: just keep the name
-            if let Some(colon_pos) = param.find(':') {
-                result.push_str(&param[..colon_pos]);
-            } else {
-                result.push_str(&param);
+            result.push_str(name);
+            // A `{` with no `}` stays open, so that matchit refuses the path.
+            if closed {
+                result.push('}');
             }
-            result.push('}');
         } else {
             result.push(ch);
         }
@@ -284,6 +274,9 @@ struct MethodRouter {
     /// Radix tree for dynamic routes (e.g., /users/{id}, /posts/{id}/comments)
     /// Only used when static lookup fails
     dynamic_router: MatchRouter<Route>,
+
+    /// The path as written of each dynamic route, by its matchit path.
+    dynamic_paths: DynamicPaths,
 }
 
 impl MethodRouter {
@@ -291,8 +284,63 @@ impl MethodRouter {
         MethodRouter {
             static_routes: AHashMap::new(),
             dynamic_router: MatchRouter::new(),
+            dynamic_paths: DynamicPaths::default(),
         }
     }
+}
+
+/// The path as written of each route in a matchit tree, by its matchit path.
+/// Only registration reads it: an error names the earlier route of a conflict.
+pub type DynamicPaths = AHashMap<String, String>;
+
+const CONFLICT_FIX: &str =
+    "Keep one of the two routes, or add a fixed segment before the parameter in one path.";
+
+/// The error for a second route at the method and path of a route.
+pub fn already_registered(method: &str, path: &str) -> PyErr {
+    route_error(method, path, "is already registered")
+}
+
+fn route_error(method: &str, path: &str, problem: &str) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "Failed to register route: {method} {path} {problem}"
+    ))
+}
+
+/// Insert the route `method path` (as written) into a matchit tree. `encoded`
+/// is the path in the form of `encode_route_path`. On an error, the message
+/// names the route, and for a conflict also the earlier route.
+pub fn insert_dynamic<T>(
+    tree: &mut MatchRouter<T>,
+    paths: &mut DynamicPaths,
+    method: &str,
+    path: &str,
+    encoded: &str,
+    value: T,
+) -> PyResult<()> {
+    let converted = convert_path(encoded);
+    let Err(error) = tree.insert(&converted, value) else {
+        paths.insert(converted, path.to_string());
+        return Ok(());
+    };
+    let problem = match error {
+        InsertError::Conflict { with } => match paths.get(&with) {
+            Some(earlier) if earlier == path => return Err(already_registered(method, path)),
+            Some(earlier) => format!("conflicts with {method} {earlier}. {CONFLICT_FIX}"),
+            None => format!("conflicts with the route {with}. {CONFLICT_FIX}"),
+        },
+        InsertError::InvalidCatchAll => {
+            "has a {name:path} parameter before the end of the path. Move it to the end.".into()
+        }
+        InsertError::InvalidParamSegment => {
+            "has two parameters in one segment. Use one parameter for each segment.".into()
+        }
+        InsertError::InvalidParam => "has a parameter with no name, or a brace with no pair. \
+                                      Write each parameter as {name} or {name:type}."
+            .into(),
+        other => format!("is not valid: {other}"),
+    };
+    Err(route_error(method, path, &problem))
 }
 
 pub struct Router {
@@ -423,31 +471,27 @@ impl Router {
 
         let handler_id = route.handler_id;
         // The lookup gets the request path in the form of `normalize_request_path`.
-        let path = &*encode_route_path(path);
+        let encoded = &*encode_route_path(path);
 
         // Elysia-style optimization: Separate static routes from dynamic routes
         // Static routes use O(1) HashMap lookup, dynamic routes use radix tree
-        if is_static_path(path) {
+        if is_static_path(encoded) {
             // Static route: store in HashMap for O(1) lookup
-            if method_router.static_routes.contains_key(path) {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Failed to register route: {} {} is already registered",
-                    method, path
-                )));
+            if method_router.static_routes.contains_key(encoded) {
+                return Err(already_registered(method, path));
             }
-            method_router.static_routes.insert(path.to_string(), route);
-        } else {
-            // Dynamic route: convert path and store in radix tree
-            let converted_path = convert_path(path);
             method_router
-                .dynamic_router
-                .insert(&converted_path, route)
-                .map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "Failed to register route: {}",
-                        e
-                    ))
-                })?;
+                .static_routes
+                .insert(encoded.to_string(), route);
+        } else {
+            insert_dynamic(
+                &mut method_router.dynamic_router,
+                &mut method_router.dynamic_paths,
+                method,
+                path,
+                encoded,
+                route,
+            )?;
         }
         self.handler_ids.push(handler_id);
 
@@ -959,19 +1003,95 @@ mod tests {
     fn a_route_that_conflicts_does_not_register() {
         let mut router = router_with(&[("GET", "/items/{id}")]);
         Python::attach(|py| {
-            let error = router
+            router
                 .register("GET", "/items/{key}", 1, py.None(), py.None(), py.None())
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.starts_with("ValueError: Failed to register route: "),
-                "{error}"
-            );
+                .unwrap_err();
         });
         assert_eq!(
             lookup(&router, "GET", "/items/1"),
             Some((0, params(&[("id", "1")])))
         );
+        assert_eq!(router.handler_ids(), [0]);
+    }
+
+    /// The error that registering `method path` after the `earlier` routes gives.
+    fn register_error(earlier: &[(&str, &str)], method: &str, path: &str) -> String {
+        let mut router = router_with(earlier);
+        Python::attach(|py| {
+            router
+                .register(method, path, earlier.len(), py.None(), py.None(), py.None())
+                .unwrap_err()
+                .to_string()
+        })
+    }
+
+    #[test]
+    fn a_dynamic_route_at_a_registered_path_is_already_registered() {
+        for path in ["/items/{id}", "/files/{rest:path}", "/\u{fc} b/{id}"] {
+            assert_eq!(
+                register_error(&[("GET", path)], "GET", path),
+                format!("ValueError: Failed to register route: GET {path} is already registered")
+            );
+        }
+        assert_eq!(
+            register_error(&[("GET", "/\u{fc} b")], "GET", "/\u{fc} b"),
+            "ValueError: Failed to register route: GET /\u{fc} b is already registered"
+        );
+    }
+
+    #[test]
+    fn a_conflict_names_both_routes_as_they_were_written() {
+        let fix =
+            "Keep one of the two routes, or add a fixed segment before the parameter in one path.";
+        for (earlier, path) in [
+            ("/files/{file_id}", "/files/{file_path:path}"),
+            ("/files/{file_path:path}", "/files/{file_id}"),
+            ("/{p:path}", "/{a}/{b}"),
+            ("/articles/{slug}", "/articles/{article_id}"),
+            ("/items/{id:int}", "/items/{id:str}"),
+            ("/files/{a:path}", "/files/{b:path}"),
+            ("/\u{fc} b/{id}", "/\u{fc} b/{rest:path}"),
+        ] {
+            assert_eq!(
+                register_error(&[("PUT", earlier)], "PUT", path),
+                format!(
+                    "ValueError: Failed to register route: PUT {path} conflicts with PUT {earlier}. {fix}"
+                )
+            );
+        }
+        // The new route conflicts with a node that several routes share.
+        assert_eq!(
+            register_error(&[("GET", "/{a}/x"), ("GET", "/{a}/y")], "GET", "/{p:path}"),
+            format!(
+                "ValueError: Failed to register route: GET /{{p:path}} conflicts with GET /{{a}}/x. {fix}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_malformed_path_error_names_the_route() {
+        let param = "has a parameter with no name, or a brace with no pair. \
+                     Write each parameter as {name} or {name:type}.";
+        for (path, problem) in [
+            (
+                "/files/{p:path}/meta",
+                "has a {name:path} parameter before the end of the path. Move it to the end.",
+            ),
+            (
+                "/files/{a}-{b}",
+                "has two parameters in one segment. Use one parameter for each segment.",
+            ),
+            ("/e/{}", param),
+            ("/e/{:int}", param),
+            ("/e/{id", param),
+            ("/e/{id/x", param),
+            ("/e/{id}}", param),
+        ] {
+            assert_eq!(
+                register_error(&[], "POST", path),
+                format!("ValueError: Failed to register route: POST {path} {problem}")
+            );
+        }
     }
 
     #[test]

@@ -1095,7 +1095,10 @@ class Command(BaseCommand):
             ws_routes.append((path, handler_id, handler, injector))
 
         if ws_routes:
-            _core.register_websocket_routes(ws_routes)
+            try:
+                _core.register_websocket_routes(ws_routes)
+            except ValueError as e:
+                raise CommandError(str(e)) from e
 
         # Register middleware metadata if present
         middleware_count = 0
