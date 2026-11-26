@@ -1,8 +1,8 @@
-"""Typed values that Rust can parse but Python cannot build.
+"""Typed values that Python cannot build.
 
-Rust parses a date with year 0 and a decimal with a huge exponent. Python
-`datetime.date` and `decimal.Decimal` reject them. Such a value must give a
-422 that names the source, and the worker must stay up.
+Python `datetime.date` and `decimal.Decimal` reject a date with year 0 and a
+decimal with a huge exponent. Such a value must give a 422 that names the
+source, and the worker must stay up.
 """
 
 from __future__ import annotations
@@ -18,12 +18,12 @@ from django_bolt.param_functions import Cookie, Header, Query
 from django_bolt.testing import TestClient
 
 CASES = [
-    ("date", "0000-01-01", "year"),
-    ("date", "-0001-01-01", "year"),
-    ("date", "+10000-01-01", "year"),
-    ("datetime", "0000-01-01T00:00:00", "year"),
-    ("datetime", "0000-01-01T00:00:00Z", "year"),
-    ("datetime", "+10000-01-01T00:00:00", "year"),
+    ("date", "0000-01-01", "expected format YYYY-MM-DD"),
+    ("date", "-0001-01-01", "expected format YYYY-MM-DD"),
+    ("date", "+10000-01-01", "expected format YYYY-MM-DD"),
+    ("datetime", "0000-01-01T00:00:00", "expected format YYYY-MM-DDTHH:MM:SS"),
+    ("datetime", "0000-01-01T00:00:00Z", "expected format YYYY-MM-DDTHH:MM:SS"),
+    ("datetime", "+10000-01-01T00:00:00", "expected format YYYY-MM-DDTHH:MM:SS"),
     ("decimal", "1E999999999999999999999", "exponent"),
     ("decimal", "1e-99999999999999999999", "exponent"),
 ]

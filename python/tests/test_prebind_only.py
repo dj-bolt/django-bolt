@@ -117,7 +117,9 @@ def test_missing_required_value_is_422(client: TestClient) -> None:
 def test_bad_typed_value_is_422(client: TestClient) -> None:
     response = client.get("/typed", headers={"X-Count": "abc"})
     assert response.status_code == 422
-    assert response.json()["detail"] == "Header 'x-count': Invalid integer 'abc': invalid digit found in string"
+    assert (
+        response.json()["detail"] == "Header 'x-count': Invalid integer 'abc': expected a whole number such as 42 or -7"
+    )
 
 
 def test_sync_route_binds_from_rust_maps(client: TestClient) -> None:

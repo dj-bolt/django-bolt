@@ -136,7 +136,7 @@ curl localhost:8000/authors/abc/articles/hello
 ```
 
 ```json
-{"detail": "Path parameter 'author_id': Invalid integer 'abc': invalid digit found in string"}
+{"detail": "Path parameter 'author_id': Invalid integer 'abc': expected a whole number such as 42 or -7"}
 ```
 
 The type comes only from the type hint. Bolt ignores a type in the path, such as `{author_id:int}`.

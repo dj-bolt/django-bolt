@@ -132,6 +132,25 @@ curl "localhost:8000/articles?page=2&search=django&tag=python&tag=web"
 - A `bool` takes `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`.
 - A `+` in the query string is a space, as in Django. Send a literal `+` as `%2B`.
 
+### Send typed values as text
+
+Bolt converts the text of a path, query, header, cookie or form value to the type of the argument.
+It accepts the text that msgspec accepts. Thus a single argument and a `list[...]` argument of one type agree.
+
+| Type | Text | Examples |
+| --- | --- | --- |
+| `int` | Digits with an optional leading `-`, at most 4300 characters. A whole number in float form up to `2**53`. | `42`, `-7`, `9223372036854775808`, `5.0`, `1e3` |
+| `float` | Digits with an optional leading `-`, fraction and exponent. `nan`, `inf` or `infinity` in any case. | `1.5`, `-2e3`, `inf` |
+| `date` | `YYYY-MM-DD` | `2024-01-15` |
+| `time` | `HH:MM:SS`, then an optional fraction, then an optional `Z` or `±HH:MM` offset. | `10:30:00`, `10:30:00.5+05:00` |
+| `datetime` | A `date`, then `T`, `t` or a space, then a `time`. Or a Unix timestamp. | `2024-01-15T10:30:00Z`, `2024-01-15 10:30:00+0530`, `1700000000` |
+
+- A `datetime` or a `time` keeps the offset of its text. A text with no offset gives a naive value. A Unix timestamp gives a `datetime` in UTC.
+- A fraction rounds to the closest microsecond.
+- An offset can have no colon, as in `+0530`.
+- Bolt refuses a leading `+`, a leading zero (`007`), `_`, whitespace and a field of another width (`2024-1-5`).
+- Bolt refuses the other ISO 8601 forms, for example `2024-01-15T10:30` with no seconds. An HTML `<input type="datetime-local">` sends this form. To accept it, declare the argument as `str` and call `datetime.fromisoformat()`.
+
 ### Rename and limit a query parameter
 
 Use `Query()` to read another key or to add limits:
@@ -251,7 +270,7 @@ curl localhost:8000/articles/export -H "X-Api-Key: secret" -H "X-Page-Size: abc"
 ```
 
 ```json
-{"detail": "Header 'x-page-size': Invalid integer 'abc': invalid digit found in string"}
+{"detail": "Header 'x-page-size': Invalid integer 'abc': expected a whole number such as 42 or -7"}
 ```
 
 To read all the headers, use `request.headers`. It is a `dict` with lower-case names.
@@ -480,7 +499,7 @@ The body has one of two forms.
 A value that Bolt converts before Python runs gives a `detail` string. This covers a path, query, header, cookie or form value with the wrong type, and a missing value of these kinds:
 
 ```json
-{"detail": "Query parameter 'page': Invalid integer 'x': invalid digit found in string"}
+{"detail": "Query parameter 'page': Invalid integer 'x': expected a whole number such as 42 or -7"}
 ```
 
 ```json

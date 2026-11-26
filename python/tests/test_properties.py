@@ -23,6 +23,7 @@ from urllib.parse import quote
 
 import httpx
 import jwt
+import msgspec
 import pytest
 from django.http import HttpResponse, QueryDict
 from django.http.cookie import parse_cookie
@@ -106,6 +107,67 @@ async def datetime_value(v: datetime.datetime):
 @api.get("/time")
 async def time_value(v: datetime.time):
     return {"v": v.isoformat()}
+
+
+def _describe(value):
+    """Give the JSON form of a converted value: its type, its fields and its UTC offset."""
+    if isinstance(value, datetime.datetime | datetime.time):
+        offset = value.utcoffset()
+        seconds = None if offset is None else offset.total_seconds()
+        return [type(value).__name__, value.replace(tzinfo=None).isoformat(), seconds]
+    if isinstance(value, datetime.date):
+        return ["date", value.isoformat()]
+    return [type(value).__name__, repr(value)]
+
+
+@api.get("/scalar/int")
+async def scalar_int(v: int):
+    return _describe(v)
+
+
+@api.get("/list/int")
+async def list_int(v: Annotated[list[int], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/float")
+async def scalar_float(v: float):
+    return _describe(v)
+
+
+@api.get("/list/float")
+async def list_float(v: Annotated[list[float], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/date")
+async def scalar_date(v: datetime.date):
+    return _describe(v)
+
+
+@api.get("/list/date")
+async def list_date(v: Annotated[list[datetime.date], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/time")
+async def scalar_time(v: datetime.time):
+    return _describe(v)
+
+
+@api.get("/list/time")
+async def list_time(v: Annotated[list[datetime.time], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/datetime")
+async def scalar_datetime(v: datetime.datetime):
+    return _describe(v)
+
+
+@api.get("/list/datetime")
+async def list_datetime(v: Annotated[list[datetime.datetime], Query()]):
+    return _describe(v[0])
 
 
 @api.get("/cookies")
@@ -242,23 +304,160 @@ def test_a_naive_datetime_query_param_round_trips(client, value, separator):
     assert response.json() == {"v": value.isoformat()}
 
 
-# RFC 3339 offsets have whole minutes. Bolt gives the handler the time in UTC,
-# so the instant must be in the years that Python can show in UTC.
+# RFC 3339 offsets have whole minutes.
 utc_offsets = st.integers(min_value=-(24 * 60 - 1), max_value=24 * 60 - 1).map(
     lambda minutes: datetime.timezone(datetime.timedelta(minutes=minutes))
 )
 
 
-@given(
-    value=st.datetimes(min_value=datetime.datetime(2, 1, 1), max_value=datetime.datetime(9998, 12, 31)),
-    offset=utc_offsets,
-)
-def test_an_aware_datetime_query_param_is_the_same_instant(client, value, offset):
+@given(value=st.datetimes(), offset=utc_offsets)
+def test_an_aware_datetime_query_param_keeps_its_offset(client, value, offset):
     aware = value.replace(tzinfo=offset)
     response = client.get("/datetime", params={"v": aware.isoformat()})
     returned = datetime.datetime.fromisoformat(response.json()["v"])
-    assert returned == aware
-    assert returned.utcoffset() == datetime.timedelta(0)
+    assert returned.replace(tzinfo=None) == value
+    assert returned.utcoffset() == aware.utcoffset()
+
+
+# Texts for the parameter types that Rust converts: valid forms of msgspec's
+# grammar, forms of fromisoformat and int(), and mutations of each one.
+_MUTATION_CHARS = [" ", "\t", "+", "-", "0", "9", ":", ".", ",", "e", "T", "t", "Z", "z", "W", "_", "é", "\u0663"]
+
+
+def _digit_text(min_size, max_size):
+    return st.text("0123456789", min_size=min_size, max_size=max_size)
+
+
+@st.composite
+def _mutated(draw, texts):
+    """Insert, delete or replace up to two characters of a text."""
+    text = draw(texts)
+    for _ in range(draw(st.integers(min_value=0, max_value=2))):
+        at = draw(st.integers(min_value=0, max_value=len(text)))
+        char = draw(st.sampled_from(_MUTATION_CHARS))
+        operation = draw(st.sampled_from(["insert", "delete", "replace"]))
+        if operation == "insert":
+            text = text[:at] + char + text[at:]
+        elif operation == "delete":
+            text = text[:at] + text[at + 1 :]
+        else:
+            text = text[:at] + char + text[at + 1 :]
+    return text
+
+
+@st.composite
+def _clock_texts(draw):
+    """HH:MM:SS with a fraction of 0 to 9 digits and an offset in each style."""
+    value = draw(st.times())
+    text = value.strftime("%H:%M:%S")
+    digits = draw(st.integers(min_value=0, max_value=9))
+    if digits:
+        text += "." + (f"{value.microsecond:06}" + draw(_digit_text(3, 3)))[:digits]
+    zone = draw(st.sampled_from(["", "Z", "z", "+HH:MM", "-HH:MM", "+HHMM", "-HHMM"]))
+    if "HH" in zone:
+        minutes = draw(st.integers(min_value=0, max_value=24 * 60 - 1))
+        zone = zone.replace("HH", f"{minutes // 60:02}").replace("MM", f"{minutes % 60:02}")
+    return text + zone
+
+
+@st.composite
+def _datetime_texts(draw):
+    day = draw(st.dates())
+    separator = draw(st.sampled_from("Tt "))
+    return f"{day.year:04}-{day.month:02}-{day.day:02}{separator}{draw(_clock_texts())}"
+
+
+# Each field can be out of range: month 13, hour 24, second 60, offset hour 24.
+_near_dates = st.from_regex(r"\d{4}-\d{2}-\d{2}", fullmatch=True)
+_near_clocks = st.from_regex(r"\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:?\d{2})?", fullmatch=True)
+_python_forms = st.sampled_from(
+    [
+        "2024-01-15T10:30",
+        "2024-01-15T10",
+        "20240115T103000",
+        "2024-W03-1",
+        "2024-01-15T10:30:00,5",
+        "2024-01-15T10:30:00+05",
+        "2024-01-15T10:30:00+05:30:15",
+        "2024-01-15",
+        "10:30",
+        "1030",
+        "24:00:00",
+        "24-01-15",
+        "2024-1-5",
+        "+2024-01-15",
+    ]
+)
+# Unix timestamps from before year 1 to after year 9999.
+_timestamps = st.one_of(
+    st.integers(min_value=-63_000_000_000, max_value=254_000_000_000).map(str),
+    st.floats(min_value=-63e9, max_value=254e9).map(repr),
+)
+_number_texts = st.one_of(
+    st.integers().map(str),
+    st.integers(min_value=-(10**60), max_value=10**60).map(str),
+    st.integers(min_value=4290, max_value=4310).map(lambda length: "1" * length),
+    st.integers(min_value=-(2**54), max_value=2**54).map(lambda value: f"{value}.0"),
+    st.floats().map(repr),
+    st.from_regex(r"-?\d{1,5}(\.\d{1,5})?([eE][+-]?\d{1,3})?", fullmatch=True),
+    st.sampled_from(["inf", "-Infinity", "NaN", "+5", "007", "1_000", ".5", "5.", "0x10"]),
+)
+_date_texts = st.one_of(st.dates().map(datetime.date.isoformat), _near_dates, _python_forms)
+_time_texts = st.one_of(_clock_texts(), _near_clocks, _python_forms)
+_full_datetime_texts = st.one_of(
+    _datetime_texts(),
+    st.builds("{}T{}".format, _near_dates, _near_clocks),
+    _python_forms,
+    _timestamps,
+)
+PARAM_TEXTS = st.one_of(
+    st.tuples(st.just("int"), _mutated(_number_texts)),
+    st.tuples(st.just("float"), _mutated(_number_texts)),
+    st.tuples(st.just("date"), _mutated(_date_texts)),
+    st.tuples(st.just("time"), _mutated(_time_texts)),
+    st.tuples(st.just("datetime"), _mutated(_full_datetime_texts)),
+)
+PARAM_TYPES = {
+    "int": int,
+    "float": float,
+    "date": datetime.date,
+    "time": datetime.time,
+    "datetime": datetime.datetime,
+}
+
+
+@example(case=("datetime", "2024-01-15T10:30:00+05:30"))
+@example(case=("datetime", "24-01-15"))
+@example(case=("int", "9223372036854775808"))
+@example(case=("datetime", "2024-01-15T10:30:00+0530"))
+@example(case=("time", "10:30:00+05:00"))
+@example(case=("datetime", "-16964e15"))
+@example(case=("datetime", "253402300800"))
+@example(case=("float", "-0"))
+@given(case=PARAM_TEXTS)
+def test_a_scalar_and_a_list_param_convert_as_msgspec(client, case):
+    """A scalar parameter and a list parameter of one type accept the same texts, with the same value.
+
+    msgspec is the reference: the list path calls `msgspec.convert(text, T, strict=False)`.
+    It gives the same result on each supported Python version; `fromisoformat` does not.
+    """
+    kind, text = case
+    try:
+        expected = _describe(msgspec.convert(text, PARAM_TYPES[kind], strict=False))
+    except msgspec.ValidationError:
+        expected = None
+    except ValueError:
+        # msgspec raises a plain ValueError for a timestamp in year 10000, and the
+        # list path then answers 500. The scalar path refuses the value.
+        assert client.get(f"/scalar/{kind}", params={"v": text}).status_code == 422
+        return
+    for path in (f"/scalar/{kind}", f"/list/{kind}"):
+        response = client.get(path, params={"v": text})
+        if expected is None:
+            assert response.status_code == 422, (path, text, response.text)
+        else:
+            assert response.status_code == 200, (path, text, response.text)
+            assert response.json() == expected, (path, text)
 
 
 @given(value=st.times())

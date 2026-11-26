@@ -312,7 +312,7 @@ HTTP/1.1 422 Unprocessable Entity
 content-length: 94
 content-type: application/json
 
-{"detail":"Path parameter 'article_id': Invalid integer 'abc': invalid digit found in string"}
+{"detail":"Path parameter 'article_id': Invalid integer 'abc': expected a whole number such as 42 or -7"}
 ```
 
 For the other exceptions and the format of error responses, see [Error handling](../topics/error-handling.md).
