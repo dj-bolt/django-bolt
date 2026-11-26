@@ -62,14 +62,31 @@ def struct_from_fields(name: str, fields: list[Any]) -> type[msgspec.Struct]:
     return msgspec.defstruct(f"{name}_Args", required + optional)
 
 
+def _point_at_root(value: Any, root_ref: str) -> Any:
+    """Return ``value`` with each ``$ref`` to ``root_ref`` replaced by ``#``, the root of the document."""
+    if isinstance(value, dict):
+        return {
+            key: "#" if key == "$ref" and item == root_ref else _point_at_root(item, root_ref)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_point_at_root(item, root_ref) for item in value]
+    return value
+
+
 def _inline_root_ref(raw: dict[str, Any]) -> dict[str, Any]:
-    """Resolve a top-level ``$ref`` while retaining definitions it depends on."""
+    """Resolve a top-level ``$ref`` while retaining definitions it depends on.
+
+    The root definition moves to the top of the document. Thus a reference to it from
+    inside, as in a recursive Struct, becomes ``#``. Else it points at a removed definition.
+    """
     if "$ref" not in raw:
         return raw
     defs = raw.get("$defs") or {}
-    ref = raw["$ref"].rsplit("/", 1)[-1]
-    schema = dict(defs.get(ref, {}))
-    others = {key: value for key, value in defs.items() if key != ref}
+    root_ref = raw["$ref"]
+    ref = root_ref.rsplit("/", 1)[-1]
+    schema = _point_at_root(dict(defs.get(ref, {})), root_ref)
+    others = {key: _point_at_root(value, root_ref) for key, value in defs.items() if key != ref}
     if others:
         schema["$defs"] = others
     return schema
@@ -94,6 +111,11 @@ def output_schema_from_return(fn: Callable) -> dict[str, Any] | None:
             f"{getattr(fn, '__name__', fn)!r} returns ToolResult, so its output schema cannot be derived. "
             "Pass output_schema as a JSON Schema dict for the structured content, or leave it out."
         )
+    return object_schema(annotation)
+
+
+def object_schema(annotation: Any) -> dict[str, Any] | None:
+    """Return the JSON Schema of ``annotation`` when it describes an object, else None."""
     schema = _inline_root_ref(msgspec.json.schema(annotation))
     if schema.get("type") != "object":
         return None

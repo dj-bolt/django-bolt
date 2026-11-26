@@ -2569,6 +2569,9 @@ class BoltAPI:
 
                 return serialize_response_sync(result, default_entry)
 
+            # An MCP tool call of the route serializes its result with these, as HTTP does.
+            meta["_multi_response_serializers"] = (_dispatch_multi_async, _dispatch_multi_sync)
+
             async def execute_multi(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
                 # Rust sets both prebound keys or neither. It sets neither when it
                 # bails, and then the injector raises the proper error.
