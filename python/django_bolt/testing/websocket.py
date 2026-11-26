@@ -422,7 +422,15 @@ class WebSocketTestClient:
         if not self._accepted:
             # An error before accept fails the handshake, as the server answers 500.
             # A refused request value fails it as a refused scalar does.
-            self._decide(_invalid_request(error) if isinstance(error, RequestValidationError) else error)
+            if isinstance(error, RequestValidationError):
+                try:
+                    error = _invalid_request(error)
+                except Exception:
+                    # The detail cannot be made, for example for RequestValidationError(None).
+                    # The handshake fails with the error itself, as for another error.
+                    self._decide(error)
+                    return
+            self._decide(error)
             return
         # The server does not report a client that left as a handler error.
         if not isinstance(error, (WebSocketDisconnect, ConnectionResetError)):

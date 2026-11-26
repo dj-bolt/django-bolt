@@ -19,6 +19,7 @@ import msgspec
 import pytest
 
 from django_bolt import BoltAPI, WebSocket
+from django_bolt.datastructures import UploadFile
 from django_bolt.exceptions import RequestValidationError
 from django_bolt.param_functions import Cookie, Form, Header, Query
 from django_bolt.testing import TestClient, WebSocketTestClient
@@ -810,6 +811,45 @@ async def test_each_form_of_a_websocket_validation_error_gives_a_detail(item, de
         async with asyncio.timeout(2), WebSocketTestClient(socket_api, "/ws"):
             pass
     assert str(excinfo.value) == detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("errors", [None, 5])
+async def test_a_websocket_validation_error_with_no_detail_fails_the_handshake_at_once(errors):
+    # The detail of such an error cannot be made. The handshake fails with the error itself.
+    socket_api = BoltAPI()
+
+    @socket_api.websocket("/ws")
+    async def refuse(websocket: WebSocket):
+        raise RequestValidationError(errors)
+
+    with pytest.raises(RequestValidationError):
+        async with asyncio.timeout(2), WebSocketTestClient(socket_api, "/ws"):
+            pass
+
+
+class ItemsAndFile(msgspec.Struct):
+    ids: list[int] = []
+    doc: UploadFile | None = None
+
+
+def test_a_file_part_with_the_name_of_a_list_field_is_the_input_of_its_error():
+    # A file part replaces the text parts of its name. The error shows the part that msgspec refused.
+    file_api = BoltAPI()
+
+    @file_api.post("/items")
+    def items(model: Annotated[ItemsAndFile, Form()]) -> dict:
+        return {"ids": model.ids}
+
+    with TestClient(file_api) as client:
+        response = client.post("/items", files=[("ids", (None, "5")), ("ids", ("x.txt", b"7", "text/plain"))])
+
+    assert response.status_code == 422
+    [error] = response.json()["detail"]
+    assert error["msg"] == "Expected `int`, got `object` - at `$[0]`"
+    assert error["input"] == [
+        {"filename": "x.txt", "content_type": "text/plain", "size": 1, "content": "Nw==", "temp_path": None}
+    ]
 
 
 BOUND_ERRORS = {

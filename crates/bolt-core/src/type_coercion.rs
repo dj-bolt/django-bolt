@@ -625,7 +625,8 @@ fn micros(time: NaiveTime) -> u32 {
 /// The items are read in order. The first text that does not convert raises
 /// `ValueError(index, message)`. An item that is not text gives `items`
 /// itself, for msgspec to refuse, but only when no earlier text was refused.
-/// No request source gives an item that is not text.
+/// Only a form model with a file field gives such an item: a file part with
+/// the name of the sequence field.
 #[pyfunction]
 #[pyo3(signature = (items, type_hint, min_length = 0, max_length = usize::MAX))]
 pub fn parse_text_items<'py>(

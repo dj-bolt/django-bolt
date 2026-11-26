@@ -203,16 +203,23 @@ def _convert_item_fields(
 
 
 def _item_text_inputs(
-    inputs: dict[str, Any], request_values: Any, fields: tuple[tuple[str, str, int, int, int], ...]
+    inputs: dict[str, Any],
+    request_values: Any,
+    fields: tuple[tuple[str, str, int, int, int], ...],
+    files: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Give a copy of ``inputs`` with the request text of each typed sequence field, for the "input" of an error.
 
     ``_convert_item_fields`` puts the converted items in place of the text.
     The request still holds the text, under the ``loc`` name of the field.
+    A file part replaces the text parts of its name, and it is never
+    converted. Thus a field in ``files`` keeps its value.
     Only the error path calls this function.
     """
     texts = dict(inputs)
     for key, name, *_ in fields:
+        if files is not None and key in files:
+            continue
         value = request_values.get(name)
         if value is not None:
             texts[key] = value if isinstance(value, list) else [value]
@@ -970,14 +977,14 @@ def _create_param_struct_extractor(
                             param_type,
                             source,
                             has_files=True,
-                            inputs=_item_text_inputs(merged, param_map, _item_fields),
+                            inputs=_item_text_inputs(merged, param_map, _item_fields, files_map),
                             refused=refused,
                         )
                     )
             try:
                 result = msgspec.convert(values, struct_type, strict=False, dec_hook=_upload_file_dec_hook)
             except msgspec.ValidationError as e:
-                inputs = _item_text_inputs(merged, param_map, _item_fields) if has_items else merged
+                inputs = _item_text_inputs(merged, param_map, _item_fields, files_map) if has_items else merged
                 errors = _collect_struct_errors(struct_type, values, param_type, source, has_files=True, inputs=inputs)
                 if not errors and forbids_unknown:
                     errors = _unknown_field_errors(merged, known, param_type, source, files_map)
