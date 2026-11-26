@@ -30,9 +30,10 @@ from typing import Any
 
 from django_bolt import BoltAPI, _core
 from django_bolt._urlconf import served_api
+from django_bolt.exceptions import RequestValidationError
 from django_bolt.websocket import CloseCode, WebSocket, WebSocketDisconnect, WebSocketException
 from django_bolt.websocket.close_codes import check_close_frame
-from django_bolt.websocket.handlers import build_websocket_request
+from django_bolt.websocket.handlers import build_websocket_request, invalid_request_detail
 
 # Each WebSocketTestClient is one connection with its own test app. The
 # connections to one API share its rate-limit buckets, as the connections to
@@ -361,7 +362,10 @@ class WebSocketTestClient:
 
         # Call the pre-compiled injector to get (args, kwargs). The server
         # calls it with no await, so this client does the same.
-        args, kwargs = meta["injector"](request)
+        try:
+            args, kwargs = meta["injector"](request)
+        except RequestValidationError as error:
+            raise _invalid_request(error) from error
 
         # Prepend websocket to args (same as Rust does)
         args = [ws] + list(args)
@@ -420,7 +424,8 @@ class WebSocketTestClient:
         """Record an error of the handler: a failed handshake, or a close with 1011."""
         if not self._accepted:
             # An error before accept fails the handshake, as the server answers 500.
-            self._decide(error)
+            # A refused request value fails it as a refused scalar does.
+            self._decide(_invalid_request(error) if isinstance(error, RequestValidationError) else error)
             return
         # The server does not report a client that left as a handler error.
         if not isinstance(error, (WebSocketDisconnect, ConnectionResetError)):
@@ -620,6 +625,16 @@ class WebSocketTestClient:
                 yield await self.receive_json(timeout=timeout)
             except (ConnectionClosed, TimeoutError):
                 break
+
+
+def _invalid_request(error: RequestValidationError) -> ValueError:
+    """Give the ValueError that Rust raises for a refused scalar, for a value that an extractor refused.
+
+    The server answers 400 for both.
+    """
+    invalid = ValueError(invalid_request_detail(error))
+    invalid.__cause__ = error
+    return invalid
 
 
 class HandshakeRejected(Exception):

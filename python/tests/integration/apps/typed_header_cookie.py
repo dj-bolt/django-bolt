@@ -2,7 +2,7 @@
 
 Each route declares an int header and an int cookie. Valid requests send the
 converted values back. A bad value must give HTTP 422, or HTTP 400 at a
-WebSocket upgrade.
+WebSocket upgrade. A bad item of a list is a bad value too.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from django_bolt import BoltAPI, WebSocket
-from django_bolt.params import Cookie, Header
+from django_bolt.params import Cookie, Header, Query
 
 api = BoltAPI()
 
@@ -38,3 +38,13 @@ async def typed_ws(
 ):
     await websocket.accept()
     await websocket.send_text(f"{type(x_count).__name__}:{x_count} {type(page).__name__}:{page}")
+
+
+@api.websocket("/ws/list")
+async def list_ws(
+    websocket: WebSocket,
+    ids: Annotated[list[int], Query()],
+    x_ids: Annotated[list[int] | None, Header()] = None,
+):
+    await websocket.accept()
+    await websocket.send_text(f"{ids} {x_ids}")

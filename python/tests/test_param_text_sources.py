@@ -9,10 +9,12 @@ accept the same text. Audit findings F1 to F5.
 from __future__ import annotations
 
 import datetime
+import math
 import sys
 from typing import Annotated
 from urllib.parse import quote
 
+import msgspec
 import pytest
 
 from django_bolt import BoltAPI, WebSocket
@@ -337,10 +339,56 @@ async def form_list(
     return describe(first(int_, float_, date_, time_, datetime_)[0])
 
 
+class QueryLists(msgspec.Struct):
+    int_: list[int] | None = None
+    float_: list[float] | None = None
+    date_: list[datetime.date] | None = None
+    time_: list[datetime.time] | None = None
+    datetime_: list[datetime.datetime] | None = None
+
+
+class HeaderLists(msgspec.Struct):
+    x_int: list[int] | None = None
+    x_float: list[float] | None = None
+    x_date: list[datetime.date] | None = None
+    x_time: list[datetime.time] | None = None
+    x_datetime: list[datetime.datetime] | None = None
+
+
+def first_item(model: msgspec.Struct):
+    return describe(first(*msgspec.structs.astuple(model))[0])
+
+
+@api.get("/query-model")
+async def query_model(lists: Annotated[QueryLists, Query()]):
+    return first_item(lists)
+
+
+@api.get("/header-model")
+async def header_model(lists: Annotated[HeaderLists, Header()]):
+    return first_item(lists)
+
+
+@api.post("/form-model")
+async def form_model(lists: Annotated[QueryLists, Form()]):
+    return first_item(lists)
+
+
 @api.websocket("/ws")
 async def socket(websocket: WebSocket, int_: int | None = None, datetime_: datetime.datetime | None = None):
     await websocket.accept()
     await websocket.send_json(describe(first(int_, datetime_)))
+
+
+@api.websocket("/ws/list")
+async def socket_list(
+    websocket: WebSocket,
+    v: Annotated[list[datetime.datetime], Query()],
+    x_ids: Annotated[list[int] | None, Header()] = None,
+    lists: Annotated[QueryLists | None, Query()] = None,
+):
+    await websocket.accept()
+    await websocket.send_json([describe(item) for item in v])
 
 
 @api.websocket("/ws/datetime/{v}")
@@ -499,3 +547,171 @@ def test_an_int_has_at_most_the_digits_that_int_accepts_at_startup(int_max_str_d
         # Bolt reads the limit once, when the client starts. A later change has no effect.
         sys.set_int_max_str_digits(0)
         assert client.get("/int", params={"v": "9" * 641}).status_code == 422
+
+
+@pytest.mark.parametrize(("kind", "text", "expected"), FORMS)
+def test_a_query_model_list_field_converts_as_a_single_value(client, kind, text, expected):
+    """A list field of a query model reads each item as a single argument does."""
+    assert_converts(client.get("/query-model", params={f"{kind}_": text}), kind, text, expected)
+
+
+@pytest.mark.parametrize(("kind", "text", "expected"), SAMPLES)
+def test_a_header_model_list_field_converts_as_a_single_value(client, kind, text, expected):
+    assert_converts(client.get("/header-model", headers={f"x-{kind}": text}), kind, text, expected)
+
+
+@pytest.mark.parametrize(("kind", "text", "expected"), FORMS)
+def test_a_form_model_list_field_converts_as_a_single_value(client, kind, text, expected):
+    assert_converts(client.post("/form-model", data={f"{kind}_": text}), kind, text, expected)
+
+
+INT_ERROR = "Invalid integer '5.0': expected a whole number such as 42 or -7"
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "kwargs", "loc", "index"),
+    [
+        ("GET", "/query-model", {"params": {"int_": ["1", "+2", "5.0"]}}, ["query", "int_"], 2),
+        ("POST", "/form-model", {"data": {"int_": ["1", "+2", "5.0"]}}, ["body", "int_"], 2),
+        ("GET", "/header-model", {"headers": {"x-int": "5.0"}}, ["header", "x-int"], 0),
+    ],
+    ids=["query", "form", "header"],
+)
+def test_a_model_list_item_error_names_the_item(client, method, path, kwargs, loc, index):
+    """msgspec read `5.0` as 5. The Rust parser of one int refuses it, and the error names the item."""
+    response = client.request(method, path, **kwargs)
+    assert response.status_code == 422, response.text
+    [error] = response.json()["detail"]
+    assert error["loc"] == loc
+    assert error["msg"] == f"{INT_ERROR} - at `$[{index}]`"
+
+
+@pytest.mark.parametrize(
+    ("field", "texts", "expected"),
+    [
+        ("int_", ["+5", "007"], [["int", "0x5"], ["int", "0x7"]]),
+        ("float_", [".5", "1e999"], [["float", "0.5"], ["float", "inf"]]),
+        ("date_", ["20240115"], [["date", "2024-01-15"]]),
+        ("time_", ["10:30+05:30"], [["time", "10:30:00", 19800.0, False]]),
+        ("datetime_", ["2024-01-15T10:30Z"], [["datetime", "2024-01-15T10:30:00", 0.0, True]]),
+    ],
+)
+def test_a_model_list_field_holds_each_item(field, texts, expected):
+    api = BoltAPI()
+
+    @api.get("/lists")
+    async def lists(lists: Annotated[QueryLists, Query()]):
+        return [describe(item) for item in getattr(lists, field)]
+
+    with TestClient(api) as client:
+        response = client.get("/lists", params={field: texts})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+def test_each_sequence_type_holds_the_converted_items():
+    """A plain list, set, frozenset or tuple gets the items that Rust built, in its own type."""
+    api = BoltAPI()
+
+    @api.get("/sequences")
+    async def sequences(
+        a: Annotated[list[int], Query()],
+        b: Annotated[set[int], Query()],
+        c: Annotated[frozenset[int], Query()],
+        d: Annotated[tuple[int, ...], Query()],
+        e: Annotated[tuple[int], Query()],
+    ):
+        return [[type(value).__name__, sorted(value)] for value in (a, b, c, d, e)]
+
+    with TestClient(api) as client:
+        response = client.get("/sequences", params={"a": ["+1", "2"], "b": ["2", "+2"], "c": "3", "d": ["4", "5"], "e": "6"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [
+        ["list", [1, 2]],
+        ["set", [2]],
+        ["frozenset", [3]],
+        ["tuple", [4, 5]],
+        ["tuple", [6]],
+    ]
+
+
+class Bounded(msgspec.Struct):
+    v: Annotated[list[int], msgspec.Meta(min_length=2)]
+
+
+def test_a_list_out_of_its_length_bounds_gets_the_length_error_before_an_item_is_read():
+    """msgspec checks the length first, as master did. Rust reads no item of such a list."""
+    api = BoltAPI()
+
+    @api.get("/bounded")
+    async def bounded(v: Annotated[list[int], Query(), msgspec.Meta(max_length=1)]):
+        return v
+
+    @api.get("/bounded-model")
+    async def bounded_model(model: Annotated[Bounded, Query()]):
+        return model.v
+
+    with TestClient(api) as client:
+        assert client.get("/bounded", params={"v": "+1"}).json() == [1]
+        too_many = client.get("/bounded", params={"v": ["x", "y"]})
+        assert too_many.status_code == 422, too_many.text
+        assert too_many.json()["detail"][0]["msg"] == "Expected `array` of length <= 1"
+        in_bounds = client.get("/bounded", params={"v": ["5.0"]})
+        assert in_bounds.json()["detail"][0]["msg"] == f"{INT_ERROR} - at `$[0]`"
+
+        assert client.get("/bounded-model", params={"v": ["+1", "2"]}).json() == [1, 2]
+        too_few = client.get("/bounded-model", params={"v": ["x"]})
+        assert too_few.status_code == 422, too_few.text
+        assert too_few.json()["detail"][0]["msg"] == "Expected `array` of length >= 2"
+
+
+def test_a_float_list_item_with_a_long_fraction_and_a_large_exponent_is_inf(monkeypatch):
+    """float() reads 0.<9999 zeros>1e100000 as 1e90000, which is inf. msgspec read it as 1.0."""
+    text = "0." + "0" * 9999 + "1e100000"
+    assert float(text) == math.inf
+    monkeypatch.setenv("DJANGO_BOLT_MAX_PARAM_LENGTH", "16384")
+    api = BoltAPI()
+
+    @api.get("/floats")
+    async def floats(v: Annotated[list[float], Query()]):
+        return [describe(item) for item in v]
+
+    with TestClient(api) as client:
+        response = client.get("/floats", params={"v": ["1.5", text]})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [describe(1.5), describe(math.inf)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected"), [(text, expected) for kind, text, expected in SAMPLES if kind == "datetime"]
+)
+async def test_a_websocket_list_item_converts_or_is_refused_as_a_scalar(text, expected):
+    """A refused list item refuses the upgrade as a refused scalar does: a ValueError here, 400 on the server."""
+    query = f"v=2024-01-15&v={quote(text, safe='')}"
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=r"^Query parameter 'v': .* - at `\$\[1\]`$"):
+            async with WebSocketTestClient(api, "/ws/list", query_string=query):
+                pass
+        return
+    async with WebSocketTestClient(api, "/ws/list", query_string=query) as websocket:
+        assert await websocket.receive_json() == [describe(dt(2024, 1, 15)), describe(expected)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "headers", "detail"),
+    [
+        ("v=2024-01-15", {"x-ids": "5.0"}, f"Header 'x-ids': {INT_ERROR} - at `$[0]`"),
+        ("v=2024-01-15&int_=1&int_=5.0", {}, f"Query parameter 'int_': {INT_ERROR} - at `$[1]`"),
+    ],
+    ids=["header", "query-model"],
+)
+async def test_a_websocket_list_item_of_each_source_is_refused_as_a_scalar(query, headers, detail):
+    with pytest.raises(ValueError) as excinfo:
+        async with WebSocketTestClient(api, "/ws/list", query_string=query, headers=headers):
+            pass
+    assert str(excinfo.value) == detail
