@@ -1905,3 +1905,33 @@ def test_response_class_in_the_return_type_keeps_the_examples_and_the_components
         **_json_content({"anyOf": [{"type": "string"}, {"$ref": "#/components/schemas/GateReason"}]}),
     }
     assert schema["components"]["schemas"]["GateReason"]["enum"] == ["entitlement", "capability"]
+
+
+class HiddenFieldQuery(Serializer):
+    token: str = field(include_in_schema=False, default="")
+    page: int = 1
+
+
+def test_parameters_keep_a_path_parameter_required_and_the_fields_after_a_hidden_query_field():
+    """A path parameter with a default is required. A hidden field of a query model hides only itself."""
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Test API", version="1.0.0"))
+
+    @api.get("/items/{item_id}")
+    async def item(item_id: int = 1) -> dict:
+        return {"id": item_id}
+
+    @api.get("/items")
+    async def items(filters: Annotated[HiddenFieldQuery, Query()]) -> dict:
+        return {"page": filters.page, "token": filters.token}
+
+    schema = _get_schema(api)
+    validate(schema)
+    path_parameter = schema["paths"]["/items/{item_id}"]["get"]["parameters"][0]
+    query_parameters = schema["paths"]["/items"]["get"]["parameters"]
+
+    assert (path_parameter["name"], path_parameter["in"], path_parameter["required"]) == ("item_id", "path", True)
+    assert [(p["name"], p["in"], p["schema"]) for p in query_parameters] == [
+        ("page", "query", {"type": "integer", "default": 1})
+    ]
+    with TestClient(api) as client:
+        assert client.get("/items?page=2&token=k").json() == {"page": 2, "token": "k"}
