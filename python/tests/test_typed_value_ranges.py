@@ -18,12 +18,12 @@ from django_bolt.param_functions import Cookie, Header, Query
 from django_bolt.testing import TestClient
 
 CASES = [
-    ("date", "0000-01-01", "expected format YYYY-MM-DD"),
-    ("date", "-0001-01-01", "expected format YYYY-MM-DD"),
-    ("date", "+10000-01-01", "expected format YYYY-MM-DD"),
-    ("datetime", "0000-01-01T00:00:00", "expected format YYYY-MM-DDTHH:MM:SS"),
-    ("datetime", "0000-01-01T00:00:00Z", "expected format YYYY-MM-DDTHH:MM:SS"),
-    ("datetime", "+10000-01-01T00:00:00", "expected format YYYY-MM-DDTHH:MM:SS"),
+    ("date", "0000-01-01", "expected ISO 8601 format (e.g., 2024-01-15)"),
+    ("date", "-0001-01-01", "expected ISO 8601 format (e.g., 2024-01-15)"),
+    ("date", "+10000-01-01", "expected ISO 8601 format (e.g., 2024-01-15)"),
+    ("datetime", "0000-01-01T00:00:00", "expected ISO 8601 format (e.g., 2024-01-15T10:30:00Z)"),
+    ("datetime", "0000-01-01T00:00:00Z", "expected ISO 8601 format (e.g., 2024-01-15T10:30:00Z)"),
+    ("datetime", "+10000-01-01T00:00:00", "expected ISO 8601 format (e.g., 2024-01-15T10:30:00Z)"),
     ("decimal", "1E999999999999999999999", "exponent"),
     ("decimal", "1e-99999999999999999999", "exponent"),
 ]

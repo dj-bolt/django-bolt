@@ -309,7 +309,7 @@ curl -i localhost:8000/articles/abc
 
 ```text
 HTTP/1.1 422 Unprocessable Entity
-content-length: 94
+content-length: 105
 content-type: application/json
 
 {"detail":"Path parameter 'article_id': Invalid integer 'abc': expected a whole number such as 42 or -7"}

@@ -135,21 +135,38 @@ curl "localhost:8000/articles?page=2&search=django&tag=python&tag=web"
 ### Send typed values as text
 
 Bolt converts the text of a path, query, header, cookie or form value to the type of the argument.
-It accepts the text that msgspec accepts. Thus a single argument and a `list[...]` argument of one type agree.
+For `int`, `float`, `date`, `time` and `datetime`, Bolt reads the text as Python reads it, with `int()`, `float()` and `fromisoformat()`.
+A single argument and a `list[...]` argument of these types accept the same text.
 
 | Type | Text | Examples |
 | --- | --- | --- |
-| `int` | Digits with an optional leading `-`, at most 4300 characters. A whole number in float form up to `2**53`. | `42`, `-7`, `9223372036854775808`, `5.0`, `1e3` |
-| `float` | Digits with an optional leading `-`, fraction and exponent. `nan`, `inf` or `infinity` in any case. | `1.5`, `-2e3`, `inf` |
-| `date` | `YYYY-MM-DD` | `2024-01-15` |
-| `time` | `HH:MM:SS`, then an optional fraction, then an optional `Z` or `±HH:MM` offset. | `10:30:00`, `10:30:00.5+05:00` |
-| `datetime` | A `date`, then `T`, `t` or a space, then a `time`. Or a Unix timestamp. | `2024-01-15T10:30:00Z`, `2024-01-15 10:30:00+0530`, `1700000000` |
+| `int` | An optional `+` or `-`, then ASCII digits. | `42`, `-7`, `+5`, `007`, `9223372036854775808` |
+| `float` | An optional `+` or `-`, then digits with an optional point and exponent. Or `nan`, `inf` or `infinity` in any case. | `1.5`, `.5`, `-2e3`, `1e999`, `inf` |
+| `date` | `YYYY-MM-DD` or `YYYYMMDD`. Or a week date: `YYYY-Www-D`, `YYYYWwwD`, `YYYY-Www` or `YYYYWww`. | `2024-01-15`, `20240115`, `2024-W03-1` |
+| `time` | An optional `T`, then `HH`, `HH:MM`, `HH:MM:SS`, `HHMM` or `HHMMSS`. A fraction of the second can follow, after `.` or `,`. Then an optional offset: `Z`, or a sign and the hours, minutes and seconds in one of these forms. | `10:30`, `10:30:00.5`, `103000`, `10:30:00+05:30`, `10:30:00Z` |
+| `datetime` | A `date`, then optionally `T`, `t` or one whitespace character and a `time` with no `T`. | `2024-01-15T10:30`, `2024-01-15 10:30:00Z`, `20240115T103000+0530` |
 
-- A `datetime` or a `time` keeps the offset of its text. A text with no offset gives a naive value. A Unix timestamp gives a `datetime` in UTC.
-- A fraction rounds to the closest microsecond.
-- An offset can have no colon, as in `+0530`.
-- Bolt refuses a leading `+`, a leading zero (`007`), `_`, whitespace and a field of another width (`2024-1-5`).
-- Bolt refuses the other ISO 8601 forms, for example `2024-01-15T10:30` with no seconds. An HTML `<input type="datetime-local">` sends this form. To accept it, declare the argument as `str` and call `datetime.fromisoformat()`.
+- A `datetime` or a `time` keeps the offset of its text. `Z`, `+00:00` and `-00:00` give `datetime.timezone.utc`. A text with no offset gives a naive value.
+- A `date` alone gives a `datetime` at midnight.
+- Bolt keeps the first six digits of a fraction, as Python does.
+- An HTML `<input type="datetime-local">` sends `2024-01-15T10:30`. A `datetime` argument accepts it.
+- An `int` has at most the digits of `sys.get_int_max_str_digits()`: 4300 by default, and never more than 4300. Bolt reads the limit when the server starts. A later `sys.set_int_max_str_digits()` call has no effect.
+
+Bolt refuses some text that Python reads:
+
+- In a number: `_`, whitespace and digits that are not ASCII, as in `1_000`, ` 5` or `٣`.
+- Between the date and the time: a character other than `T`, `t` or whitespace, as in `2024-01-15x10:30`.
+- Hour 24 and a fraction of an hour or a minute, as in `24:00` or `10:30.5`. Python 3.12 and 3.14 read them differently.
+- An offset with a minute or a second of 60 or more (`+05:60`), and an offset of zero seconds with a fraction (`+00:00:00.5`).
+- Text between the time and the offset, as in `10:30:00 +05:00`, and a NUL character.
+
+A `bool`, a `UUID` and a `Decimal` still differ between a single argument and a `list[...]` argument:
+
+| Type | Only a single argument accepts | Only a `list[...]` item accepts |
+| --- | --- | --- |
+| `bool` | `yes`, `no`, `on`, `off` | |
+| `UUID` | `{...}` and `urn:uuid:...` | |
+| `Decimal` | | `NaN`, `Infinity`, `_` and whitespace |
 
 ### Rename and limit a query parameter
 

@@ -4,13 +4,16 @@
 //! eliminating the need for Python's convert_primitive() function.
 //! Performance improvement: ~100-500µs per parameter.
 
-use chrono::{
-    DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike,
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 use pyo3::exceptions::PyValueError;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyAnyMethods, PyDateTime, PyDelta, PyDict, PyDictMethods, PyTime, PyTzInfo};
-use pyo3::{Bound, IntoPyObject, Py, PyAny, PyResult, Python};
+use pyo3::types::{
+    PyAnyMethods, PyDateTime, PyDelta, PyDict, PyDictMethods, PyList, PyListMethods, PyString,
+    PyStringMethods, PyTime, PyTzInfo,
+};
+use pyo3::{Bound, IntoPyObject, Py, PyAny, PyResult, Python, pyfunction};
 use uuid::Uuid;
 
 // OPTIMIZATION: Cache Python classes for type construction (avoids repeated imports)
@@ -163,20 +166,20 @@ pub const TYPE_TIME: u8 = 9;
 #[derive(Debug, Clone)]
 pub enum CoercedValue {
     Int(i64),
-    /// The text of an integer beyond `i64`: an optional `-` and at most
-    /// [`MAX_INT_TEXT_LEN`] characters of ASCII digits.
+    /// The text of an integer beyond `i64`: an optional `-` and ASCII digits,
+    /// at most the digit limit of [`resolve_int_max_str_digits`].
     BigInt(String),
     Float(f64),
     Bool(bool),
     String(String),
     Uuid(Uuid),
     /// A datetime with the UTC offset of its text.
-    DateTime(DateTime<FixedOffset>),
+    DateTime(NaiveDateTime, UtcOffset),
     NaiveDateTime(NaiveDateTime),
     Date(NaiveDate),
     Time(NaiveTime),
     /// A time with the UTC offset of its text.
-    TimeTz(NaiveTime, FixedOffset),
+    TimeTz(NaiveTime, UtcOffset),
     // Holds the original input string, validated by is_valid_decimal_literal().
     // Python's decimal.Decimal is constructed from this string directly, so a
     // large exponent (e.g. "1e999999999") is never expanded into its full digit
@@ -271,7 +274,12 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
             .map(CoercedValue::Uuid)
             .map_err(|e| format!("Invalid UUID '{}': {}", value, e)),
 
-        TYPE_DATETIME => parse_datetime(value),
+        TYPE_DATETIME => parse_datetime(value).ok_or_else(|| {
+            format!(
+                "Invalid datetime '{}': expected ISO 8601 format (e.g., 2024-01-15T10:30:00Z)",
+                value
+            )
+        }),
 
         TYPE_DECIMAL => {
             if !is_valid_decimal_literal(value) {
@@ -286,302 +294,280 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
             }
         }
 
-        TYPE_DATE => parse_ymd(value.as_bytes())
+        TYPE_DATE => parse_date(value.as_bytes())
             .map(CoercedValue::Date)
-            .ok_or_else(|| format!("Invalid date '{}': expected format YYYY-MM-DD", value)),
+            .ok_or_else(|| {
+                format!(
+                    "Invalid date '{}': expected ISO 8601 format (e.g., 2024-01-15)",
+                    value
+                )
+            }),
 
-        TYPE_TIME => match parse_clock(value.as_bytes()) {
-            Some((time, None)) => Ok(CoercedValue::Time(time)),
-            Some((time, Some(offset))) => Ok(CoercedValue::TimeTz(time, offset)),
-            None => Err(format!(
-                "Invalid time '{}': expected format HH:MM:SS[.ffffff][Z|±HH:MM]",
+        TYPE_TIME => parse_time(value.as_bytes()).ok_or_else(|| {
+            format!(
+                "Invalid time '{}': expected ISO 8601 format (e.g., 10:30 or 10:30:00+05:30)",
                 value
-            )),
-        },
+            )
+        }),
 
         _ => Ok(CoercedValue::String(value.to_string())),
     }
 }
 
-// The parsers below accept a text if and only if `msgspec.convert(text, T,
-// strict=False)` accepts it, and give the value that msgspec gives. A
-// `list[T]` parameter converts each value with that call, so a scalar and a
-// list parameter of one type agree. msgspec gives the same result on each
-// supported Python version; `fromisoformat` does not. The parsers read fixed
-// field widths and skip no whitespace. A NUL character is refused: msgspec
-// stops at it and ignores the rest of the text.
+// The parsers below follow Python: `int()` and `float()` for the number
+// texts, and `fromisoformat()` of `date`, `time` and `datetime` for the ISO
+// 8601 texts. Python 3.12, 3.13 and 3.14 must each accept a text and give the
+// same value. Thus Bolt refuses hour 24 (only 3.14 reads it) and a fraction
+// of an hour or a minute (3.14 refuses it). Bolt also refuses some texts that
+// Python reads but that are not ISO 8601: whitespace, `_` or other digits than
+// ASCII in a number, a date and time separator other than `T`, `t` or a space,
+// text between the time and the offset, an offset field out of range, and a
+// NUL character. Each parser reads the text once, with no Python call.
 
-/// Longest integer text that becomes a Python `int`, with its sign. msgspec
-/// refuses a longer one. This is also the default of
-/// `sys.get_int_max_str_digits()`.
-pub const MAX_INT_TEXT_LEN: usize = 4300;
+/// The most digits that an `int` text can have: the default of
+/// `sys.get_int_max_str_digits()`. A higher limit, or no limit, keeps this
+/// bound, so the build of a Python `int` stays short under the GIL.
+pub const MAX_INT_DIGITS: usize = 4300;
 
-/// Largest magnitude of a float text that msgspec gives as an `int`: 2**53.
-const MAX_INT_FROM_FLOAT: f64 = 9_007_199_254_740_992.0;
+/// The lowest digit limit that Python allows, other than no limit. Each limit
+/// accepts a text of this length.
+const MIN_INT_DIGITS_LIMIT: usize = 640;
 
-/// The Unix timestamps of 0001-01-01T00:00:00Z and 10000-01-01T00:00:00Z, the
-/// bounds that msgspec checks before it rounds the microseconds.
-const EPOCH_SECS_MIN: i64 = -62_135_596_800;
-const EPOCH_SECS_MAX: i64 = 253_402_300_800;
+/// The digit limit of an `int` text. [`resolve_int_max_str_digits`] sets it.
+static INT_MAX_DIGITS: AtomicUsize = AtomicUsize::new(MAX_INT_DIGITS);
 
-/// The form of a number text in msgspec's grammar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NumberForm {
-    /// `-?(0|[1-9][0-9]*)`
-    Integer,
-    /// An integer part, then `\.[0-9]+` or `[eE][+-]?[0-9]+` or both.
-    Real,
-    /// `-?` and `nan`, `inf` or `infinity`, in any case.
-    NonFinite,
-}
-
-/// Classify `text` by msgspec's number grammar. None: the text is not a number.
-fn number_form(text: &[u8]) -> Option<NumberForm> {
-    let digits = text.strip_prefix(b"-").unwrap_or(text);
-    let integer_len = match digits {
-        [b'0', ..] => 1,
-        [b'1'..=b'9', ..] => digits.iter().take_while(|c| c.is_ascii_digit()).count(),
-        _ => {
-            return [&b"nan"[..], b"inf", b"infinity"]
-                .iter()
-                .any(|word| digits.eq_ignore_ascii_case(word))
-                .then_some(NumberForm::NonFinite);
-        }
+/// Read the digit limit of `int()` from `sys.get_int_max_str_digits()`.
+///
+/// The server and the test client call this once, when they start. A later
+/// call of `sys.set_int_max_str_digits()` does not change the limit of Bolt.
+pub fn resolve_int_max_str_digits(py: Python<'_>) -> PyResult<()> {
+    let limit: usize = py
+        .import("sys")?
+        .call_method0("get_int_max_str_digits")?
+        .extract()?;
+    let limit = if limit == 0 {
+        MAX_INT_DIGITS
+    } else {
+        limit.min(MAX_INT_DIGITS)
     };
-    let mut rest = &digits[integer_len..];
-    if rest.is_empty() {
-        return Some(NumberForm::Integer);
-    }
-    if let Some(fraction) = rest.strip_prefix(b".") {
-        let count = fraction.iter().take_while(|c| c.is_ascii_digit()).count();
-        if count == 0 {
-            return None;
-        }
-        rest = &fraction[count..];
-    }
-    if let Some(exponent) = rest.strip_prefix(b"e").or_else(|| rest.strip_prefix(b"E")) {
-        let exponent = exponent
-            .strip_prefix(b"+")
-            .or_else(|| exponent.strip_prefix(b"-"))
-            .unwrap_or(exponent);
-        if exponent.is_empty() || !exponent.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        rest = &[];
-    }
-    rest.is_empty().then_some(NumberForm::Real)
+    INT_MAX_DIGITS.store(limit, Ordering::Relaxed);
+    Ok(())
 }
 
-/// Parse an `int` as msgspec does. An integer beyond `i64` keeps its text
-/// for Python. A whole number in float form, such as `5.0` or `1e3`, is an
-/// int up to 2**53. A leading `+` or zero, `_` and whitespace are refused.
+/// Parse an `int` as `int()` parses ASCII text: an optional sign, then digits.
+/// An integer beyond `i64` keeps its text for Python.
 fn parse_int(value: &str) -> Result<CoercedValue, String> {
-    // One pass for the common case: Rust's parser reads the same digits once
-    // the text has no leading `+` and no leading zero.
-    let unsigned = value.strip_prefix('-').unwrap_or(value).as_bytes();
-    if matches!(unsigned, [b'1'..=b'9', ..] | [b'0'])
-        && let Ok(int) = value.parse::<i64>()
+    let parsed = value.parse::<i64>();
+    if let Ok(int) = parsed
+        && value.len() <= MIN_INT_DIGITS_LIMIT
     {
         return Ok(CoercedValue::Int(int));
     }
-    match number_form(value.as_bytes()) {
-        // The pass above took each integer in the i64 range.
-        Some(NumberForm::Integer) if value.len() <= MAX_INT_TEXT_LEN => {
-            Ok(CoercedValue::BigInt(value.to_owned()))
-        }
-        Some(NumberForm::Integer) => Err(format!(
-            "Invalid integer '{}': more than {} characters",
-            value, MAX_INT_TEXT_LEN
-        )),
-        Some(NumberForm::Real) => match value.parse::<f64>() {
-            Ok(real) if real.fract() == 0.0 && real.abs() <= MAX_INT_FROM_FLOAT => {
-                Ok(CoercedValue::Int(real as i64))
-            }
-            _ => Err(format!(
-                "Invalid integer '{}': not a whole number from -2**53 to 2**53",
-                value
-            )),
-        },
-        _ => Err(format!(
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
             "Invalid integer '{}': expected a whole number such as 42 or -7",
             value
-        )),
+        ));
     }
+    let limit = INT_MAX_DIGITS.load(Ordering::Relaxed);
+    if digits.len() > limit {
+        return Err(format!(
+            "Invalid integer '{}': more than {} digits",
+            value, limit
+        ));
+    }
+    Ok(match parsed {
+        Ok(int) => CoercedValue::Int(int),
+        // Only an overflow gets here: each character is a digit.
+        Err(_) => CoercedValue::BigInt(value.strip_prefix('+').unwrap_or(value).to_owned()),
+    })
 }
 
-/// Parse a `float` as msgspec does. A finite text that overflows is refused.
+/// Parse a `float` with the Rust parser. It reads the ASCII texts that
+/// `float()` reads and gives the same value: an optional sign, digits with an
+/// optional point and exponent, or `inf`, `infinity` or `nan` in any case.
 fn parse_float(value: &str) -> Result<CoercedValue, String> {
-    let form = number_form(value.as_bytes()).ok_or_else(|| {
+    value.parse::<f64>().map(CoercedValue::Float).map_err(|_| {
         format!(
             "Invalid float '{}': expected a number such as 1.5, -2e3, inf or nan",
             value
         )
-    })?;
-    match value.parse::<f64>() {
-        // msgspec reads `-0` as the int 0, so the float is 0.0, not -0.0.
-        Ok(float) if form == NumberForm::Integer && float == 0.0 => Ok(CoercedValue::Float(0.0)),
-        Ok(float) if float.is_finite() || form == NumberForm::NonFinite => {
-            Ok(CoercedValue::Float(float))
+    })
+}
+
+/// A UTC offset as a Python `timedelta` holds it: whole seconds, then
+/// microseconds with the same sign. It is less than 24 hours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UtcOffset {
+    pub seconds: i32,
+    pub micros: i32,
+}
+
+impl UtcOffset {
+    /// The offset of `Z`, `+00:00` and `-00:00`. Python gives `timezone.utc` for it.
+    pub const UTC: Self = Self {
+        seconds: 0,
+        micros: 0,
+    };
+}
+
+fn digit(c: u8) -> Option<u32> {
+    c.is_ascii_digit().then(|| u32::from(c - b'0'))
+}
+
+fn pair(high: u8, low: u8) -> Option<u32> {
+    Some(digit(high)? * 10 + digit(low)?)
+}
+
+/// Read two ASCII digits at `at`.
+fn two_digits(text: &[u8], at: usize) -> Option<u32> {
+    match *text.get(at..at + 2)? {
+        [high, low] => pair(high, low),
+        _ => None,
+    }
+}
+
+/// Parse a date: `YYYY-MM-DD`, `YYYYMMDD`, or a week date `YYYY-Www`,
+/// `YYYY-Www-D`, `YYYYWww` or `YYYYWwwD`. The year is from 1 to 9999.
+fn parse_date(text: &[u8]) -> Option<NaiveDate> {
+    let year = i32::try_from(two_digits(text, 0)? * 100 + two_digits(text, 2)?).ok()?;
+    let date = match text[4..] {
+        [b'-', b'W', w0, w1] | [b'W', w0, w1] => week_date(year, pair(w0, w1)?, 1),
+        [b'-', b'W', w0, w1, b'-', day] | [b'W', w0, w1, day] => {
+            week_date(year, pair(w0, w1)?, digit(day)?)
         }
-        _ => Err(format!("Invalid float '{}': out of range", value)),
-    }
-}
-
-/// Parse a `datetime` as msgspec does: a Unix timestamp in UTC, or
-/// `YYYY-MM-DD(T|t| )HH:MM:SS[.f+][Z|z|±HH[:]MM]`.
-fn parse_datetime(value: &str) -> Result<CoercedValue, String> {
-    let bytes = value.as_bytes();
-    let parsed = match number_form(bytes) {
-        Some(NumberForm::Integer) => value
-            .parse::<i64>()
-            .ok()
-            .and_then(|secs| datetime_from_epoch(secs, 0))
-            .map(CoercedValue::DateTime),
-        Some(_) => value
-            .parse::<f64>()
-            .ok()
-            .and_then(datetime_from_timestamp)
-            .map(CoercedValue::DateTime),
-        None => parse_datetime_text(bytes),
-    };
-    parsed.ok_or_else(|| {
-        format!(
-            "Invalid datetime '{}': expected format YYYY-MM-DDTHH:MM:SS[.ffffff][Z|±HH:MM] \
-             (e.g., 2024-01-15T10:30:00Z) or a Unix timestamp",
-            value
-        )
-    })
-}
-
-/// Parse `YYYY-MM-DD(T|t| )HH:MM:SS[.f+][Z|z|±HH[:]MM]`. A round-up past 9999-12-31 is refused.
-fn parse_datetime_text(text: &[u8]) -> Option<CoercedValue> {
-    if text.len() < 19 || !matches!(text[10], b'T' | b't' | b' ') {
-        return None;
-    }
-    let date = parse_ymd(&text[..10])?;
-    let (time, round_up, offset) = parse_clock_fields(&text[11..])?;
-    let mut local = date.and_time(time);
-    if round_up {
-        local = local.checked_add_signed(TimeDelta::microseconds(1))?;
-        if local.year() > 9999 {
-            return None;
+        [b'-', m0, m1, b'-', d0, d1] | [m0, m1, d0, d1] => {
+            NaiveDate::from_ymd_opt(year, pair(m0, m1)?, pair(d0, d1)?)
         }
-    }
-    Some(match offset {
-        None => CoercedValue::NaiveDateTime(local),
-        Some(offset) => CoercedValue::DateTime(local.and_local_timezone(offset).single()?),
-    })
+        _ => None,
+    }?;
+    (1..=9999).contains(&date.year()).then_some(date)
 }
 
-/// Give the UTC datetime of a float Unix timestamp, as msgspec computes it.
-fn datetime_from_timestamp(timestamp: f64) -> Option<DateTime<FixedOffset>> {
-    // Each timestamp in range has a magnitude below 1e12. The bound keeps the
-    // arithmetic below from overflow.
-    if !timestamp.is_finite() || timestamp.abs() >= 1e12 {
-        return None;
-    }
-    // The casts truncate toward zero, as the C conversions in msgspec do.
-    let mut secs = timestamp.trunc() as i64;
-    let mut nanos = (1_000_000_000.0 * (timestamp - secs as f64)) as i32;
-    if nanos != 0 && timestamp < 0.0 {
-        secs -= 1;
-        nanos += 1_000_000_000;
-    }
-    datetime_from_epoch(secs, nanos as u32)
+/// The date of day `day` (1 is Monday) of ISO week `week` of `year`.
+fn week_date(year: i32, week: u32, day: u32) -> Option<NaiveDate> {
+    let weekday = Weekday::try_from(u8::try_from(day.checked_sub(1)?).ok()?).ok()?;
+    NaiveDate::from_isoywd_opt(year, week, weekday)
 }
 
-/// Give the UTC datetime of a Unix timestamp, rounded to the closest microsecond.
-fn datetime_from_epoch(secs: i64, nanos: u32) -> Option<DateTime<FixedOffset>> {
-    if !(EPOCH_SECS_MIN..=EPOCH_SECS_MAX).contains(&secs) {
-        return None;
-    }
-    let micros = (nanos + 500) / 1000;
-    let (secs, micros) = if micros == 1_000_000 {
-        (secs + 1, 0)
-    } else {
-        (secs, micros)
+/// Parse `HH`, `HH:MM`, `HH:MM:SS`, `HHMM` or `HHMMSS`, then an optional
+/// fraction of the second: `.` or `,` and one digit or more. Python drops the
+/// digits after the sixth. Give the hours, minutes, seconds and microseconds.
+/// The caller checks the range of each field.
+fn parse_hms(text: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    let hour = two_digits(text, 0)?;
+    let (minute_at, extended) = match text.get(2) {
+        None => return Some((hour, 0, 0, 0)),
+        Some(b':') => (3, true),
+        Some(_) => (2, false),
     };
-    let utc = DateTime::from_timestamp(secs, micros * 1000)?;
-    (utc.year() <= 9999).then(|| utc.fixed_offset())
-}
-
-fn digits(field: &[u8]) -> Option<u32> {
-    field.iter().try_fold(0u32, |total, &c| {
-        c.is_ascii_digit().then(|| total * 10 + u32::from(c - b'0'))
-    })
-}
-
-/// Parse exactly `YYYY-MM-DD`, year 1 to 9999.
-fn parse_ymd(text: &[u8]) -> Option<NaiveDate> {
-    let [y0, y1, y2, y3, b'-', m0, m1, b'-', d0, d1] = *text else {
-        return None;
+    let minute = two_digits(text, minute_at)?;
+    let second_at = match text.get(minute_at + 2) {
+        None => return Some((hour, minute, 0, 0)),
+        Some(b':') if extended => minute_at + 3,
+        Some(_) if !extended => minute_at + 2,
+        Some(_) => return None,
     };
-    let year = digits(&[y0, y1, y2, y3])?;
-    if year == 0 {
-        return None;
-    }
-    NaiveDate::from_ymd_opt(year as i32, digits(&[m0, m1])?, digits(&[d0, d1])?)
+    let second = two_digits(text, second_at)?;
+    let micro = match text[second_at + 2..] {
+        [] => 0,
+        [b'.' | b',', ref fraction @ ..]
+            if !fraction.is_empty() && fraction.iter().all(u8::is_ascii_digit) =>
+        {
+            fraction
+                .iter()
+                .chain(std::iter::repeat(&b'0'))
+                .take(6)
+                .fold(0, |total, &c| total * 10 + u32::from(c - b'0'))
+        }
+        _ => return None,
+    };
+    Some((hour, minute, second, micro))
 }
 
-/// Parse a `time`: `HH:MM:SS[.f+][Z|z|±HH[:]MM]`, rounded to the closest
-/// microsecond. The round-up of 23:59:59.9999995 wraps to 00:00:00, as in msgspec.
-fn parse_clock(text: &[u8]) -> Option<(NaiveTime, Option<FixedOffset>)> {
-    let (time, round_up, offset) = parse_clock_fields(text)?;
-    let time = if round_up {
-        time.overflowing_add_signed(TimeDelta::microseconds(1)).0
-    } else {
-        time
+/// Parse a time of day with an optional UTC offset: `Z`, or a sign and the
+/// form of [`parse_hms`].
+fn parse_clock(text: &[u8]) -> Option<(NaiveTime, Option<UtcOffset>)> {
+    let zone_at = text
+        .iter()
+        .position(|c| matches!(c, b'Z' | b'+' | b'-'))
+        .unwrap_or(text.len());
+    let (hour, minute, second, micro) = parse_hms(&text[..zone_at])?;
+    // chrono refuses hour 24 and second 60, as Python 3.12 and 3.13 do.
+    let time = NaiveTime::from_hms_micro_opt(hour, minute, second, micro)?;
+    let offset = match text[zone_at..] {
+        [] => None,
+        [b'Z'] => Some(UtcOffset::UTC),
+        [sign @ (b'+' | b'-'), ref zone @ ..] => Some(parse_offset(sign, zone)?),
+        _ => return None,
     };
     Some((time, offset))
 }
 
-/// Parse `HH:MM:SS[.f+][Z|z|±HH[:]MM]`. Give the time truncated to the
-/// microsecond, whether the seventh fraction digit is 5 or more, and the offset.
-fn parse_clock_fields(text: &[u8]) -> Option<(NaiveTime, bool, Option<FixedOffset>)> {
-    let [h0, h1, b':', m0, m1, b':', s0, s1, ref rest @ ..] = *text else {
+/// Parse the fields of an offset after its sign. Python reads `+05:60` as six
+/// hours; Bolt refuses a field out of range.
+fn parse_offset(sign: u8, zone: &[u8]) -> Option<UtcOffset> {
+    let (hours, minutes, seconds, micros) = parse_hms(zone)?;
+    if hours > 23 || minutes > 59 || seconds > 59 {
         return None;
-    };
-    let (hour, minute, second) = (digits(&[h0, h1])?, digits(&[m0, m1])?, digits(&[s0, s1])?);
-    let mut rest = rest;
-    let mut micro = 0;
-    let mut round_up = false;
-    if let Some(fraction) = rest.strip_prefix(b".") {
-        let count = fraction.iter().take_while(|c| c.is_ascii_digit()).count();
-        if count == 0 {
-            return None;
-        }
-        let kept = count.min(6);
-        micro = digits(&fraction[..kept])? * 10u32.pow(6 - kept as u32);
-        round_up = count > 6 && fraction[6] >= b'5';
-        rest = &fraction[count..];
     }
-    let offset = match rest {
-        [] => None,
-        [b'Z' | b'z'] => Some(FixedOffset::east_opt(0)?),
-        [sign @ (b'+' | b'-'), h0, h1, b':', m0, m1] | [sign @ (b'+' | b'-'), h0, h1, m0, m1] => {
-            let (hours, minutes) = (digits(&[*h0, *h1])?, digits(&[*m0, *m1])?);
-            if hours > 23 || minutes > 59 {
-                return None;
-            }
-            let seconds = (hours * 3600 + minutes * 60) as i32;
-            Some(FixedOffset::east_opt(if *sign == b'-' {
-                -seconds
-            } else {
-                seconds
-            })?)
+    let seconds = (hours * 3600 + minutes * 60 + seconds) as i32;
+    // For +00:00:00.5, Python 3.13 keeps the fraction; 3.12 and 3.14 give UTC.
+    if seconds == 0 && micros != 0 {
+        return None;
+    }
+    let micros = micros as i32;
+    Some(if sign == b'-' {
+        UtcOffset {
+            seconds: -seconds,
+            micros: -micros,
         }
-        _ => return None,
-    };
-    // chrono refuses second 60 here. It makes a leap second only from a nanosecond value of 1e9 or more.
-    let time = NaiveTime::from_hms_micro_opt(hour, minute, second, micro)?;
-    Some((time, round_up, offset))
+    } else {
+        UtcOffset { seconds, micros }
+    })
+}
+
+/// Parse a `time`: an optional `T`, then the form of [`parse_clock`].
+fn parse_time(text: &[u8]) -> Option<CoercedValue> {
+    let (time, offset) = parse_clock(text.strip_prefix(b"T").unwrap_or(text))?;
+    Some(match offset {
+        None => CoercedValue::Time(time),
+        Some(offset) => CoercedValue::TimeTz(time, offset),
+    })
+}
+
+/// Parse a `datetime`: a date of [`parse_date`], then optionally a separator
+/// and the form of [`parse_clock`]. A date alone is midnight. The separator is
+/// `T`, `t` or one whitespace character, such as a space or a tab. Python
+/// takes any one character; chrono took any whitespace, so a tab stays valid.
+fn parse_datetime(text: &str) -> Option<CoercedValue> {
+    let date_len = text
+        .bytes()
+        .position(|c| !matches!(c, b'0'..=b'9' | b'-' | b'W'))
+        .unwrap_or(text.len());
+    let date = parse_date(&text.as_bytes()[..date_len])?;
+    // Each byte before `date_len` is ASCII, so a character starts there.
+    let mut rest = text[date_len..].chars();
+    match rest.next() {
+        None => return Some(CoercedValue::NaiveDateTime(date.and_time(NaiveTime::MIN))),
+        Some(separator) if separator == 'T' || separator == 't' || separator.is_whitespace() => {}
+        Some(_) => return None,
+    }
+    let (time, offset) = parse_clock(rest.as_str().as_bytes())?;
+    let local = date.and_time(time);
+    Some(match offset {
+        None => CoercedValue::NaiveDateTime(local),
+        Some(offset) => CoercedValue::DateTime(local, offset),
+    })
 }
 
 /// Build a Python `int` from the text of a [`CoercedValue::BigInt`].
 ///
-/// `int(text)` refuses more digits than `sys.get_int_max_str_digits()`, which
-/// an application can lower. Integer arithmetic on chunks of 18 digits has no
-/// such limit, so a value that Rust accepted always converts.
+/// `int(text)` refuses more digits than `sys.get_int_max_str_digits()`, and an
+/// application can lower that limit after Bolt read it. Integer arithmetic on
+/// chunks of 18 digits has no such limit, so a value that Rust accepted
+/// always converts.
 fn big_int_to_py<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>> {
     const CHUNK: usize = 18;
     let (negative, digits) = match text.strip_prefix('-') {
@@ -605,18 +591,47 @@ fn big_int_to_py<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>
     if negative { value.neg() } else { Ok(value) }
 }
 
-/// Give the Python `tzinfo` of a fixed offset. UTC is the cached
-/// `datetime.timezone.utc`, which `timezone(timedelta(0))` also gives.
-fn tzinfo_to_py<'py>(py: Python<'py>, offset: FixedOffset) -> PyResult<Bound<'py, PyTzInfo>> {
-    match offset.local_minus_utc() {
-        0 => Ok(PyTzInfo::utc(py)?.to_owned()),
-        seconds => PyTzInfo::fixed_offset(py, PyDelta::new(py, 0, seconds, 0, true)?),
+/// Give the Python `tzinfo` of an offset. UTC is the cached
+/// `datetime.timezone.utc`, as `fromisoformat()` gives.
+fn tzinfo_to_py(py: Python<'_>, offset: UtcOffset) -> PyResult<Bound<'_, PyTzInfo>> {
+    if offset == UtcOffset::UTC {
+        return Ok(PyTzInfo::utc(py)?.to_owned());
     }
+    PyTzInfo::fixed_offset(
+        py,
+        PyDelta::new(py, 0, offset.seconds, offset.micros, true)?,
+    )
 }
 
-/// Microseconds of a time that [`parse_clock_fields`] or chrono built. No leap second occurs.
+/// Microseconds of a time that [`parse_clock`] built. No leap second occurs.
 fn micros(time: NaiveTime) -> u32 {
     time.nanosecond() / 1000
+}
+
+/// Convert the text items of a `list[T]` parameter with the parser of one `T`
+/// value, so that a list and a single value of one type accept the same text.
+///
+/// The extractors call this once for each parameter, at most, with the type
+/// hint that the route registration found. An item that is not text stays as
+/// it is. The first refused item raises `ValueError(index, message)`.
+#[pyfunction]
+pub fn parse_text_items<'py>(
+    items: &Bound<'py, PyList>,
+    type_hint: u8,
+) -> PyResult<Bound<'py, PyList>> {
+    let py = items.py();
+    let converted = PyList::empty(py);
+    for (index, item) in items.iter().enumerate() {
+        let Ok(text) = item.cast::<PyString>() else {
+            converted.append(item)?;
+            continue;
+        };
+        match coerce_typed(&text.to_string_lossy(), type_hint) {
+            Ok(value) => converted.append(coerced_value_to_py(py, &value)?)?,
+            Err(message) => return Err(PyValueError::new_err((index, message))),
+        }
+    }
+    Ok(converted)
 }
 
 /// Non-string type hints of one request source, keyed by wire name.
@@ -692,8 +707,7 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> PyResult<Py<
 
         // Temporal types: direct C-API construction via pyo3's chrono feature.
         // An aware value keeps the fields and the offset of its text.
-        CoercedValue::DateTime(v) => {
-            let local = v.naive_local();
+        CoercedValue::DateTime(local, offset) => {
             PyDateTime::new(
                 py,
                 local.year(),
@@ -703,7 +717,7 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> PyResult<Py<
                 local.minute() as u8,
                 local.second() as u8,
                 micros(local.time()),
-                Some(&tzinfo_to_py(py, *v.offset())?),
+                Some(&tzinfo_to_py(py, *offset)?),
             )?
             .into_any()
             .unbind()
@@ -779,6 +793,7 @@ fn set_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeDelta;
     use proptest::prelude::*;
 
     /// The decimal grammar of `is_valid_decimal_literal`, as a regex.
@@ -807,8 +822,7 @@ mod tests {
 
         #[test]
         fn a_float_round_trips(value in any::<f64>()) {
-            // Debug keeps the sign of -0.0: Display gives "-0", the int 0 for msgspec.
-            let Ok(CoercedValue::Float(parsed)) = coerce(&format!("{value:?}"), TYPE_FLOAT) else {
+            let Ok(CoercedValue::Float(parsed)) = coerce(&value.to_string(), TYPE_FLOAT) else {
                 return Err(TestCaseError::fail(format!("{value} was refused")));
             };
             prop_assert!(parsed.to_bits() == value.to_bits() || (parsed.is_nan() && value.is_nan()));
@@ -891,87 +905,116 @@ mod tests {
             }
         }
 
+        /// A date converts in each form that `date.fromisoformat()` reads.
         #[test]
-        fn an_integer_timestamp_is_a_utc_datetime(secs in EPOCH_SECS_MIN..EPOCH_SECS_MAX) {
-            let Ok(CoercedValue::DateTime(value)) = coerce(&secs.to_string(), TYPE_DATETIME) else {
-                return Err(TestCaseError::fail(format!("{secs} was refused")));
-            };
-            prop_assert_eq!(value.timestamp(), secs);
-            prop_assert_eq!(value.offset().local_minus_utc(), 0);
-        }
-
-        /// A datetime of the grammar keeps its fields and its offset. A fraction
-        /// rounds to the closest microsecond by its seventh digit.
-        #[test]
-        fn a_datetime_text_of_the_grammar_converts(
-            days in 1i32..=3_652_059,
-            seconds in 0u32..86_400,
-            fraction in "(\\.[0-9]{1,9})?",
-            separator in "[Tt ]",
-            zone in "|[Zz]|[+-](0[0-9]|1[0-9]|2[0-3]):?[0-5][0-9]",
-        ) {
+        fn a_date_converts_in_each_form(days in 1i32..=3_652_059) {
             let date = NaiveDate::from_num_days_from_ce_opt(days).unwrap();
-            let time = NaiveTime::from_num_seconds_from_midnight_opt(seconds, 0).unwrap();
-            let text = format!("{}{separator}{}{fraction}{zone}", date.format("%Y-%m-%d"), time.format("%H:%M:%S"));
-            let local = date.and_time(time) + fraction_delta(&fraction);
-            match coerce(&text, TYPE_DATETIME) {
-                Ok(CoercedValue::NaiveDateTime(value)) => {
-                    prop_assert!(zone.is_empty(), "{}", text);
-                    prop_assert_eq!(value, local);
-                }
-                Ok(CoercedValue::DateTime(value)) => {
-                    prop_assert_eq!(Some(value.offset().local_minus_utc()), zone_seconds(&zone), "{}", text);
-                    prop_assert_eq!(value.naive_local(), local);
-                }
-                Err(error) => prop_assert!(local.year() > 9999, "{}: {}", text, error),
-                Ok(other) => prop_assert!(false, "{}: {:?}", text, other),
+            let week = date.iso_week();
+            let day = date.weekday().number_from_monday();
+            let monday = date - TimeDelta::days(i64::from(day) - 1);
+            for (text, expected) in [
+                (date.format("%Y-%m-%d").to_string(), date),
+                (date.format("%Y%m%d").to_string(), date),
+                (format!("{:04}-W{:02}-{day}", week.year(), week.week()), date),
+                (format!("{:04}W{:02}{day}", week.year(), week.week()), date),
+                (format!("{:04}-W{:02}", week.year(), week.week()), monday),
+                (format!("{:04}W{:02}", week.year(), week.week()), monday),
+            ] {
+                prop_assert!(
+                    matches!(coerce(&text, TYPE_DATE), Ok(CoercedValue::Date(v)) if v == expected),
+                    "{}: {:?}", text, coerce(&text, TYPE_DATE)
+                );
+                let midnight = expected.and_time(NaiveTime::MIN);
+                prop_assert!(
+                    matches!(coerce(&text, TYPE_DATETIME), Ok(CoercedValue::NaiveDateTime(v)) if v == midnight),
+                    "{}", text
+                );
             }
         }
 
+        /// A time converts in each form that `time.fromisoformat()` reads, alone,
+        /// after `T`, and after a date and a separator. A fraction keeps its
+        /// first six digits. An offset keeps its fields.
         #[test]
-        fn a_time_text_of_the_grammar_converts(
-            seconds in 0u32..86_400,
-            fraction in "(\\.[0-9]{1,9})?",
-            zone in "|[Zz]|[+-](0[0-9]|1[0-9]|2[0-3]):?[0-5][0-9]",
+        fn a_time_converts_in_each_form(
+            (hour, minute, second) in (0u32..24, 0u32..60, 0u32..60),
+            precision in 0usize..3,
+            extended in any::<bool>(),
+            fraction in "([.,][0-9]{1,9})?",
+            zone in concat!(
+                "|Z|[+-]([01][0-9]|2[0-3])(:[0-5][0-9](:[0-5][0-9]([.,][0-9]{1,9})?)?)?",
+                "|[+-]([01][0-9]|2[0-3])([0-5][0-9]([0-5][0-9]([.,][0-9]{1,9})?)?)?",
+            ),
+            separator in "[Tt \\t\\n\u{a0}\u{3000}]",
+            days in 1i32..=3_652_059,
         ) {
-            let time = NaiveTime::from_num_seconds_from_midnight_opt(seconds, 0).unwrap();
-            let text = format!("{}{fraction}{zone}", time.format("%H:%M:%S"));
-            let expected = time.overflowing_add_signed(fraction_delta(&fraction)).0;
-            match coerce(&text, TYPE_TIME) {
-                Ok(CoercedValue::Time(value)) => {
-                    prop_assert!(zone.is_empty(), "{}", text);
-                    prop_assert_eq!(value, expected);
+            let colon = if extended { ":" } else { "" };
+            let fields = [hour, minute, second];
+            let mut text = format!("{hour:02}");
+            for field in &fields[1..=precision] {
+                text.push_str(&format!("{colon}{field:02}"));
+            }
+            let fraction = if precision == 2 { fraction } else { String::new() };
+            text.push_str(&fraction);
+            text.push_str(&zone);
+            let kept = |index: usize| if index <= precision { fields[index] } else { 0 };
+            let time = NaiveTime::from_hms_micro_opt(kept(0), kept(1), kept(2), micros_of(&fraction)).unwrap();
+            let offset = offset_of(&zone);
+            let date = NaiveDate::from_num_days_from_ce_opt(days).unwrap();
+            let datetime_text = format!("{}{separator}{text}", date.format("%Y-%m-%d"));
+            let timed = [coerce(&text, TYPE_TIME), coerce(&format!("T{text}"), TYPE_TIME)];
+            let dated = coerce(&datetime_text, TYPE_DATETIME);
+            match offset {
+                // Python versions disagree on an offset of zero seconds with a fraction.
+                None if !zone.is_empty() => {
+                    prop_assert!(timed.iter().all(Result::is_err), "{}", text);
+                    prop_assert!(dated.is_err(), "{}", datetime_text);
                 }
-                Ok(CoercedValue::TimeTz(value, offset)) => {
-                    prop_assert_eq!(Some(offset.local_minus_utc()), zone_seconds(&zone), "{}", text);
-                    prop_assert_eq!(value, expected);
+                None => {
+                    for result in timed {
+                        prop_assert!(matches!(result, Ok(CoercedValue::Time(v)) if v == time), "{}", text);
+                    }
+                    prop_assert!(
+                        matches!(dated, Ok(CoercedValue::NaiveDateTime(v)) if v == date.and_time(time)),
+                        "{}", datetime_text
+                    );
                 }
-                other => prop_assert!(false, "{}: {:?}", text, other),
+                Some(offset) => {
+                    for result in timed {
+                        prop_assert!(
+                            matches!(result, Ok(CoercedValue::TimeTz(v, o)) if v == time && o == offset),
+                            "{}", text
+                        );
+                    }
+                    prop_assert!(
+                        matches!(dated, Ok(CoercedValue::DateTime(v, o)) if v == date.and_time(time) && o == offset),
+                        "{}", datetime_text
+                    );
+                }
             }
         }
 
-        /// No field of another width, no sign, no whitespace and no other
-        /// separator converts (F2).
+        /// No field of another width, no sign before a year, no whitespace and
+        /// no other separator converts (F2).
         #[test]
         fn an_accepted_text_is_of_the_grammar(
             value in concat!(
-                "[ \\t+-]?[0-9]{1,5}-[0-9]{1,3}-[0-9]{1,3}",
-                "([Tt _]?[0-9]{1,3}:[0-9]{1,3}(:[0-9]{1,3})?([.,][0-9]{0,8})?([Zz]|[+-][0-9]{1,3}:?[0-9]{0,3})?)?[ \\t]?",
-                "|[ \\t+T-]?[0-9]{1,3}:[0-9]{1,3}(:[0-9]{1,3})?([.,][0-9]{0,8})?([Zz]|[+-][0-9]{1,3}:?[0-9]{0,3})?[ \\t]?",
+                "[ \\t+-]?[0-9]{1,5}-?W?[0-9]{0,3}-?[0-9]{0,3}",
+                "([Tt _x\\t\u{3000}]?[0-9]{1,3}:?[0-9]{0,3}(:?[0-9]{0,3})?([.,][0-9]{0,8})?[ x]?([Zz]|[+-][0-9]{1,3}:?[0-9]{0,3}(:?[0-9]{0,2}([.,][0-9]{0,3})?)?)?)?[ \\t]?",
+                "|[ \\t+Tt-]?[0-9]{1,3}:?[0-9]{0,3}(:?[0-9]{0,3})?([.,][0-9]{0,8})?[ x]?([Zz]|[+-][0-9]{1,3}:?[0-9]{0,3})?[ \\t]?",
                 "|[ \\t+-]?[0-9_]{1,6}([.,][0-9]{0,3})?([eE][+-]?[0-9]{0,3})?[ \\t]?",
                 "|.{0,24}",
             ),
         ) {
             let date = format!("^{DATE_GRAMMAR}$");
-            let clock = format!("^{CLOCK_GRAMMAR}$");
-            let datetime = format!("^(?:{DATE_GRAMMAR}[Tt ]{CLOCK_GRAMMAR}|{NUMBER_GRAMMAR})$");
-            let number = format!("^(?:{NUMBER_GRAMMAR})$");
+            let time = format!("^T?{CLOCK_GRAMMAR}$");
+            let datetime = format!("^{DATE_GRAMMAR}([Tt\\s]{CLOCK_GRAMMAR})?$");
             for (type_hint, grammar) in [
                 (TYPE_DATE, date),
-                (TYPE_TIME, clock),
+                (TYPE_TIME, time),
                 (TYPE_DATETIME, datetime),
-                (TYPE_INT, number.clone()),
-                (TYPE_FLOAT, number),
+                (TYPE_INT, format!("^{INT_GRAMMAR}$")),
+                (TYPE_FLOAT, format!("^{FLOAT_GRAMMAR}$")),
             ] {
                 if coerce(&value, type_hint).is_ok() {
                     let grammar = regex::Regex::new(&grammar).unwrap();
@@ -981,34 +1024,46 @@ mod tests {
         }
     }
 
-    /// The grammar of msgspec's date, clock and number texts, as regexes.
-    const DATE_GRAMMAR: &str = "[0-9]{4}-[0-9]{2}-[0-9]{2}";
-    const CLOCK_GRAMMAR: &str =
-        r"[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?([Zz]|[+-][0-9]{2}:?[0-9]{2})?";
-    const NUMBER_GRAMMAR: &str =
-        r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?|-?(?i:nan|inf|infinity)";
+    /// The grammar of the texts that Bolt reads, as regexes.
+    const DATE_GRAMMAR: &str = "[0-9]{4}(-[0-9]{2}-[0-9]{2}|[0-9]{4}|-?W[0-9]{2}|-W[0-9]{2}-[0-9]|W[0-9]{3})";
+    const CLOCK_GRAMMAR: &str = concat!(
+        "[0-9]{2}(:[0-9]{2}(:[0-9]{2}([.,][0-9]+)?)?|[0-9]{2}([0-9]{2}([.,][0-9]+)?)?)?",
+        "(Z|[+-][0-9]{2}(:[0-9]{2}(:[0-9]{2}([.,][0-9]+)?)?|[0-9]{2}([0-9]{2}([.,][0-9]+)?)?)?)?",
+    );
+    const INT_GRAMMAR: &str = "[+-]?[0-9]+";
+    const FLOAT_GRAMMAR: &str =
+        r"[+-]?(([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?|(?i:inf|infinity|nan))";
 
-    /// The time of a fraction text such as ".1234565": its first six digits,
-    /// plus one microsecond when the seventh digit is 5 or more.
-    fn fraction_delta(fraction: &str) -> TimeDelta {
-        let digits = fraction.trim_start_matches('.');
+    /// The microseconds of a fraction text such as ".1234567": its first six digits.
+    fn micros_of(fraction: &str) -> u32 {
+        let digits = fraction.get(1..).unwrap_or("");
         let kept = &digits[..digits.len().min(6)];
-        let micro: i64 = format!("{kept:0<6}").parse().unwrap();
-        let round_up = digits.len() > 6 && digits.as_bytes()[6] >= b'5';
-        TimeDelta::microseconds(micro + i64::from(round_up))
+        format!("{kept:0<6}").parse().unwrap()
     }
 
-    /// The UTC offset in seconds of a zone text such as "Z", "+05:30" or "-0530".
-    fn zone_seconds(zone: &str) -> Option<i32> {
-        let digits: String = zone.chars().filter(char::is_ascii_digit).collect();
-        match zone.as_bytes().first()? {
-            b'Z' | b'z' => Some(0),
-            sign => {
-                let seconds = digits[..2].parse::<i32>().unwrap() * 3600
-                    + digits[2..].parse::<i32>().unwrap() * 60;
-                Some(if *sign == b'-' { -seconds } else { seconds })
-            }
+    /// The offset of a zone text such as "Z", "+05:30", "-0530" or "+05:30:15.5".
+    /// None for no zone, and for a zone of zero seconds with a fraction.
+    fn offset_of(zone: &str) -> Option<UtcOffset> {
+        let sign = match zone.as_bytes().first()? {
+            b'Z' => return Some(UtcOffset::UTC),
+            b'-' => -1,
+            _ => 1,
+        };
+        let (fields, fraction) = match zone[1..].find(['.', ',']) {
+            Some(at) => (&zone[1..at + 1], &zone[at + 2..]),
+            None => (&zone[1..], ""),
+        };
+        let digits: String = fields.chars().filter(char::is_ascii_digit).collect();
+        let field = |at: usize| digits.get(at..at + 2).map_or(0, |d| d.parse::<i32>().unwrap());
+        let seconds = field(0) * 3600 + field(2) * 60 + field(4);
+        let micros = micros_of(&format!(".{fraction}")) as i32;
+        if seconds == 0 && micros != 0 {
+            return None;
         }
+        Some(UtcOffset {
+            seconds: sign * seconds,
+            micros: sign * micros,
+        })
     }
 
     #[test]
@@ -1037,11 +1092,18 @@ mod tests {
 
     #[test]
     fn python_year_range_is_enforced() {
-        for value in ["0000-01-01", "-0001-01-01", "+10000-01-01", "10000-01-01"] {
+        for value in [
+            "0000-01-01",
+            "-0001-01-01",
+            "+10000-01-01",
+            "10000-01-01",
+            "0000-W01-1",
+            "9999-W52-6",
+        ] {
             let error = coerce_param(value, TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                format!("Invalid date '{value}': expected format YYYY-MM-DD")
+                format!("Invalid date '{value}': expected ISO 8601 format (e.g., 2024-01-15)")
             );
         }
         for value in [
@@ -1051,15 +1113,17 @@ mod tests {
             "10000-01-01T00:00:00",
         ] {
             let error = coerce_param(value, TYPE_DATETIME, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("expected format YYYY-MM-DDTHH:MM:SS"),
-                "{value}: {error}"
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Invalid datetime '{value}': expected ISO 8601 format (e.g., 2024-01-15T10:30:00Z)"
+                )
             );
         }
         assert!(coerce_param("0001-01-01", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
+        assert!(coerce_param("0001-W01-1", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
         assert!(coerce_param("9999-12-31", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
+        assert!(coerce_param("9999-W52-5", TYPE_DATE, DEFAULT_MAX_PARAM_LENGTH).is_ok());
     }
 
     #[test]
@@ -1073,7 +1137,7 @@ mod tests {
         ] {
             let error = coerce_param(value, type_hint, DEFAULT_MAX_PARAM_LENGTH).unwrap_err();
             assert!(
-                error.to_string().contains("expected format"),
+                error.to_string().contains("expected ISO 8601 format"),
                 "{value}: {error}"
             );
         }
@@ -1193,7 +1257,7 @@ mod tests {
                 TYPE_DATETIME,
                 DEFAULT_MAX_PARAM_LENGTH
             ),
-            Ok(CoercedValue::DateTime(_))
+            Ok(CoercedValue::DateTime(_, UtcOffset::UTC))
         ));
 
         // ISO 8601 with timezone offset
@@ -1203,7 +1267,7 @@ mod tests {
                 TYPE_DATETIME,
                 DEFAULT_MAX_PARAM_LENGTH
             ),
-            Ok(CoercedValue::DateTime(_))
+            Ok(CoercedValue::DateTime(_, UtcOffset::UTC))
         ));
 
         // Naive datetime
@@ -1241,6 +1305,27 @@ mod tests {
         }))
     }
 
+    /// Check `repr()` of the Python value of each text, as Python 3.12, 3.13
+    /// and 3.14 give it for `fromisoformat()`, `int()` or `float()`.
+    fn assert_python_values(type_hint: u8, cases: &[(&str, &str)]) {
+        for (value, expected) in cases {
+            let repr = python_repr(value, type_hint)
+                .unwrap_or_else(|| panic!("{value:?} was refused: {:?}", coerce(value, type_hint)))
+                .0;
+            assert_eq!(repr, *expected, "{value:?}");
+        }
+    }
+
+    fn assert_refused(type_hint: u8, values: &[&str]) {
+        for value in values {
+            assert!(
+                coerce(value, type_hint).is_err(),
+                "{value:?} converted to {:?}",
+                coerce(value, type_hint)
+            );
+        }
+    }
+
     #[test]
     fn f1_an_aware_datetime_keeps_its_utc_offset() {
         for (value, fields, offset) in [
@@ -1263,6 +1348,16 @@ mod tests {
                 "2024-01-15T10:30:00-23:59",
                 "2024, 1, 15, 10, 30",
                 "datetime.timedelta(days=-1, seconds=60)",
+            ),
+            (
+                "2024-01-15T10:30:00+05:30:15.5",
+                "2024, 1, 15, 10, 30",
+                "datetime.timedelta(seconds=19815, microseconds=500000)",
+            ),
+            (
+                "2024-01-15T10:30:00-05:30:15.5",
+                "2024, 1, 15, 10, 30",
+                "datetime.timedelta(days=-1, seconds=66584, microseconds=500000)",
             ),
             (
                 "9999-12-31T23:59:59-01:00",
@@ -1298,230 +1393,353 @@ mod tests {
             );
             assert_eq!(utcoffset, offset, "{value}");
         }
-        let (repr, utcoffset) = python_repr("2024-01-15T10:30:00", TYPE_DATETIME).unwrap();
-        assert_eq!(repr, "datetime.datetime(2024, 1, 15, 10, 30)");
-        assert_eq!(utcoffset, "None");
+        assert_python_values(
+            TYPE_DATETIME,
+            &[
+                (
+                    "2024-01-15T10:30:00Z",
+                    "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone.utc)",
+                ),
+                (
+                    "2024-01-15T10:30:00-00:00",
+                    "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone.utc)",
+                ),
+                ("2024-01-15T10:30:00", "datetime.datetime(2024, 1, 15, 10, 30)"),
+            ],
+        );
     }
 
     #[test]
     fn f2_text_that_is_not_iso_8601_is_refused() {
-        for (value, type_hint) in [
-            ("24-01-15", TYPE_DATE),
-            ("2024-1-5", TYPE_DATE),
-            ("+2024-01-15", TYPE_DATE),
-            (" 2024-01-15", TYPE_DATE),
-            ("2024-01-15 ", TYPE_DATE),
-            ("24-01-15", TYPE_DATETIME),
-            ("2024-1-5", TYPE_DATETIME),
-            ("+2024-01-15", TYPE_DATETIME),
-            ("2024-01-15", TYPE_DATETIME),
-            ("2024-01-1510:30:00", TYPE_DATETIME),
-            ("2024-10-31T9:34:5Z", TYPE_DATETIME),
-            ("2024-01-15T1:2:3", TYPE_DATETIME),
-            ("\t2024-01-15T10:30:00", TYPE_DATETIME),
-            ("2024-01-15T 10:30:00", TYPE_DATETIME),
-            ("2024-01-15T10:30:0", TYPE_DATETIME),
-            ("\t10:30:00", TYPE_TIME),
-            ("1:2:3", TYPE_TIME),
-            ("10:3", TYPE_TIME),
-            ("10:30:0", TYPE_TIME),
-            ("10:30", TYPE_TIME),
-            ("10:30:00 ", TYPE_TIME),
-        ] {
-            assert!(
-                coerce(value, type_hint).is_err(),
-                "{value:?} converted to {:?}",
-                coerce(value, type_hint)
-            );
-        }
+        assert_refused(
+            TYPE_DATE,
+            &[
+                "24-01-15",
+                "2024-1-5",
+                "+2024-01-15",
+                " 2024-01-15",
+                "2024-01-15 ",
+                "2024-1-15",
+                "2024-01-5",
+            ],
+        );
+        assert_refused(
+            TYPE_DATETIME,
+            &[
+                "24-01-15",
+                "2024-1-5",
+                "+2024-01-15",
+                "2024-01-1510:30:00",
+                "2024-10-31T9:34:5Z",
+                "2024-01-15T1:2:3",
+                "\t2024-01-15T10:30:00",
+                "2024-01-15T 10:30:00",
+                "2024-01-15T10:30:0",
+                " 2024-01-15",
+            ],
+        );
+        assert_refused(TYPE_TIME, &["\t10:30:00", "1:2:3", "10:3", "10:30:0", "10:30:00 "]);
+    }
+
+    /// Python reads these texts, but they are not ISO 8601. Bolt refuses them.
+    #[test]
+    fn python_texts_that_are_not_iso_8601_are_refused() {
+        assert_refused(
+            TYPE_DATETIME,
+            &[
+                // fromisoformat() takes any one character between the date and the time.
+                "2024-01-15x10:30:00",
+                "2024-01-15_10:30:00",
+                "2024-01-15-10:30:00",
+                "2024-01-15  10:30:00",
+                "2024-01-15\u{e9}10:30:00",
+                "2024-01-15010:30:00",
+                "2024-W03-10:30",
+                // Python skips the text between the time and the offset.
+                "2024-01-15T10:30:00 +05:30",
+                "2024-01-15T10:30:00.Z",
+                // Python reads a minute of 60 in an offset as one hour.
+                "2024-01-15T10:30:00+05:60",
+                "2024-01-15T10:30:00\0",
+                "2024-01-15\u{0}10:30:00",
+            ],
+        );
+        assert_refused(
+            TYPE_TIME,
+            &[
+                "10:30:00 +05:00",
+                "10:30:00x+05:00",
+                "10:30:+05:00",
+                "10:+05:00",
+                "10:30:00.1234567abc+05:00",
+                "10:30:00.123456 +05:00",
+                "10:30:00+00:99",
+                "10:30:00+05:30:60",
+                "10:30:00\0",
+                "10:30:00Z\0abc",
+                "10:30:00+05:00:00.123456\0junk",
+            ],
+        );
+        // date.fromisoformat() reads a text of ten characters with text after the date.
+        assert_refused(TYPE_DATE, &["20240115xx", "2024W031xx", "2024-01-15\0"]);
+    }
+
+    /// Python 3.12, 3.13 and 3.14 give different results for these texts.
+    #[test]
+    fn texts_that_python_versions_read_differently_are_refused() {
+        // Only Python 3.14 reads hour 24 as midnight of the next day.
+        assert_refused(TYPE_TIME, &["24:00", "24:00:00", "24:00:00Z"]);
+        assert_refused(TYPE_DATETIME, &["2024-01-15T24:00", "2024-12-31T24:00:00"]);
+        // Python 3.14 refuses a fraction of an hour or a minute; 3.12 reads it.
+        assert_refused(TYPE_TIME, &["10.5", "10:30.5", "1030.5", "10:30:00+05:30.5"]);
+        assert_refused(TYPE_DATETIME, &["2024-01-15T10:30.5", "2024-01-15T10.5"]);
+        // Python 3.13 keeps the fraction of an offset of zero seconds; 3.12 and 3.14 give UTC.
+        assert_refused(TYPE_TIME, &["10:30:00+00:00:00.5", "10:30:00-00:00:00.000001"]);
+        // Python 3.13 refuses a point with no digit before the offset; 3.12 and 3.14 skip it.
+        assert_refused(TYPE_TIME, &["10.+05:00", "10:30:00.+05:00"]);
     }
 
     #[test]
     fn f3_an_int_beyond_i64_converts_as_python_does() {
-        let longest = "9".repeat(4300);
-        for value in [
-            "9223372036854775808",
-            "-9223372036854775809",
-            "18446744073709551616",
-            "-340282366920938463463374607431768211457",
-            &longest,
+        let longest = "9".repeat(MAX_INT_DIGITS);
+        let negative_longest = format!("-{longest}");
+        let zeros = format!("{}1", "0".repeat(MAX_INT_DIGITS - 1));
+        for (value, expected) in [
+            ("9223372036854775808", "9223372036854775808"),
+            ("-9223372036854775809", "-9223372036854775809"),
+            ("+18446744073709551616", "18446744073709551616"),
+            (
+                "-340282366920938463463374607431768211457",
+                "-340282366920938463463374607431768211457",
+            ),
+            (longest.as_str(), longest.as_str()),
+            (negative_longest.as_str(), negative_longest.as_str()),
+            (zeros.as_str(), "1"),
         ] {
             let (repr, _) =
                 python_repr(value, TYPE_INT).unwrap_or_else(|| panic!("{value} was refused"));
-            assert_eq!(repr, value);
+            assert_eq!(repr, expected, "{value}");
         }
-        // msgspec, and so the list[int] path, refuses these forms.
-        let too_long = "9".repeat(4301);
-        let negative_too_long = format!("-{longest}");
-        for value in [
-            "+5",
-            "007",
-            "-007",
-            "1_000",
-            " 5",
-            "5 ",
-            "\u{0663}",
-            "\u{ff15}",
-            &too_long,
-            &negative_too_long,
-        ] {
-            assert!(coerce(value, TYPE_INT).is_err(), "{value:?}");
-        }
-        // msgspec reads a whole number in float form as an int.
-        for (value, expected) in [
-            ("5.0", "5"),
-            ("1e3", "1000"),
-            ("-0.0", "0"),
-            ("1e-999", "0"),
-            ("9007199254740992.0", "9007199254740992"),
-        ] {
-            assert_eq!(python_repr(value, TYPE_INT).unwrap().0, expected, "{value}");
-        }
-        for value in ["1.5", "9007199254740994.0", "1e999", "nan", "inf"] {
-            assert!(coerce(value, TYPE_INT).is_err(), "{value:?}");
-        }
+        // int() refuses more digits than sys.get_int_max_str_digits(), 4300 by default.
+        let too_long = "9".repeat(MAX_INT_DIGITS + 1);
+        let zeros_too_long = "0".repeat(MAX_INT_DIGITS + 1);
+        let error = coerce(&too_long, TYPE_INT).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!("Invalid integer '{too_long}': more than 4300 digits")
+        );
+        assert_refused(TYPE_INT, &[&zeros_too_long, &format!("-{too_long}")]);
+    }
+
+    /// `int()` reads a sign and leading zeros. It refuses a fraction, an
+    /// exponent and a Unix timestamp form. `_`, whitespace and digits that are
+    /// not ASCII stay refused, as on master.
+    #[test]
+    fn an_int_is_read_as_python_reads_it() {
+        assert_python_values(
+            TYPE_INT,
+            &[
+                ("+5", "5"),
+                ("007", "7"),
+                ("-007", "-7"),
+                ("-0", "0"),
+                ("+0", "0"),
+                ("0009223372036854775807", "9223372036854775807"),
+            ],
+        );
+        assert_refused(
+            TYPE_INT,
+            &[
+                "5.0", "1e3", "5.", "1.5", "nan", "inf", "", "+", "-", "+-5", "--5", "0x10", "0b1",
+                "1_000", " 5", "5 ", "\t5", "5\n", "\u{0663}", "\u{ff15}",
+            ],
+        );
+        let error = coerce("abc", TYPE_INT).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Invalid integer 'abc': expected a whole number such as 42 or -7"
+        );
     }
 
     #[test]
     fn f4_iso_8601_forms_that_python_accepts() {
-        for (value, expected) in [
-            (
-                "2024-01-15T10:30:00+0530",
-                "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800)))",
-            ),
-            (
-                "2024-01-15T10:30:00.123-0530",
-                "datetime.datetime(2024, 1, 15, 10, 30, 0, 123000, tzinfo=datetime.timezone(datetime.timedelta(days=-1, seconds=66600)))",
-            ),
-            (
-                "2024-01-15t10:30:00",
-                "datetime.datetime(2024, 1, 15, 10, 30)",
-            ),
-            (
+        assert_python_values(
+            TYPE_DATETIME,
+            &[
+                // An HTML <input type="datetime-local"> sends this form.
+                (
+                    "2024-01-15T10:30",
+                    "datetime.datetime(2024, 1, 15, 10, 30)",
+                ),
+                ("2024-01-15T10", "datetime.datetime(2024, 1, 15, 10, 0)"),
+                ("2024-01-15 10:30", "datetime.datetime(2024, 1, 15, 10, 30)"),
+                // chrono took any whitespace here, and Python takes any one character.
+                ("2024-01-15\t10:30", "datetime.datetime(2024, 1, 15, 10, 30)"),
+                (
+                    "2024-01-15\u{3000}10:30:00Z",
+                    "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone.utc)",
+                ),
+                (
+                    "2024-01-15t10:30:00",
+                    "datetime.datetime(2024, 1, 15, 10, 30)",
+                ),
+                (
+                    "2024-01-15T10:30:00+0530",
+                    "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800)))",
+                ),
+                (
+                    "2024-01-15T10:30:00.123-0530",
+                    "datetime.datetime(2024, 1, 15, 10, 30, 0, 123000, tzinfo=datetime.timezone(datetime.timedelta(days=-1, seconds=66600)))",
+                ),
+                (
+                    "2024-01-15T10:30:00+05",
+                    "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=18000)))",
+                ),
+                (
+                    "2024-01-15T10:30+05:30",
+                    "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800)))",
+                ),
+                (
+                    "2024-01-15T10Z",
+                    "datetime.datetime(2024, 1, 15, 10, 0, tzinfo=datetime.timezone.utc)",
+                ),
+                // Basic format, and week dates.
+                ("20240115T103000", "datetime.datetime(2024, 1, 15, 10, 30)"),
+                ("20240115T1030", "datetime.datetime(2024, 1, 15, 10, 30)"),
+                ("20240115", "datetime.datetime(2024, 1, 15, 0, 0)"),
+                ("20240115T10:30:00", "datetime.datetime(2024, 1, 15, 10, 30)"),
+                (
+                    "2024-W03-1T10:30:00",
+                    "datetime.datetime(2024, 1, 15, 10, 30)",
+                ),
+                ("2024W031T103000", "datetime.datetime(2024, 1, 15, 10, 30)"),
+                ("2024-W03", "datetime.datetime(2024, 1, 15, 0, 0)"),
+                ("2020-W53-7", "datetime.datetime(2021, 1, 3, 0, 0)"),
+                // A comma before the fraction. Python drops the digits after the sixth.
+                (
+                    "2024-01-15T10:30:00,5",
+                    "datetime.datetime(2024, 1, 15, 10, 30, 0, 500000)",
+                ),
+                (
+                    "2024-01-15T10:30:00.1234567",
+                    "datetime.datetime(2024, 1, 15, 10, 30, 0, 123456)",
+                ),
+                (
+                    "2024-01-15T10:30:00.9999995",
+                    "datetime.datetime(2024, 1, 15, 10, 30, 0, 999999)",
+                ),
+                // A date alone is midnight.
+                ("2024-01-15", "datetime.datetime(2024, 1, 15, 0, 0)"),
+            ],
+        );
+        assert_python_values(
+            TYPE_DATE,
+            &[
+                ("20240115", "datetime.date(2024, 1, 15)"),
+                ("2024-W03-1", "datetime.date(2024, 1, 15)"),
+                ("2024W031", "datetime.date(2024, 1, 15)"),
+                ("2024-W03", "datetime.date(2024, 1, 15)"),
+                ("2024W03", "datetime.date(2024, 1, 15)"),
+                ("0001-W01-1", "datetime.date(1, 1, 1)"),
+            ],
+        );
+        // Python refuses these forms too.
+        assert_refused(
+            TYPE_DATETIME,
+            &[
                 "2024-01-15T10:30:00z",
-                "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone.utc)",
-            ),
-            // msgspec rounds to the closest microsecond by the seventh digit.
-            (
-                "2024-01-15T10:30:00.1234565",
-                "datetime.datetime(2024, 1, 15, 10, 30, 0, 123457)",
-            ),
-            (
-                "2024-01-15T10:30:00.12345649",
-                "datetime.datetime(2024, 1, 15, 10, 30, 0, 123456)",
-            ),
-            (
-                "2024-02-29T23:59:59.9999999",
-                "datetime.datetime(2024, 3, 1, 0, 0)",
-            ),
-            // msgspec reads a number as a Unix timestamp in UTC.
-            (
+                "2024-015",
+                "2024015",
+                "2024-01-15T",
+                "2024-01-15T10:3",
+                "2024-01-15T10:30:00+24:00",
+                "2024-01-15T10:30:00+5:30",
+                "2024-01-15T10:30:00UTC",
                 "1700000000",
-                "datetime.datetime(2023, 11, 14, 22, 13, 20, tzinfo=datetime.timezone.utc)",
-            ),
-            (
                 "-1.5",
-                "datetime.datetime(1969, 12, 31, 23, 59, 58, 500000, tzinfo=datetime.timezone.utc)",
-            ),
-        ] {
-            assert_eq!(
-                python_repr(value, TYPE_DATETIME)
-                    .unwrap_or_else(|| panic!("{value} was refused"))
-                    .0,
-                expected,
-                "{value}"
-            );
-        }
-        // msgspec, and so the list[datetime] path, refuses these forms.
-        for value in [
-            "2024-01-15T10:30",
-            "2024-01-15T10",
-            "20240115T103000",
-            "2024-W03-1T10:30:00",
-            "2024-01-15T10:30:00,5",
-            "2024-01-15T10:30:00+05",
-            "2024-01-15T10:30:00+05:30:15",
-            "2024-01-15T10:30:00+24:00",
-            "2024-01-15T24:00:00",
-            "9999-12-31T23:59:59.9999995",
-            "253402300800",
-            "-62135596800.5",
-            "-16964e15",
-            "9.3e18",
-            "1e300",
-            "-1e300",
-            "nan",
-            "2024-01-15T10:30:00\0",
-        ] {
-            assert!(coerce(value, TYPE_DATETIME).is_err(), "{value:?}");
-        }
-        for value in [
-            "20240115",
-            "2024-W03-1",
-            "2024-015",
-            "0000-01-01",
-            "2023-02-29",
-        ] {
-            assert!(coerce(value, TYPE_DATE).is_err(), "{value:?}");
-        }
+                "２０２４-01-15T10:30:00",
+            ],
+        );
+        assert_refused(
+            TYPE_DATE,
+            &[
+                "2024-015", "0000-01-01", "2023-02-29", "2024-W53-1", "2024-W00-1", "2024-W01-0",
+                "2024-W01-8", "2024-W031", "2024W03-1", "2024-0115", "202401-15", "2024-01-15Z",
+            ],
+        );
     }
 
     #[test]
     fn f5_a_time_with_an_offset_converts() {
-        for (value, expected) in [
-            (
-                "10:30:00+05:00",
-                "datetime.time(10, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=18000)))",
-            ),
-            (
-                "10:30:00.123+0530",
-                "datetime.time(10, 30, 0, 123000, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800)))",
-            ),
-            (
-                "10:30:00Z",
-                "datetime.time(10, 30, tzinfo=datetime.timezone.utc)",
-            ),
-            (
-                "10:30:00-00:00",
-                "datetime.time(10, 30, tzinfo=datetime.timezone.utc)",
-            ),
-            ("10:30:00", "datetime.time(10, 30)"),
-            ("23:59:59.9999995", "datetime.time(0, 0)"),
-        ] {
-            assert_eq!(
-                python_repr(value, TYPE_TIME)
-                    .unwrap_or_else(|| panic!("{value} was refused"))
-                    .0,
-                expected,
-                "{value}"
-            );
-        }
-        for value in [
-            "10",
-            "1030",
-            "10:30:00,5",
-            "10:30:00+05",
-            "T10:30:00",
-            "24:00:00",
-        ] {
-            assert!(coerce(value, TYPE_TIME).is_err(), "{value:?}");
-        }
+        assert_python_values(
+            TYPE_TIME,
+            &[
+                (
+                    "10:30:00+05:00",
+                    "datetime.time(10, 30, tzinfo=datetime.timezone(datetime.timedelta(seconds=18000)))",
+                ),
+                (
+                    "10:30:00.123+0530",
+                    "datetime.time(10, 30, 0, 123000, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800)))",
+                ),
+                (
+                    "10:30:00Z",
+                    "datetime.time(10, 30, tzinfo=datetime.timezone.utc)",
+                ),
+                (
+                    "10:30:00-00:00",
+                    "datetime.time(10, 30, tzinfo=datetime.timezone.utc)",
+                ),
+                (
+                    "10+05:30",
+                    "datetime.time(10, 0, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800)))",
+                ),
+                (
+                    "10:30:00-23:59:59.999999",
+                    "datetime.time(10, 30, tzinfo=datetime.timezone(datetime.timedelta(days=-1, microseconds=1)))",
+                ),
+                ("10:30:00", "datetime.time(10, 30)"),
+                ("10:30", "datetime.time(10, 30)"),
+                ("10", "datetime.time(10, 0)"),
+                ("1030", "datetime.time(10, 30)"),
+                ("103000.5", "datetime.time(10, 30, 0, 500000)"),
+                ("T10:30:00", "datetime.time(10, 30)"),
+                ("10:30:00,5", "datetime.time(10, 30, 0, 500000)"),
+                ("23:59:59.9999995", "datetime.time(23, 59, 59, 999999)"),
+            ],
+        );
+        assert_refused(
+            TYPE_TIME,
+            &[
+                "10:30:00z",
+                "t10:30:00",
+                "10:30:00+24:00",
+                "10:3000",
+                "1030:00",
+                "10:30:00.",
+                "10:30:00+",
+                "10:30:00Z+05:00",
+                "10:30:00+05:3",
+                "10:30:00+0530:15",
+                "１０:30:00",
+            ],
+        );
     }
 
+    /// Rust reads the ASCII texts that `float()` reads, with the same value, as on master.
     #[test]
-    fn a_float_is_read_as_msgspec_reads_it() {
-        for value in [
-            "+1.5", ".5", "5.", "+inf", "+nan", "1e999", "-1e999", "1_000.5", " 1.5",
-        ] {
-            assert!(coerce(value, TYPE_FLOAT).is_err(), "{value:?}");
-        }
-        assert!(matches!(coerce("-0", TYPE_FLOAT), Ok(CoercedValue::Float(v)) if v.to_bits() == 0));
-        assert!(
-            matches!(coerce("-0.0", TYPE_FLOAT), Ok(CoercedValue::Float(v)) if v.to_bits() == (-0.0f64).to_bits())
-        );
+    fn a_float_is_read_as_python_reads_it() {
         for (value, expected) in [
             ("1.5", 1.5),
+            ("+1.5", 1.5),
+            (".5", 0.5),
+            ("5.", 5.0),
+            ("1e5", 100000.0),
+            ("1E+5", 100000.0),
             ("1e-999", 0.0),
+            ("1e999", f64::INFINITY),
+            ("-1e999", f64::NEG_INFINITY),
+            ("+inf", f64::INFINITY),
             ("Infinity", f64::INFINITY),
             ("-INF", f64::NEG_INFINITY),
             ("18446744073709551616", 18446744073709551616.0),
@@ -1531,7 +1749,53 @@ mod tests {
                 "{value}"
             );
         }
-        assert!(matches!(coerce("-nAn", TYPE_FLOAT), Ok(CoercedValue::Float(v)) if v.is_nan()));
+        assert!(
+            matches!(coerce("-0", TYPE_FLOAT), Ok(CoercedValue::Float(v)) if v.to_bits() == (-0.0f64).to_bits())
+        );
+        for value in ["nan", "-nAn", "+NaN"] {
+            assert!(matches!(coerce(value, TYPE_FLOAT), Ok(CoercedValue::Float(v)) if v.is_nan()));
+        }
+        assert_refused(
+            TYPE_FLOAT,
+            &[
+                "", ".", "e5", "1e", "1e+", "0x1p3", "1.5f", "infinit", "infinityy", "1_000.5",
+                " 1.5", "1.5 ", "1.5\n", "\u{0663}.5",
+            ],
+        );
+        let error = coerce("abc", TYPE_FLOAT).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Invalid float 'abc': expected a number such as 1.5, -2e3, inf or nan"
+        );
+    }
+
+    /// A `list[T]` parameter converts each text item with the parser of one `T`.
+    #[test]
+    fn parse_text_items_converts_each_text_and_names_the_first_refused_item() {
+        Python::initialize();
+        Python::attach(|py| {
+            let items = PyList::new(py, ["7", "+5", "9223372036854775808"]).unwrap();
+            let converted = parse_text_items(&items, TYPE_INT).unwrap();
+            assert_eq!(
+                converted.repr().unwrap().to_string(),
+                "[7, 5, 9223372036854775808]"
+            );
+
+            let mixed = PyList::new(py, [1i64.into_pyobject(py).unwrap().into_any()]).unwrap();
+            mixed.append("2024-01-15T10:30").unwrap();
+            let converted = parse_text_items(&mixed, TYPE_DATETIME).unwrap();
+            assert_eq!(
+                converted.repr().unwrap().to_string(),
+                "[1, datetime.datetime(2024, 1, 15, 10, 30)]"
+            );
+
+            let refused = PyList::new(py, ["1", "2", "5.0"]).unwrap();
+            let error = parse_text_items(&refused, TYPE_INT).unwrap_err();
+            assert_eq!(
+                error.value(py).getattr("args").unwrap().repr().unwrap().to_string(),
+                "(2, \"Invalid integer '5.0': expected a whole number such as 42 or -7\")"
+            );
+        });
     }
 
     #[test]

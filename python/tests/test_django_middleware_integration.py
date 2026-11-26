@@ -3569,11 +3569,11 @@ class TestTypedParamsKeepRawStringsForDjango:
             return {"count": count, "x_count": x_count}
 
         with TestClient(api) as client:
-            response = client.get("/typed", headers={"X-Count": "7.0", "Cookie": "n=5e0"})
+            response = client.get("/typed", headers={"X-Count": "0007", "Cookie": "n=0005"})
 
         assert response.status_code == 200, response.text
         assert response.json() == {"count": 5, "x_count": 7}
-        assert RawValuesRecorder.seen == {"cookie": "5e0", "header": "7.0"}
+        assert RawValuesRecorder.seen == {"cookie": "0005", "header": "0007"}
 
 
 class QueryRecorder(MiddlewareMixin):

@@ -193,9 +193,10 @@ class TestIntegerBoundaries:
     """
     Test integer type coercion at and beyond the i64 boundaries.
 
-    Rust gives an i64 value as an i64, and a longer integer of at most 4300
-    characters as a Python int, as msgspec and the list[int] path do.
-    Validated by: src/type_coercion.rs parse_int()
+    Rust reads an int as Python's int() reads ASCII text. A value in the i64
+    range is an i64; a longer value is a Python int, up to the digit limit
+    of int() (4300 digits by default).
+    Validated by: crates/bolt-core/src/type_coercion.rs parse_int()
     """
 
     def test_int_max_i64_succeeds(self, client):
@@ -216,11 +217,11 @@ class TestIntegerBoundaries:
 
     @pytest.mark.parametrize(
         "value",
-        ["9223372036854775808", "-9223372036854775809", "1" * 4300],
-        ids=["i64-max-plus-one", "i64-min-minus-one", "4300-digits"],
+        ["9223372036854775808", "-9223372036854775809", "1" * 4300, "-" + "9" * 4300],
+        ids=["i64-max-plus-one", "i64-min-minus-one", "4300-digits", "4300-digits-negative"],
     )
     def test_f3_an_int_beyond_i64_converts_as_python_does(self, client, value):
-        """An int beyond i64 is a Python int, as int() and the list[int] path give."""
+        """An int beyond i64 is a Python int, as int() gives."""
         response = client.get("/query/int", params={"value": value})
         assert response.status_code == 200, response.text
         assert response.json() == {"value": int(value), "type": "int"}
@@ -228,35 +229,50 @@ class TestIntegerBoundaries:
     @pytest.mark.parametrize(
         ("path", "detail"),
         [
-            ("/int/3.14", "Path parameter 'value': Invalid integer '3.14': not a whole number from -2**53 to 2**53"),
+            # No implicit truncation and no scientific notation.
+            (
+                "/int/3.14",
+                "Path parameter 'value': Invalid integer '3.14': expected a whole number such as 42 or -7",
+            ),
+            (
+                "/int/1e10",
+                "Path parameter 'value': Invalid integer '1e10': expected a whole number such as 42 or -7",
+            ),
             (
                 "/query/int?value=",
                 "Query parameter 'value': Invalid integer '': expected a whole number such as 42 or -7",
             ),
-            # msgspec and the list[int] path refuse a longer integer.
+            # int() refuses more digits than sys.get_int_max_str_digits().
             (
                 "/query/int?value=" + "1" * 4301,
-                f"Query parameter 'value': Invalid integer '{'1' * 4301}': more than 4300 characters",
+                f"Query parameter 'value': Invalid integer '{'1' * 4301}': more than 4300 digits",
             ),
         ],
-        ids=["fraction", "empty", "4301-digits"],
+        ids=["float", "scientific", "empty", "4301-digits"],
     )
     def test_invalid_int_rejected(self, client, path, detail):
-        """Each value that is not an int gets 422 with the reason."""
+        """Each value that int() refuses gets 422 with the reason."""
         response = client.get(path)
         assert response.status_code == 422
         assert response.json() == {"detail": detail}
 
-    @pytest.mark.parametrize("value", ["+123", "0123", "1_000", " 1", "1 ", "\u0661"])
-    def test_int_forms_that_the_list_path_refuses_are_rejected(self, client, value):
-        """int() accepts these forms, but msgspec and so list[int] refuse them."""
+    def test_int_with_plus_sign_accepted(self, client):
+        """An explicit plus sign is a valid integer, as for Python's int()."""
+        # A bare `+` in a query is a space, so the sign is encoded.
+        response = client.get("/query/int?value=%2B123")
+        assert response.status_code == 200
+        assert response.json() == {"value": 123, "type": "int"}
+
+    def test_int_with_leading_zeros_accepted(self, client):
+        """Leading zeros are valid, as for Python's int()."""
+        assert client.get("/query/int", params={"value": "007"}).json() == {"value": 7, "type": "int"}
+        assert client.get("/query/int", params={"value": "-007"}).json() == {"value": -7, "type": "int"}
+
+    @pytest.mark.parametrize("value", ["1_000", " 1", "1 ", "\u0661"])
+    def test_int_forms_that_master_refused_stay_refused(self, client, value):
+        """int() accepts `_`, whitespace and other digits than ASCII. Bolt keeps refusing them."""
         response = client.get("/query/int", params={"value": value})
         assert response.status_code == 422, response.text
-
-    def test_a_whole_number_in_float_form_is_an_int(self, client):
-        """msgspec and so list[int] read 1e10 and 5.0 as int up to 2**53."""
-        assert client.get("/int/1e10").json() == {"value": 10000000000, "type": "int"}
-        assert client.get("/int/5.0").json() == {"value": 5, "type": "int"}
 
 
 # =============================================================================
@@ -466,12 +482,11 @@ class TestDateTimeValidation:
     Note: This tests datetime validation at the Python layer (via msgspec validation)
     or Rust layer (for typed path params). Query params with str type pass through.
 
-    src/type_coercion.rs parse_datetime() accepts the forms that msgspec accepts:
-    - RFC 3339 with an offset (2024-01-15T10:30:00+05:30), kept as it is
-    - RFC 3339 with Z suffix (2024-01-15T10:30:00Z)
+    Supported formats in src/type_coercion.rs parse_datetime():
+    - RFC 3339 with timezone (2024-01-15T10:30:00+00:00)
+    - ISO 8601 with Z suffix (2024-01-15T10:30:00Z)
     - Naive datetime (2024-01-15T10:30:00)
-    - A Unix timestamp (1700000000), in UTC
-    A date alone (2024-01-15) gets 422.
+    - Date only (2024-01-15) - converted to midnight
     """
 
     def test_datetime_rfc3339_format_passthrough(self, client):

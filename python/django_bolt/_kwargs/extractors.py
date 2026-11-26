@@ -19,6 +19,7 @@ from django.core.exceptions import FieldDoesNotExist
 from django.db.models import ForeignObjectRel, Model, OneToOneRel, QuerySet, prefetch_related_objects
 from django.db.models.query import ModelIterable
 
+from .._core import parse_text_items
 from .._field_marker import _FieldMarker
 from .._serializer_before import RAW_VALIDATED, before_plan, run_before_validators
 from .._serializer_input import ignore_read_only_input, read_only_input_extractor
@@ -30,6 +31,7 @@ from ..typing import (
     is_msgspec_struct,
     is_optional,
     is_upload_file_type,
+    resolve_type_alias,
     unwrap_optional,
 )
 
@@ -69,6 +71,66 @@ _SINGLE_VALUE_SOURCES = ("path", "header", "cookie")
 # This map gives the `loc` source of a struct parameter error for each source name in messages.
 # A scalar parameter from the same source has the same `loc` source.
 _STRUCT_ERROR_SOURCES = {"query parameter": "query", "cookie": "cookie", "form field": "body"}
+# The Rust type hints of the item types that Rust reads from text: the TYPE_*
+# values of middleware/compiler.py. The middleware package imports this module,
+# so the values are copied. A list of such items converts with the parser of a
+# single value, so both accept the same text.
+_TEXT_ITEM_HINTS = {int: 1, float: 2, datetime.datetime: 6, datetime.date: 8, datetime.time: 9}
+
+
+def _text_item_hint(field_type: Any) -> int | None:
+    """Give the Rust type hint of the items of a sequence type, or None.
+
+    The type is ``list[T]``, ``set[T]``, ``frozenset[T]``, ``tuple[T]`` or
+    ``tuple[T, ...]``, also behind ``Optional`` or ``Annotated``. ``T`` is
+    ``int``, ``float``, ``date``, ``time`` or ``datetime``, also behind
+    ``Annotated``. msgspec then gets the converted items and checks the
+    ``msgspec.Meta`` constraints.
+    """
+    inner = unwrap_optional(resolve_type_alias(field_type))
+    if get_origin(inner) is Annotated:
+        inner = unwrap_optional(resolve_type_alias(get_args(inner)[0]))
+    if get_origin(inner) not in _SEQUENCE_ORIGINS:
+        return None
+    items = [arg for arg in get_args(inner) if arg is not Ellipsis]
+    if len(items) != 1:
+        return None
+    item = resolve_type_alias(items[0])
+    if get_origin(item) is Annotated:
+        item = resolve_type_alias(get_args(item)[0])
+    return _TEXT_ITEM_HINTS.get(item)
+
+
+def _item_error(loc: str, key: str, error: ValueError, value: list[Any]) -> dict[str, Any]:
+    """Give the error of the item that ``parse_text_items`` refused, as msgspec names an item."""
+    index, message = error.args
+    return {"type": "validation_error", "loc": (loc, key), "msg": f"{message} - at `$[{index}]`", "input": value}
+
+
+def _parse_text_item_fields(
+    data: dict[str, Any], fields: tuple[tuple[str, str, int], ...], loc: str
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Convert the text items of the sequence fields of a parameter model.
+
+    ``fields`` holds the key in ``data``, the name in ``loc`` and the type hint
+    of each field. Give the values with the converted items, and the error of
+    each field with a refused item, by its key.
+    """
+    converted: dict[str, Any] | None = None
+    errors: dict[str, dict[str, Any]] = {}
+    for key, name, hint in fields:
+        value = data.get(key)
+        if type(value) is not list:
+            continue
+        try:
+            items = parse_text_items(value, hint)
+        except ValueError as error:
+            errors[key] = _item_error(loc, name, error, value)
+            continue
+        if converted is None:
+            converted = dict(data)
+        converted[key] = items
+    return (data if converted is None else converted), errors
 
 
 def _holds_one_item(annotation: Any) -> bool:
@@ -147,6 +209,7 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     wrap = is_sequence and one_item
     # Rust gives each value of a repeated form key as a list.
     take_last = loc == "body" and not is_sequence
+    item_hint = _text_item_hint(target)
     if wrap and loc in _SINGLE_VALUE_SOURCES and not _holds_one_item(target):
         raise TypeError(
             f"The {loc} parameter {key!r} gets one value, but its type {target!r} cannot hold one item. "
@@ -161,8 +224,14 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
             value = [value]
         elif take_last and type(value) is list:
             value = value[-1]
+        items = value
+        if item_hint is not None and type(value) is list:
+            try:
+                items = parse_text_items(value, item_hint)
+            except ValueError as error:
+                raise RequestValidationError(errors=[_item_error(loc, key, error, value)]) from None
         try:
-            return msgspec.convert((value,), holder, strict=False).value
+            return msgspec.convert((items,), holder, strict=False).value
         except msgspec.ValidationError as error:
             # Remove the position of the value in the holder from the error path.
             msg = str(error).replace(" - at `$[0]`", "").replace("`$[0]", "`$")
@@ -545,6 +614,7 @@ def _collect_struct_errors(
     source: str,
     has_files: bool = False,
     inputs: dict[str, Any] | None = None,
+    refused: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Collect validation errors for every field of a msgspec struct from the provided input mapping.
@@ -558,6 +628,7 @@ def _collect_struct_errors(
         source (str): The source in `loc` ("query", "cookie" or "body").
         has_files (bool): Enable upload-file decoding hooks when True.
         inputs (dict[str, Any] | None): The values as the request gave them, for the "input" of an error. `data` holds the UTF-8 bytes of a bytes field. The default is `data`.
+        refused (dict[str, dict[str, Any]] | None): The error of each field with an item that `parse_text_items` refused, by encoded name.
 
     Returns:
         list[dict[str, Any]]: A list of error dictionaries. Each dictionary contains:
@@ -572,7 +643,9 @@ def _collect_struct_errors(
     errors: list[dict[str, Any]] = []
     for field in msgspec.structs.fields(struct_type):
         encoded_name = getattr(field, "encode_name", field.name)
-        if encoded_name in data:
+        if refused and encoded_name in refused:
+            errors.append(refused[encoded_name])
+        elif encoded_name in data:
             try:
                 msgspec.convert(data[encoded_name], type=field.type, strict=False, dec_hook=dec_hook)
             except (msgspec.ValidationError, NotImplementedError) as e:
@@ -717,6 +790,12 @@ def _create_param_struct_extractor(
     _seq_field_names = _collect_sequence_field_names(struct_type)
     # Empty for a model with no bytes field, so such a model has no cost for each request.
     _bytes_fields = _bytes_field_plan(struct_type)
+    # The sequence fields whose text items Rust converts. Empty for most models.
+    _item_fields = tuple(
+        (f.encode_name, f.encode_name, hint)
+        for f in msgspec.structs.fields(struct_type)
+        if (hint := _text_item_hint(f.type)) is not None
+    )
     # A struct that forbids unknown fields must not get the keys of other parameters.
     # For any other struct, the set is empty and the request path does not change.
     forbids_unknown = struct_type.__struct_config__.forbid_unknown_fields
@@ -757,6 +836,14 @@ def _create_param_struct_extractor(
                     merged[name] = [value]
 
             values = _encode_bytes_fields(merged, _bytes_fields) if _bytes_fields else merged
+            if _item_fields:
+                values, refused = _parse_text_item_fields(values, _item_fields, source)
+                if refused:
+                    raise RequestValidationError(
+                        errors=_collect_struct_errors(
+                            struct_type, values, param_type, source, has_files=True, inputs=merged, refused=refused
+                        )
+                    )
             try:
                 result = msgspec.convert(values, struct_type, strict=False, dec_hook=_upload_file_dec_hook)
             except msgspec.ValidationError as e:
@@ -817,6 +904,14 @@ def _create_param_struct_extractor(
                         break
 
             values = _encode_bytes_fields(param_map, _bytes_fields) if _bytes_fields else param_map
+            if _item_fields:
+                values, refused = _parse_text_item_fields(values, _item_fields, source)
+                if refused:
+                    raise RequestValidationError(
+                        errors=_collect_struct_errors(
+                            struct_type, values, param_type, source, inputs=param_map, refused=refused
+                        )
+                    )
             try:
                 return msgspec.convert(values, struct_type, strict=False)
             except msgspec.ValidationError as e:
@@ -837,6 +932,7 @@ def _collect_header_struct_errors(
     data: dict[str, Any],
     inputs: dict[str, Any],
     strict: bool = True,
+    refused: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return one error for each missing or invalid field of a header struct.
 
@@ -845,11 +941,15 @@ def _collect_header_struct_errors(
     with the UTF-8 bytes of a bytes field. ``inputs`` holds the values as the
     request gave them, for the ``input`` of an error.
     ``strict`` is the conversion mode of the extractor.
+    ``refused`` holds the error of each field with an item that
+    ``parse_text_items`` refused, by encoded name.
     The ``loc`` of each error is ``("header", header name)``, as for a scalar header.
     """
     errors: list[dict[str, Any]] = []
     for header_name, encoded_name, field_type, required in header_fields:
-        if encoded_name in data:
+        if refused and encoded_name in refused:
+            errors.append(refused[encoded_name])
+        elif encoded_name in data:
             try:
                 msgspec.convert(data[encoded_name], type=field_type, strict=strict)
             except msgspec.ValidationError as e:
@@ -888,7 +988,9 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     A header gives one value. A sequence field (``list``, ``set``, ``frozenset``
     or ``tuple``) gets a sequence of that one item, as a sequence header
     parameter does. Rust does not convert the item, so a struct with a sequence
-    field converts with ``strict=False``, as the cookie struct does.
+    field converts with ``strict=False``, as the cookie struct does. An
+    ``int``, ``float``, ``date``, ``time`` or ``datetime`` item first converts
+    with ``parse_text_items``, as a single header value does.
 
     Args:
         struct_type: The msgspec.Struct or Serializer class
@@ -910,6 +1012,12 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     error_fields = tuple(header_fields)
     bytes_fields = _bytes_field_plan(struct_type)
     strict = not any(wrap for _, _, wrap in header_to_encoded)
+    # The sequence fields whose text item Rust converts. Empty for most models.
+    item_fields = tuple(
+        (encoded_name, header_name, hint)
+        for header_name, encoded_name, field_type, _ in header_fields
+        if (hint := _text_item_hint(field_type)) is not None
+    )
 
     def extract(headers_map: dict[str, str]) -> Any:
         converted = {}
@@ -919,6 +1027,12 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
                 converted[encoded_name] = [value] if wrap else value
 
         values = _encode_bytes_fields(converted, bytes_fields) if bytes_fields else converted
+        if item_fields:
+            values, refused = _parse_text_item_fields(values, item_fields, "header")
+            if refused:
+                raise RequestValidationError(
+                    errors=_collect_header_struct_errors(error_fields, values, converted, strict, refused)
+                )
         try:
             return msgspec.convert(values, struct_type, strict=strict)
         except msgspec.ValidationError as e:

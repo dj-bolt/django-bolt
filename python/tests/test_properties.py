@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import decimal
 import itertools
+import re
 import sys
 import time
 import types
@@ -23,7 +24,6 @@ from urllib.parse import quote
 
 import httpx
 import jwt
-import msgspec
 import pytest
 from django.http import HttpResponse, QueryDict
 from django.http.cookie import parse_cookie
@@ -114,7 +114,8 @@ def _describe(value):
     if isinstance(value, datetime.datetime | datetime.time):
         offset = value.utcoffset()
         seconds = None if offset is None else offset.total_seconds()
-        return [type(value).__name__, value.replace(tzinfo=None).isoformat(), seconds]
+        utc = value.tzinfo is datetime.UTC
+        return [type(value).__name__, value.replace(tzinfo=None).isoformat(), seconds, utc]
     if isinstance(value, datetime.date):
         return ["date", value.isoformat()]
     return [type(value).__name__, repr(value)]
@@ -319,12 +320,33 @@ def test_an_aware_datetime_query_param_keeps_its_offset(client, value, offset):
     assert returned.utcoffset() == aware.utcoffset()
 
 
-# Texts for the parameter types that Rust converts: valid forms of msgspec's
-# grammar, forms of fromisoformat and int(), and mutations of each one.
-_MUTATION_CHARS = [" ", "\t", "+", "-", "0", "9", ":", ".", ",", "e", "T", "t", "Z", "z", "W", "_", "é", "\u0663"]
+# Texts for the parameter types that Rust converts: the forms that Python reads,
+# fields out of range, and mutations of each one.
+_MUTATION_CHARS = [
+    " ",
+    "\t",
+    "\0",
+    "+",
+    "-",
+    "0",
+    "9",
+    ":",
+    ".",
+    ",",
+    "e",
+    "T",
+    "t",
+    "x",
+    "Z",
+    "z",
+    "W",
+    "_",
+    "é",
+    "٣",
+]
 
 
-def _digit_text(min_size, max_size):
+def _digits(min_size, max_size):
     return st.text("0123456789", min_size=min_size, max_size=max_size)
 
 
@@ -345,119 +367,171 @@ def _mutated(draw, texts):
     return text
 
 
+# Mostly in range. Hour 24 and minute or second 60 also occur.
+_two_digit_fields = st.one_of(st.integers(min_value=0, max_value=59), st.sampled_from([23, 24, 60, 99]))
+
+
+@st.composite
+def _hms_texts(draw):
+    """HH, HH:MM, HH:MM:SS, HHMM or HHMMSS, with a fraction after SS, or after HH or MM."""
+    fields = [draw(_two_digit_fields) for _ in range(draw(st.integers(min_value=1, max_value=3)))]
+    separator = draw(st.sampled_from([":", ""]))
+    text = separator.join(f"{field:02}" for field in fields)
+    if draw(st.booleans()):
+        text += draw(st.sampled_from(".,")) + draw(_digits(0, 9))
+    return text
+
+
 @st.composite
 def _clock_texts(draw):
-    """HH:MM:SS with a fraction of 0 to 9 digits and an offset in each style."""
-    value = draw(st.times())
-    text = value.strftime("%H:%M:%S")
-    digits = draw(st.integers(min_value=0, max_value=9))
-    if digits:
-        text += "." + (f"{value.microsecond:06}" + draw(_digit_text(3, 3)))[:digits]
-    zone = draw(st.sampled_from(["", "Z", "z", "+HH:MM", "-HH:MM", "+HHMM", "-HHMM"]))
-    if "HH" in zone:
-        minutes = draw(st.integers(min_value=0, max_value=24 * 60 - 1))
-        zone = zone.replace("HH", f"{minutes // 60:02}").replace("MM", f"{minutes % 60:02}")
-    return text + zone
+    zone = draw(st.sampled_from(["", "", "Z", "+", "-"]))
+    if zone in "+-":
+        zone += draw(_hms_texts())
+    return draw(_hms_texts()) + zone
+
+
+@st.composite
+def _date_texts(draw):
+    day = draw(st.dates())
+    year, week, weekday = day.isocalendar()
+    return draw(
+        st.sampled_from(
+            [
+                day.isoformat(),
+                f"{day.year:04}{day.month:02}{day.day:02}",
+                f"{year:04}-W{week:02}-{weekday}",
+                f"{year:04}W{week:02}{weekday}",
+                f"{year:04}-W{week:02}",
+                f"{year:04}W{week:02}",
+                f"{draw(_digits(4, 4))}-{draw(_digits(2, 2))}-{draw(_digits(2, 2))}",
+                f"{draw(_digits(4, 4))}-W{draw(_digits(2, 2))}-{draw(_digits(1, 1))}",
+            ]
+        )
+    )
 
 
 @st.composite
 def _datetime_texts(draw):
-    day = draw(st.dates())
-    separator = draw(st.sampled_from("Tt "))
-    return f"{day.year:04}-{day.month:02}-{day.day:02}{separator}{draw(_clock_texts())}"
+    date = draw(_date_texts())
+    if draw(st.integers(min_value=0, max_value=4)) == 0:
+        return date
+    return date + draw(st.sampled_from(["T", "t", " ", "x", "\t", "\u3000", "\x1f", "  "])) + draw(_clock_texts())
 
 
-# Each field can be out of range: month 13, hour 24, second 60, offset hour 24.
-_near_dates = st.from_regex(r"\d{4}-\d{2}-\d{2}", fullmatch=True)
-_near_clocks = st.from_regex(r"\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:?\d{2})?", fullmatch=True)
-_python_forms = st.sampled_from(
-    [
-        "2024-01-15T10:30",
-        "2024-01-15T10",
-        "20240115T103000",
-        "2024-W03-1",
-        "2024-01-15T10:30:00,5",
-        "2024-01-15T10:30:00+05",
-        "2024-01-15T10:30:00+05:30:15",
-        "2024-01-15",
-        "10:30",
-        "1030",
-        "24:00:00",
-        "24-01-15",
-        "2024-1-5",
-        "+2024-01-15",
-    ]
-)
-# Unix timestamps from before year 1 to after year 9999.
-_timestamps = st.one_of(
-    st.integers(min_value=-63_000_000_000, max_value=254_000_000_000).map(str),
-    st.floats(min_value=-63e9, max_value=254e9).map(repr),
-)
 _number_texts = st.one_of(
     st.integers().map(str),
     st.integers(min_value=-(10**60), max_value=10**60).map(str),
     st.integers(min_value=4290, max_value=4310).map(lambda length: "1" * length),
     st.integers(min_value=-(2**54), max_value=2**54).map(lambda value: f"{value}.0"),
     st.floats().map(repr),
-    st.from_regex(r"-?\d{1,5}(\.\d{1,5})?([eE][+-]?\d{1,3})?", fullmatch=True),
-    st.sampled_from(["inf", "-Infinity", "NaN", "+5", "007", "1_000", ".5", "5.", "0x10"]),
-)
-_date_texts = st.one_of(st.dates().map(datetime.date.isoformat), _near_dates, _python_forms)
-_time_texts = st.one_of(_clock_texts(), _near_clocks, _python_forms)
-_full_datetime_texts = st.one_of(
-    _datetime_texts(),
-    st.builds("{}T{}".format, _near_dates, _near_clocks),
-    _python_forms,
-    _timestamps,
+    st.from_regex(r"[+-]?\d{0,5}(\.\d{0,5})?([eE][+-]?\d{1,3})?", fullmatch=True),
+    st.sampled_from(["inf", "-Infinity", "NaN", "+nan", "+5", "007", "1_000", ".5", "5.", "0x10", "1e999"]),
 )
 PARAM_TEXTS = st.one_of(
     st.tuples(st.just("int"), _mutated(_number_texts)),
     st.tuples(st.just("float"), _mutated(_number_texts)),
-    st.tuples(st.just("date"), _mutated(_date_texts)),
-    st.tuples(st.just("time"), _mutated(_time_texts)),
-    st.tuples(st.just("datetime"), _mutated(_full_datetime_texts)),
+    st.tuples(st.just("date"), _mutated(_date_texts())),
+    st.tuples(st.just("time"), _mutated(st.builds("{}{}".format, st.sampled_from(["", "T"]), _clock_texts()))),
+    st.tuples(st.just("datetime"), _mutated(_datetime_texts())),
 )
-PARAM_TYPES = {
-    "int": int,
-    "float": float,
-    "date": datetime.date,
-    "time": datetime.time,
-    "datetime": datetime.datetime,
+
+# The ISO 8601 forms that Bolt reads (see docs/src/topics/requests.md).
+_ISO_DATE = r"\d{4}(?:-\d{2}-\d{2}|\d{4}|-?W\d{2}|-W\d{2}-\d|W\d{3})"
+_HMS = r"\d{2}(?::\d{2}(?::\d{2}(?:[.,]\d+)?)?|\d{2}(?:\d{2}(?:[.,]\d+)?)?)?"
+_CLOCK = rf"(?P<clock>{_HMS})(?:Z|[+-](?P<zone>{_HMS}))?"
+ISO_FORMS = {
+    "date": re.compile(_ISO_DATE, re.ASCII),
+    "time": re.compile(rf"T?{_CLOCK}", re.ASCII),
+    # The separator is T, t or one whitespace character of Rust's char::is_whitespace().
+    "datetime": re.compile(
+        rf"{_ISO_DATE}(?:[Tt\t\n\x0b\x0c\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]{_CLOCK})?",
+        re.ASCII,
+    ),
 }
+PARAM_TYPES = {"date": datetime.date, "time": datetime.time, "datetime": datetime.datetime}
 
 
+def _python_reads_it_on_each_version(match: re.Match) -> bool:
+    """False for a text of the ISO forms that Bolt refuses although a Python version reads it."""
+    groups = match.groupdict()
+    if (groups.get("clock") or "").startswith("24"):
+        # Only Python 3.14 reads hour 24, as midnight of the next day.
+        return False
+    zone = groups.get("zone")
+    if zone is None:
+        return True
+    fields, _, fraction = zone.replace(",", ".").partition(".")
+    fields = fields.replace(":", "")
+    hours, minutes, seconds = (int(fields[at : at + 2] or 0) for at in (0, 2, 4))
+    if minutes > 59 or seconds > 59:
+        # Each version reads +05:60 as six hours. It is not ISO 8601.
+        return False
+    # For +00:00:00.5, Python 3.13 keeps the fraction; 3.12 and 3.14 give UTC.
+    return bool(hours or minutes or seconds) or not int(fraction[:6] or 0)
+
+
+def _python_value(kind: str, text: str):
+    """Give the value that Python reads from `text`, or None when Bolt must refuse the text.
+
+    Bolt reads a number as `int()` or `float()` reads it, with no whitespace,
+    `_` or digits that are not ASCII. It reads an ISO 8601 form of the grammar
+    as `fromisoformat()` reads it on each supported Python version.
+    """
+    try:
+        if kind == "int":
+            return int(text) if re.fullmatch(r"[+-]?[0-9]+", text, re.ASCII) else None
+        if kind == "float":
+            readable = text.isascii() and "_" not in text and not any(char.isspace() for char in text)
+            return float(text) if readable else None
+        match = ISO_FORMS[kind].fullmatch(text)
+        if match is None or not _python_reads_it_on_each_version(match):
+            return None
+        return PARAM_TYPES[kind].fromisoformat(text)
+    except ValueError:
+        return None
+
+
+@example(case=("datetime", "2024-01-15T10:30"))
 @example(case=("datetime", "2024-01-15T10:30:00+05:30"))
+@example(case=("datetime", "2024-01-15"))
+@example(case=("datetime", "20240115"))
+@example(case=("datetime", "2024-01-15x10:30:00"))
+@example(case=("datetime", "2024-01-15T10:30:00z"))
+@example(case=("datetime", "1700000000"))
 @example(case=("datetime", "24-01-15"))
-@example(case=("int", "9223372036854775808"))
-@example(case=("datetime", "2024-01-15T10:30:00+0530"))
-@example(case=("time", "10:30:00+05:00"))
 @example(case=("datetime", "-16964e15"))
-@example(case=("datetime", "253402300800"))
+@example(case=("time", "10:30"))
+@example(case=("time", "10:30:00+05:00"))
+@example(case=("time", "10:30:00 +05:00"))
+@example(case=("time", "24:00"))
+@example(case=("time", "10:30.5"))
+@example(case=("time", "10:30:00+00:00:00.5"))
+@example(case=("time", "10:30:00+05:60"))
+@example(case=("date", "20240115xx"))
+@example(case=("int", "9223372036854775808"))
+@example(case=("int", "007"))
+@example(case=("int", "+5"))
+@example(case=("int", "5.0"))
+@example(case=("int", "-16964e15"))
+@example(case=("float", ".5"))
 @example(case=("float", "-0"))
+@example(case=("float", "1e999"))
 @given(case=PARAM_TEXTS)
-def test_a_scalar_and_a_list_param_convert_as_msgspec(client, case):
-    """A scalar parameter and a list parameter of one type accept the same texts, with the same value.
+def test_a_scalar_and_a_list_param_convert_as_python(client, case):
+    """A scalar and a list parameter of one type accept the texts that Python reads, with the same value.
 
-    msgspec is the reference: the list path calls `msgspec.convert(text, T, strict=False)`.
-    It gives the same result on each supported Python version; `fromisoformat` does not.
+    The reference is `int()`, `float()` and `fromisoformat()`. See `_python_value`
+    for the texts that Python reads and Bolt refuses.
     """
     kind, text = case
-    try:
-        expected = _describe(msgspec.convert(text, PARAM_TYPES[kind], strict=False))
-    except msgspec.ValidationError:
-        expected = None
-    except ValueError:
-        # msgspec raises a plain ValueError for a timestamp in year 10000, and the
-        # list path then answers 500. The scalar path refuses the value.
-        assert client.get(f"/scalar/{kind}", params={"v": text}).status_code == 422
-        return
+    value = _python_value(kind, text)
     for path in (f"/scalar/{kind}", f"/list/{kind}"):
         response = client.get(path, params={"v": text})
-        if expected is None:
+        if value is None:
             assert response.status_code == 422, (path, text, response.text)
         else:
             assert response.status_code == 200, (path, text, response.text)
-            assert response.json() == expected, (path, text)
+            assert response.json() == _describe(value), (path, text)
 
 
 @given(value=st.times())
