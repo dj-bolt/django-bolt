@@ -260,10 +260,11 @@ The server runs the statements of one connection in their order. Each statement 
 
 Thus a read at the connection limit does not wait for the round trip of another read. Its statement goes out at once, behind the statements in flight on the connection with the fewest statements.
 `DJANGO_BOLT_LOOP_PIPELINE_DEPTH` sets how many statements one connection can have in flight.
-With each connection at that number, a read waits, and the read that waited longest gets the next place.
+A read waits when no connection can take its statement. That is when each connection is at that number, cancels a statement, or runs a slow statement.
+The read that waited longest gets the next place.
 
 A statement behind a slow statement waits for it. Bolt keeps the time of the fastest reads of a database.
-It puts no statement behind a statement that runs for much longer than that time. Such a read uses another connection, or waits for a place.
+It puts no statement behind a statement that runs for much longer than that time.
 
 Measured with one process on one core, 64 client connections, and a database 2 ms away. The values are requests in one second for a handler that returns a QuerySet:
 

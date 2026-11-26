@@ -238,6 +238,8 @@ class _SlowLink:
         self.port = self.listener.getsockname()[1]
         self.sockets: list[socket.socket] = []
         self.lock = threading.Lock()
+        # With a list here, the relay records each part that it moves: the side that sent it, and the bytes.
+        self.traffic: list[tuple[str, bytes]] | None = None
         self.threads = [threading.Thread(target=self._accept, daemon=True)]
         self.threads[0].start()
 
@@ -253,8 +255,8 @@ class _SlowLink:
             server = socket.socket(family, socket.SOCK_STREAM)
             server.connect(self.target)
             pumps = [
-                threading.Thread(target=self._pump, args=(client, server), daemon=True),
-                threading.Thread(target=self._pump, args=(server, client), daemon=True),
+                threading.Thread(target=self._pump, args=(client, server, "client"), daemon=True),
+                threading.Thread(target=self._pump, args=(server, client, "server"), daemon=True),
             ]
             with self.lock:
                 self.sockets += [client, server]
@@ -262,9 +264,12 @@ class _SlowLink:
             for pump in pumps:
                 pump.start()
 
-    def _pump(self, source: socket.socket, sink: socket.socket) -> None:
+    def _pump(self, source: socket.socket, sink: socket.socket, side: str) -> None:
         with contextlib.suppress(OSError):
             while data := source.recv(self.CHUNK):
+                if self.traffic is not None:
+                    with self.lock:
+                        self.traffic.append((side, data))
                 sink.sendall(data)
                 time.sleep(0.001)
         # The other side must see the end of the data.
@@ -312,6 +317,19 @@ def on_loop_through_a_slow_link(request, postgres_database, monkeypatch, django_
     try:
         with _setting_on(behind, monkeypatch, django_db_blocker, {}) as database:
             yield database
+    finally:
+        link.close()
+
+
+@pytest.fixture
+def recorded_link(postgres_database, monkeypatch, django_db_blocker):
+    """``on_loop``, with the database behind a ``_SlowLink`` that records its traffic. Gives the relay."""
+    link = _SlowLink(postgres_database)
+    link.traffic = []
+    behind = {**postgres_database, "host": "127.0.0.1", "port": str(link.port)}
+    try:
+        with _setting_on(behind, monkeypatch, django_db_blocker, {}):
+            yield link
     finally:
         link.close()
 
@@ -629,6 +647,22 @@ def _own_method_class(method: str) -> type[QuerySet]:
     return type("OwnMethodQuerySet", (QuerySet,), {method: recorded})
 
 
+class _OrderFromTheDatabase(QuerySet):
+    """A QuerySet class whose ``order_by`` queries, as for an order that the database holds."""
+
+    def order_by(self, *field_names: str) -> QuerySet:
+        assert Author.objects.using(ALIAS).filter(name="Bob").exists()
+        return super().order_by(*field_names)
+
+
+# The async call -> the name of the author that it gives.
+ORDER_HOOK_READS: dict[str, Callable[[QuerySet], Any]] = {
+    "afirst": lambda authors: authors.afirst(),
+    "alast": lambda authors: authors.alast(),
+    "aget": lambda authors: authors.aget(name="Bob"),
+}
+
+
 # The sync method that a class replaces -> the async call that runs it with the setting off.
 OWN_METHODS: dict[str, Callable[[QuerySet], Any]] = {
     "_fetch_all": lambda authors: _names(authors),
@@ -692,6 +726,29 @@ def _api() -> BoltAPI:
     api = BoltAPI()
     _probe_threads_route(api)
     _returned_queryset_routes(api)
+
+    @api.get("/order-hook/{read}")
+    async def order_hook(read: str):
+        author = await ORDER_HOOK_READS[read](_OrderFromTheDatabase(model=Author, using=ALIAS))
+        return {"name": author.name}
+
+    @api.get("/iterator-before-a-wrapper")
+    async def iterator_before_a_wrapper():
+        def passes(execute: Any, sql: str, params: Any, many: bool, context: Any) -> Any:
+            return execute(sql, params, many, context)
+
+        # No wrapper is on the connection when the iterator is made.
+        iterator = aiter(LoopProbe.objects.using(ALIAS).order_by("id"))
+        with connections[ALIAS].execute_wrapper(passes):
+            return {"built_on": [probe.built_on async for probe in iterator]}
+
+    @api.get("/two-marked-reads")
+    async def two_marked_reads():
+        probes = LoopProbe.objects.using(ALIAS)
+        slow = probes.annotate(mark=RawSQL("%s", ["first-statement"]), nap=RawSQL("(SELECT 1 FROM pg_sleep(0.3))", []))
+        fast = probes.annotate(mark=RawSQL("%s", ["second-statement"]))
+        first, second = await asyncio.gather(slow.aget(label="a"), fast.aget(label="a"))
+        return [first.mark, second.mark]
 
     @api.get("/own-method/{method}")
     async def own_method(method: str):
@@ -1539,6 +1596,24 @@ def test_a_read_at_the_connection_limit_goes_out_behind_the_statement_in_flight(
     assert response.json() == {"values": list(range(12)), "on_the_connection_of_the_slow_read": [True] * 12}
 
 
+def test_a_statement_goes_to_the_database_before_the_result_of_the_statement_before(recorded_link, monkeypatch):
+    """The relay sees the second statement while the server still runs the first one."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    with TestClient(_api()) as client:
+        response = client.get("/two-marked-reads")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == ["first-statement", "second-statement"]
+    traffic = recorded_link.traffic
+    first_sent = next(at for at, (side, data) in enumerate(traffic) if side == "client" and b"first-statement" in data)
+    second_sent = next(
+        at for at, (side, data) in enumerate(traffic) if side == "client" and b"second-statement" in data
+    )
+    # The server sends nothing for the first statement until its sleep ends.
+    first_result = next(at for at, (side, _data) in enumerate(traffic) if side == "server" and at > first_sent)
+    assert second_sent < first_result, [(side, data[:40]) for side, data in traffic[first_sent:]]
+
+
 def test_a_connection_takes_statements_up_to_the_pipeline_depth(on_loop, monkeypatch):
     monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
     monkeypatch.setenv("DJANGO_BOLT_LOOP_PIPELINE_DEPTH", "3")
@@ -1930,6 +2005,30 @@ def test_a_queryset_class_with_its_own_method_runs_it(on_loop, method):
 
     assert response.status_code == 200, response.text
     assert response.json() == expected
+
+
+@pytest.mark.parametrize("read", sorted(ORDER_HOOK_READS))
+def test_a_queryset_class_whose_order_by_queries_reads_on_a_thread(on_loop, read):
+    """``first``, ``last`` and ``get`` of Django call ``order_by`` of the class. Sync code cannot query on the event loop."""
+    expected = _with_the_setting_off(_api, f"/order-hook/{read}")
+    assert expected == {"name": {"afirst": "Ada", "alast": "Cy", "aget": "Bob"}[read]}
+
+    with TestClient(_api()) as client:
+        response = client.get(f"/order-hook/{read}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+def test_an_iterator_reads_where_the_code_that_reads_it_is(on_loop):
+    """The iterator is made with no execute wrapper, and read under one. A read under a wrapper uses a thread."""
+    with TestClient(_api()) as client:
+        response = client.get("/iterator-before-a-wrapper")
+
+    assert response.status_code == 200, response.text
+    built_on = response.json()["built_on"]
+    assert len(built_on) == 2
+    assert all(name.startswith(ORM_THREAD) for name in built_on), built_on
 
 
 @pytest.mark.parametrize("name", sorted(ITERABLE_CLASSES))

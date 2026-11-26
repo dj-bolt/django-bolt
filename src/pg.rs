@@ -346,7 +346,6 @@ async fn drive(
                         let null = std::ptr::null();
                         if (api.send_query_params)(conn, sql.as_ptr(), 0, null, null, null, null, 0)
                             == 0
-                            || (api.pipeline_sync)(conn) == 0
                         {
                             let failure = connection_failure(api, conn, "sending query");
                             // libpq did not take this statement.
@@ -360,8 +359,12 @@ async fn drive(
                         } else {
                             0
                         };
+                        // libpq has the statement, and can have sent a part of it.
                         in_flight.push_back((token, sent));
                         unsent = true;
+                        if (api.pipeline_sync)(conn) == 0 {
+                            return Err(connection_failure(api, conn, "sending query"));
+                        }
                     }
                     if unsent {
                         match (api.flush)(conn) {

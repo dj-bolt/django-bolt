@@ -1023,13 +1023,16 @@ def _aiter(self: QuerySet) -> Any:
     """``QuerySet.__aiter__``: the rows of ``async for``."""
     if self._result_cache is not None:
         return _django_aiter(self)
-    pool = _pool_for(self)
-    if pool is None:
-        return _django_aiter(self)
 
     async def generator() -> Any:
         # Another iterator of this QuerySet can have read the rows after this one was made.
         if self._result_cache is None:
+            # The code that reads the iterator can be in a transaction that started after this call.
+            pool = _pool_for(self)
+            if pool is None:
+                async for item in _django_aiter(self):
+                    yield item
+                return
             await _fetch_all(self, pool)
         for item in self._result_cache:
             yield item
@@ -1044,9 +1047,13 @@ async def _aget(self: QuerySet, *args: Any, **kwargs: Any) -> Any:
     pool = _pool_for(self)
     if pool is None:
         return await _django_aget(self, *args, **kwargs)
-    clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
-    if self.query.can_filter() and not self.query.distinct_fields:
-        clone = clone.order_by()
+    try:
+        clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
+        if self.query.can_filter() and not self.query.distinct_fields:
+            clone = clone.order_by()
+    except SynchronousOnlyOperation:
+        # A method of the class queried, for example its own ``order_by``. Only a thread can run it.
+        return await _django_aget(self, *args, **kwargs)
     # PostgreSQL takes a limit with ``select_for_update``, so ``get`` always sets the limit here.
     limit = MAX_GET_RESULTS
     clone.query.set_limits(high=limit)
@@ -1111,21 +1118,27 @@ def _stopping_class(queryset_class: type) -> type:
     return stopping
 
 
-async def _first_row(queryset: QuerySet, method: str, pool: _Pool) -> Any:
+async def _first_row(queryset: QuerySet, method: str, pool: _Pool, django_method: Any) -> Any:
     """Run ``first`` or ``last`` of Django, with the query on the event loop.
 
     The two methods differ between Django versions, so this function does not
     copy them. It calls the method of Django on a clone that stops where it
     would query. That clone gives the QuerySet that Django built: ordered,
     reversed and limited to one row. The event loop then reads its rows.
+
+    The method of Django calls other methods of the class, such as
+    ``order_by``. When one of them queries, ``django_method`` runs the read
+    on a thread.
     """
     queryset_class = type(queryset)
-    clone = queryset._chain()
-    clone.__class__ = _stopping_class(queryset_class)
     try:
+        clone = queryset._chain()
+        clone.__class__ = _stopping_class(queryset_class)
         return getattr(clone, method)()
     except _Unfetched as unfetched:
         built = unfetched.queryset
+    except SynchronousOnlyOperation:
+        return await django_method(queryset)
     built.__class__ = queryset_class
     await _fetch_all(built, pool)
     # ``for obj in queryset[:1]: return obj``
@@ -1140,7 +1153,7 @@ async def _afirst(self: QuerySet) -> Any:
     pool = _pool_for(self) if self._result_cache is None and type(self).first is _django_first else None
     if pool is None:
         return await _django_afirst(self)
-    return await _first_row(self, "first", pool)
+    return await _first_row(self, "first", pool, _django_afirst)
 
 
 async def _alast(self: QuerySet) -> Any:
@@ -1148,7 +1161,7 @@ async def _alast(self: QuerySet) -> Any:
     pool = _pool_for(self) if type(self).last is _django_last else None
     if pool is None:
         return await _django_alast(self)
-    return await _first_row(self, "last", pool)
+    return await _first_row(self, "last", pool, _django_alast)
 
 
 async def _aexists(self: QuerySet) -> bool:
