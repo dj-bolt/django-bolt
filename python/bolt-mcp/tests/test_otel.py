@@ -368,6 +368,23 @@ def test_tracing_runs_at_its_place_in_the_middleware_order(provider, exporter):
     assert span.attributes["error.type"] == "tool_error"
 
 
+def test_second_instrument_call_raises(provider, exporter):
+    api = BoltAPI()
+    mcp = MCP("instrumented-twice")
+    instrument(mcp, tracer_provider=provider)
+    with pytest.raises(ValueError, match="already instrumented"):
+        instrument(mcp, tracer_provider=provider)
+
+    @mcp.tool
+    def ping() -> str:
+        return "pong"
+
+    mount_mcp(api, mcp)
+    with TestClient(api) as client:
+        _rpc(client, "tools/call", {"name": "ping", "arguments": {}})
+    assert [span.name for span in exporter.get_finished_spans()] == ["tools/call ping"]
+
+
 def _run_python(script: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

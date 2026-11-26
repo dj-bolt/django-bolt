@@ -130,7 +130,12 @@ def instrument(mcp: MCP, *, tracer_provider: TracerProvider | None = None) -> No
     exception message) only when the environment variable
     ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is ``true`` at this call.
     The ``mcp.resource.uri`` attribute has no userinfo and no signature values.
+
+    Raise ``ValueError`` when ``mcp`` is already instrumented.
     """
+    # The middleware of an earlier instrument() call comes from this module.
+    if any(getattr(fn, "__module__", None) == __name__ for fn in mcp._tool_middleware):
+        raise ValueError(f"MCP server {mcp.name!r} is already instrumented")
     tracer = trace.get_tracer(__name__, tracer_provider=tracer_provider)
     capture_content = os.environ.get(_CAPTURE_MESSAGE_CONTENT, "").lower() == "true"
 
