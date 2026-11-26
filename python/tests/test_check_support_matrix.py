@@ -32,7 +32,7 @@ RELEASES = {
 }
 
 
-def _check(tmp_path, monkeypatch, floor):
+def _check(tmp_path, monkeypatch, floor, djangos=("5.2", "6.0", "6.1")):
     monkeypatch.setattr(check_support_matrix, "fetch_releases", lambda product, _max_attempts: RELEASES[product])
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text(
@@ -42,9 +42,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
-    "Framework :: Django :: 5.2",
-    "Framework :: Django :: 6.0",
-    "Framework :: Django :: 6.1",
+    {"".join(f'"Framework :: Django :: {series}",' for series in djangos)}
 ]
 dependencies = ["Django>={floor}", "msgspec>=0.20"]
 """,
@@ -65,3 +63,13 @@ def test_a_floor_in_the_oldest_declared_series_is_current(tmp_path, monkeypatch,
 def test_a_floor_outside_the_oldest_declared_series_is_drift(tmp_path, monkeypatch, floor):
     drift, _ = _check(tmp_path, monkeypatch, floor)
     assert [d.subject for d in drift] == [f"Django>={floor}"]
+
+
+@pytest.mark.parametrize(
+    ("floor", "is_drift"), [("6", False), ("6.0", False), ("6.0.4", False), ("5.2", True), ("6.1", True)]
+)
+def test_a_floor_without_a_minor_names_the_x_0_series(tmp_path, monkeypatch, floor, is_drift):
+    """`Django>=6` is the same floor as `Django>=6.0`."""
+    drift, _ = _check(tmp_path, monkeypatch, floor, djangos=("6.0", "6.1"))
+    floor_drift = [d.subject for d in drift if d.subject.startswith("Django>=")]
+    assert floor_drift == ([f"Django>={floor}"] if is_drift else [])
