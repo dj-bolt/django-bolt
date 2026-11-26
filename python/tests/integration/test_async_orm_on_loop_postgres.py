@@ -52,6 +52,7 @@ from django_bolt.middleware import DjangoMiddlewareStack
 from django_bolt.serializers import Serializer, computed_field
 from django_bolt.testing import TestClient
 from tests.test_models import Author, BlogPost, Tag
+from tests.thread_pools import shutdown_closing_connections
 
 from .test_dead_connection_recovery_server_integration import backend_pids, terminate_backends
 
@@ -185,6 +186,10 @@ def _add_database(postgres_database, monkeypatch, django_db_blocker, options: di
     }
     configured = connections.configure_settings({"default": connections.settings["default"], ALIAS: database})
     monkeypatch.setitem(connections.settings, ALIAS, configured[ALIAS])
+    # The process has one ORM pool, and the first use sets its size from the databases: 4 threads with this
+    # database, 1 thread with only SQLite. The test thus gets a pool of its own. The pool of the other tests
+    # comes back after the test.
+    monkeypatch.setattr(concurrency, "_orm_executor", None)
     with django_db_blocker.unblock():
         try:
             with connections[ALIAS].schema_editor() as editor:
@@ -196,6 +201,9 @@ def _add_database(postgres_database, monkeypatch, django_db_blocker, options: di
             _seed()
             yield LoopDb(postgres_database, application_name)
         finally:
+            orm_pool = concurrency._orm_executor
+            if orm_pool is not None:
+                shutdown_closing_connections(orm_pool)
             connections[ALIAS].close()
             del connections[ALIAS]
 
