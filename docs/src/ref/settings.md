@@ -303,6 +303,16 @@ This is a Django setting, not an environment variable.
 A 1xx to 3xx response writes an access-log line only when it took this number of milliseconds or more.
 It applies to each API with no `logging_config`. It is the `min_duration_ms` of `LoggingConfig`.
 
+## Async ORM
+
+### BOLT_ASYNC_ORM_ON_LOOP
+
+Default: `False`. Type: `bool`.
+
+Run `async for` over a QuerySet and `aget()` on the event loop, with no thread. The setting applies to PostgreSQL with psycopg 3.
+It has no effect on Windows.
+See [Async ORM](../topics/async-orm.md#run-async-reads-on-the-event-loop).
+
 ## Signals
 
 ### BOLT_EMIT_SIGNALS
@@ -362,6 +372,7 @@ See [runbolt](runbolt.md) for the options.
 | `DJANGO_BOLT_ORM_THREADS` | int, 1 or more | `1` when each database is SQLite, else `4` | Threads of the ORM pool of one process. It runs the QuerySets that async handlers return, `await request.auser()`, and the async ORM calls of a route with no Django middleware. |
 | `DJANGO_BOLT_EXECUTOR_THREADS` | int, 1 or more | CPU count + 4, at most `32` | Threads of the shared pool of one process. Blocking sync handlers and `sync_to_thread` calls run on it. |
 | `DJANGO_BOLT_LANE_IDLE_SECONDS` | number, more than 0 | `10` | Idle seconds after which a request lane closes its database connections and stops. |
+| `DJANGO_BOLT_LOOP_CONNECTIONS` | int, 1 or more | `4` | Connections of one worker thread to one PostgreSQL database, for [`BOLT_ASYNC_ORM_ON_LOOP`](#bolt_async_orm_on_loop). |
 
 See [Async ORM](../topics/async-orm.md) and [Middleware](../topics/middleware.md).
 

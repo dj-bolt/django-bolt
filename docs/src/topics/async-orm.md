@@ -140,6 +140,7 @@ curl localhost:8000/articles/99
 A sync ORM call in an `async def` handler raises Django's `SynchronousOnlyOperation`, and the client gets a `500` response. This also applies to a relation that is not loaded, for example `article.author` after `aget()`.
 
 Bolt sends each async ORM call to the ORM thread pool. Thus `DJANGO_BOLT_ORM_THREADS` limits the queries in flight. See [Tune the thread pools](#tune-the-thread-pools).
+On PostgreSQL, `aget()` and `async for` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
 
 ## Iterate over a QuerySet
 
@@ -164,6 +165,49 @@ async def list_titles() -> list[str]:
 
 `async for` loads all rows in one call to the ORM thread pool. It then iterates over them in memory.
 A returned QuerySet with a `list[Struct]` return type reads only the Struct fields, with `.values()`, and makes no model instances. Return the QuerySet when the rows need no change.
+
+## Run async reads on the event loop
+
+Django's async ORM runs each call on a thread. On PostgreSQL, Bolt can run `async for` and `aget()` on the event loop, with no thread. Add the setting:
+
+```python title="blog/settings.py"
+BOLT_ASYNC_ORM_ON_LOOP = True
+```
+
+Your handlers do not change. Bolt reads the setting when the server starts. Each `async for` and each `aget()` then has three steps:
+
+1. Django builds the SQL statement.
+2. Bolt sends the statement on a connection of the event loop. The event loop serves other requests while the database works.
+3. Django builds the rows and the model instances.
+
+The result is the result of the sync ORM. The setting is off by default.
+It needs PostgreSQL, psycopg 3 and the `django.db.backends.postgresql` engine. It has no effect on Windows.
+
+### Reads that stay on the ORM thread pool
+
+Some reads need the database connection of Django. For these reads, Bolt uses the ORM thread pool, as with the setting off:
+
+| Read | Cause |
+| --- | --- |
+| A QuerySet with `prefetch_related()` | The prefetch queries are sync code. |
+| A read on a route with Django middleware | The thread of the request keeps state, for example the schema of a tenant. |
+| A read in a transaction | Only the connection of the transaction has its rows. A `TestClient` in a Django `TestCase` gives such a connection to the handlers. |
+| A read with `DEBUG = True` | Django logs each query from its own cursor. |
+| A database with another `ENGINE`, for example PostGIS or django-tenants | Another backend can change how a connection opens. |
+| The other async calls, for example `afirst()`, `acount()`, `acreate()` and `asave()` | Bolt replaces only `async for` and `aget()`. |
+
+### Connections of the event loop
+
+A loop connection is not a connection of Django. Each worker thread has its own loop connections for each database.
+
+- A loop connection opens with the connection parameters of `DATABASES`.
+- A loop connection copies the session settings and the type adapters of a Django connection to the same database. The changes of a `connection_created` receiver are thus on it.
+- `DJANGO_BOLT_LOOP_CONNECTIONS` sets the connections of one worker thread to one database. The default is `4`. A read waits when each connection is in use.
+- The connections stay open. `CONN_MAX_AGE` does not close them, and Django's connection pool (`OPTIONS["pool"]`) does not hold them.
+- After a database restart, Bolt sends a read that failed on a dead connection one more time, on a new connection.
+- A tool that records queries from the cursor of Django does not see these reads.
+
+Add the loop connections to the connection count of your database. See [Tune the thread pools](#tune-the-thread-pools).
 
 ## Avoid N+1 queries
 
@@ -350,6 +394,7 @@ DJANGO_BOLT_ORM_THREADS=8 python manage.py runbolt --processes 4
 On a route with Django middleware, the ORM calls of a request run on the thread of that request, not on the ORM pool. See [Middleware](middleware.md).
 
 Each thread that runs a query keeps its own database connection. These are the threads of the two pools, the worker threads, and one thread for each running request with Django middleware. Add up the threads of all processes. Keep the total below the connection limit of your database.
+With `BOLT_ASYNC_ORM_ON_LOOP`, each worker thread also has up to `DJANGO_BOLT_LOOP_CONNECTIONS` connections to each PostgreSQL database.
 
 SQLite gets one ORM thread by default, because SQLite has one writer and a file lock. PostgreSQL and MySQL can serve parallel queries, so they get four.
 

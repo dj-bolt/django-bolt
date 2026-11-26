@@ -634,13 +634,18 @@ def check_pool_environment() -> None:
     startup, so an invalid value stops startup and not a later request.
 
     Raises:
-        ImproperlyConfigured: DJANGO_BOLT_EXECUTOR_THREADS or
-            DJANGO_BOLT_ORM_THREADS is not an int of 1 or more.
+        ImproperlyConfigured: DJANGO_BOLT_EXECUTOR_THREADS,
+            DJANGO_BOLT_ORM_THREADS or DJANGO_BOLT_LOOP_CONNECTIONS is not
+            an int of 1 or more.
     """
     _thread_count("DJANGO_BOLT_EXECUTOR_THREADS")
     _thread_count("DJANGO_BOLT_ORM_THREADS")
     configure_connection_checks()
     _check_connection_pools()
+    # async_orm imports this module.
+    from . import async_orm  # noqa: PLC0415
+
+    async_orm.configure()
 
 
 def _check_connection_pools() -> None:
