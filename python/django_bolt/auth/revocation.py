@@ -726,7 +726,9 @@ class DjangoORMRevocation(RevocationStore):
         key = f"version:{user_id}"
         model = self._model_for(key)
         await model.objects.aget_or_create(jti=key, defaults={"expires_at": _NEVER_EXPIRES})
-        await model.objects.filter(jti=key).aupdate(version=F("version") + 1)
+        # A collation without case can give the row of a jti, for example VERSION:u from an
+        # earlier release. Set expires_at, so the cleanup task does not delete the version.
+        await model.objects.filter(jti=key).aupdate(version=F("version") + 1, expires_at=_NEVER_EXPIRES)
         return await self.get_user_version(user_id)
 
 
