@@ -413,6 +413,7 @@ Bolt serves an API at static paths. `runbolt` and the test clients refuse these 
 
 Django alone does not serve Bolt routes, so it does not refuse these prefixes.
 `manage.py check`, `manage.py migrate`, `reverse()` and the Django views work with such a URLconf.
+There is one exception. When one parameter name is two times in a path, `reverse()` raises the error of Django itself.
 
 ### What moves with the prefix
 

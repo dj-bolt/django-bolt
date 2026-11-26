@@ -262,7 +262,7 @@ The two namespaces are the `namespace` of the API. See [Mount an API in the URLc
 - `ImproperlyConfigured`: at startup, `runbolt` and the test clients refuse a prefix that Bolt cannot serve at static paths.
   Examples are `re_path()`, `i18n_patterns()`, a converter other than `str`, two parameters in one segment, one parameter two times, no trailing slash, and include keyword arguments.
   They also refuse an ASGI mount, a Django mount or an MCP server of the API under a prefix with a parameter.
-  The message names the URLconf entry. Django alone does not refuse the prefix: `manage.py check` and `reverse()` work.
+  The message names the URLconf entry. Django alone does not refuse the prefix: `manage.py check` and `reverse()` work. The exception is one parameter name two times in a path: there `reverse()` raises the error of Django itself.
 - `ValueError`: at startup, a handler or a dependency takes a prefix parameter as an argument with no marker. Read it from `request.params` or with `Path()`.
 
 ### api.mount()
