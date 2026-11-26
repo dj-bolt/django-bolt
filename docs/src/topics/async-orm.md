@@ -188,6 +188,11 @@ Your handlers do not change. Bolt reads the setting when the server starts. Each
 3. Django builds the rows and the model instances.
 
 The result is the result of the sync ORM. The setting is off by default.
+
+The setting removes the wait of the threads of one process for the GIL. Measure it on your deployment before you keep it.
+Measured with one process and a local PostgreSQL, a returned QuerySet gave 79% more requests per second with the process on two cores.
+With the process on one core, it gave 7 to 24% fewer, because the async driver of psycopg uses more CPU for a query than the sync driver.
+The async ORM calls gave 12 to 20% more on one core and 45 to 64% more on two cores.
 It needs PostgreSQL, psycopg 3 and the `django.db.backends.postgresql` engine. It has no effect on Windows.
 
 ### Reads that stay on the ORM thread pool
