@@ -185,6 +185,27 @@ fn read_rate_limit_ipv6_prefix(settings: &DjangoSettings<'_>) -> PyResult<u8> {
     settings.int_up_to("BOLT_RATE_LIMIT_IPV6_PREFIX", 128, DEFAULT_IPV6_PREFIX)
 }
 
+/// Remove the script name from the front of a `STATIC_URL` or `MEDIA_URL`.
+///
+/// Django puts `FORCE_SCRIPT_NAME` in front of a relative `STATIC_URL`, and a
+/// project under a sub-path often writes it in front itself. The proxy removes
+/// the script name from the path, so Bolt serves the files without it, as
+/// WhiteNoise does.
+///
+/// Django puts the whole script prefix in front, so `FORCE_SCRIPT_NAME`
+/// `"/myapp//"` gives `"/myapp//static/"`. Bolt keeps one slash of the rest,
+/// as for `"/myapp/"`. Python refuses a URL that is the script name at startup,
+/// before this runs (see `_script_prefix.refuse_files_at_script_name`).
+pub(crate) fn without_script_name<'a>(url: &'a str, script_name: Option<&str>) -> &'a str {
+    let script_name = script_name.map_or("", |name| name.trim_end_matches('/'));
+    match url.strip_prefix(script_name) {
+        Some(rest) if !script_name.is_empty() && rest.starts_with('/') => {
+            &rest[rest.len() - rest.trim_start_matches('/').len() - 1..]
+        }
+        _ => url,
+    }
+}
+
 /// The scope prefix for a static URL such as `"/static/"`, or None when the
 /// URL cannot be mounted. An empty prefix (`"/"`) would shadow every route.
 pub(crate) fn static_scope_prefix(static_url: &str) -> Option<String> {
@@ -224,6 +245,8 @@ pub(crate) struct ServerConfig {
     pub rate_limit_ipv6_prefix: u8,
     pub static_files_config: Option<Arc<ScopeConfig>>,
     pub media_files_config: Option<Arc<ScopeConfig>>,
+    /// `FORCE_SCRIPT_NAME`. None when it is not set or empty.
+    pub script_name: Option<Arc<str>>,
 }
 
 impl ServerConfig {
@@ -251,9 +274,13 @@ impl ServerConfig {
         let stream_config = StreamConfig::read(&settings)?;
         let rate_limit_ipv6_prefix = read_rate_limit_ipv6_prefix(&settings)?;
         let ws_config = Arc::new(WsConfig::from_django_settings(&settings)?);
+        let script_name: Option<Arc<str>> = settings
+            .optional_str("FORCE_SCRIPT_NAME")?
+            .filter(|name| !name.is_empty())
+            .map(Arc::from);
 
         let (global_cors_config, static_files_config, media_files_config) = if read_cors_and_files {
-            read_cors_and_file_scopes(&settings, debug)?
+            read_cors_and_file_scopes(&settings, debug, script_name.as_deref())?
         } else {
             (None, None, None)
         };
@@ -280,6 +307,7 @@ impl ServerConfig {
             rate_limit_ipv6_prefix,
             static_files_config,
             media_files_config,
+            script_name,
         })
     }
 
@@ -318,6 +346,7 @@ type CorsAndFileScopes = (
 fn read_cors_and_file_scopes(
     settings: &DjangoSettings<'_>,
     debug: bool,
+    script_name: Option<&str>,
 ) -> PyResult<CorsAndFileScopes> {
     let py = settings.py();
 
@@ -345,7 +374,8 @@ fn read_cors_and_file_scopes(
             return Ok(None); // No static URL configured
         };
 
-        let Some(url_prefix) = static_scope_prefix(&static_url) else {
+        let Some(url_prefix) = static_scope_prefix(without_script_name(&static_url, script_name))
+        else {
             return Ok(None);
         };
 
@@ -395,6 +425,7 @@ fn read_cors_and_file_scopes(
         let Some(media_url) = settings.optional_str("MEDIA_URL")? else {
             return Ok(None); // No media URL configured
         };
+        let media_url = without_script_name(&media_url, script_name);
 
         // MEDIA_URL must be a path-style prefix (e.g. "/media/") — CDN-style
         // full URLs and missing leading slash produce malformed scope prefixes.
@@ -898,6 +929,7 @@ pub fn start_server(
         media_files_config: config.media_files_config,
         access_loggers,
         error_renderer,
+        script_name: config.script_name,
     });
 
     py.detach(|| {
@@ -1297,6 +1329,38 @@ mod tests {
         assert_eq!(without_trailing_slash("/ws/room//"), "/ws/room/");
         assert_eq!(without_trailing_slash("/"), "/");
         assert_eq!(without_trailing_slash(""), "");
+    }
+
+    #[test]
+    fn without_script_name_removes_a_whole_leading_segment_only() {
+        let myapp = Some("/myapp");
+        assert_eq!(without_script_name("/myapp/static/", myapp), "/static/");
+        assert_eq!(
+            without_script_name("/myapp/static/", Some("/myapp/")),
+            "/static/"
+        );
+        assert_eq!(without_script_name("/a/b/media/", Some("/a/b")), "/media/");
+        assert_eq!(
+            without_script_name("/myapp//static/", Some("/myapp//")),
+            "/static/"
+        );
+        assert_eq!(without_script_name("/myapp//", Some("/myapp//")), "/");
+        assert_eq!(without_script_name("/myapp/", myapp), "/");
+        assert_eq!(
+            without_script_name("/myappx/static/", myapp),
+            "/myappx/static/"
+        );
+        assert_eq!(without_script_name("/static/", myapp), "/static/");
+        assert_eq!(without_script_name("/myapp", myapp), "/myapp");
+        assert_eq!(without_script_name("/static/", Some("/")), "/static/");
+        assert_eq!(
+            without_script_name("/myapp/static/", None),
+            "/myapp/static/"
+        );
+        assert_eq!(
+            without_script_name("https://cdn.example.com/static/", myapp),
+            "https://cdn.example.com/static/"
+        );
     }
 
     fn bound_ip(host: &str) -> std::io::Result<IpAddr> {

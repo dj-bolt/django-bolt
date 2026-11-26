@@ -46,4 +46,5 @@ zstd = { workspace = true }
 bolt-loop = { workspace = true }
 
 [dev-dependencies]
+mime_guess = { workspace = true }
 proptest = { workspace = true }
