@@ -1797,6 +1797,11 @@ mod tests {
         assert!(
             matches!(coerce("-0", TYPE_FLOAT), Ok(CoercedValue::Float(v)) if v.to_bits() == (-0.0f64).to_bits())
         );
+        // float() gives inf for 1e90000 written with 10,000 fraction digits. msgspec gave 1.0.
+        let long = format!("0.{}1e100000", "0".repeat(9999));
+        assert!(
+            matches!(coerce_param(&long, TYPE_FLOAT, 16384), Ok(CoercedValue::Float(v)) if v == f64::INFINITY)
+        );
         for value in ["nan", "-nAn", "+NaN"] {
             assert!(matches!(coerce(value, TYPE_FLOAT), Ok(CoercedValue::Float(v)) if v.is_nan()));
         }
