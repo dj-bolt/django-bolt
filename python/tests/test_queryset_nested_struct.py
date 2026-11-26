@@ -15,12 +15,13 @@ from django.db.backends import utils as db_utils
 from django.db.models.functions import JSONObject
 
 from django_bolt import BoltAPI, ViewSet
-from django_bolt.pagination import CursorPagination, PageNumberPagination, paginate
+from django_bolt.exceptions import ResponseValidationError
+from django_bolt.pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
 from django_bolt.responses import JSON
 from django_bolt.testing import TestClient
-from django_bolt.views import RetrieveMixin
+from django_bolt.views import ListMixin, RetrieveMixin
 
-from .test_models import Author, BlogPost, Comment, User, UserProfile
+from .test_models import Author, BlogPost, Comment, Note, Notebook, User, UserBadge, UserProfile, UserSecret
 
 
 class AuthorOut(msgspec.Struct):
@@ -663,3 +664,437 @@ def test_instances_from_a_handler_with_no_await(sql_statements):
         assert response.status_code == 200, response.text
         assert response.json() == expected[0]
         assert len(sql_statements) == 1, sql_statements
+
+
+# A reverse relation whose query name differs from its accessor, and a reverse
+# one-to-one with no row (#949). Every path gives the same response.
+
+
+class BadgeOut(msgspec.Struct):
+    label: str
+
+
+class UserWithBadge(msgspec.Struct):
+    username: str
+    badge: BadgeOut | None = None
+
+
+class UserWithBadgeRow(msgspec.Struct):
+    username: str
+    badge_row: BadgeOut | None
+
+
+class ProfileOfBadgedUser(msgspec.Struct):
+    bio: str
+    user: UserWithBadge
+
+
+class UserWithRequiredProfile(msgspec.Struct):
+    username: str
+    profile: ProfileOut | None
+
+
+class UserWithRequiredBadge(msgspec.Struct):
+    username: str
+    profile: ProfileOut | None
+    badge: BadgeOut | None
+
+
+class ProfileOfUserWithRequiredBadge(msgspec.Struct):
+    bio: str
+    user: UserWithRequiredBadge
+
+
+def _make_users() -> tuple[User, User]:
+    ada = User.objects.create(username="ada", email="ada@example.com", password_hash="x")
+    bob = User.objects.create(username="bob", email="bob@example.com", password_hash="x")
+    UserProfile.objects.create(user=ada, bio="Hi")
+    UserProfile.objects.create(user=bob, bio="Yo")
+    UserBadge.objects.create(user=ada, label="Gold")
+    return ada, bob
+
+
+def _routes_of(item_type: type, model: type, order: str) -> tuple[BoltAPI, list[str], list[str]]:
+    """Register each path that reads ``item_type``: a list path and a path of one object."""
+    api = BoltAPI()
+
+    @api.get("/values", response_model=list[item_type])
+    async def values():
+        return model.objects.order_by(order)
+
+    @api.get("/values-sync", response_model=list[item_type])
+    def values_sync():
+        return model.objects.order_by(order)
+
+    @api.get("/page", response_model=list[item_type])
+    @paginate(PageNumberPagination)
+    async def page():
+        return model.objects.order_by(order)
+
+    @api.get("/page-sync", response_model=list[item_type])
+    @paginate(PageNumberPagination)
+    def page_sync():
+        return model.objects.order_by(order)
+
+    @api.get("/page-of-list", response_model=list[item_type])
+    @paginate(PageNumberPagination)
+    async def page_of_list():
+        return [item async for item in model.objects.order_by(order)]
+
+    @api.get("/instances", response_model=list[item_type])
+    async def instances():
+        return [item async for item in model.objects.order_by(order)]
+
+    @api.get("/instances-sync", response_model=list[item_type])
+    def instances_sync():
+        return list(model.objects.order_by(order))
+
+    @api.get("/unvalidated", response_model=list[item_type], validate_response=False)
+    async def unvalidated():
+        return [item async for item in model.objects.order_by(order)]
+
+    @api.get("/unvalidated-sync", response_model=list[item_type], validate_response=False)
+    def unvalidated_sync():
+        return list(model.objects.order_by(order))
+
+    @api.get("/one/{pk}", response_model=item_type)
+    async def one(pk: int):
+        return await model.objects.aget(pk=pk)
+
+    @api.get("/one-sync/{pk}", response_model=item_type)
+    def one_sync(pk: int):
+        return model.objects.get(pk=pk)
+
+    @api.viewset("/viewset")
+    class ItemViewSet(RetrieveMixin, ViewSet):
+        queryset = model.objects.all()
+        serializer_class = item_type
+
+    list_paths = ["/values", "/values-sync", "/page", "/page-sync", "/page-of-list"]
+    list_paths += ["/instances", "/instances-sync", "/unvalidated", "/unvalidated-sync"]
+    one_paths = ["/one/{pk}", "/one-sync/{pk}", "/viewset/{pk}"]
+    return api, list_paths, one_paths
+
+
+def _assert_each_path(api: BoltAPI, list_paths, one_paths, rows: list[dict], pks: list[int]) -> None:
+    """Request each path. Collect each path with a wrong response, so a failure names all of them."""
+    wrong: list[tuple[str, int, Any]] = []
+    with TestClient(api, raise_server_exceptions=False) as client:
+        for path in list_paths:
+            response = client.get(path)
+            body = response.json() if response.status_code == 200 else None
+            if path.startswith("/page") and body is not None:
+                body = body["items"]
+            if body != rows:
+                wrong.append((path, response.status_code, response.text))
+        for path in one_paths:
+            for pk, row in zip(pks, rows, strict=True):
+                response = client.get(path.format(pk=pk))
+                if response.status_code != 200 or response.json() != row:
+                    wrong.append((path.format(pk=pk), response.status_code, response.text))
+    assert wrong == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reverse_relation_with_a_query_name_that_differs_from_its_accessor():
+    """The Struct names the accessor ``badge``. Django queries the relation as ``badge_row``."""
+    ada, bob = _make_users()
+    rows = [{"username": "ada", "badge": {"label": "Gold"}}, {"username": "bob", "badge": None}]
+    api, list_paths, one_paths = _routes_of(UserWithBadge, User, "username")
+    _assert_each_path(api, list_paths, one_paths, rows, [ada.pk, bob.pk])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reverse_relation_named_by_its_query_name():
+    """A field with the query name worked for a QuerySet. Each path now reads the relation through its accessor."""
+    ada, bob = _make_users()
+    rows = [{"username": "ada", "badge_row": {"label": "Gold"}}, {"username": "bob", "badge_row": None}]
+    api, list_paths, one_paths = _routes_of(UserWithBadgeRow, User, "username")
+    _assert_each_path(api, list_paths, one_paths, rows, [ada.pk, bob.pk])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_accessor_of_a_reverse_relation_one_level_down():
+    ada, bob = _make_users()
+    profiles = list(UserProfile.objects.order_by("user__username"))
+    rows = [
+        {"bio": "Hi", "user": {"username": "ada", "badge": {"label": "Gold"}}},
+        {"bio": "Yo", "user": {"username": "bob", "badge": None}},
+    ]
+    api, list_paths, one_paths = _routes_of(ProfileOfBadgedUser, UserProfile, "user__username")
+    _assert_each_path(api, list_paths, one_paths, rows, [profile.pk for profile in profiles])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reverse_one_to_one_with_no_row_and_no_default_gives_null():
+    """A field typed ``X | None`` with no default gets None when the related row does not exist."""
+    ada, bob = _make_users()
+    UserProfile.objects.filter(user=bob).delete()
+    rows = [{"username": "ada", "profile": {"bio": "Hi"}}, {"username": "bob", "profile": None}]
+    api, list_paths, one_paths = _routes_of(UserWithRequiredProfile, User, "username")
+    _assert_each_path(api, list_paths, one_paths, rows, [ada.pk, bob.pk])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reverse_one_to_one_with_no_row_one_level_down_gives_null():
+    """The relation has no row, and its query name differs from its accessor."""
+    ada, bob = _make_users()
+    profiles = list(UserProfile.objects.order_by("user__username"))
+    rows = [
+        {"bio": "Hi", "user": {"username": "ada", "profile": {"bio": "Hi"}, "badge": {"label": "Gold"}}},
+        {"bio": "Yo", "user": {"username": "bob", "profile": {"bio": "Yo"}, "badge": None}},
+    ]
+    api, list_paths, one_paths = _routes_of(ProfileOfUserWithRequiredBadge, UserProfile, "user__username")
+    _assert_each_path(api, list_paths, one_paths, rows, [profile.pk for profile in profiles])
+
+
+class ArrayProfileOut(msgspec.Struct, array_like=True):
+    bio: str
+
+
+class ArrayUserWithRequiredProfile(msgspec.Struct, array_like=True):
+    username: str
+    profile: ArrayProfileOut | None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reverse_one_to_one_of_an_array_like_struct():
+    """msgspec reads an ``array_like`` Struct from attributes or from an array, but not from a dict."""
+    ada, bob = _make_users()
+    UserProfile.objects.filter(user=bob).delete()
+    rows = [["ada", ["Hi"]], ["bob", None]]
+    api, list_paths, one_paths = _routes_of(ArrayUserWithRequiredProfile, User, "username")
+    # The paths that read instances. The values() and unvalidated paths make dicts, which never give arrays.
+    instance_paths = [path for path in list_paths if path.startswith(("/page", "/instances"))]
+    _assert_each_path(api, instance_paths, one_paths, rows, [ada.pk, bob.pk])
+
+
+class UserWithPhoto(msgspec.Struct):
+    username: str
+    photo_url: str | None = None
+    profile: ProfileOut | None = None
+
+
+class UserWithRequiredPhoto(msgspec.Struct):
+    username: str
+    photo_url: str
+    profile: ProfileOut | None = None
+
+
+def _instance_paths(item_type: type) -> tuple[BoltAPI, list[str], list[str]]:
+    api, list_paths, one_paths = _routes_of(item_type, User, "username")
+    return api, [path for path in list_paths if path.startswith(("/page", "/instances"))], one_paths
+
+
+@pytest.mark.django_db(transaction=True)
+def test_attribute_that_raises_gives_the_field_default_as_from_attributes_does():
+    """``User.photo_url`` raises ``ValueError``. msgspec reads an attribute that raises as a missing attribute."""
+    ada, bob = _make_users()
+    users = [ada, bob]
+    rows = [msgspec.to_builtins(msgspec.convert(user, UserWithPhoto, from_attributes=True)) for user in users]
+    assert rows[0] == {"username": "ada", "photo_url": None, "profile": {"bio": "Hi"}}
+    api, list_paths, one_paths = _instance_paths(UserWithPhoto)
+    _assert_each_path(api, list_paths, one_paths, rows, [user.pk for user in users])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_attribute_that_raises_on_a_required_field_gives_the_error_of_from_attributes():
+    ada, _ = _make_users()
+    with pytest.raises(msgspec.ValidationError) as plain:
+        msgspec.convert(ada, UserWithRequiredPhoto, from_attributes=True)
+    api, list_paths, one_paths = _instance_paths(UserWithRequiredPhoto)
+    with TestClient(api) as client:
+        for path in [*list_paths, *(path.format(pk=ada.pk) for path in one_paths)]:
+            with pytest.raises(ResponseValidationError) as served:
+                client.get(path)
+            assert str(plain.value) in str(served.value), path
+
+
+class UserWithPrivateNames(msgspec.Struct):
+    username: str
+    _instance: str = "none"
+    _relations: list[str] = []
+    profile: ProfileOut | None = None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_field_with_a_private_name_reads_the_instance():
+    """Bolt reads a Struct with a reverse one-to-one through a view. A field name cannot reach the storage of the view."""
+    ada, bob = _make_users()
+    users = [ada, bob]
+    rows = [msgspec.to_builtins(msgspec.convert(user, UserWithPrivateNames, from_attributes=True)) for user in users]
+    assert rows[0] == {"username": "ada", "_instance": "none", "_relations": [], "profile": {"bio": "Hi"}}
+    api, list_paths, one_paths = _instance_paths(UserWithPrivateNames)
+    _assert_each_path(api, list_paths, one_paths, rows, [user.pk for user in users])
+
+
+class UserWithEmail(msgspec.Struct):
+    username: str
+    email: str = "unknown"
+    profile: ProfileOut | None = None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_deferred_field_on_the_event_loop_gives_the_field_default():
+    """The deferred ``email`` cannot load on the event loop. msgspec reads the failed read as a missing attribute."""
+    _make_users()
+    api = BoltAPI()
+
+    @api.get("/page", response_model=list[UserWithEmail])
+    @paginate(PageNumberPagination)
+    async def page():
+        return User.objects.only("username").order_by("username")
+
+    with TestClient(api) as client:
+        response = client.get("/page")
+    assert response.status_code == 200, response.text
+    assert response.json()["items"] == [
+        {"username": "ada", "email": "unknown", "profile": {"bio": "Hi"}},
+        {"username": "bob", "email": "unknown", "profile": {"bio": "Yo"}},
+    ]
+
+
+class NotebookOut(msgspec.Struct):
+    title: str
+
+
+class NoteOut(msgspec.Struct):
+    text: str
+    notebook: NotebookOut | None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_query_name_of_a_generic_relation_reads_only_through_a_query():
+    """``notebook`` is the query name of a GenericRelation. On a Note instance, ``notebook`` is a manager."""
+    ada, _ = _make_users()
+    book = Notebook.objects.create(title="B1")
+    Note.objects.create(content_object=book, text="n1")
+    Note.objects.create(content_object=ada, text="n2")
+    rows = [{"text": "n1", "notebook": {"title": "B1"}}, {"text": "n2", "notebook": None}]
+    api, list_paths, one_paths = _routes_of(NoteOut, Note, "text")
+
+    @api.viewset("/notes")
+    class NoteViewSet(ListMixin, ViewSet):
+        queryset = Note.objects.order_by("text")
+        serializer_class = NoteOut
+
+    _assert_each_path(api, ["/values", "/values-sync", "/notes"], [], rows, [])
+    instance_paths = [path for path in list_paths if not path.startswith("/values")]
+    instance_paths += [path.format(pk=Note.objects.get(text="n1").pk) for path in one_paths]
+    with TestClient(api) as client:
+        for path in instance_paths:
+            with pytest.raises(TypeError, match=r"NoteOut\.notebook is the query name of a GenericRelation"):
+                client.get(path)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_accessor_relation_loads_with_one_query_for_each_relation(sql_statements):
+    """The join uses the query name and the prefetch uses the accessor. No path reads a row at a time."""
+    ada, _ = _make_users()
+    User.objects.create(username="cy", email="cy@example.com", password_hash="x")
+    rows = [
+        {"username": "ada", "profile": {"bio": "Hi"}, "badge": {"label": "Gold"}},
+        {"username": "bob", "profile": {"bio": "Yo"}, "badge": None},
+        {"username": "cy", "profile": None, "badge": None},
+    ]
+    api, _, _ = _routes_of(UserWithRequiredBadge, User, "username")
+    # The values() query. The count and the page query with joins. The query of
+    # the handler and one query for each relation: the profiles and the badges.
+    cases = (("/values", 1), ("/page", 2), ("/page-sync", 2), ("/page-of-list", 3))
+    cases += (("/instances", 3), ("/instances-sync", 3), ("/unvalidated", 3), ("/unvalidated-sync", 3))
+    cases += ((f"/one/{ada.pk}", 3), (f"/viewset/{ada.pk}", 3))
+    with TestClient(api) as client:
+        for path, queries in cases:
+            sql_statements.clear()
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.text)
+            body = response.json()
+            expected = rows[0] if path.startswith(("/one/", "/viewset/")) else rows
+            assert (body["items"] if path.startswith("/page") else body) == expected, path
+            assert len(sql_statements) == queries, (path, sql_statements)
+
+
+class OneUserCursor(CursorPagination):
+    page_size = 1
+    ordering = "id"
+
+
+class OneUserPage(PageNumberPagination):
+    page_size = 1
+
+
+class OneUserLimit(LimitOffsetPagination):
+    page_size = 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_each_paginator_pages_through_instances_that_become_rows():
+    """CursorPagination reads the ordering field of the last instance. Bolt makes the rows after that."""
+    ada, bob = _make_users()
+    UserProfile.objects.filter(user=bob).delete()
+    pages = [{"username": "ada", "profile": {"bio": "Hi"}}, {"username": "bob", "profile": None}]
+    api = BoltAPI()
+
+    @api.get("/cursor", response_model=list[UserWithRequiredProfile])
+    @paginate(OneUserCursor)
+    async def cursor():
+        return User.objects.all()
+
+    @api.get("/cursor-sync", response_model=list[UserWithRequiredProfile])
+    @paginate(OneUserCursor)
+    def cursor_sync():
+        return User.objects.all()
+
+    @api.get("/page", response_model=list[UserWithRequiredProfile])
+    @paginate(OneUserPage)
+    async def page():
+        return User.objects.order_by("id")
+
+    @api.get("/limit", response_model=list[UserWithRequiredProfile])
+    @paginate(OneUserLimit)
+    async def limit():
+        return User.objects.order_by("id")
+
+    with TestClient(api) as client:
+        for path in ("/cursor", "/cursor-sync"):
+            first = client.get(path)
+            assert first.status_code == 200, (path, first.text)
+            assert first.json()["items"] == pages[:1], path
+            cursor_value = first.json()["next_cursor"]
+            assert cursor_value, path
+            second = client.get(path, params={"cursor": cursor_value})
+            assert second.status_code == 200, (path, second.text)
+            assert second.json()["items"] == pages[1:], path
+        for path, params in (("/page", {"page": 2}), ("/limit", {"offset": 1})):
+            response = client.get(path, params=params)
+            assert response.status_code == 200, (path, response.text)
+            assert response.json()["items"] == pages[1:], path
+
+
+class SecretOut(msgspec.Struct):
+    code: str
+
+
+class UserWithSecretRow(msgspec.Struct):
+    username: str
+    secret_row: SecretOut | None = None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_hidden_reverse_relation_reads_only_through_a_query():
+    """A hidden relation has no accessor. A QuerySet reads it. A model instance cannot, so Bolt names the field.
+
+    The default of the field would be ``null`` for a user who has the related row.
+    """
+    ada, bob = _make_users()
+    UserSecret.objects.create(user=ada, code="s1")
+    rows = [{"username": "ada", "secret_row": {"code": "s1"}}, {"username": "bob", "secret_row": None}]
+    api, list_paths, one_paths = _routes_of(UserWithSecretRow, User, "username")
+    values_paths = [path for path in list_paths if path.startswith("/values")]
+    _assert_each_path(api, values_paths, [], rows, [ada.pk, bob.pk])
+    instance_paths = [path for path in list_paths if not path.startswith("/values")]
+    instance_paths += [path.format(pk=ada.pk) for path in one_paths]
+    with TestClient(api) as client:
+        for path in instance_paths:
+            with pytest.raises(TypeError, match=r"UserWithSecretRow\.secret_row is a hidden relation"):
+                client.get(path)

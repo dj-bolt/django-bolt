@@ -28,6 +28,11 @@ dependencies = [
     "pyjwt>=2.8",
 ]
 
+[project.optional-dependencies]
+# bolt_mcp.otel: OpenTelemetry spans for MCP calls. 1.27 is the oldest release
+# that the tests of bolt_mcp.otel pass with.
+otel = ["opentelemetry-api>=1.27"]
+
 [project.urls]
 Homepage = "https://github.com/FarhanAliRaza/django-bolt"
 Repository = "https://github.com/FarhanAliRaza/django-bolt"

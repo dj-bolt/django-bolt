@@ -4,6 +4,8 @@ Test models for Django ORM integration tests.
 These models are used to verify that ViewSets work with real Django ORM operations.
 """
 
+from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
+from django.contrib.contenttypes.models import ContentType
 from django.db import models
 
 
@@ -109,6 +111,11 @@ class User(models.Model):
     def __str__(self):
         return self.username
 
+    @property
+    def photo_url(self):
+        """Raise as ``FieldFile.url`` does for a file field with no file."""
+        raise ValueError("The 'photo' attribute has no file associated with it.")
+
 
 class UserProfile(models.Model):
     """User profile with one-to-one relationship to User."""
@@ -127,6 +134,48 @@ class UserProfile(models.Model):
 
     def __str__(self):
         return f"Profile for {self.user.username}"
+
+
+class UserBadge(models.Model):
+    """One-to-one relation to User whose query name differs from its accessor."""
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="badge", related_query_name="badge_row")
+    label = models.CharField(max_length=50)
+
+    class Meta:
+        app_label = "django_bolt"
+
+
+class UserSecret(models.Model):
+    """Hidden one-to-one relation to User: it has a query name, but no accessor."""
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="+", related_query_name="secret_row")
+    code = models.CharField(max_length=50)
+
+    class Meta:
+        app_label = "django_bolt"
+
+
+class Note(models.Model):
+    """A note on any object, through a generic foreign key."""
+
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+    object_id = models.PositiveIntegerField()
+    content_object = GenericForeignKey("content_type", "object_id")
+    text = models.CharField(max_length=50)
+
+    class Meta:
+        app_label = "django_bolt"
+
+
+class Notebook(models.Model):
+    """The query name ``notebook`` lets a query on Note follow the generic relation."""
+
+    title = models.CharField(max_length=50)
+    notes = GenericRelation(Note, related_query_name="notebook")
+
+    class Meta:
+        app_label = "django_bolt"
 
 
 class Document(models.Model):

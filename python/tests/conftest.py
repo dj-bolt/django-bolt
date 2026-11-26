@@ -251,11 +251,15 @@ def django_db_setup(django_db_blocker):
                 Comment,
                 Country,
                 Document,
+                Note,
+                Notebook,
                 Release,
                 ShortJtiRevokedToken,
                 Tag,
                 User,
+                UserBadge,
                 UserProfile,
+                UserSecret,
             )
 
             models = [
@@ -266,6 +270,10 @@ def django_db_setup(django_db_blocker):
                 Comment,
                 User,
                 UserProfile,
+                UserBadge,
+                UserSecret,
+                Note,
+                Notebook,
                 Document,
                 Release,
                 Country,
