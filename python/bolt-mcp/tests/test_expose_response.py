@@ -6,6 +6,7 @@ and compares the two. The ``response_model`` and the return annotation apply to 
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from collections.abc import AsyncIterator
 
@@ -30,6 +31,10 @@ class GroupOut(msgspec.Struct):
 
 class Missing(msgspec.Struct):
     detail: str
+
+
+class Net(msgspec.Struct):
+    ip: ipaddress.IPv4Address
 
 
 SECRET_ROW = {"name": "a", "password_hash": "SECRET"}
@@ -388,6 +393,30 @@ def test_mcp_tool_result_does_not_change():
         tools = _tools(client)
     assert result["structuredContent"] == {"name": "a", "extra": 1}
     assert "outputSchema" not in tools["row"]
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_a_struct_with_no_json_schema_gives_no_output_schema(explicit):
+    """msgspec has no JSON Schema for ``IPv4Address``, but Bolt encodes it. The route mounts with no ``outputSchema``."""
+    api = BoltAPI()
+    mcp = MCP("t")
+
+    @api.get("/net", response_model=Net)
+    async def net():
+        return Net(ip=ipaddress.IPv4Address("10.0.0.1"))
+
+    if explicit:
+        api.mount_mcp(mcp, expose=[net])
+    else:
+        expose_routes(mcp, api, only_marked=False)
+        api.mount_mcp(mcp)
+    with TestClient(api) as client:
+        http_resp = client.get("/net")
+        tools = _tools(client)
+        result = _call(client, "net")
+    assert http_resp.json() == {"ip": "10.0.0.1"}
+    assert "outputSchema" not in tools["net"]
+    _assert_same_as_http(result, http_resp)
 
 
 def test_expose_routes_with_patterns_skips_a_stream_route():

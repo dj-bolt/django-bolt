@@ -547,6 +547,8 @@ A tool result has no headers and no cookies.
 Thus Bolt does not send the headers and the cookies of the response.
 
 A route that validates its body against one `msgspec.Struct` gets that schema as the `outputSchema` of the tool.
+msgspec has no JSON Schema for some types that Bolt encodes, such as `IPv4Address` or `Path`.
+A route with such a field in its `Struct` has no `outputSchema`.
 Each other route has no `outputSchema`.
 When a tool has an `outputSchema`, a success result with a different body is an error result.
 An example is a `PlainText` return from a route with `response_model=PublicUser`.

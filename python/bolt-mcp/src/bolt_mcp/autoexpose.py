@@ -123,7 +123,8 @@ def _output_schema(meta: dict[str, Any]) -> dict[str, Any] | None:
     """Return the output schema of an exposed route, or None when Bolt does not hold its body to one object shape.
 
     Bolt validates each body of the default status against a plain Struct. A Serializer can dump other fields,
-    and a list body goes in ``{"result": ...}``, so these routes get no schema.
+    and a list body goes in ``{"result": ...}``, so these routes get no schema. msgspec has no JSON Schema for
+    some types that Bolt encodes, such as ``IPv4Address`` or ``Path``. A Struct with such a field gets no schema.
     """
     response_type = meta["response_type"]
     if (
@@ -134,7 +135,10 @@ def _output_schema(meta: dict[str, Any]) -> dict[str, Any] | None:
         or compile_serializer_dumper(response_type) is not None
     ):
         return None
-    return schema.object_schema(response_type)
+    try:
+        return schema.object_schema(response_type)
+    except TypeError:
+        return None
 
 
 def _route_tool_fn(name: str, handler: Callable, meta: dict[str, Any], output_schema: dict[str, Any] | None) -> Any:
