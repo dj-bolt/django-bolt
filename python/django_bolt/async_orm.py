@@ -181,17 +181,24 @@ def _libpq_addresses(database: Any) -> dict[str, int] | None:
 
 
 def _deliver(cursor: _RustCursor, result: tuple[int, Any, Any]) -> None:
-    """Take the result of a query from Rust. Runs on the event loop."""
+    """Take the result of a query from Rust, or the end of a cancel request. Runs on the event loop."""
+    if result[0] == _Libpq.CANCEL_SENT:
+        cursor.cancelling = False
+        if result[2] is not None:
+            logger.warning("The server did not get the cancel request of a loop query: %s", result[2])
+        cursor.settled()
+        return
     cursor.pending = False
     waiter = cursor.waiter
     if not waiter.done():
         waiter.set_result(result)
         return
     # The query was cancelled. The pool waits for its connection.
-    on_result = cursor.on_result
-    if on_result is not None:
-        cursor.on_result = None
-        on_result(cursor)
+    cursor.settled()
+
+
+class _StaleConnection(Exception):  # noqa: N818 - not an error of the caller: the pool takes another connection
+    """The database closed the connection while it was idle. The server did not get the statement."""
 
 
 class _RustCursor:
@@ -207,6 +214,7 @@ class _RustCursor:
     """
 
     __slots__ = (
+        "cancelling",
         "connection",
         "create_future",
         "database",
@@ -236,7 +244,9 @@ class _RustCursor:
         self.waiter: Any = None
         # True from the send of a query until Rust gives its result.
         self.pending = False
-        # The pool sets this callback for a cancelled query. It gets this cursor when the result is here.
+        # True while Rust sends the cancel request of a cancelled query.
+        self.cancelling = False
+        # The pool sets this callback for a cancelled query. It gets this cursor when the query is settled.
         self.on_result: Any = None
         self.query = b""
         self.result: Any = None
@@ -282,6 +292,8 @@ class _RustCursor:
             raise self._server_error(first, second)
         if kind == _Libpq.CONNECTION_ERROR:
             raise database.OperationalError(second)
+        if kind == _Libpq.STALE:
+            raise _StaleConnection(second)
         status = database.pq.ExecStatus(first)
         if status in (status.COMMAND_OK, status.EMPTY_QUERY):
             self.result = status
@@ -327,13 +339,19 @@ class _RustCursor:
         """Ask the server to stop the query, as psycopg does for a cancelled task.
 
         Without the request, the query runs to its end and keeps its
-        connection busy. The request is a short blocking call on a connection
-        of its own.
+        connection busy. The request opens a connection of its own and
+        blocks, so Rust sends it from another thread, with no GIL.
+        ``settled`` gives the connection back only after the request ended:
+        a request that comes late would stop the next query of the connection.
         """
-        try:
-            self.connection.cancel()
-        except self.database.Error as error:
-            logger.warning("The server did not get the cancel request of a loop query: %s", error)
+        self.cancelling = self.native.cancel(self)
+
+    def settled(self) -> None:
+        """Give the connection of a cancelled query back to the pool, when Rust and the cancel request ended."""
+        on_result = self.on_result
+        if on_result is not None and not self.pending and not self.cancelling:
+            self.on_result = None
+            on_result(self)
 
     def close(self) -> None:
         """Close the connection. Rust makes no call on it after ``native.close()`` returns."""
@@ -561,11 +579,11 @@ class _Pool:
         """Take ``cursor`` back after a query that did not complete.
 
         A cancelled query asked the server to cancel it, and did not wait. Its
-        connection comes back here when Rust read the end of the query. A
-        connection that is not idle then still runs a query, and the next
-        query on it would fail.
+        connection comes back here when the query is settled: see
+        ``_RustCursor.settled``. A connection that is not idle then still
+        runs a query, and the next query on it would fail.
         """
-        if cursor.pending:
+        if cursor.pending or cursor.cancelling:
             self.cancelled.add(cursor)
             cursor.on_result = self._give_back
             return
@@ -618,13 +636,15 @@ class _Pool:
         ``wrapper.queries_logged``, ``connection.queries`` and the
         ``django.db.backends`` logger get the query, as with the cursor of Django.
 
-        A database restart ends each connection of the pool. The query then
-        fails on a dead connection, before the database runs it. The pool
-        closes its idle connections and sends the query one more time on a
-        new connection.
+        A database restart ends each idle connection of the pool. Rust finds
+        such a connection before it sends the statement. The pool then closes
+        its idle connections, which are of the same age, and takes a new one.
+
+        A connection that ends after the send fails the read. The database
+        can have run the statement, so the pool does not send it again.
         """
         database_error = self.database.Error
-        for first_try in (True, False):
+        while True:
             cursor = await self.acquire()
             cursor.waiter = None
             try:
@@ -636,15 +656,17 @@ class _Pool:
                     CursorWrapper(cursor, wrapper).execute(sql, params)
                     await cursor.wait()
                 rows = cursor.fetchall()
-            except database_error as error:
-                if not cursor.connection.broken:
-                    # The query failed and the connection is good.
-                    self._give_back(cursor)
-                    raise _django_error(self.database, error) from error
+            except _StaleConnection:
                 self.discard(cursor)
                 self.discard_idle()
-                if not first_try:
-                    raise _django_error(self.database, error) from error
+            except database_error as error:
+                if cursor.connection.broken:
+                    self.discard(cursor)
+                    self.discard_idle()
+                else:
+                    # The query failed and the connection is good.
+                    self._give_back(cursor)
+                raise _django_error(self.database, error) from error
             except BaseException:
                 # A cancel, or an error of a type adapter.
                 self._give_back(cursor)
@@ -652,7 +674,6 @@ class _Pool:
             else:
                 self.release(cursor)
                 return rows
-        raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _django_error(database: Any, error: Exception) -> Exception:
@@ -678,6 +699,9 @@ def _new_pool(loop: WorkerLoop, alias: str) -> _Pool | None:
     elif not settings_dict["AUTOCOMMIT"]:
         # Each read of a thread is then in the transaction of that thread.
         reason = "AUTOCOMMIT is off"
+    elif "cursor_factory" in settings_dict["OPTIONS"]:
+        # Django then makes cursors of that class. Only its own client cursor merges the parameters as Rust needs.
+        reason = "OPTIONS has a cursor_factory"
     else:
         addresses = _libpq_addresses(database)
         reason = f"the {database.pq.__impl__} implementation of psycopg does not give its libpq functions"
@@ -827,7 +851,9 @@ async def _rows(pool: _Pool, compiler: Any) -> Any:
 async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
     """Fill the result cache of ``queryset``: ``QuerySet._fetch_all`` with the query on the event loop."""
     query = queryset.query
-    compiler = query.get_compiler(using=queryset.db)
+    # A router can give another database for each call of ``queryset.db``. The read uses the database of its pool.
+    alias = pool.alias
+    compiler = query.get_compiler(using=alias)
     rows = await _rows(pool, compiler)
     if rows is None:
         await SyncToAsync(queryset._fetch_all)()
@@ -837,6 +863,9 @@ async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
     # the rows. Give it this compiler, which has the rows.
     compiler.execute_sql = lambda *_args, **_kwargs: (rows,)
     query.get_compiler = lambda *_args, **_kwargs: compiler
+    # The iterable class reads ``queryset.db`` for the instances that it builds.
+    database_of_the_queryset = queryset._db
+    queryset._db = alias
     try:
         queryset._result_cache = list(queryset._iterable_class(queryset))
         return
@@ -847,6 +876,7 @@ async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
         # starts on a thread.
         _models_on_threads.add(queryset.model)
     finally:
+        queryset._db = database_of_the_queryset
         del query.get_compiler
     await SyncToAsync(queryset._fetch_all)()
 
@@ -875,7 +905,9 @@ def _aiter(self: QuerySet) -> Any:
         return _django_aiter(self)
 
     async def generator() -> Any:
-        await _fetch_all(self, pool)
+        # Another iterator of this QuerySet can have read the rows after this one was made.
+        if self._result_cache is None:
+            await _fetch_all(self, pool)
         for item in self._result_cache:
             yield item
 
@@ -998,12 +1030,14 @@ async def _alast(self: QuerySet) -> Any:
 
 async def _aexists(self: QuerySet) -> bool:
     """``QuerySet.aexists``: the lines of ``QuerySet.exists`` and ``Query.has_results``, with the query awaited."""
+    if type(self).exists is not _django_exists:
+        return await _django_aexists(self)
     if self._result_cache is not None:
         return bool(self._result_cache)
-    pool = _pool_for(self) if type(self).exists is _django_exists else None
+    pool = _pool_for(self)
     if pool is None:
         return await _django_aexists(self)
-    rows = await _rows(pool, self.query.exists().get_compiler(using=self.db))
+    rows = await _rows(pool, self.query.exists().get_compiler(using=pool.alias))
     if rows is None:
         return await _django_aexists(self)
     return bool(rows)

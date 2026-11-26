@@ -216,7 +216,9 @@ class _SlowLink:
 
     CHUNK = 16 * 1024
 
-    def __init__(self, params: dict[str, Any]) -> None:
+    def __init__(self, params: dict[str, Any], connect_seconds: float = 0.0) -> None:
+        # Each new connection waits this long before it reaches the database.
+        self.connect_seconds = connect_seconds
         host = params.get("host") or "/var/run/postgresql"
         port = int(params.get("port") or 5432)
         # libpq reads a host that starts with a slash as the directory of a Unix socket.
@@ -238,6 +240,7 @@ class _SlowLink:
             except TimeoutError:
                 continue
             client.settimeout(None)
+            time.sleep(self.connect_seconds)
             family = socket.AF_UNIX if isinstance(self.target, str) else socket.AF_INET
             server = socket.socket(family, socket.SOCK_STREAM)
             server.connect(self.target)
@@ -294,9 +297,9 @@ def on_loop(request, postgres_database, monkeypatch, django_db_blocker):
 
 
 @pytest.fixture
-def on_loop_through_a_slow_link(postgres_database, monkeypatch, django_db_blocker):
-    """``on_loop``, with the database behind a ``_SlowLink``."""
-    link = _SlowLink(postgres_database)
+def on_loop_through_a_slow_link(request, postgres_database, monkeypatch, django_db_blocker):
+    """``on_loop``, with the database behind a ``_SlowLink``. An indirect parameter gives its connect time."""
+    link = _SlowLink(postgres_database, getattr(request, "param", 0.0))
     behind = {**postgres_database, "host": "127.0.0.1", "port": str(link.port)}
     try:
         with _setting_on(behind, monkeypatch, django_db_blocker, {}) as database:
@@ -625,11 +628,17 @@ OWN_METHODS: dict[str, Callable[[QuerySet], Any]] = {
     "first": lambda authors: authors.afirst(),
     "last": lambda authors: authors.alast(),
     "exists": lambda authors: authors.aexists(),
+    "exists_with_rows": lambda authors: _exists_with_rows(authors),
 }
 
 
 async def _names(authors: QuerySet) -> list[str]:
     return [author.name async for author in authors]
+
+
+async def _exists_with_rows(authors: QuerySet) -> bool:
+    assert await _names(authors) == ["Ada"]
+    return await authors.aexists()
 
 
 class QueryingIterable(ModelIterable):
@@ -658,6 +667,19 @@ class CloningIterable(ModelIterable):
 ITERABLE_CLASSES = {"querying": QueryingIterable, "cloning": CloningIterable}
 
 
+class _AnotherDatabaseForEachCall:
+    """A database router, as one that spreads the reads over replicas: each call can give another database."""
+
+    calls = 0
+
+    def db_for_read(self, model: Any, **hints: Any) -> str | None:
+        if model is not LoopProbe:
+            return None
+        type(self).calls += 1
+        # ``default`` is the SQLite database, which has no table of this model.
+        return ALIAS if type(self).calls == 1 else "default"
+
+
 def _api() -> BoltAPI:
     api = BoltAPI()
     _probe_threads_route(api)
@@ -665,7 +687,7 @@ def _api() -> BoltAPI:
 
     @api.get("/own-method/{method}")
     async def own_method(method: str):
-        authors = _own_method_class(method)(model=Author, using=ALIAS).filter(name="Ada")
+        authors = _own_method_class(method.removesuffix("_with_rows"))(model=Author, using=ALIAS).filter(name="Ada")
         own_method_calls.clear()
         await OWN_METHODS[method](authors)
         return {"calls": own_method_calls}
@@ -704,6 +726,29 @@ def _api() -> BoltAPI:
         except Exception as error:
             return {"error": type(error).__qualname__, "sql": connections[ALIAS].queries[-1]["sql"]}
         return {"error": None}
+
+    @api.get("/two-iterators")
+    async def two_iterators():
+        posts = _posts().order_by("id")
+        # Two iterators of one QuerySet, made before one of them reads.
+        first_iterator, second_iterator = posts.__aiter__(), posts.__aiter__()
+        first = [post async for post in first_iterator]
+        second = [post async for post in second_iterator]
+        return {"rows": len(first), "same_objects": all(a is b for a, b in zip(first, second, strict=True))}
+
+    @api.get("/routed")
+    async def routed():
+        _AnotherDatabaseForEachCall.calls = 0
+        # ``DISTINCT ON`` is PostgreSQL SQL. The compiler of the SQLite database refuses it.
+        probes = [probe async for probe in LoopProbe.objects.order_by("label").distinct("label")]
+        return {"databases": [probe._state.db for probe in probes], "labels": [probe.label for probe in probes]}
+
+    @api.get("/slow-read-outcome")
+    async def slow_read_outcome():
+        try:
+            return {"pid": await asyncio.wait_for(_backend_pid(nap=20), 30)}
+        except Exception as error:
+            return {"module": type(error).__module__, "error": type(error).__qualname__}
 
     @api.get("/current-user")
     async def current_user():
@@ -862,6 +907,19 @@ def _api() -> BoltAPI:
             return {"same_connection": following == before}
         return {"same_connection": None}
 
+    @api.get("/late-cancel-request")
+    async def late_cancel_request():
+        # Open the one connection of the loop.
+        await _backend_pid()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(_backend_pid(nap=0.2), timeout=0.1)
+        # The cancelled query ends at 0.2 seconds. Its cancel request reaches the server later.
+        try:
+            await asyncio.wait_for(_backend_pid(nap=1), timeout=10)
+        except Exception as error:
+            return {"next": type(error).__qualname__}
+        return {"next": "ok"}
+
     @api.get("/cancelled-waiter")
     async def cancelled_waiter():
         # Open the one connection of the loop, so the first query below takes it at once.
@@ -927,10 +985,6 @@ def _api() -> BoltAPI:
             return {"rows": await async_orm.fetch(ALIAS, STATEMENTS[name], None)}
         except Exception as error:
             return {"module": type(error).__module__, "error": type(error).__qualname__, "message": str(error)}
-
-    @api.get("/slow-backend-pid")
-    async def slow_backend_pid():
-        return {"pid": await asyncio.wait_for(_backend_pid(nap=1), 10)}
 
     @api.get("/two-at-once")
     async def two_at_once():
@@ -1029,6 +1083,10 @@ def test_a_returned_queryset_gives_the_response_of_the_thread_path(loop_db, name
     assert not any(name.startswith(ORM_THREAD) for name in built_by_loop), built_by_loop
     if name in ("struct", "renamed", "serializer", "computed", "values"):
         assert len(built_by_loop) == 2
+
+
+def _built_on_the_handler_thread(threads: dict[str, Any]) -> bool:
+    return all(name == threads["handler"] for name in (*threads["async_for"], threads["aget"]))
 
 
 def _built_on_orm_threads(threads: dict[str, Any]) -> bool:
@@ -1624,7 +1682,9 @@ def test_an_idle_connection_closes_and_the_next_read_opens_one(on_loop, monkeypa
 def test_a_closed_client_leaves_no_connection_open(on_loop):
     with TestClient(_api()) as client:
         assert client.get("/authors").status_code == 200
-    connections[ALIAS].close()
+        connections[ALIAS].close()
+        # The one connection that stays is the loop connection.
+        on_loop.wait_for_backends(1)
 
     on_loop.wait_for_backends(0)
 
@@ -1674,11 +1734,15 @@ def assumed_role(postgres_database):
     role = psycopg.sql.Identifier(f"bolt_role_{secrets.token_hex(4)}")
     with psycopg.connect(**postgres_database, autocommit=True) as admin:
         admin.execute(psycopg.sql.SQL("CREATE ROLE {}").format(role))
-        admin.execute(psycopg.sql.SQL("GRANT ALL ON SCHEMA public TO {}").format(role))
-    yield role.as_string()
-    with psycopg.connect(**postgres_database, autocommit=True) as admin:
-        admin.execute(psycopg.sql.SQL("DROP OWNED BY {}").format(role))
-        admin.execute(psycopg.sql.SQL("DROP ROLE {}").format(role))
+    try:
+        with psycopg.connect(**postgres_database, autocommit=True) as admin:
+            admin.execute(psycopg.sql.SQL("GRANT ALL ON SCHEMA public TO {}").format(role))
+        yield role.as_string()
+    finally:
+        # A role is in each database of the server. It must not stay after a failed test.
+        with psycopg.connect(**postgres_database, autocommit=True) as admin:
+            admin.execute(psycopg.sql.SQL("DROP OWNED BY {}").format(role))
+            admin.execute(psycopg.sql.SQL("DROP ROLE {}").format(role))
 
 
 def test_a_loop_connection_has_the_role_of_assume_role(assumed_role, postgres_database, monkeypatch, django_db_blocker):
@@ -1696,7 +1760,7 @@ def test_a_loop_connection_has_the_role_of_assume_role(assumed_role, postgres_da
 @pytest.mark.parametrize("method", sorted(OWN_METHODS))
 def test_a_queryset_class_with_its_own_method_runs_it(on_loop, method):
     expected = _with_the_setting_off(_api, f"/own-method/{method}")
-    assert expected == {"calls": [method]}
+    assert expected == {"calls": [method.removesuffix("_with_rows")]}
 
     with TestClient(_api()) as client:
         response = client.get(f"/own-method/{method}")
@@ -1785,7 +1849,7 @@ def test_a_database_with_the_connection_pool_of_django_reads_on_the_event_loop(o
         threads = client.get("/threads").json()
         many = client.get("/many-at-once/4").json()
 
-    assert not _built_on_orm_threads(threads), threads
+    assert _built_on_the_handler_thread(threads), threads
     assert many == {"connections": 4}
 
 
@@ -1876,28 +1940,86 @@ def test_a_statement_that_is_not_one_select_gives_the_outcome_of_psycopg(on_loop
     assert after.json() == ["Ada", "Bob", "Cy"]
 
 
-def _terminate_backend(db: LoopDb, pid: int) -> None:
+def _terminate_the_backend_that_sleeps(db: LoopDb) -> None:
+    """Wait until a backend of the test runs ``pg_sleep``, then end it."""
+    deadline = time.monotonic() + 10
     with psycopg.connect(**db.params, autocommit=True) as admin:
-        admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+        while time.monotonic() < deadline:
+            killed = admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+                " WHERE application_name = %s AND state = 'active' AND query LIKE '%%pg_sleep%%'",
+                (db.application_name,),
+            ).fetchall()
+            if killed:
+                return
+            time.sleep(0.02)
 
 
-def test_a_connection_that_dies_during_a_query_fails_no_request(on_loop):
-    """The pool sends the query again on a new connection: see ``_Pool.fetch``."""
+def test_a_connection_that_dies_during_a_query_fails_the_read_and_not_the_next_read(on_loop):
+    """The database can have run the statement, so the pool does not send it again."""
     with TestClient(_api()) as client:
         assert client.get("/authors").json() == ["Ada", "Bob", "Cy"]
         connections[ALIAS].close()
-        (before,) = backend_pids(on_loop.params, on_loop.application_name)
 
-        # The query takes 1 second. The server ends its connection after 0.3 seconds.
-        killer = threading.Timer(0.3, _terminate_backend, args=(on_loop, before))
+        killer = threading.Thread(target=_terminate_the_backend_that_sleeps, args=(on_loop,))
         killer.start()
         try:
-            response = client.get("/slow-backend-pid")
+            response = client.get("/slow-read-outcome")
         finally:
             killer.join()
+        after = client.get("/authors")
+
+    assert response.json() == {"module": "django.db.utils", "error": "OperationalError"}
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+def test_two_iterators_of_one_queryset_read_the_rows_one_time(on_loop):
+    with TestClient(_api()) as client:
+        response = client.get("/two-iterators")
+
+    assert response.json() == {"rows": 3, "same_objects": True}
+
+
+def test_a_read_uses_one_database_when_the_router_gives_another_for_each_call(on_loop):
+    """The pool, the statement and the instances of one read must be of one database."""
+    with override_settings(DATABASE_ROUTERS=[_AnotherDatabaseForEachCall()]), TestClient(_api()) as client:
+        response = client.get("/routed")
 
     assert response.status_code == 200, response.text
-    assert response.json()["pid"] != before
+    assert response.json() == {"databases": [ALIAS, ALIAS], "labels": ["a", "b"]}
+
+
+@pytest.mark.parametrize("on_loop", [{"cursor_factory": psycopg.ClientCursor}], indirect=True, ids=["cursor_factory"])
+def test_a_database_with_a_cursor_factory_reads_on_the_orm_pool(on_loop, caplog):
+    """Django then makes cursors of that class, and not of its own class."""
+    caplog.set_level(logging.INFO, logger="django_bolt.async_orm")
+    with TestClient(_api()) as client:
+        threads = client.get("/threads").json()
+
+    assert _built_on_orm_threads(threads), threads
+    assert _loop_log(caplog) == [
+        f"The async ORM reads of the database {ALIAS!r} use the ORM thread pool: OPTIONS has a cursor_factory."
+    ]
+
+
+def test_auser_gives_a_user_whose_model_queries_when_it_builds_an_instance(users):
+    """Without the thread, the load fails, and the backend then gives no user for a valid token."""
+    user_model = get_user_model()
+
+    def count_groups(sender: Any, instance: Any, **kwargs: Any) -> None:
+        instance.groups_in_the_database = Group.objects.count()
+
+    post_init.connect(count_groups, sender=user_model)
+    try:
+        with override_settings(BOLT_ASYNC_ORM_ON_LOOP=True), TestClient(_auth_api()) as client:
+            assert client.get("/warm-up").status_code == 200
+            first = _me(client, users["active"])
+            second = _me(client, users["active"])
+    finally:
+        post_init.disconnect(count_groups, sender=user_model)
+        concurrency.check_pool_environment()
+
+    assert first == second == {"username": "ada", "is_user": True}
 
 
 def test_a_read_that_sync_code_runs_in_its_transaction_has_the_rows_of_the_transaction(on_loop):
@@ -1953,7 +2075,7 @@ def test_a_tool_that_replaces_the_execute_of_the_cursor_wrapper_gets_each_statem
             threads = client.get("/threads")
 
     assert threads.status_code == 200, threads.text
-    assert not _built_on_orm_threads(threads.json()), threads.json()
+    assert _built_on_the_handler_thread(threads.json()), threads.json()
     assert len(statements) == 2, statements
     assert all(statement.startswith('SELECT "django_bolt_loopprobe"."id"') for statement in statements)
 
@@ -1972,3 +2094,14 @@ def test_a_tool_that_sends_no_statement_gives_an_error_and_not_the_rows_of_an_ea
 
     assert response.json() == {"module": "django.db.utils", "error": "ProgrammingError"}
     assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+@pytest.mark.parametrize("on_loop_through_a_slow_link", [0.3], indirect=True, ids=["slow_connect"])
+def test_a_cancel_request_that_comes_late_does_not_stop_the_next_query(on_loop_through_a_slow_link, monkeypatch):
+    """The request names a connection, not a query. The pool keeps the connection until the request ended."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    with TestClient(_api()) as client:
+        response = client.get("/late-cancel-request")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"next": "ok"}

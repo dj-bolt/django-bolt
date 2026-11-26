@@ -217,7 +217,7 @@ Some reads need the database connection of a thread, or sync code. For these rea
 | A read in a transaction | Only the connection of the transaction has its rows. A `TestClient` in a Django `TestCase` gives such a connection to the handlers. |
 | A read in async code that sync code calls with `async_to_sync()` | The thread of the sync code can have a transaction. |
 | A database with another `ENGINE`, for example PostGIS or django-tenants | Another backend can change how a connection opens. |
-| A database with `OPTIONS["server_side_binding"]`, or with `AUTOCOMMIT` off | Bolt sends a statement with its parameters in it, outside a transaction. |
+| A database with `OPTIONS["server_side_binding"]` or `OPTIONS["cursor_factory"]`, or with `AUTOCOMMIT` off | Bolt sends a statement with its parameters in it, outside a transaction. The cursor of Django puts the parameters in. |
 | A database whose connections have an execute wrapper from a `connection_created` receiver | A wrapper of `connection.execute_wrapper()` is sync code around the query. It measures the time of the query and gets its error. |
 | A QuerySet class with its own `get()`, `first()`, `last()`, `exists()` or `_fetch_all()`, or with its own iterable class | Your code runs in place of Django's code, and it can query. |
 | A model whose rows need a query, for example in `from_db()` or in a `post_init` receiver | Sync code cannot query on the event loop. Bolt finds this at the first read of the model. That read runs two times. |
@@ -241,8 +241,10 @@ Django opens each loop connection, with the parameters of `DATABASES`. No thread
 | `DJANGO_BOLT_LOOP_IDLE_SECONDS` | `600` | A connection that no read used for this time closes. |
 | `DJANGO_BOLT_LOOP_LIFETIME_SECONDS` | `1800` | A connection older than this time closes. |
 
-- After a database restart, Bolt sends a read that failed on a dead connection one more time, on a new connection.
-- When a request stops during a query, Bolt asks the server to cancel the query.
+- A read does not use a connection that the database closed while the connection was idle, for example after a database restart. The loop opens a new one.
+- A connection that ends during a query fails that read, as on a thread. Bolt does not send the statement again, because the database can have run it.
+- When a request stops during a query, Bolt asks the server to cancel the query. The request does not block the event loop.
+- With a database router, one read uses one database: the database that the router gives for the first call.
 - With `DEBUG = True`, `connection.queries` and the `django.db.backends` logger have each read, with its time.
 - A database error is a `django.db` error around the psycopg error, with the fields that the sync ORM gives.
 - A tool that replaces `CursorWrapper.execute` gets the statement of each read. It gets no query time and no database error, because the query runs after that method returns.

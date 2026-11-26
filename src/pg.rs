@@ -43,6 +43,8 @@ const ROWS: i32 = 0;
 const NO_ROWS: i32 = 1;
 const SERVER_ERROR: i32 = 2;
 const CONNECTION_ERROR: i32 = 3;
+const STALE: i32 = 4;
+const CANCEL_SENT: i32 = 5;
 
 /// Declare the libpq functions that this module calls: the table of their
 /// addresses, and their names for Python.
@@ -93,6 +95,9 @@ libpq! {
     result_error_field = "PQresultErrorField": fn(Res, c_int) -> *const c_char;
     result_error_message = "PQresultErrorMessage": fn(Res) -> *const c_char;
     clear = "PQclear": fn(Res) -> ();
+    get_cancel = "PQgetCancel": fn(Conn) -> *mut c_void;
+    cancel = "PQcancel": fn(*mut c_void, *mut c_char, c_int) -> c_int;
+    free_cancel = "PQfreeCancel": fn(*mut c_void) -> ();
 }
 
 fn address(addresses: &Bound<'_, PyDict>, name: &str) -> PyResult<usize> {
@@ -129,6 +134,8 @@ impl Drop for Results {
 enum Failure {
     /// `close` ran. Nothing waits for this query.
     Closed,
+    /// The connection ended while it was idle. The server did not get the statement.
+    Stale(String),
     Connection(String),
 }
 
@@ -206,6 +213,16 @@ async fn run(shared: &Shared, watcher: &AsyncFd<OwnedFd>, sql: &CStr) -> Result<
     let fd = watcher.get_ref().as_raw_fd();
 
     shared.step(|api, conn| {
+        // An idle connection has no input. Input before the statement is a
+        // message that no query asked for, and then usually the end of the
+        // connection: a server that stops sends a last message and closes a
+        // moment later. The caller sends the statement on another
+        // connection, because this one did not send it.
+        if socket_events(fd, libc::POLLIN) != 0 {
+            return Err(Failure::Stale(
+                "the server sent data or closed the connection while it was idle".to_owned(),
+            ));
+        }
         // SAFETY: `conn` is a live connection, and a step is its only user.
         if unsafe { (api.send_query)(conn, sql.as_ptr()) } == 0 {
             return Err(connection_failure(api, conn, "sending query"));
@@ -398,6 +415,10 @@ async fn serve(
         let result = match &outcome {
             Ok(results) => payload(py, &shared.api, &results.list),
             Err(Failure::Closed) => return,
+            Err(Failure::Stale(message)) => message
+                .into_pyobject(py)
+                .map_err(PyErr::from)
+                .and_then(|message| triple(py, STALE, none(py), message.into_any())),
             Err(Failure::Connection(message)) => message
                 .into_pyobject(py)
                 .map_err(PyErr::from)
@@ -449,6 +470,18 @@ impl LibpqConnection {
     #[pyo3(name = "CONNECTION_ERROR")]
     fn connection_error() -> i32 {
         CONNECTION_ERROR
+    }
+
+    #[classattr]
+    #[pyo3(name = "STALE")]
+    fn stale() -> i32 {
+        STALE
+    }
+
+    #[classattr]
+    #[pyo3(name = "CANCEL_SENT")]
+    fn cancel_sent() -> i32 {
+        CANCEL_SENT
     }
 
     /// `addresses` maps the name of each libpq function to its address, in
@@ -513,7 +546,9 @@ impl LibpqConnection {
 
     /// Send `sql`. The event loop gets `deliver(token, result)` when the
     /// query ends: see `payload`. A connection error gives
-    /// `(CONNECTION_ERROR, None, message)`. A query that `close` stops gives
+    /// `(CONNECTION_ERROR, None, message)`. A connection that ended while it
+    /// was idle gives `(STALE, None, message)`: the server did not get the
+    /// statement. A query that `close` stops gives
     /// no call.
     fn query(&self, py: Python<'_>, sql: &[u8], token: Py<PyAny>) -> PyResult<()> {
         let sql = CString::new(sql)
@@ -534,6 +569,59 @@ impl LibpqConnection {
             link.task = Some(task.abort_handle());
             Ok(())
         })
+    }
+
+    /// Ask the server to stop the query in flight. Returns false when the
+    /// connection is closed or libpq gives no cancel request.
+    ///
+    /// The request opens a connection of its own and blocks, so a blocking
+    /// thread of the runtime sends it, with no GIL. When the request ended,
+    /// the event loop gets `deliver(token, (CANCEL_SENT, None, error))`.
+    /// `error` is None, or the message of libpq.
+    fn cancel(&self, py: Python<'_>, token: Py<PyAny>) -> bool {
+        let shared = Arc::clone(&self.shared);
+        let request = py.detach(|| {
+            let link = shared.link.lock().unwrap();
+            // None after `close`.
+            link.watcher.as_ref()?;
+            // SAFETY: the connection is live, and the lock keeps the task of the query out of libpq.
+            let request = unsafe { (shared.api.get_cancel)(shared.conn.0 as Conn) };
+            (!request.is_null()).then_some(Pointer(request as usize))
+        });
+        let Some(request) = request else {
+            return false;
+        };
+        let runtime = shared.runtime.clone();
+        runtime.spawn_blocking(move || {
+            let api = shared.api;
+            let mut buffer = [0 as c_char; 256];
+            // SAFETY: the request came from PQgetCancel. It has its own copy
+            // of the address of the server, so it stays valid when the
+            // connection closes. This thread is its only user, and frees it one time.
+            let error = unsafe {
+                let sent = (api.cancel)(request.0 as *mut c_void, buffer.as_mut_ptr(), 256);
+                (api.free_cancel)(request.0 as *mut c_void);
+                (sent == 0).then(|| {
+                    CStr::from_ptr(buffer.as_ptr())
+                        .to_string_lossy()
+                        .trim()
+                        .to_owned()
+                })
+            };
+            Python::attach(move |py| {
+                let delivered = error
+                    .into_pyobject(py)
+                    .map_err(PyErr::from)
+                    .and_then(|error| triple(py, CANCEL_SENT, none(py), error.into_any()))
+                    .and_then(|result| {
+                        shared.call_soon.call1(py, (&shared.deliver, token, result))
+                    });
+                if let Err(error) = delivered {
+                    error.print(py);
+                }
+            });
+        });
+        true
     }
 
     /// Stop the query in flight and the watch of the socket. After this call

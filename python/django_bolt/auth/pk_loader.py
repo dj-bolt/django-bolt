@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from django.core.exceptions import ValidationError
+from django.core.exceptions import SynchronousOnlyOperation, ValidationError
 from django.db import DEFAULT_DB_ALIAS, connections, models, router
 
 from .. import async_orm
@@ -129,7 +129,7 @@ async def load_user_by_pk(model: type, user_id: Any) -> Any | None:
     setting is off, the manager of the model builds its own QuerySet, or the
     read needs the connection of Django.
     """
-    if async_orm.enabled:
+    if async_orm.enabled and model not in async_orm._models_on_threads:
         pk_field = model._meta.pk
         try:
             pk_python = pk_field.to_python(user_id)
@@ -146,7 +146,11 @@ async def load_user_by_pk(model: type, user_id: Any) -> Any | None:
             sql, fields, converters = compiled
             rows = await async_orm.fetch(alias, sql, (pk_value,))
             if rows is not None:
-                return _user_from_row(model, alias, fields, converters, rows[0] if rows else None, connection)
+                try:
+                    return _user_from_row(model, alias, fields, converters, rows[0] if rows else None, connection)
+                except SynchronousOnlyOperation:
+                    # The code that builds the user queried. Only a thread can run it: see ``async_orm._fetch_all``.
+                    async_orm._models_on_threads.add(model)
     return await run_in_orm_executor(load_user_by_pk_sync, model, user_id)
 
 
