@@ -1,6 +1,7 @@
 //! WebSocket router for matching paths to handlers
 
 use ahash::AHashMap;
+use bolt_core::router;
 use pyo3::prelude::*;
 
 /// WebSocket route definition
@@ -21,9 +22,14 @@ pub struct WebSocketRouter {
     dynamic_router: matchit::Router<WebSocketRoute>,
     /// Track if we have any dynamic routes
     has_dynamic_routes: bool,
+    /// The path as written of each dynamic route, by its matchit path
+    dynamic_paths: router::DynamicPaths,
     /// Each route path as it was written, for Actix registration
     paths: Vec<String>,
 }
+
+/// The method that a registration error gives for a WebSocket route.
+const METHOD: &str = "WEBSOCKET";
 
 impl Default for WebSocketRouter {
     fn default() -> Self {
@@ -37,6 +43,7 @@ impl WebSocketRouter {
             static_routes: AHashMap::new(),
             dynamic_router: matchit::Router::new(),
             has_dynamic_routes: false,
+            dynamic_paths: router::DynamicPaths::default(),
             paths: Vec::new(),
         }
     }
@@ -55,26 +62,28 @@ impl WebSocketRouter {
             injector,
         };
 
-        // Actix matches the decoded request path, so it gets the path as it
-        // was written.
-        if !self.paths.iter().any(|known| known == path) {
-            self.paths.push(path.to_string());
-        }
         // `find` gets the request path with its `%XX` escapes.
-        let path = &*bolt_core::router::encode_route_path(path);
+        let encoded = &*router::encode_route_path(path);
 
-        if !path.contains('{') {
-            self.static_routes.insert(path.to_string(), route);
+        if !encoded.contains('{') {
+            if self.static_routes.contains_key(encoded) {
+                return Err(router::already_registered(METHOD, path));
+            }
+            self.static_routes.insert(encoded.to_string(), route);
         } else {
-            let converted = bolt_core::router::convert_path(path);
-            self.dynamic_router.insert(&converted, route).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "Failed to register WebSocket route: {}",
-                    e
-                ))
-            })?;
+            router::insert_dynamic(
+                &mut self.dynamic_router,
+                &mut self.dynamic_paths,
+                METHOD,
+                path,
+                encoded,
+                route,
+            )?;
             self.has_dynamic_routes = true;
         }
+        // Actix matches the decoded request path, so it gets the path as it
+        // was written.
+        self.paths.push(path.to_string());
 
         Ok(())
     }
@@ -183,8 +192,70 @@ mod tests {
     }
 
     #[test]
-    fn actix_gets_each_route_path_one_time_as_it_was_written() {
-        let router = router_with(&["/ws/\u{fc}", "/ws/{room}/a b", "/ws/\u{fc}"]);
+    fn actix_gets_each_route_path_as_it_was_written() {
+        let router = router_with(&["/ws/\u{fc}", "/ws/{room}/a b"]);
         assert_eq!(router.get_all_paths(), ["/ws/\u{fc}", "/ws/{room}/a b"]);
+    }
+
+    /// The error that registering `path` after the `earlier` routes gives.
+    /// The earlier routes stay as they were.
+    fn register_error(earlier: &[&str], path: &str) -> String {
+        let mut router = router_with(earlier);
+        let error = Python::attach(|py| {
+            router
+                .register(path, earlier.len(), py.None(), None)
+                .unwrap_err()
+                .to_string()
+        });
+        assert_eq!(router.get_all_paths(), earlier);
+        for (handler_id, earlier_path) in earlier.iter().enumerate() {
+            let request_path =
+                bolt_core::router::encode_route_path(&earlier_path.replace("{room}", "r"))
+                    .into_owned();
+            let (route, _) = router.find(&request_path).unwrap();
+            assert_eq!(route.handler_id, handler_id);
+        }
+        error
+    }
+
+    #[test]
+    fn a_second_route_at_a_registered_path_does_not_replace_the_first() {
+        for path in ["/live", "/live/{room}", "/\u{fc}"] {
+            assert_eq!(
+                register_error(&[path], path),
+                format!(
+                    "ValueError: Failed to register route: WEBSOCKET {path} is already registered"
+                )
+            );
+        }
+        // The same path after the escapes that a request path gets.
+        assert_eq!(
+            register_error(&["/a b"], "/a%20b"),
+            "ValueError: Failed to register route: WEBSOCKET /a%20b is already registered"
+        );
+    }
+
+    #[test]
+    fn a_conflict_names_both_websocket_routes() {
+        assert_eq!(
+            register_error(&["/live/{room}"], "/live/{p:path}"),
+            "ValueError: Failed to register route: WEBSOCKET /live/{p:path} conflicts with \
+             WEBSOCKET /live/{room}. Keep one of the two routes, or add a fixed segment \
+             before the parameter in one path."
+        );
+    }
+
+    #[test]
+    fn a_malformed_websocket_path_error_names_the_route() {
+        assert_eq!(
+            register_error(&[], "/w/{p:path}/x"),
+            "ValueError: Failed to register route: WEBSOCKET /w/{p:path}/x has a {name:path} \
+             parameter before the end of the path. Move it to the end."
+        );
+        assert_eq!(
+            register_error(&[], "/w/{room"),
+            "ValueError: Failed to register route: WEBSOCKET /w/{room has a parameter with no \
+             name, or a brace with no pair. Write each parameter as {name} or {name:type}."
+        );
     }
 }

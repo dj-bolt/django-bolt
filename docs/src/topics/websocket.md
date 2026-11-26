@@ -125,6 +125,8 @@ A value that fails a check of its parameter gets `400` too, before `accept()`.
 Examples are an item of a `list[int]`, a `Query(ge=1)` limit and a field of a parameter model.
 
 A route matches the request path with and without a trailing slash.
+Thus `/live` and `/live/` are one route, and a second route at that path stops the startup.
+[Routes that stop the startup](routing.md#routes-that-stop-the-startup) gives each such error.
 A WebSocket has no request body, so a body, form or file parameter is not available.
 
 The `WebSocket` object also has these attributes: `path`, `path_info`, `query_params`, `headers`, `cookies`, `path_params`, `subprotocols`, `client` and `state`.
