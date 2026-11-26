@@ -201,8 +201,9 @@ The path is the full path, with the prefix, the mount path and the trailing slas
   Move the parameter to the end of the path.
 - **Two parameters in one segment.** `/files/{name}-{version}` gives `has two parameters in one segment`.
   Use one parameter for the segment, and split the value in the handler.
-- **A parameter with no name, or a brace with no pair.** `/files/{}` and `/files/{id` give `has a parameter with no name, or a brace with no pair`.
+- **A parameter with no name, or a `{` with no `}`.** `/files/{}` and `/files/{id` give `has a parameter with no name, or a brace with no pair`.
   Write each parameter as `{name}` or `{name:type}`.
+  A `}` with no `{` before it is a plain character, so `/files/id}` registers.
 
 ## Add a prefix to each route
 
