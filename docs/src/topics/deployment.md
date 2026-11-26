@@ -308,17 +308,32 @@ For `https://example.com/blog/articles/42?page=2`, Bolt gets `/articles/42?page=
 | `request.get_full_path()` | `"/blog/articles/42?page=2"` |
 | `request.build_absolute_uri()` | `"https://example.com/blog/articles/42?page=2"` |
 | `reverse()`, `{% url %}` and `get_script_prefix()` | A path that starts with `/blog/` |
+| `WebSocket.path` and `WebSocket.path_info` | `"/blog/ws/chat"` and `"/ws/chat"`, as for a request |
 
 These rules also apply:
 
 - The router matches `request.path_info`. Bolt gives 404 for `/blog/articles/42`, because the proxy removes `/blog`.
-- `reverse()` gives the sub-path in all user code: handlers, dependencies, middleware, error formatters, streaming bodies, WebSocket handlers, MCP tools, lifespans and thread hops.
+- `reverse()` gives the sub-path in handlers, dependencies, middleware, error formatters, streaming bodies, WebSocket handlers, MCP tools, resources and prompts, ASGI mounts and lifespans.
+- `reverse()` also gives it in `sync_to_thread()`, `run_in_orm_executor()` and asgiref's `sync_to_async()`. A thread that you start yourself, for example with `asyncio.to_thread()` or `threading.Thread`, does not get it, as under Django's `ASGIHandler`.
 - The `Location` of a trailing-slash redirect starts with `/blog`.
 - The OpenAPI schema has the server `/blog`, and the docs pages load the schema from `/blog/docs/openapi.json`. A server that you set in `OpenAPIConfig` stays.
 - Bolt serves `STATIC_URL` and `MEDIA_URL` without `/blog`, as WhiteNoise does. Django puts `/blog` in front of a relative `STATIC_URL`, such as `"static/"`, so `{% static %}` gives `/blog/static/...`.
-- A Django app of `mount_django()`, such as the admin, gets the paths that it gets under WSGI.
 - The ASGI scope of an app of `mount_asgi()` has `/blog` at the start of `root_path`, so the app builds its URLs under the sub-path.
-- `WebSocket.path` is the path without the sub-path.
+- The scope of a WebSocket route has `/blog` in `root_path` and at the start of `path`.
+
+A Django app of `mount_django()` gets the paths that Django's `ASGIHandler` gives it.
+Django takes `FORCE_SCRIPT_NAME` as the script name and ignores the mount path.
+Thus Django resolves the path with the mount path, for example `/admin/login/`.
+The URL patterns of the app must contain the mount path, as for `clear_root_path=True`.
+The admin mount of `runbolt` works in this way.
+URL patterns without the mount path give 404.
+Bolt does not change the `Location` of a redirect from the app.
+
+Bolt refuses these values at startup with `ImproperlyConfigured`:
+
+- A `FORCE_SCRIPT_NAME` that is not a `str`.
+- A `FORCE_SCRIPT_NAME` with a character that Django percent-encodes in a URL, for example a space or `é`.
+- A `STATIC_URL` or `MEDIA_URL` that is the sub-path, such as `"/blog/"`, when Bolt serves those files. The files would be at `/`, and hide each route.
 
 Bolt reads no request header for the sub-path.
 `TestClient` sends each path to Bolt as you give it, with no proxy. It follows a redirect to `/blog/...` as it is, and Bolt gives 404, as Django's test client does. Pass `follow_redirects=False` to check such a redirect.
