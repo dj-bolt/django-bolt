@@ -192,7 +192,6 @@ Some reads need the database connection of Django. For these reads, Bolt uses th
 | A QuerySet with `prefetch_related()` | The prefetch queries are sync code. |
 | A read on a route with Django middleware | The thread of the request keeps state, for example the schema of a tenant. |
 | A read in a transaction | Only the connection of the transaction has its rows. A `TestClient` in a Django `TestCase` gives such a connection to the handlers. |
-| A read with `DEBUG = True` | Django logs each query from its own cursor. |
 | A database with another `ENGINE`, for example PostGIS or django-tenants | Another backend can change how a connection opens. |
 | The other async calls, for example `acount()`, `aaggregate()`, `acreate()` and `asave()` | Bolt replaces only the five reads above. |
 
@@ -213,7 +212,8 @@ A loop connection is not a connection of Django. Each worker thread has its own 
 
 - `CONN_MAX_AGE` does not apply to a loop connection, and Django's connection pool (`OPTIONS["pool"]`) does not hold it.
 - After a database restart, Bolt sends a read that failed on a dead connection one more time, on a new connection.
-- A tool that records queries from the cursor of Django does not see these reads.
+- A read goes through the cursor wrapper of Django. Thus `connection.queries` and the `django.db.backends` logger have it with `DEBUG = True`, and each wrapper of `connection.execute_wrapper()` gets its statement.
+- A wrapper gets the statement before the event loop sends it. A wrapper that measures the time of its `execute` call thus measures no query time.
 
 Add the loop connections to the connection count of your database. See [Tune the thread pools](#tune-the-thread-pools).
 

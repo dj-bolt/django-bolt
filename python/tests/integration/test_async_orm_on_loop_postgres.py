@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
 import sys
 import threading
@@ -386,6 +387,57 @@ def _api() -> BoltAPI:
             "last_is_the_last_row": last.pk == rows[-1].pk,
         }
 
+    @api.get("/query-log")
+    async def query_log():
+        names = [name async for name in _ada()]
+        # The connection wrapper of this thread has the log, as ``connection.queries`` in a Django view.
+        queries = connections[ALIAS].queries
+        return {
+            "handler": threading.current_thread().name,
+            "names": names,
+            "sql": queries[-1]["sql"],
+            "has_time": float(queries[-1]["time"]) >= 0,
+        }
+
+    @api.get("/wrapped")
+    async def wrapped():
+        seen = []
+
+        def spy(execute: Any, sql: str, params: Any, many: bool, context: Any) -> Any:
+            seen.append(
+                {
+                    "sql": sql,
+                    "params": list(params),
+                    "many": many,
+                    "alias": context["connection"].alias,
+                    "cursor": type(context["cursor"]).__name__,
+                }
+            )
+            return execute(sql, params, many, context)
+
+        with connections[ALIAS].execute_wrapper(spy):
+            names = [name async for name in _ada()]
+        return {"names": names, "seen": seen}
+
+    @api.get("/skipped")
+    async def skipped():
+        try:
+            with connections[ALIAS].execute_wrapper(_skip_the_query):
+                return [name async for name in _ada()]
+        except Exception as error:
+            return {"module": type(error).__module__, "error": type(error).__qualname__}
+
+    @api.get("/blocked")
+    async def blocked():
+        def blocker(*args: Any) -> Any:
+            raise RuntimeError("No queries in this block.")
+
+        try:
+            with connections[ALIAS].execute_wrapper(blocker):
+                return [name async for name in _ada()]
+        except RuntimeError as error:
+            return {"error": type(error).__qualname__, "message": str(error)}
+
     @api.get("/twice")
     async def twice():
         posts = _posts().order_by("id")
@@ -530,12 +582,90 @@ def test_a_database_with_a_custom_backend_reads_on_the_orm_pool(on_loop, monkeyp
     assert _built_on_orm_threads(threads), threads
 
 
-def test_debug_keeps_the_query_log_of_django(on_loop):
-    """With ``DEBUG``, Django logs each query from its own cursor."""
-    with override_settings(DEBUG=True), TestClient(_api()) as client:
-        threads = client.get("/threads").json()
+def _ada() -> Any:
+    return Author.objects.using(ALIAS).filter(name="Ada").values_list("name", flat=True)
 
-    assert _built_on_orm_threads(threads), threads
+
+def test_debug_logs_a_read_of_the_loop_as_django_logs_a_query(on_loop, caplog):
+    """With ``DEBUG``, ``connection.queries`` and the ``django.db.backends`` logger get each query."""
+    with CaptureQueriesContext(connections[ALIAS]) as captured:
+        assert list(_ada()) == ["Ada"]
+    expected_sql = captured[-1]["sql"]
+
+    caplog.set_level(logging.DEBUG, logger="django.db.backends")
+    with override_settings(DEBUG=True), TestClient(_api()) as client:
+        # The first read of a loop reads the state of a Django connection, with a query of its own.
+        assert client.get("/authors").status_code == 200
+        caplog.clear()
+        logged = client.get("/query-log").json()
+
+    handler = logged["handler"]
+    assert not handler.startswith(ORM_THREAD)
+    assert logged == {"handler": handler, "names": ["Ada"], "sql": expected_sql, "has_time": True}
+    records = [record for record in caplog.records if record.name == "django.db.backends"]
+    assert [(record.sql, record.params, record.alias) for record in records] == [(expected_sql, ("Ada",), ALIAS)]
+    assert records[0].duration > 0
+
+
+def test_a_wrapper_of_execute_wrapper_gets_each_read(on_loop):
+    with TestClient(_api()) as client:
+        wrapped = client.get("/wrapped").json()
+
+    assert wrapped["names"] == ["Ada"]
+    (seen,) = wrapped["seen"]
+    assert seen["sql"].endswith('WHERE "django_bolt_author"."name" = %s')
+    assert seen == {"sql": seen["sql"], "params": ["Ada"], "many": False, "alias": ALIAS, "cursor": "CursorWrapper"}
+
+
+def _skip_the_query(execute: Any, sql: str, params: Any, many: bool, context: Any) -> None:
+    """A wrapper that does not call ``execute``."""
+
+
+def test_a_wrapper_that_sends_nothing_gives_the_error_of_django(on_loop):
+    with pytest.raises(Exception) as sync_error, connections[ALIAS].execute_wrapper(_skip_the_query):  # noqa: PT011
+        list(_ada())
+    expected = {"module": type(sync_error.value).__module__, "error": type(sync_error.value).__qualname__}
+
+    with TestClient(_api()) as client:
+        skipped = client.get("/skipped").json()
+        after = client.get("/authors")
+
+    assert skipped == expected == {"module": "django.db.utils", "error": "ProgrammingError"}
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+def test_a_wrapper_that_raises_stops_the_read(on_loop):
+    with TestClient(_api()) as client:
+        blocked = client.get("/blocked").json()
+        after = client.get("/authors")
+
+    assert blocked == {"error": "RuntimeError", "message": "No queries in this block."}
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+def test_a_wrapper_that_a_connection_created_receiver_installs_gets_each_read(on_loop):
+    """A tool installs its wrapper on each new connection of Django. The loop connections copy that state."""
+    statements = []
+
+    def record(execute: Any, sql: str, params: Any, many: bool, context: Any) -> Any:
+        statements.append(sql)
+        return execute(sql, params, many, context)
+
+    def install(sender: Any, connection: Any, **kwargs: Any) -> None:
+        if connection.alias == ALIAS:
+            connection.execute_wrappers.append(record)
+
+    connection_created.connect(install)
+    try:
+        with TestClient(_api()) as client:
+            assert client.get("/authors").status_code == 200
+            statements.clear()
+            assert client.get("/get/one").status_code == 200
+    finally:
+        connection_created.disconnect(install)
+
+    assert len(statements) == 1, statements
+    assert statements[0].startswith('SELECT "django_bolt_blogpost"."id"')
 
 
 def test_a_read_on_another_event_loop_uses_the_orm_pool(on_loop):
@@ -548,14 +678,13 @@ def test_a_read_on_another_event_loop_uses_the_orm_pool(on_loop):
 
 
 def test_an_expression_that_reads_the_server_version_compiles_on_the_event_loop(on_loop):
+    """Each request has a connection wrapper of its own on the event loop thread, so each read gives it the version."""
     with TestClient(_api()) as client:
-        result = client.get("/compiled/server_version").json()
+        results = [client.get("/compiled/server_version").json() for _ in range(2)]
 
-    assert result == {
-        "handler": result["handler"],
-        "built_on": result["handler"],
-        "value": connections[ALIAS].pg_version,
-    }
+    version = connections[ALIAS].pg_version
+    for result in results:
+        assert result == {"handler": result["handler"], "built_on": result["handler"], "value": version}
 
 
 def test_an_expression_that_needs_a_connection_to_compile_uses_the_orm_pool(on_loop):

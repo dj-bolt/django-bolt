@@ -36,6 +36,7 @@ from asgiref.sync import SyncToAsync
 from django.conf import settings
 from django.core.exceptions import EmptyResultSet, ImproperlyConfigured, SynchronousOnlyOperation
 from django.db import connections
+from django.db.backends.utils import CursorDebugWrapper, CursorWrapper
 from django.db.models.query import MAX_GET_RESULTS, QuerySet
 from django.db.utils import (
     DatabaseError,
@@ -117,6 +118,8 @@ class _Template(NamedTuple):
     session_sql: str
     session_values: tuple[str, ...]
     pg_version: int
+    # The wrappers that the connection had when it opened, as a ``connection_created`` receiver installs them.
+    execute_wrappers: tuple[Any, ...]
 
 
 def _read_template(alias: str) -> _Template:
@@ -137,6 +140,7 @@ def _read_template(alias: str) -> _Template:
             session_sql="SELECT " + ", ".join(["set_config(%s, %s, false)"] * len(session)) if session else "",
             session_values=tuple(value for pair in session for value in pair),
             pg_version=wrapper.pg_version,
+            execute_wrappers=tuple(wrapper.execute_wrappers),
         )
     finally:
         # With each read on the loop, this thread can get no more work. It must not keep a connection open.
@@ -211,10 +215,6 @@ class _Pool:
             template = _templates.get(alias)
             if template is None:
                 template = _templates[alias] = await run_in_orm_executor(_read_template, alias)
-        # The compile step reads the server version for some expressions.
-        # Without this value, the connection wrapper of the loop thread would
-        # open a sync connection to read it.
-        connections[alias].__dict__.setdefault("pg_version", template.pg_version)
         self.template = template
 
     async def acquire(self) -> Any:
@@ -353,8 +353,8 @@ class _Pool:
                 waiter.set_result(None)
                 return
 
-    async def fetch(self, sql: str, params: Any) -> list[tuple[Any, ...]]:
-        """Run one read and return its rows.
+    async def fetch(self, wrapper: Any, sql: str, params: Any) -> list[tuple[Any, ...]]:
+        """Run one read and return its rows. ``wrapper`` is the connection wrapper of Django for this thread.
 
         A database restart ends each connection of the pool. The query then
         fails on a dead connection, before the database runs it. The pool
@@ -368,7 +368,12 @@ class _Pool:
             except database_error as error:
                 raise _django_error(self.database, error) from error
             try:
-                await cursor.execute(sql, params)
+                if wrapper.queries_logged:
+                    # ``connection.queries`` and the ``django.db.backends`` logger, as with the cursor of Django.
+                    with CursorDebugWrapper(cursor, wrapper).debug_sql(sql, params, use_last_executed_query=True):
+                        await _execute(cursor, wrapper, sql, params)
+                else:
+                    await _execute(cursor, wrapper, sql, params)
                 rows = await cursor.fetchall()
             except database_error as error:
                 if not cursor.connection.broken:
@@ -387,6 +392,23 @@ class _Pool:
                 self.release(cursor)
                 return rows
         raise AssertionError("unreachable")  # pragma: no cover
+
+
+async def _execute(cursor: Any, wrapper: Any, sql: str, params: Any) -> None:
+    """Send one statement through the cursor wrapper of Django.
+
+    ``CursorWrapper.execute`` calls each wrapper of ``connection.execute_wrapper``
+    and then ``execute`` of the cursor. Thus the wrappers, and a tool that
+    replaces ``CursorWrapper.execute``, get each statement of the loop. With
+    an async cursor, the call gives a coroutine and sends nothing. The
+    database gets the statement here, after the wrappers return. A wrapper
+    that measures the time of its ``execute`` call thus measures no query time.
+    """
+    pending = CursorWrapper(cursor, wrapper).execute(sql, params)
+    if not asyncio.iscoroutine(pending):
+        # With the cursor of Django, the read of the rows then fails with this error.
+        raise ProgrammingError("A wrapper of connection.execute_wrapper() did not call execute. The query has no rows.")
+    await pending
 
 
 def _django_error(database: Any, error: Exception) -> Exception:
@@ -424,7 +446,6 @@ def _pool_for(queryset: QuerySet) -> _Pool | None:
     - The database is not PostgreSQL with psycopg 3 and Django's backend.
     - The connection of the thread is in a transaction. The test client gives
       the handlers such a connection, and only it has the rows of the test.
-    - Django logs the queries, as with ``DEBUG``. The log comes from the cursor of Django.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -443,8 +464,7 @@ def _pool_for(queryset: QuerySet) -> _Pool | None:
         pool = pools[alias] = _new_pool(loop, alias)
     if pool is None:
         return None
-    wrapper = connections[alias]
-    if wrapper.in_atomic_block or wrapper.queries_logged:
+    if connections[alias].in_atomic_block:
         return None
     return pool
 
@@ -457,6 +477,16 @@ async def _rows(pool: _Pool, compiler: Any) -> Any:
     """
     if pool.template is None:
         await pool.prepare()
+    template = pool.template
+    # On an event loop thread, Django keeps one connection wrapper for each
+    # request, so each read prepares the wrapper of its request.
+    wrapper = compiler.connection
+    # The compile step reads the server version for some expressions. Without
+    # this value, the wrapper would open a sync connection to read it.
+    wrapper.__dict__.setdefault("pg_version", template.pg_version)
+    if template.execute_wrappers:
+        installed = wrapper.execute_wrappers
+        installed.extend(added for added in template.execute_wrappers if added not in installed)
     try:
         sql, params = compiler.as_sql()
     except EmptyResultSet:
@@ -464,7 +494,7 @@ async def _rows(pool: _Pool, compiler: Any) -> Any:
         return ()
     except SynchronousOnlyOperation:
         return None
-    return await pool.fetch(sql, params) if sql else ()
+    return await pool.fetch(wrapper, sql, params) if sql else ()
 
 
 async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
