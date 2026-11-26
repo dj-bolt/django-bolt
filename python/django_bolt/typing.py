@@ -340,6 +340,22 @@ def resolve_type_alias(annotation: Any) -> Any:
 # The constraint arguments of Query() and Path(), with the msgspec.Meta names.
 _MARKER_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "min_length", "max_length", "pattern")
 
+# The msgspec.Meta names that the OpenAPI schema shows next to the $ref of a struct.
+_SCHEMA_KEYWORDS = ("title", "description", "examples", "extra_json_schema")
+
+
+def _schema_keywords(metas: list[msgspec.Meta]) -> tuple[msgspec.Meta, ...]:
+    """The schema keywords of ``metas``, without the constraints.
+
+    msgspec cannot apply a constraint such as ``ge`` to a struct, and binding ignores it.
+    """
+    keyword_metas = []
+    for meta in metas:
+        keywords = {name: value for name in _SCHEMA_KEYWORDS if (value := getattr(meta, name)) is not None}
+        if keywords:
+            keyword_metas.append(msgspec.Meta(**keywords))
+    return tuple(keyword_metas)
+
 
 def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, Any, tuple[msgspec.Meta, ...]]:
     """Split a parameter annotation into its value type, its ``Param`` or ``Depends`` marker and its schema Meta.
@@ -354,9 +370,10 @@ def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, A
     upload or a ``File()`` parameter keeps only its base type, as before. A
     ``NewType`` or a ``type`` alias resolves to the type it names.
 
-    The third item holds the ``msgspec.Meta`` items of ``Annotated`` that a
-    struct or a dataclass type does not keep. Binding does not use them. Only
-    the OpenAPI schema reads them, for example the description of a body. (#958)
+    The third item holds the schema keywords of the ``msgspec.Meta`` items of a
+    struct or a dataclass type: ``title``, ``description``, ``examples`` and
+    ``extra_json_schema``. Binding does not use them. Only the OpenAPI schema
+    reads them, for example the description of a body. (#958)
 
     Raises:
         TypeError: msgspec cannot apply a constraint to the type, for example ``ge`` to a ``Decimal``.
@@ -370,16 +387,15 @@ def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, A
         constraints = [extra for extra in extras if isinstance(extra, msgspec.Meta)]
     else:
         base, marker, constraints = annotation, default_marker, []
-    schema_meta = tuple(constraints)
+    inner = unwrap_optional(base)
+    if is_msgspec_struct(inner) or is_dataclass_type(inner):
+        return base, marker, _schema_keywords(constraints)
     if isinstance(marker, Param):
         marker_constraints = {
             name: value for name in _MARKER_CONSTRAINTS if (value := getattr(marker, name)) is not None
         }
         if marker_constraints:
             constraints.append(msgspec.Meta(**marker_constraints))
-    inner = unwrap_optional(base)
-    if is_msgspec_struct(inner) or is_dataclass_type(inner):
-        return base, marker, schema_meta
     if not constraints or is_upload_file_type(inner) or (isinstance(marker, Param) and marker.source == "file"):
         return base, marker, ()
     constrained = Annotated[(inner, *constraints)]
@@ -590,7 +606,7 @@ class FieldDefinition:
     """Original Param marker (for accessing file constraints, etc.)"""
 
     schema_meta: tuple[msgspec.Meta, ...] = ()
-    """The ``msgspec.Meta`` items that a struct or a dataclass type does not keep.
+    """The schema keywords of the ``msgspec.Meta`` items of a struct or a dataclass type.
 
     Binding does not use them. Only the OpenAPI schema reads them. (#958)
     """

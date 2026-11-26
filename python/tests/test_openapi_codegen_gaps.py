@@ -938,6 +938,33 @@ def test_meta_of_an_annotated_struct_body_does_not_change_binding():
         assert dataclass_body.json() == {"type": "NewUser", "name": "b"}
 
 
+def test_constraint_in_the_meta_of_a_struct_body_stays_out_of_the_schema():
+    """A struct body ignores a constraint such as ``ge`` in its Meta, so the schema ignores it too (#958).
+
+    msgspec cannot apply ``ge`` or ``min_length`` to a struct. The schema
+    keeps only the schema keywords, and ``/docs/openapi.json`` still works.
+    """
+    api = BoltAPI(openapi_config=_config())
+
+    @api.post("/users")
+    async def create_user(body: Annotated[UserRead, msgspec.Meta(min_length=1, description="The user.")]) -> UserRead:
+        return body
+
+    @api.post("/ranked")
+    async def create_ranked(body: Annotated[UserRead, msgspec.Meta(ge=1)]) -> UserRead:
+        return body
+
+    schema = _get_schema(api)
+    validate(schema)
+    assert _request_body_schema(schema, "/users") == {**USER_REF, "description": "The user."}
+    assert _request_body_schema(schema, "/ranked") == USER_REF
+
+    with TestClient(api) as client:
+        created = client.post("/users", json={"id": 1, "name": "a"})
+        assert created.status_code == 200
+        assert created.json() == {"id": 1, "name": "a"}
+
+
 # ---------------------------------------------------------------------------
 # #290 — strict mode
 # ---------------------------------------------------------------------------
