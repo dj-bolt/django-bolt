@@ -11,12 +11,12 @@ import datetime
 import enum
 import inspect
 from collections.abc import Callable
-from types import SimpleNamespace
+from functools import partial
 from typing import Annotated, Any, Literal, NamedTuple, get_args, get_origin
 
 import msgspec
 from django.core.exceptions import FieldDoesNotExist
-from django.db.models import ForeignObjectRel, Model, QuerySet, prefetch_related_objects
+from django.db.models import ForeignObjectRel, Model, OneToOneRel, QuerySet, prefetch_related_objects
 from django.db.models.query import ModelIterable
 
 from .._field_marker import _FieldMarker
@@ -1413,12 +1413,12 @@ class _RowPlan(NamedTuple):
     """The ``select_related()`` paths, with query names."""
     prefetches: tuple[str, ...]
     """The ``prefetch_related_objects()`` paths, with accessors."""
-    read_instance: Callable[[Any], SimpleNamespace]
-    """Reads a model instance into an object with the attributes of the Struct fields."""
+    read_instance: Callable[[Any], _InstanceView]
+    """Gives the view of a model instance that msgspec reads."""
     needs_rows: bool
-    """True if a reverse one-to-one relation can have no row. msgspec then reads these objects, not instances."""
+    """True if a reverse one-to-one relation can have no row. msgspec then reads views, not instances."""
     instance_error: str | None
-    """Why a model instance cannot give the Struct, or None. A hidden relation has no accessor."""
+    """Why a model instance cannot give the Struct, or None. See ``_reverse_relation``."""
 
 
 def _field_value_type(annotation: Any) -> Any:
@@ -1489,7 +1489,7 @@ def _compile_nested_projector(item_type: type) -> Callable[[list[Any]], list[dic
     """Build the reader of objects for a Struct with a nested Struct field, once per route.
 
     A field of a nested Struct that holds a model instance gives the row of
-    that instance, not the instance. So does the object that
+    that instance, not the instance. So does the view that
     :meth:`StructRelationLoader.rows` makes of an instance. A relation with
     no object gives None.
     """
@@ -1508,7 +1508,7 @@ def _compile_nested_projector(item_type: type) -> Callable[[list[Any]], list[dic
             row = {}
             for name, wire, nested_type in fields:
                 value = getattr(item, name, None)
-                if nested_type is not None and isinstance(value, (Model, SimpleNamespace)):
+                if nested_type is not None and isinstance(value, (Model, _InstanceView)):
                     value = reader_of(nested_type)(value)
                 row[wire] = value
             return row
@@ -1591,12 +1591,12 @@ class StructRelationLoader:
         """Return the items for msgspec, after :meth:`load`. It makes no query.
 
         An instance whose Struct nests a reverse one-to-one relation becomes an
-        object with one attribute for each field: msgspec cannot read a
-        relation with no row as None. Other items stay as they are.
+        :class:`_InstanceView`: msgspec cannot read a relation with no row as
+        None. Other items stay as they are.
         """
         if not items or not isinstance(items[0], Model):
             return items
-        readers: dict[type, Callable[[Any], SimpleNamespace]] = {}
+        readers: dict[type, Callable[[Any], _InstanceView]] = {}
         for kind in {type(item) for item in items}:
             if issubclass(kind, Model) and (plan := self._plan_of(kind)).needs_rows:
                 readers[kind] = plan.read_instance
@@ -1618,7 +1618,7 @@ class _Relation(NamedTuple):
     query_name: str
     """The name of the relation in a query."""
     accessor: str | None
-    """The name of the relation on a model instance. A hidden relation (``related_name="+"``) has none."""
+    """The attribute of a model instance that gives the related object, or None if no attribute gives it."""
 
 
 def _relation_of(model: type, name: str) -> _Relation | None:
@@ -1630,7 +1630,7 @@ def _relation_of(model: type, name: str) -> _Relation | None:
     """
     for rel in model._meta.related_objects:
         if rel.get_accessor_name() == name:
-            return _Relation(rel, rel.name, name)
+            return _reverse_relation(rel)
     try:
         field = model._meta.get_field(name)
     except FieldDoesNotExist:
@@ -1638,9 +1638,20 @@ def _relation_of(model: type, name: str) -> _Relation | None:
     if not field.is_relation or field.related_model is None:
         return None
     if isinstance(field, ForeignObjectRel):
-        # A hidden relation (related_name ends with "+") has no attribute on the instance.
-        return _Relation(field, name, None if field.hidden else field.get_accessor_name())
+        return _reverse_relation(field)
     return _Relation(field, name, name)
+
+
+def _reverse_relation(rel: ForeignObjectRel) -> _Relation:
+    """Return the relation of ``rel``. Only a reverse one-to-one that is not hidden has an accessor.
+
+    A hidden relation (``related_name="+"``) has no attribute on the instance.
+    The attribute of a ``GenericRel`` (the query name of a ``GenericRelation``)
+    gives a manager, not the related object. A reverse foreign key and a
+    many-to-many relation have many rows, and ``_row_plan`` refuses them.
+    """
+    accessor = rel.get_accessor_name() if isinstance(rel, OneToOneRel) and not rel.hidden else None
+    return _Relation(rel, rel.name, accessor)
 
 
 def _row_plan(model: type, struct_type: type, prefix: str, attr_prefix: str, outer: tuple[type, ...]) -> _RowPlan:
@@ -1655,9 +1666,9 @@ def _row_plan(model: type, struct_type: type, prefix: str, attr_prefix: str, out
     joins: list[str] = []
     prefetches: list[str] = []
     readers: list[tuple[str, str, Callable[[dict[str, Any]], dict[str, Any]] | None]] = []
-    # The attribute of the instance, the field name, the reader of a nested
-    # instance, and the error of a reverse one-to-one relation with no row.
-    attributes: list[tuple[str, str, Callable[[Any], SimpleNamespace] | None, type | None]] = []
+    # The reader of each relation field, by field name. The view of an
+    # instance reads each other field from the instance itself.
+    relations: dict[str, Callable[[Any], Any]] = {}
     needs_rows = False
     instance_error = None
     for field in msgspec.structs.fields(struct_type):
@@ -1673,7 +1684,6 @@ def _row_plan(model: type, struct_type: type, prefix: str, attr_prefix: str, out
             path = prefix + field.name
             paths.append(path)
             readers.append((field.encode_name, path, None))
-            attributes.append((field.name, field.name, None, None))
             continue
         if nested_type in outer:
             raise TypeError(
@@ -1686,9 +1696,14 @@ def _row_plan(model: type, struct_type: type, prefix: str, attr_prefix: str, out
             paths.append(path)
             paths.extend(nested_plan.paths)
             readers.append((field.encode_name, path, nested_plan.build))
+            kind = (
+                "a hidden relation (related_name='+')"
+                if relation.field.hidden
+                else "the query name of a GenericRelation"
+            )
             instance_error = instance_error or (
-                f"{struct_type.__name__}.{field.name} is a hidden relation (related_name='+'). "
-                "A model instance has no attribute for it. Return a QuerySet, so Bolt reads it with .values()."
+                f"{struct_type.__name__}.{field.name} is {kind}. No attribute of a model instance gives its row. "
+                "Only a QuerySet response with no pagination reads it, with .values()."
             )
             continue
         attr_path = attr_prefix + relation.accessor
@@ -1702,14 +1717,13 @@ def _row_plan(model: type, struct_type: type, prefix: str, attr_prefix: str, out
         prefetches.append(attr_path)
         prefetches.extend(nested_plan.prefetches)
         readers.append((field.encode_name, path, nested_plan.build))
-        no_row = None
-        if isinstance(relation.field, ForeignObjectRel):
-            # Only a reverse one-to-one gets here: the check above refuses the other reverse relations.
+        no_row: type[Exception] | tuple[()] = ()
+        if isinstance(relation.field, OneToOneRel):
             no_row = getattr(model, relation.accessor).RelatedObjectDoesNotExist
             needs_rows = True
         needs_rows = needs_rows or nested_plan.needs_rows
         instance_error = instance_error or nested_plan.instance_error
-        attributes.append((relation.accessor, field.name, nested_plan.read_instance, no_row))
+        relations[field.name] = _relation_reader(relation.accessor, nested_plan.read_instance, no_row)
 
     def build(row: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -1721,39 +1735,51 @@ def _row_plan(model: type, struct_type: type, prefix: str, attr_prefix: str, out
         build,
         tuple(joins),
         tuple(prefetches),
-        _compile_instance_reader(tuple(attributes)),
+        partial(_InstanceView, relations),
         needs_rows,
         instance_error,
     )
 
 
-def _compile_instance_reader(
-    attributes: tuple[tuple[str, str, Callable[[Any], SimpleNamespace] | None, type | None], ...],
-) -> Callable[[Any], SimpleNamespace]:
-    """Build the reader of a model instance into an object with the field names, once per model.
+class _InstanceView:
+    """A model instance as msgspec reads it, with the relation fields of a Struct read by the plan.
 
-    msgspec reads the object by attribute, as it reads the instance. It does
-    not read a dict into an ``array_like`` Struct.
-    A relation to read must be loaded already. A reverse one-to-one with no
-    row gives None. Another missing attribute gives no attribute: msgspec
-    then uses the default of the field or reports the missing field.
+    msgspec reads each other field from the instance itself. Thus an
+    attribute that raises has the same effect as without the view: msgspec
+    uses the default of the field or reports the missing field. msgspec does
+    not read a dict into an ``array_like`` Struct, so the view is not a dict.
     """
 
-    def read_instance(instance: Any) -> SimpleNamespace:
-        row: dict[str, Any] = {}
-        for attribute, name, read_nested, no_row in attributes:
-            try:
-                value = getattr(instance, attribute)
-            except AttributeError as exc:
-                if no_row is None or not isinstance(exc, no_row):
-                    continue
-                value = None
-            if read_nested is not None and value is not None:
-                value = read_nested(value)
-            row[name] = value
-        return SimpleNamespace(**row)
+    __slots__ = ("_instance", "_relations")
 
-    return read_instance
+    def __init__(self, relations: dict[str, Callable[[Any], Any]], instance: Any) -> None:
+        self._instance = instance
+        self._relations = relations
+
+    def __getattr__(self, name: str) -> Any:
+        read = self._relations.get(name)
+        if read is None:
+            return getattr(self._instance, name)
+        return read(self._instance)
+
+
+def _relation_reader(
+    accessor: str, read_nested: Callable[[Any], _InstanceView], no_row: type[Exception] | tuple[()]
+) -> Callable[[Any], Any]:
+    """Build the reader of one relation field, once per model. The relation must be loaded already.
+
+    ``no_row`` is the error of a reverse one-to-one with no row, which gives
+    None. An empty tuple catches no error.
+    """
+
+    def read(instance: Any) -> Any:
+        try:
+            value = getattr(instance, accessor)
+        except no_row:
+            return None
+        return None if value is None else read_nested(value)
+
+    return read
 
 
 def _compile_struct_coercer(annotation: type) -> Callable[[Any], Any]:

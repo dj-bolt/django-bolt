@@ -15,12 +15,13 @@ from django.db.backends import utils as db_utils
 from django.db.models.functions import JSONObject
 
 from django_bolt import BoltAPI, ViewSet
+from django_bolt.exceptions import ResponseValidationError
 from django_bolt.pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, paginate
 from django_bolt.responses import JSON
 from django_bolt.testing import TestClient
-from django_bolt.views import RetrieveMixin
+from django_bolt.views import ListMixin, RetrieveMixin
 
-from .test_models import Author, BlogPost, Comment, User, UserBadge, UserProfile, UserSecret
+from .test_models import Author, BlogPost, Comment, Note, Notebook, User, UserBadge, UserProfile, UserSecret
 
 
 class AuthorOut(msgspec.Struct):
@@ -866,6 +867,106 @@ def test_reverse_one_to_one_of_an_array_like_struct():
     # The paths that read instances. The values() and unvalidated paths make dicts, which never give arrays.
     instance_paths = [path for path in list_paths if path.startswith(("/page", "/instances"))]
     _assert_each_path(api, instance_paths, one_paths, rows, [ada.pk, bob.pk])
+
+
+class UserWithPhoto(msgspec.Struct):
+    username: str
+    photo_url: str | None = None
+    profile: ProfileOut | None = None
+
+
+class UserWithRequiredPhoto(msgspec.Struct):
+    username: str
+    photo_url: str
+    profile: ProfileOut | None = None
+
+
+def _instance_paths(item_type: type) -> tuple[BoltAPI, list[str], list[str]]:
+    api, list_paths, one_paths = _routes_of(item_type, User, "username")
+    return api, [path for path in list_paths if path.startswith(("/page", "/instances"))], one_paths
+
+
+@pytest.mark.django_db(transaction=True)
+def test_attribute_that_raises_gives_the_field_default_as_from_attributes_does():
+    """``User.photo_url`` raises ``ValueError``. msgspec reads an attribute that raises as a missing attribute."""
+    ada, bob = _make_users()
+    users = [ada, bob]
+    rows = [msgspec.to_builtins(msgspec.convert(user, UserWithPhoto, from_attributes=True)) for user in users]
+    assert rows[0] == {"username": "ada", "photo_url": None, "profile": {"bio": "Hi"}}
+    api, list_paths, one_paths = _instance_paths(UserWithPhoto)
+    _assert_each_path(api, list_paths, one_paths, rows, [user.pk for user in users])
+
+
+@pytest.mark.django_db(transaction=True)
+def test_attribute_that_raises_on_a_required_field_gives_the_error_of_from_attributes():
+    ada, _ = _make_users()
+    with pytest.raises(msgspec.ValidationError) as plain:
+        msgspec.convert(ada, UserWithRequiredPhoto, from_attributes=True)
+    api, list_paths, one_paths = _instance_paths(UserWithRequiredPhoto)
+    with TestClient(api) as client:
+        for path in [*list_paths, *(path.format(pk=ada.pk) for path in one_paths)]:
+            with pytest.raises(ResponseValidationError) as served:
+                client.get(path)
+            assert str(plain.value) in str(served.value), path
+
+
+class UserWithEmail(msgspec.Struct):
+    username: str
+    email: str = "unknown"
+    profile: ProfileOut | None = None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_deferred_field_on_the_event_loop_gives_the_field_default():
+    """The deferred ``email`` cannot load on the event loop. msgspec reads the failed read as a missing attribute."""
+    _make_users()
+    api = BoltAPI()
+
+    @api.get("/page", response_model=list[UserWithEmail])
+    @paginate(PageNumberPagination)
+    async def page():
+        return User.objects.only("username").order_by("username")
+
+    with TestClient(api) as client:
+        response = client.get("/page")
+    assert response.status_code == 200, response.text
+    assert response.json()["items"] == [
+        {"username": "ada", "email": "unknown", "profile": {"bio": "Hi"}},
+        {"username": "bob", "email": "unknown", "profile": {"bio": "Yo"}},
+    ]
+
+
+class NotebookOut(msgspec.Struct):
+    title: str
+
+
+class NoteOut(msgspec.Struct):
+    text: str
+    notebook: NotebookOut | None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_query_name_of_a_generic_relation_reads_only_through_a_query():
+    """``notebook`` is the query name of a GenericRelation. On a Note instance, ``notebook`` is a manager."""
+    ada, _ = _make_users()
+    book = Notebook.objects.create(title="B1")
+    Note.objects.create(content_object=book, text="n1")
+    Note.objects.create(content_object=ada, text="n2")
+    rows = [{"text": "n1", "notebook": {"title": "B1"}}, {"text": "n2", "notebook": None}]
+    api, list_paths, one_paths = _routes_of(NoteOut, Note, "text")
+
+    @api.viewset("/notes")
+    class NoteViewSet(ListMixin, ViewSet):
+        queryset = Note.objects.order_by("text")
+        serializer_class = NoteOut
+
+    _assert_each_path(api, ["/values", "/values-sync", "/notes"], [], rows, [])
+    instance_paths = [path for path in list_paths if not path.startswith("/values")]
+    instance_paths += [path.format(pk=Note.objects.get(text="n1").pk) for path in one_paths]
+    with TestClient(api) as client:
+        for path in instance_paths:
+            with pytest.raises(TypeError, match=r"NoteOut\.notebook is the query name of a GenericRelation"):
+                client.get(path)
 
 
 @pytest.mark.django_db(transaction=True)
