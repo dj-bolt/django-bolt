@@ -257,6 +257,71 @@ Without this setting, all clients behind the proxy share one rate-limit bucket.
 You do not need Django's `SECURE_PROXY_SSL_HEADER`.
 That setting trusts the header from every peer. If you set it, make sure that the proxy replaces the header of the client, as `proxy_set_header` does.
 
+### Serve under a sub-path
+
+A proxy can serve the project under a sub-path, for example `https://example.com/blog/`.
+The proxy removes the sub-path, and Bolt serves the rest of the path, as Django does under WSGI.
+Set `FORCE_SCRIPT_NAME` to the sub-path:
+
+```python title="blog/settings.py"
+FORCE_SCRIPT_NAME = "/blog"
+STATIC_URL = "static/"
+```
+
+In nginx, a URI after the upstream in `proxy_pass` removes the location from the path.
+The `upstream` and the `map` are the ones of the [nginx](#nginx) example:
+
+```nginx
+location /blog/ {
+    proxy_pass http://blog/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+}
+```
+
+Set `X-Forwarded-For` and `X-Forwarded-Proto` in this location too.
+Without them, nginx passes the values of the client, and Bolt accepts them from a proxy in `BOLT_TRUSTED_PROXIES`.
+The `Upgrade` and `Connection` headers let WebSocket requests through.
+
+In Caddy, `handle_path` removes the sub-path:
+
+```text
+example.com {
+    redir /blog /blog/ 308
+    handle_path /blog/* {
+        reverse_proxy 127.0.0.1:8000
+    }
+}
+```
+
+For `https://example.com/blog/articles/42?page=2`, Bolt gets `/articles/42?page=2`. User code then sees these values:
+
+| Value | Result |
+| --- | --- |
+| `request.path` | `"/blog/articles/42"` |
+| `request.path_info` | `"/articles/42"` |
+| `request.META["SCRIPT_NAME"]` | `"/blog"` |
+| `request.get_full_path()` | `"/blog/articles/42?page=2"` |
+| `request.build_absolute_uri()` | `"https://example.com/blog/articles/42?page=2"` |
+| `reverse()`, `{% url %}` and `get_script_prefix()` | A path that starts with `/blog/` |
+
+These rules also apply:
+
+- The router matches `request.path_info`. Bolt gives 404 for `/blog/articles/42`, because the proxy removes `/blog`.
+- `reverse()` gives the sub-path in all user code: handlers, dependencies, middleware, error formatters, streaming bodies, WebSocket handlers, MCP tools, lifespans and thread hops.
+- The `Location` of a trailing-slash redirect starts with `/blog`.
+- The OpenAPI schema has the server `/blog`, and the docs pages load the schema from `/blog/docs/openapi.json`. A server that you set in `OpenAPIConfig` stays.
+- Bolt serves `STATIC_URL` and `MEDIA_URL` without `/blog`, as WhiteNoise does. Django puts `/blog` in front of a relative `STATIC_URL`, such as `"static/"`, so `{% static %}` gives `/blog/static/...`.
+- A Django app of `mount_django()`, such as the admin, gets the paths that it gets under WSGI.
+- `WebSocket.path` is the path without the sub-path.
+
+Bolt reads no request header for the sub-path.
+A proxy that keeps the sub-path needs no `FORCE_SCRIPT_NAME`. Mount the API under the prefix instead. See [Mount an API in the URLconf](routing.md#mount-an-api-in-the-urlconf).
+
 ## Configure database connections
 
 Bolt does not close database connections at the end of each request.
