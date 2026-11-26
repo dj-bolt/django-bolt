@@ -492,12 +492,18 @@ fn task_event(handle: &TaskHandle, inputs: &FuturesUnordered<PendingInput>, even
 /// with its result. When the task settles first (`tasks/cancel`, the TTL or
 /// the end of the store), its token cancels the coroutine.
 async fn run_task(handle: TaskHandle, call: PreparedCall) {
+    // A task cancelled before its first poll never starts its tool.
+    if handle.cancel_token().is_cancelled() {
+        return;
+    }
     let PreparedCall {
         callable,
         payload,
         mut events,
     } = call;
-    let mut dispatch = std::pin::pin!(worker_loop::dispatch_cancellable(
+    // Joined: after a cancel, the body ends when the coroutine has ended, so
+    // a stop of the server can wait for its cleanup.
+    let mut dispatch = std::pin::pin!(worker_loop::dispatch_cancellable_joined(
         callable,
         payload,
         handle.cancel_token().clone(),

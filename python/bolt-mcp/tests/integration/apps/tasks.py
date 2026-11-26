@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from pathlib import Path
 
 from bolt_mcp import MCP, Context, mount_mcp
 
@@ -26,6 +28,23 @@ async def multiply(a: int, b: int, ctx: Context) -> dict:
 async def confirm(ctx: Context) -> dict:
     answer = await ctx.elicit("Proceed?")
     return {"answer": answer["content"]}
+
+
+@mcp.tool(task=True)
+def sync_sleep(seconds: float, marker: str) -> dict:
+    Path(marker, "started").touch()
+    time.sleep(seconds)
+    return {"slept": seconds}
+
+
+@mcp.tool(task=True)
+async def cleanup(marker: str) -> dict:
+    Path(marker, "started").touch()
+    try:
+        await asyncio.sleep(30)
+    finally:
+        Path(marker, "finally").touch()
+    return {"never": True}
 
 
 mount_mcp(api, mcp)

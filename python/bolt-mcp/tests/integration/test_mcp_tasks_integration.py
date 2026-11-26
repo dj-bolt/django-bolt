@@ -9,6 +9,7 @@ that let another process get a ``tasks/get``.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -77,6 +78,40 @@ def test_elicit_in_a_task_over_tcp(make_server_project):
         assert final["result"]["structuredContent"] == {"answer": {"go": True}}
 
 
+def _wait_for(path: Path, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"{path} did not appear")
+        time.sleep(0.02)
+
+
+def test_sigterm_while_a_sync_task_runs_logs_no_error(make_server_project, tmp_path):
+    project = make_server_project(api_source=mcp_app_source("tasks"))
+    with project.start() as server:
+        client = _NewConnectionClient(server)
+        arguments = {"seconds": 1.5, "marker": str(tmp_path)}
+        _rpc(client, "tools/call", {"name": "sync_sleep", "arguments": arguments})
+        _wait_for(tmp_path / "started")
+        stdout, stderr = server.stop()
+    assert server.process.returncode == 0, stdout + stderr
+    output = stdout + stderr
+    assert "Traceback" not in output, output
+    assert "ERROR" not in output, output
+
+
+def test_sigterm_cancels_a_running_async_task_and_its_cleanup_runs(make_server_project, tmp_path):
+    project = make_server_project(api_source=mcp_app_source("tasks"))
+    with project.start() as server:
+        client = _NewConnectionClient(server)
+        _rpc(client, "tools/call", {"name": "cleanup", "arguments": {"marker": str(tmp_path)}})
+        _wait_for(tmp_path / "started")
+        stdout, stderr = server.stop()
+    assert (tmp_path / "finally").exists(), "the finally block of the task did not run at shutdown"
+    output = stdout + stderr
+    assert "Traceback" not in output, output
+
+
 @pytest.mark.parametrize(
     ("spawn_kwargs", "option"),
     [
@@ -96,4 +131,4 @@ def test_runbolt_refuses_task_tools_with_more_than_one_process(make_server_proje
         process.kill()
     assert process.returncode != 0, stdout
     assert option in stderr
-    assert "task tools (confirm, multiply)" in stderr
+    assert "task tools (cleanup, confirm, multiply, sync_sleep)" in stderr
