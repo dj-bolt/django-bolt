@@ -896,7 +896,8 @@ class BoltAPI:
         # ``_no_route_handler`` makes it at the first call.
         self._no_route: tuple[int, Callable] | None = None
 
-        # The API that owns each route that mount() copied. The mount cycle check reads it.
+        # The API that owns each route that mount() or the runbolt merge copied.
+        # The mount cycle check reads it.
         self._handler_api_map: dict[int, BoltAPI] = {}
 
         # Signal emission - disabled by default for performance

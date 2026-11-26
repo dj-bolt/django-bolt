@@ -689,6 +689,42 @@ def test_merge_apis_runs_the_middleware_of_the_first_api_for_a_path_with_no_rout
     assert second_response.headers["x-api"] == "second"
 
 
+def _two_apis_and_their_merge() -> tuple[BoltAPI, BoltAPI, BoltAPI]:
+    first = BoltAPI()
+    second = BoltAPI()
+
+    @first.get("/first")
+    async def first_route():
+        return {"api": "first"}
+
+    @second.get("/second")
+    async def second_route():
+        return {"api": "second"}
+
+    merged = runbolt_module.Command().merge_apis([("first.api", first), ("second.api", second)])
+    return first, second, merged
+
+
+def test_an_api_cannot_mount_a_merge_that_has_its_routes():
+    first, second, merged = _two_apis_and_their_merge()
+
+    for source in (first, second):
+        with pytest.raises(ValueError, match="mount cycle"):
+            source.mount("/merged", merged)
+    assert [path for _method, path, _id, _handler in first._routes] == ["/first"]
+    assert [path for _method, path, _id, _handler in second._routes] == ["/second"]
+
+
+def test_an_unrelated_api_can_mount_a_merge():
+    _first, _second, merged = _two_apis_and_their_merge()
+    parent = BoltAPI()
+    parent.mount("/merged", merged)
+
+    with TestClient(parent) as client:
+        assert client.get("/merged/first").json() == {"api": "first"}
+        assert client.get("/merged/second").json() == {"api": "second"}
+
+
 def _api_with_mcp(server_name: str, path: str) -> BoltAPI:
     api = BoltAPI()
     mount_mcp(api, MCP(server_name, "1.0"), path=path)

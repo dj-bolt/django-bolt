@@ -600,8 +600,10 @@ def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int) -> Non
     """Copy the metadata of one handler of ``api`` into ``merged`` with a new handler id.
 
     The metadata keeps the logging, auth and middleware of ``api``. A route
-    that ``api`` mounted keeps those of its sub-app.
+    that ``api`` mounted keeps those of its sub-app. The handler keeps its owner
+    API, because the mount cycle check of ``mount()`` reads it.
     """
+    merged._handler_api_map[new_handler_id] = api._handler_api_map.get(old_handler_id, api)
     if old_handler_id in api._handler_meta:
         merged._handler_meta[new_handler_id] = api._handler_meta[old_handler_id]
     if old_handler_id in api._handler_middleware:
