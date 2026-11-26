@@ -579,24 +579,6 @@ def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
     return new_scope
 
 
-def _scope_with_script_name(scope: dict[str, Any], script_name: str) -> dict[str, Any]:
-    """Put the script name (``FORCE_SCRIPT_NAME``) in front of the path of a Django scope.
-
-    The proxy removed it. Django's ``ASGIRequest`` then gives the path with it
-    and the path info without it, as ``WSGIRequest`` does.
-    """
-    path = scope["path"]
-    raw_path = scope.get("raw_path")
-    if not isinstance(raw_path, (bytes, bytearray, memoryview)):
-        raw_path = path.encode()
-    return {
-        **scope,
-        "path": script_name + path,
-        "raw_path": script_name.encode() + bytes(raw_path),
-        "root_path": script_name + (scope.get("root_path") or ""),
-    }
-
-
 def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: str) -> dict[str, Any]:
     """Prepend root_path to root-relative redirect Location headers."""
     if not root_path:
@@ -4349,13 +4331,6 @@ class BoltAPI:
                     django_scope = dict(scope)
                 django_scope["root_path"] = ""
             root_path = django_scope.get("root_path") or ""
-            script_name = _script_prefix.script_name
-            if script_name and django_scope.get("type") == "http":
-                django_scope = _scope_with_script_name(django_scope, script_name)
-                # A Location that Django builds has the script name. A rewrite
-                # puts the script name and the mount path in front of one that does not.
-                if root_path:
-                    root_path = django_scope["root_path"]
 
             async def django_send(message):
                 rewritten = _rewrite_django_mount_redirect_message(message, root_path)

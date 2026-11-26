@@ -317,6 +317,7 @@ These rules also apply:
 - The OpenAPI schema has the server `/blog`, and the docs pages load the schema from `/blog/docs/openapi.json`. A server that you set in `OpenAPIConfig` stays.
 - Bolt serves `STATIC_URL` and `MEDIA_URL` without `/blog`, as WhiteNoise does. Django puts `/blog` in front of a relative `STATIC_URL`, such as `"static/"`, so `{% static %}` gives `/blog/static/...`.
 - A Django app of `mount_django()`, such as the admin, gets the paths that it gets under WSGI.
+- The ASGI scope of an app of `mount_asgi()` has `/blog` at the start of `root_path`, so the app builds its URLs under the sub-path.
 - `WebSocket.path` is the path without the sub-path.
 
 Bolt reads no request header for the sub-path.

@@ -839,6 +839,7 @@ pub fn handle_test_websocket(
                     // Give the app the request path as sent, as the server does.
                     let scope = build_asgi_scope_from_parts(
                         py,
+                        app.config.script_name.as_deref(),
                         &mount.prefix,
                         &path,
                         query_string.as_deref().unwrap_or_default().as_bytes(),

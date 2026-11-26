@@ -321,6 +321,49 @@ def test_a_mounted_api_reverses_with_the_script_name_and_serves_without_it(mount
         assert client.get("/posts/3").status_code == 404
 
 
+async def _http_scope_app(scope, receive, send):
+    body = json.dumps({"root_path": scope["root_path"], "path": scope["path"]}).encode()
+    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": body})
+
+
+async def _websocket_scope_app(scope, receive, send):
+    await receive()
+    await send({"type": "websocket.accept"})
+    await send({"type": "websocket.send", "text": json.dumps({"root_path": scope["root_path"], "path": scope["path"]})})
+    await send({"type": "websocket.close"})
+
+
+def test_an_asgi_app_gets_the_script_name_in_its_root_path(settings):
+    # An ASGI app builds its URLs from root_path, as a WSGI app does from SCRIPT_NAME.
+    api = BoltAPI()
+    api.mount_asgi("/asgi", _http_scope_app)
+    root = BoltAPI()
+    root.mount_asgi("/", _http_scope_app)
+
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    with TestClient(api) as client:
+        mounted = client.get("/asgi/page").json()
+    with TestClient(root) as client:
+        at_root = client.get("/page").json()
+
+    assert mounted == {"root_path": "/myapp/asgi", "path": "/page"}
+    assert at_root == {"root_path": "/myapp", "path": "/page"}
+
+
+@pytest.mark.asyncio
+async def test_a_websocket_asgi_app_gets_the_script_name_in_its_root_path_and_path(settings):
+    # As the ASGI specification asks, the path starts with root_path.
+    api = BoltAPI()
+    api.mount_asgi("/ws", _websocket_scope_app)
+
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    async with WebSocketTestClient(api, "/ws/room") as ws:
+        scope = json.loads(await ws.receive_text())
+
+    assert scope == {"root_path": "/myapp/ws", "path": "/myapp/ws/room"}
+
+
 # --- mount_django -------------------------------------------------------------
 
 
