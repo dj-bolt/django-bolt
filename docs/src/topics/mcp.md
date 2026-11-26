@@ -510,21 +510,37 @@ The span has these attributes of the [OpenTelemetry semantic conventions for MCP
 | `mcp.method.name` | `tools/call`, `resources/read` or `prompts/get` |
 | `gen_ai.tool.name` | The tool name, for `tools/call` |
 | `gen_ai.operation.name` | `execute_tool`, for `tools/call` |
-| `mcp.resource.uri` | The URI, for `resources/read` |
+| `mcp.resource.uri` | The URI, for `resources/read`, with no credentials |
 | `gen_ai.prompt.name` | The prompt name, for `prompts/get` |
-| `error.type` | `tool_error` for an `isError` result, or the class name of an exception |
+| `error.type` | The kind of error of a failed call |
 
-An `isError` result or an exception also sets the `ERROR` status. The span records the exception.
+A failed call sets `error.type` and the `ERROR` status:
+
+- `tools/call`: Bolt changes an exception in a tool into an `isError` result before the middleware gets it. Thus `error.type` is `tool_error`.
+- `resources/read` and `prompts/get`: `error.type` is the class name of the exception, for example `ValueError`. An unknown URI or prompt, or invalid arguments, gives `JsonRpcError`.
+- An exception in middleware that runs in the span gives its class name, for each method.
+
+`mcp.resource.uri` has no userinfo (`user:password@`).
+The values of the query parameters `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature` are `REDACTED`, as in the OpenTelemetry HTTP conventions.
+Bolt does not record a URI that it cannot parse.
+
 The span is the current span while the tool runs, also for a sync tool. Thus a span that a tool makes is a child of the MCP span.
 
-The span does not record the tool arguments or the tool result.
+The span does not record the tool arguments, the tool result or the text of an exception.
 To record them, set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` before the `instrument()` call.
 The span then has `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result` as JSON.
-Arguments and results can contain personal data, so turn this on only where your traces can keep it.
+It also gets an `exception` event, with the message and the stack trace, for each exception in the span.
+Arguments, results and exception messages can contain personal data. Turn this on only where your traces can keep it.
 
 `instrument()` registers middleware, so the order rule of middleware applies.
 Middleware that you register after `instrument()` runs in the span. Middleware that you register before it runs out of the span.
-Bolt does not set `mcp.session.id`, `mcp.protocol.version` or `jsonrpc.request.id`, because MCP middleware does not get these values.
+A second `instrument()` call on one server raises `ValueError`.
+
+These limits apply:
+
+- The parent of the span comes only from the request `_meta`. A span that is current in your own middleware does not become the parent.
+- Bolt refuses some calls before the middleware runs. Examples are a call to an unknown tool, a call that fails authentication or the guards, and a malformed request. These calls get no span, so their JSON-RPC errors do not show as error spans.
+- Bolt does not set `mcp.session.id`, `mcp.protocol.version` or `jsonrpc.request.id`, because MCP middleware does not get these values.
 
 ## Expose existing routes as tools
 

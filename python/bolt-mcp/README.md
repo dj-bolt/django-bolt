@@ -162,7 +162,11 @@ Each `tools/call`, `resources/read` and `prompts/get` then gets one `SERVER` spa
 example `tools/call greet`, with the attributes of the
 [OpenTelemetry semantic conventions for MCP](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/).
 The parent of the span is the `traceparent` in the request `_meta`. A span that a tool makes
-is a child of it. The span records the tool arguments and result only when
+is a child of it. A failed call sets `error.type` and the `ERROR` status. For `tools/call`,
+Bolt changes a tool exception into an `isError` result first, so `error.type` is `tool_error`.
+For `resources/read` and `prompts/get`, `error.type` is the class name of the exception.
+`mcp.resource.uri` has no userinfo and no signature values. The span records the tool
+arguments, the tool result and the exception text only when
 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`. `bolt_mcp` does not import
 OpenTelemetry, so a server that does not call `instrument()` does not change.
 
