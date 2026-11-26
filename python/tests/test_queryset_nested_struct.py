@@ -910,6 +910,24 @@ def test_attribute_that_raises_on_a_required_field_gives_the_error_of_from_attri
             assert str(plain.value) in str(served.value), path
 
 
+class UserWithPrivateNames(msgspec.Struct):
+    username: str
+    _instance: str = "none"
+    _relations: list[str] = []
+    profile: ProfileOut | None = None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_field_with_a_private_name_reads_the_instance():
+    """Bolt reads a Struct with a reverse one-to-one through a view. A field name cannot reach the storage of the view."""
+    ada, bob = _make_users()
+    users = [ada, bob]
+    rows = [msgspec.to_builtins(msgspec.convert(user, UserWithPrivateNames, from_attributes=True)) for user in users]
+    assert rows[0] == {"username": "ada", "_instance": "none", "_relations": [], "profile": {"bio": "Hi"}}
+    api, list_paths, one_paths = _instance_paths(UserWithPrivateNames)
+    _assert_each_path(api, list_paths, one_paths, rows, [user.pk for user in users])
+
+
 class UserWithEmail(msgspec.Struct):
     username: str
     email: str = "unknown"

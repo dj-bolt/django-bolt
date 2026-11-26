@@ -1748,19 +1748,20 @@ class _InstanceView:
     attribute that raises has the same effect as without the view: msgspec
     uses the default of the field or reports the missing field. msgspec does
     not read a dict into an ``array_like`` Struct, so the view is not a dict.
+    The slots have mangled names, so a field name cannot read them.
     """
 
-    __slots__ = ("_instance", "_relations")
+    __slots__ = ("__instance", "__relations")
 
     def __init__(self, relations: dict[str, Callable[[Any], Any]], instance: Any) -> None:
-        self._instance = instance
-        self._relations = relations
+        self.__instance = instance
+        self.__relations = relations
 
     def __getattr__(self, name: str) -> Any:
-        read = self._relations.get(name)
+        read = self.__relations.get(name)
         if read is None:
-            return getattr(self._instance, name)
-        return read(self._instance)
+            return getattr(self.__instance, name)
+        return read(self.__instance)
 
 
 def _relation_reader(
