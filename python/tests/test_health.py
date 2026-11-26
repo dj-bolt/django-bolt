@@ -213,7 +213,7 @@ class TestHealthIntegration:
         assert len(api._routes) == initial_route_count + 2
 
         # Check handler names contain health/ready
-        handlers = [api._handlers[route[2]] for route in api._routes[initial_route_count:]]
+        handlers = [route[3] for route in api._routes[initial_route_count:]]
         handler_names = [h.__name__ for h in handlers]
         assert "health_handler" in handler_names
         assert "ready_handler" in handler_names
