@@ -488,7 +488,18 @@ Thus their `revoke`, `consume` and `is_revoked` raise `ReservedJtiError` for a `
 `ReservedJtiError` is a subclass of `ValueError`.
 For `DjangoCacheRevocation`, the reserved prefixes are `fam:` and `ver:`.
 For `DjangoORMRevocation`, they are `family:` and `version:`.
+A database collation can compare text without case or accents, and it can skip some characters.
+For example, the default collation of MySQL compares `VERSION:u` and `vérsion:u` equal to `version:u`.
+Thus the two stores also refuse a `jti` that a collation can read with a reserved prefix.
+The check reads a printable ASCII character in either case.
+It reads each other character as nothing or as its NFKD decomposition, and a Latin letter such as `ø` also as one character.
+A letter of another script, such as `日`, does not read as a Latin letter.
+The one exception is `آ` (U+0622), which `utf8mb4_persian_ci` compares equal to `a`.
+It also reads `i`, `j` and `y` as one letter, and `u` and `v` as one letter, as some tailored collations of MySQL do.
+The check covers each `utf8mb4` collation of MySQL 8.0, for each single character and each pair of printable ASCII characters.
 A `jti` from `create_token_pair` is a UUID, so it does not have these prefixes.
+Two `jti` values that differ only in case or accents still share one row on such a collation.
+A model of your own can keep them apart with a binary collation, for example `db_collation="utf8mb4_bin"` on MySQL.
 `JWTAuthentication(revocation_store=store)` and `JWTAuthViews` count a token as revoked when `is_revoked` raises `ReservedJtiError`.
 Thus such a token gets a 401.
 The two Django stores also raise `ReservedJtiError` for a key that they cannot keep.
@@ -526,6 +537,8 @@ DjangoCacheRevocation(
 ```
 
 Keeps entries in a Django cache. An entry lives until `exp + leeway`, or `default_ttl` seconds when `revoke()` gets no `exp`. A user version never expires.
+A database cache (`DatabaseCache` or a subclass) runs a query for each call. Thus the store uses the async cache API for it, and each call runs in a thread.
+The store calls each other cache directly on the event loop.
 `consume()` and `bump_user_version()` raise `NotImplementedError` for the file, dummy and database cache backends, and for each backend with no atomic `incr`.
 `leeway < 0` raises `ImproperlyConfigured`.
 
@@ -544,7 +557,9 @@ DjangoORMRevocation(
 Keeps entries in a database table. Add `"django_bolt.auth.revocation_db"` to `INSTALLED_APPS` and run `migrate`.
 `model` is an `"app_label.ModelName"` with the fields `jti` (unique), `revoked_at`, `expires_at` and `version`. Another form raises `ValueError` on first use.
 A family is a row with the `jti` `family:<fam>`. A user version is a row with the `jti` `version:<user_id>` that never expires.
-Thus a token `jti` cannot start with `family:` or `version:`.
+Thus a token `jti` cannot start with `family:` or `version:`, in any case or with accents.
+`bump_user_version` also sets the version row to never expire.
+Thus the cleanup task keeps the version, also when a collation gives the row of an old `jti` such as `VERSION:u`.
 The store does not delete rows. Delete rows with an `expires_at` in the past from a periodic task:
 
 <!-- fragment -->

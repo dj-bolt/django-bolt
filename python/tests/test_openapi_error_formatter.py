@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator
 from openapi_spec_validator import validate
 
 from django_bolt import BoltAPI
+from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
 from django_bolt.error_handlers import BoltError, ProblemDetails, error_schema, problem_details
 from django_bolt.exceptions import HTTPException
 from django_bolt.openapi import OpenAPIConfig
@@ -439,3 +440,28 @@ def test_strict_mode_reports_a_formatter_without_error_schema():
     api = _api(plain_error, strict=True)
     with pytest.raises(OpenAPIStrictError, match=r"error_formatter plain_error has no error_schema"):
         SchemaGenerator(api, api._openapi_config).generate()
+
+
+def _guarded_api(*, strict: bool) -> BoltAPI:
+    api = BoltAPI(
+        error_formatter=plain_error,
+        openapi_config=OpenAPIConfig(title="Errors", version="1.0.0", strict=strict),
+    )
+
+    @api.get("/me", auth=[APIKeyAuthentication(api_keys={"key1"})], guards=[IsAuthenticated()])
+    async def me() -> Item:
+        return Item(id=1, name="me")
+
+    api._register_openapi_routes()
+    return api
+
+
+def test_formatter_without_error_schema_documents_no_auth_error_body():
+    """The 401 of a formatter with no error_schema has no content. Strict mode reports the formatter."""
+    responses = _spec(_guarded_api(strict=False))["paths"]["/me"]["get"]["responses"]
+
+    assert set(responses) == {"200", "401"}
+    assert "content" not in responses["401"]
+    strict_api = _guarded_api(strict=True)
+    with pytest.raises(OpenAPIStrictError, match=r"error_formatter plain_error has no error_schema"):
+        SchemaGenerator(strict_api, strict_api._openapi_config).generate()

@@ -16,7 +16,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,7 +28,8 @@ use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::middleware::rate_limit::RateLimiters;
 use bolt_core::router::{Router, normalize_request_path};
 use bolt_core::state::{
-    AppState, AsgiMount, ScopeConfig, ServeMode, TASK_LOCALS, find_websocket_mount_in_slice,
+    AppState, AsgiMount, ScopeConfig, ServeDir, ServeMode, TASK_LOCALS,
+    find_websocket_mount_in_slice,
 };
 use bolt_core::static_files::load_finder_roots;
 use bolt_websocket::WebSocketRouter;
@@ -389,10 +390,11 @@ fn static_scope_from_dict(
 
     // Mirror the production hot-path contract: store pre-canonicalized
     // absolute roots so `find_in_directories` never canonicalizes the dir.
-    let directories: Vec<PathBuf> = directories
+    let directories: Vec<ServeDir> = directories
         .iter()
         .filter_map(|dir| Path::new(dir).canonicalize().ok())
         .filter(|p| p.is_dir())
+        .map(ServeDir::at_root)
         .collect();
 
     let csp_header: Option<HeaderValue> = static_dict

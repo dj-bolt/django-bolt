@@ -38,7 +38,7 @@ Bolt serves `GET` and `HEAD`. Static responses do not appear in the access log.
 For a request to `/static/css/site.css`, Bolt looks for `css/site.css` in this order:
 
 1. `STATIC_ROOT`.
-2. Each directory of `STATICFILES_DIRS`, in order. Bolt does not read a `(prefix, path)` entry. With `DEBUG = False`, run `collectstatic` to copy its files into `STATIC_ROOT`.
+2. Each directory of `STATICFILES_DIRS`, in order. A `(prefix, path)` entry serves its files under `prefix/`, as the Django `FileSystemFinder` does. For example, with `("vendor", BASE_DIR / "assets" / "vendor")`, `/static/vendor/app.css` gives the file `assets/vendor/app.css`.
 3. With `DEBUG = True` only: the Django staticfiles finders, for example the `static/` directory of each app.
 
 The first file found wins. A request with no file gets `404` with the body `File not found`.

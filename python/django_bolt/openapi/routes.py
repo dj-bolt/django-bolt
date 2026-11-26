@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from django.core.exceptions import ImproperlyConfigured
+
 from django_bolt.openapi.plugins import JsonRenderPlugin, YamlRenderPlugin
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.responses import HTML, JSON, PlainText
@@ -64,6 +66,14 @@ class OpenAPIRouteRegistrar:
         # Docs are at absolute paths (e.g., /docs/*) regardless of API prefix,
         # so each docs route registers with _skip_prefix=True.
         route_prefix = self.api._openapi_config.path
+        # The docs pages fetch the schema from a fixed URL. A prefix with a path
+        # parameter, such as path("<org>/", api.urls), has no fixed URL.
+        if "{" in route_prefix:
+            raise ImproperlyConfigured(
+                f"The docs of this API would be at {route_prefix!r}, under a URLconf prefix with a path "
+                "parameter. Disable them with OpenAPIConfig(enabled=False), or mount the API under a prefix "
+                "without a parameter."
+            )
 
         # Always register JSON endpoint
         json_plugin = JsonRenderPlugin()

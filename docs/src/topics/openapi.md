@@ -223,6 +223,14 @@ class Article(msgspec.Struct):
 {"properties": {"id": {"type": "integer"}, "title": {"type": "string", "maxLength": 200, "description": "The headline of the article."}}, "type": "object", "required": ["id", "title"], "title": "Article", "description": "A published article."}
 ```
 
+A type with its own component, such as a struct or an enum, gets a `$ref` to the component.
+The `msgspec.Meta` values go next to the `$ref`, as OpenAPI 3.1 allows. The component does not change.
+This applies to a field, to a return annotation such as `-> Annotated[Author, msgspec.Meta(description="The author.")]`, to a request body such as `body: Annotated[Author, msgspec.Meta(...)]`, and to the items of a list:
+
+```json
+{"$ref": "#/components/schemas/Author", "description": "The author."}
+```
+
 For a Bolt `Serializer`, use `field(description=...)`. See [Serializers](serializers.md).
 
 ## Document responses

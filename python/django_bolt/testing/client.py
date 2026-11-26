@@ -24,6 +24,7 @@ import httpx
 from httpx import Response
 
 from django_bolt import BoltAPI, _core, async_orm
+from django_bolt._urlconf import served_api
 from django_bolt.api import (
     _routes_and_native_routes,
     _validate_asgi_mount_conflicts,
@@ -431,6 +432,8 @@ class TestClient(httpx.Client):
         # use_http_layer is ignored - we always use the HTTP layer now
         _ = use_http_layer
 
+        # runbolt serves an API that the URLconf mounts under its prefixes.
+        api = served_api(api)
         # runbolt registers the docs routes before it validates the routes. Do the same.
         docs_routes = _prepare_api(api)
 
@@ -766,6 +769,7 @@ class AsyncTestClient(httpx.AsyncClient):
                              redirect response.
             **kwargs: Additional arguments passed to httpx.AsyncClient
         """
+        api = served_api(api)
         # Register the docs routes as TestClient does.
         docs_routes = _prepare_api(api)
 

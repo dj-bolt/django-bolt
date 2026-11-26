@@ -9,11 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import jwt
 import pytest
 from django.core.cache import caches
+from django.core.cache.backends.db import DatabaseCache
 from django.core.cache.backends.locmem import LocMemCache
 from django.core.cache.backends.memcached import BaseMemcachedCache
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
-from django.db import IntegrityError
+from django.db import IntegrityError, connection
 
 from django_bolt import BoltAPI
 from django_bolt.auth import JWTAuthentication, JWTAuthViews, TokenRotationError, rotate_refresh_token
@@ -29,6 +30,8 @@ from django_bolt.auth.revocation import (
 )
 from django_bolt.auth.revocation_db.models import RevokedToken
 from django_bolt.testing import TestClient
+
+from .test_models import CaseInsensitiveRevokedToken
 
 # ---------------------------------------------------------------------------
 # InMemoryRevocation
@@ -753,7 +756,7 @@ def test_orm_refuses_a_jti_that_uses_the_key_of_another_entry(orm_store, call, j
     assert RevokedToken.objects.filter(jti=jti).exists() is False
 
 
-@pytest.mark.parametrize("jti", ["fam", "family:f"])
+@pytest.mark.parametrize("jti", ["fam", "family:f", "日本語のトークン"])
 def test_cache_accepts_a_jti_that_does_not_start_with_a_reserved_prefix(cache_store, jti):
     store = cache_store()
 
@@ -762,7 +765,7 @@ def test_cache_accepts_a_jti_that_does_not_start_with_a_reserved_prefix(cache_st
     assert asyncio.run(store.is_revoked(jti)) is True
 
 
-@pytest.mark.parametrize("jti", ["family", "fam:f"])
+@pytest.mark.parametrize("jti", ["family", "fam:f", "日本語のトークン"])
 def test_orm_accepts_a_jti_that_does_not_start_with_a_reserved_prefix(orm_store, jti):
     store = orm_store()
 
@@ -1092,3 +1095,305 @@ def test_rotation_of_a_refresh_token_with_a_claim_that_the_store_cannot_keep_rai
 
     with pytest.raises(TokenRotationError):
         asyncio.run(rotate_refresh_token(claims, store=store, secret=_SECRET, rotate=rotate))
+
+
+# ---------------------------------------------------------------------------
+# DjangoCacheRevocation on a DatabaseCache (#940)
+# ---------------------------------------------------------------------------
+
+_DB_CACHE_TABLE = "bolt_revocation_cache"
+
+
+@pytest.fixture
+def db_cache_store(settings, transactional_db):
+    """Build a ``DjangoCacheRevocation`` on a ``DatabaseCache`` with its own table."""
+    settings.CACHES = {
+        **settings.CACHES,
+        "revocation-db": {"BACKEND": "django.core.cache.backends.db.DatabaseCache", "LOCATION": _DB_CACHE_TABLE},
+    }
+    call_command("createcachetable", _DB_CACHE_TABLE, verbosity=0)
+    yield DjangoCacheRevocation(cache_alias="revocation-db")
+    # The flush of transactional_db does not empty a table that has no model.
+    with connection.cursor() as cursor:
+        cursor.execute(f"DROP TABLE {connection.ops.quote_name(_DB_CACHE_TABLE)}")
+
+
+def test_cache_store_on_a_database_cache_checks_tokens_over_http(db_cache_store):
+    """A request with a token gets a 200, and a 401 after logout. It is not a 500."""
+    api = BoltAPI()
+    auth = JWTAuthentication(secret=_SECRET, revocation_store=db_cache_store)
+
+    @api.get("/protected", auth=[auth])
+    async def protected():
+        return {"ok": True}
+
+    @api.post("/logout", auth=[auth])
+    async def logout(request):
+        claims = request["context"]["auth_claims"]
+        await db_cache_store.revoke(claims["jti"], exp=claims["exp"])
+        return {"ok": True}
+
+    token = {"Authorization": f"Bearer {_signed('access', 'db-cache-jti')}"}
+    other = {"Authorization": f"Bearer {_signed('access', 'db-cache-other')}"}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        assert client.get("/protected", headers=token).status_code == 200
+        assert client.post("/logout", headers=token).status_code == 200
+        assert client.get("/protected", headers=token).status_code == 401
+        assert client.get("/protected", headers=other).status_code == 200
+
+
+def test_cache_store_on_a_database_cache_keeps_tokens_families_and_versions(db_cache_store):
+    """Each store method that the database cache supports runs on the event loop."""
+
+    async def run():
+        await db_cache_store.revoke("a", exp=int(time.time()) + FUTURE)
+        await db_cache_store.revoke_family("f", exp=int(time.time()) + FUTURE)
+        return (
+            await db_cache_store.is_revoked("a"),
+            await db_cache_store.is_revoked("b"),
+            await db_cache_store.is_family_revoked("f"),
+            await db_cache_store.is_family_revoked("g"),
+            await db_cache_store.get_user_version("u"),
+        )
+
+    assert asyncio.run(run()) == (True, False, True, False, 0)
+
+
+class IncrDatabaseCache(DatabaseCache):
+    """A database cache with its own ``incr``. Each call still runs a query."""
+
+    def incr(self, key, delta=1, version=None):
+        return super().incr(key, delta, version)
+
+
+def test_cache_store_refuses_rotation_on_a_subclass_of_the_database_cache(settings):
+    """A subclass with its own ``incr`` gets the clear error, not ``SynchronousOnlyOperation``."""
+    settings.CACHES = {
+        **settings.CACHES,
+        "incr-db": {"BACKEND": "tests.test_revocation.IncrDatabaseCache", "LOCATION": _DB_CACHE_TABLE},
+    }
+    store = DjangoCacheRevocation(cache_alias="incr-db")
+
+    with pytest.raises(NotImplementedError, match="atomic add/incr"):
+        asyncio.run(store.consume("a", exp=int(time.time()) + FUTURE))
+    with pytest.raises(NotImplementedError, match="atomic add/incr"):
+        asyncio.run(store.bump_user_version("u"))
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda store: store.is_revoked("a"),
+        lambda store: store.revoke("a", exp=int(time.time()) + FUTURE),
+        lambda store: store.consume("a", exp=int(time.time()) + FUTURE),
+        lambda store: store.is_family_revoked("f"),
+        lambda store: store.revoke_family("f", exp=int(time.time()) + FUTURE),
+        lambda store: store.get_user_version("u"),
+        lambda store: store.bump_user_version("u"),
+    ],
+    ids=["is_revoked", "revoke", "consume", "is_family_revoked", "revoke_family", "get_user_version", "bump"],
+)
+def test_cache_store_on_an_in_memory_cache_does_not_leave_the_event_loop_thread(cache_store, call):
+    """A local-memory call ends at the first step of its coroutine, so it has no thread hop.
+
+    ``is_revoked`` runs for each authenticated request. A hop to a thread pool costs much more.
+    """
+    coro = call(cache_store())
+
+    with pytest.raises(StopIteration):
+        coro.send(None)
+
+
+# ---------------------------------------------------------------------------
+# A collation without case or accents must not read a jti as a reserved key (#931)
+# ---------------------------------------------------------------------------
+
+# MySQL 8.0 compares each jti here equal to a key with a reserved prefix, in one or more of
+# utf8mb4_0900_ai_ci, utf8mb4_general_ci and utf8mb4_unicode_ci. A tailored collation also
+# compares two letters equal: y and i (utf8mb4_lt_0900_ai_ci), j and i, u and v
+# (utf8mb4_la_0900_ai_ci), ü and y (utf8mb4_da_0900_ai_ci), and alef with madda and a
+# (utf8mb4_persian_ci).
+_CACHE_LOOK_ALIKES = [
+    "FAM:f",
+    "Ver:u",
+    "fäm:f",
+    "fa\u0308m:f",
+    "f\u00adam:f",
+    "v\x01er:u",
+    "VE\u200bR:u",
+    "ｆａｍ：f",
+    "Uer:u",
+    "f\u0622m:f",
+]
+_ORM_LOOK_ALIKES = [
+    "VERSION:u",
+    "Family:f",
+    "vérsion:u",
+    "versıon:u",
+    "verßion:u",
+    "versiøn:u",
+    "famiły:f",
+    "v\u00adersion:u",
+    "version：u",
+    "versyon:u",
+    "versjon:u",
+    "famili:f",
+    "familü:f",
+    "uersion:u",
+    "f\u0622mily:f",
+]
+
+
+@_TOKEN_CALLS
+@pytest.mark.parametrize("jti", _CACHE_LOOK_ALIKES)
+def test_cache_refuses_a_jti_that_a_collation_reads_as_a_reserved_key(cache_store, call, jti):
+    store = cache_store()
+
+    with pytest.raises(ReservedJtiError):
+        asyncio.run(call(store, jti))
+
+
+@_TOKEN_CALLS
+@pytest.mark.parametrize("jti", _ORM_LOOK_ALIKES)
+def test_orm_refuses_a_jti_that_a_collation_reads_as_a_reserved_key(orm_store, call, jti):
+    store = orm_store()
+
+    with pytest.raises(ReservedJtiError):
+        asyncio.run(call(store, jti))
+
+    assert RevokedToken.objects.exists() is False
+
+
+@pytest.mark.parametrize(
+    ("store_fixture", "jti"),
+    [*(("cache_store", jti) for jti in _CACHE_LOOK_ALIKES), *(("orm_store", jti) for jti in _ORM_LOOK_ALIKES)],
+)
+def test_a_token_whose_jti_a_collation_reads_as_a_reserved_key_gets_a_401(request, store_fixture, jti):
+    store = request.getfixturevalue(store_fixture)()
+    api = BoltAPI()
+
+    @api.get("/protected", auth=[JWTAuthentication(secret=_SECRET, revocation_store=store)])
+    async def protected():
+        return {"ok": True}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/protected", headers={"Authorization": f"Bearer {_signed('access', jti)}"})
+
+    assert response.status_code == 401
+
+
+@pytest.fixture
+def nocase_orm_store(transactional_db):
+    """Build a ``DjangoORMRevocation`` on a table whose ``jti`` column compares text without case."""
+    return lambda **kwargs: DjangoORMRevocation(model="django_bolt.CaseInsensitiveRevokedToken", **kwargs)
+
+
+def _run_cleanup_task_after(seconds: int) -> None:
+    """Delete the rows that the cleanup task of the docs deletes ``seconds`` from now."""
+    CaseInsensitiveRevokedToken.objects.filter(expires_at__lt=datetime.now(UTC) + timedelta(seconds=seconds)).delete()
+
+
+def test_the_case_insensitive_column_reads_a_jti_as_the_user_version_row(nocase_orm_store):
+    """The test table shows the collision of #931: one row answers to both keys."""
+    CaseInsensitiveRevokedToken.objects.create(jti="version:u", expires_at=datetime.now(UTC))
+
+    assert CaseInsensitiveRevokedToken.objects.filter(jti="VERSION:u").exists()
+
+
+def test_a_refresh_token_cannot_put_the_user_version_in_a_row_that_expires(nocase_orm_store):
+    """A jti ``VERSION:<user id>`` must not make the row that later keeps the user version.
+
+    That row would expire with the token. The cleanup task would then delete the version,
+    and logout-all would not end the old sessions any more.
+    """
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return _ViewsUser()
+
+    JWTAuthViews(
+        store=nocase_orm_store(), secret=_SECRET, secure_cookies=False, credential_validator=validate
+    ).register(api)
+    login = {"username": "orm-user", "password": "any"}
+    no_csrf_origin = {"Sec-Fetch-Site": "none"}
+    attack = _signed_claims("refresh", sub=_ViewsUser.pk, jti=f"VERSION:{_ViewsUser.pk}")
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        refused = client.post("/auth/refresh", headers={"Cookie": f"refresh_token={attack}", **no_csrf_origin})
+        client.cookies.clear()
+        assert client.post("/auth/login", json=login).status_code == 200
+        old_session = client.cookies.get("refresh_token")
+        client.cookies.clear()
+        assert client.post("/auth/login", json=login).status_code == 200
+        assert client.post("/auth/logout-all", headers=no_csrf_origin).status_code == 200
+        client.cookies.clear()
+
+        _run_cleanup_task_after(FUTURE + 600)
+
+        stale = client.post("/auth/refresh", headers={"Cookie": f"refresh_token={old_session}", **no_csrf_origin})
+
+    assert stale.status_code == 401
+    assert refused.status_code == 401
+
+
+def test_a_user_version_bump_keeps_its_row_when_a_jti_row_has_its_key(nocase_orm_store):
+    """A row of an earlier release can have a jti that the column reads as the version key.
+
+    The bump writes the version into that row, so the row must stop expiring.
+    """
+    store = nocase_orm_store()
+    CaseInsensitiveRevokedToken.objects.create(jti="VERSION:u", expires_at=datetime.now(UTC))
+
+    assert asyncio.run(store.bump_user_version("u")) == 1
+    _run_cleanup_task_after(FUTURE)
+
+    assert asyncio.run(store.get_user_version("u")) == 1
+
+
+_NOCASE_CACHE_TABLE = "bolt_revocation_nocase_cache"
+
+
+@pytest.fixture
+def nocase_db_cache_store(settings, transactional_db):
+    """Build a ``DjangoCacheRevocation`` on a ``DatabaseCache`` whose key column compares text without case."""
+    settings.CACHES = {
+        **settings.CACHES,
+        "revocation-nocase-db": {
+            "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+            "LOCATION": _NOCASE_CACHE_TABLE,
+        },
+    }
+    table = connection.ops.quote_name(_NOCASE_CACHE_TABLE)
+    with connection.cursor() as cursor:
+        # The table of createcachetable, with the collation of the key column changed.
+        cursor.execute(
+            f"CREATE TABLE {table} (cache_key varchar(255) COLLATE NOCASE NOT NULL PRIMARY KEY, "
+            "value text NOT NULL, expires datetime NOT NULL)"
+        )
+    yield DjangoCacheRevocation(cache_alias="revocation-nocase-db")
+    with connection.cursor() as cursor:
+        cursor.execute(f"DROP TABLE {table}")
+
+
+def test_a_jti_cannot_end_the_revocation_of_a_family_in_a_case_insensitive_database_cache(nocase_db_cache_store):
+    store = nocase_db_cache_store
+    asyncio.run(store.revoke_family("f", exp=int(time.time()) + 30 * 86400))
+
+    with pytest.raises(ReservedJtiError):
+        asyncio.run(store.revoke("FAM:f", exp=int(time.time()) + PAST))
+
+    assert asyncio.run(store.is_family_revoked("f")) is True
+
+
+def test_a_token_whose_jti_is_a_family_key_gets_a_401_on_a_case_insensitive_database_cache(nocase_db_cache_store):
+    api = BoltAPI()
+
+    @api.get("/protected", auth=[JWTAuthentication(secret=_SECRET, revocation_store=nocase_db_cache_store)])
+    async def protected():
+        return {"ok": True}
+
+    with TestClient(api, raise_server_exceptions=False) as client:
+        response = client.get("/protected", headers={"Authorization": f"Bearer {_signed('access', 'FAM:f')}"})
+
+    assert response.status_code == 401

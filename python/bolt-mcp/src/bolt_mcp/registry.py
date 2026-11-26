@@ -112,10 +112,16 @@ class ToolDef:
     args_struct: Any = None
     input_schema: dict[str, Any] | None = None
     is_async: bool = False
-    injects_request: bool = False
+    request_param: str | None = None  # name of the parameter to inject the request under
     ctx_param: str | None = None  # name of the parameter to inject the Context under
     # An exposed route: {"auth_backends": [...], "guards": [...]} of the route. Rust runs them for each call.
     route_auth: dict[str, Any] | None = None
+    # An exposed route with revocation: ``await revocation_check(auth)`` raises ``HTTPException`` for a revoked token.
+    revocation_check: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    # An exposed route with route_auth: the user loaders of its auth backends, by auth_backend_index.
+    user_loaders: tuple[Any, ...] = ()
+    # A tool with task=True: {"ttl_ms": int, "poll_interval_ms": int}. Rust runs its calls as tasks.
+    task: dict[str, int] | None = None
 
 
 @dataclass

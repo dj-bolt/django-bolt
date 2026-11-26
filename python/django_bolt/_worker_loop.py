@@ -91,6 +91,12 @@ class WorkerLoop(asyncio.SelectorEventLoop):
     def is_running(self):
         return not self._closed
 
+    def is_closed(self):
+        # The pump stops with its worker thread, for example at a stop of the
+        # server. asyncio then drops the late result of a thread-pool call
+        # instead of posting it to a loop that no thread runs.
+        return self._closed or self._scheduler.is_closed()
+
     def close(self):
         raise RuntimeError("WorkerLoop is process-managed and cannot be closed")
 

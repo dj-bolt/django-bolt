@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bolt_mcp import MCP, Context, mount_mcp
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Request
 
 api = BoltAPI()
 mcp = MCP("features-itest", "2.0")
@@ -62,4 +62,14 @@ async def double(n: int) -> dict:
     return {"result": n * 2}
 
 
-mount_mcp(api, mcp, expose=[double])
+@api.get("/client")
+async def client(request: Request) -> dict:
+    """Describe the request of the caller."""
+    return {
+        "remote": request.META["REMOTE_ADDR"],
+        "agent": request.headers.get("user-agent"),
+        "anonymous": request.user.is_anonymous,
+    }
+
+
+mount_mcp(api, mcp, expose=[double, client])

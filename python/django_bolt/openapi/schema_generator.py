@@ -43,6 +43,7 @@ from .spec import (
     Parameter,
     PathItem,
     Reference,
+    ReferenceWithKeywords,
     RequestBody,
     Schema,
     SecurityScheme,
@@ -93,6 +94,17 @@ def _response_class_media(response_class: type | None) -> tuple[str, Schema] | N
         if issubclass(response_class, cls):
             return media_type, schema
     return None
+
+
+def _body_schema_type(field: Any) -> Any:
+    """The type of a body field for its schema.
+
+    Binding keeps only the struct or the dataclass type of a body. The schema
+    also shows the ``msgspec.Meta`` items of its ``Annotated``. (#958)
+    """
+    if not field.schema_meta:
+        return field.annotation
+    return Annotated[(field.annotation, *field.schema_meta)]
 
 
 def _unwrap_annotated(annotation: Any) -> Any:
@@ -195,6 +207,8 @@ def _backend_security_scheme(backend: Any) -> tuple[str, SecurityScheme] | None:
 
 _PATH_PARAM_RE = re.compile(r"{([^{}]+)}")
 _EMPTY_SCHEMA = Schema()
+# The attributes of Schema that are schema keywords. ``msgspec.Meta`` can set only these.
+_SCHEMA_KEYWORD_FIELDS = frozenset(Schema.__dataclass_fields__)
 
 # The sources of a route field that Bolt validates. A value that fails gives a 422.
 _PARAMETER_SOURCES = frozenset({"path", "query", "header", "cookie"})
@@ -587,12 +601,14 @@ class SchemaGenerator:
         attribute, translating camelCase JSON keys (e.g. ``maxLength``) to the
         snake_case field name via the alias map. Keys with no corresponding
         Schema field (e.g. arbitrary ``x-`` extensions) are skipped — the spec
-        dataclass cannot represent them. Returns the same Schema for chaining.
+        dataclass cannot represent them. A key that names an attribute but not a
+        schema keyword, such as ``reference`` or ``to_schema``, is skipped too.
+        Returns the same Schema for chaining.
         """
         alias_map = Schema.field_aliases()  # {json_alias: field_name}
         for key, value in extra.items():
             attr = alias_map.get(key, key)
-            if hasattr(schema, attr):
+            if attr in _SCHEMA_KEYWORD_FIELDS:
                 setattr(schema, attr, value)
         return schema
 
@@ -1208,6 +1224,7 @@ class SchemaGenerator:
         if body_field is not None and body_field.embed:
             return self._embedded_request_body(body_field)
 
+        dependency_body = None
         if not body_param or not body_type:
             # A dependency can read the JSON body.
             dependency_body = next(
@@ -1288,6 +1305,9 @@ class SchemaGenerator:
             return None
 
         # JSON request body
+        schema_field = body_field if body_field is not None and body_field.name == body_param else dependency_body
+        if schema_field is not None and schema_field.annotation is body_type:
+            body_type = _body_schema_type(schema_field)
         self._input_schema = True
         try:
             schema = self._type_to_schema(body_type, register_component=True)
@@ -1309,7 +1329,7 @@ class SchemaGenerator:
         """The request body of a ``Body(embed=True)`` parameter: a JSON object with the value at one key."""
         marker = field.param
         key = field.alias or field.name
-        schema = self._type_to_schema(field.annotation, register_component=True)
+        schema = self._type_to_schema(_body_schema_type(field), register_component=True)
         has_default = field.default is not inspect.Parameter.empty
         if has_default and field.default is not None:
             schema = self._with_default(schema, field.default)
@@ -2169,11 +2189,13 @@ def _node_metadata(gen: SchemaGenerator, node: Any, register: bool) -> Schema | 
     # documented custom type in ``serializers.types`` takes this path. (#235)
     base = gen._type_to_schema(node.type, register_component=register)
     extra = getattr(node, "extra_json_schema", None)
-    # Constraints already live on ``base``; docs only merge onto an inline
-    # Schema — a $ref to a component cannot take siblings.
-    if extra and isinstance(base, Schema):
-        gen._apply_json_schema_extra(base, extra)
-    return base
+    if not extra:
+        return base
+    # Constraints already live on ``base``. A reference is shared by each use of
+    # its component, so the docs go next to the ``$ref``, as OpenAPI 3.1 allows. (#945)
+    if isinstance(base, Reference):
+        base = ReferenceWithKeywords(reference=base)
+    return gen._apply_json_schema_extra(base, extra)
 
 
 def _node_str(gen: SchemaGenerator, node: Any, register: bool) -> Schema:

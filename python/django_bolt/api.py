@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import dis
 import functools
 import inspect
@@ -24,6 +25,7 @@ except ImportError:
 import msgspec
 from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
+from django.core.exceptions import ImproperlyConfigured
 from django.core.handlers.asgi import ASGIHandler
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
@@ -37,6 +39,7 @@ from ._kwargs import (
     extract_response_metadata,
     field_has_upload_file,
 )
+from ._urlconf import ApiURLConf, join_mount_path
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler, annotation_globals
@@ -460,10 +463,12 @@ _PATH_PARAM_NAME = re.compile(r"\{([^}:]+)")
 
 
 def _refuse_mount_path_arguments(path: str, app: BoltAPI) -> None:
-    """Refuse a mounted handler that takes a parameter of the mount path as an argument.
+    """Refuse a mounted handler or dependency that takes a parameter of the mount path as an argument.
 
-    The mounted API compiled each route without the mount path. An argument
-    with the name of a mount path parameter thus reads the query, not the path.
+    The mounted API compiled each route and its dependencies without the mount
+    path. An argument with the name of a mount path parameter thus reads the
+    query, not the path. An argument with a marker, such as ``Query()``, reads
+    the source of its marker on each route, so it is not refused.
     """
     names = set(_PATH_PARAM_NAME.findall(path))
     if not names:
@@ -471,15 +476,24 @@ def _refuse_mount_path_arguments(path: str, app: BoltAPI) -> None:
     routes = [(f"{method} {route_path}", handler_id) for method, route_path, handler_id, _handler in app._routes]
     routes.extend((f"WEBSOCKET {ws_path}", handler_id) for ws_path, handler_id, _handler in app._websocket_routes)
     for route, handler_id in routes:
-        for field in app._handler_meta.get(handler_id, {}).get("fields", ()):
-            # A marker such as Query() says that the argument is not from the path.
-            if field.name in names and field.param is None and field.source not in ("path", "request", "dependency"):
-                raise ValueError(
-                    f"The handler of {route} takes the parameter {field.name!r} of the mount path {path!r} as an "
-                    f"argument, and the argument reads the {field.source}. A mounted route was compiled without "
-                    f"the mount path. Read the value from request.params[{field.name!r}], or use a Router "
-                    "with this prefix."
-                )
+        meta = app._handler_meta.get(handler_id, {})
+        # dependency_fields has the request data fields of each dependency of the route, also of a nested one.
+        for owner, fields in (
+            ("The handler", meta.get("fields", ())),
+            ("A dependency of the handler", meta.get("dependency_fields", ())),
+        ):
+            for field in fields:
+                if (
+                    field.name in names
+                    and field.param is None
+                    and field.source not in ("path", "request", "dependency")
+                ):
+                    raise ValueError(
+                        f"{owner} of {route} takes the parameter {field.name!r} of the mount path {path!r} as an "
+                        f"argument, and the argument reads the {field.source}. A mounted route was compiled without "
+                        f"the mount path. Read the value from request.params[{field.name!r}], mark the argument "
+                        "with Path(), or use a Router with this prefix."
+                    )
 
 
 def _refuse_repeated_path_params(path: str) -> None:
@@ -770,11 +784,23 @@ class BoltAPI:
             ):
                 raise TypeError("error_formatter must be a sync callable, not an async one")
         self._error_formatter = error_formatter
+        # The settings of this API without its routes. ``_served_at`` makes an API with them.
+        self._init_kwargs: dict[str, Any] = {
+            "trailing_slash": trailing_slash,
+            "middleware": middleware,
+            "django_middleware": django_middleware,
+            "enable_logging": enable_logging,
+            "logging_config": logging_config,
+            "compression": compression,
+            "openapi_config": openapi_config,
+            "validate_response": validate_response,
+            "include_in_schema": include_in_schema,
+            "error_formatter": error_formatter,
+        }
         self._routes: list[tuple[str, str, int, Callable]] = []
         # Handler IDs whose lane affinity error was logged with its fix, one time each.
         self._lane_affinity_hinted: set[int] = set()
         self._websocket_routes: list[tuple[str, int, Callable]] = []  # (path, handler_id, handler)
-        self._handlers: dict[int, Callable] = {}
         # OPTIMIZATION: Use handler_id (int) as key instead of callable
         # Integer hashing is O(1) with minimal overhead vs callable hashing
         self._handler_meta: dict[int, HandlerMetadata] = {}
@@ -898,7 +924,8 @@ class BoltAPI:
         # ``_no_route_handler`` makes it at the first call.
         self._no_route: tuple[int, Callable] | None = None
 
-        # Handler-to-API mapping for merged APIs (initialized here to avoid hasattr in hot path)
+        # The API that owns each route that mount() or the runbolt merge copied.
+        # The mount cycle check reads it.
         self._handler_api_map: dict[int, BoltAPI] = {}
 
         # Signal emission - disabled by default for performance
@@ -1302,7 +1329,6 @@ class BoltAPI:
             full_path = _normalize_path(f"{self.prefix}{_leading_slash(path)}", "strip")
             _refuse_repeated_path_params(full_path)
 
-            self._handlers[handler_id] = fn
             # A config decorator that runs after this one is above it, and has no effect.
             mark_route_handler(fn)
 
@@ -1310,7 +1336,6 @@ class BoltAPI:
             # This enables injection of path params, query params, headers, cookies
             meta = self._compile_websocket_binder(fn, full_path)
             meta["is_async"] = True
-            meta["is_websocket"] = True
             # Rust reads this key for every route. A WebSocket route never uses it.
             meta["default_status_code"] = 200
             self._apply_dependency_tree(meta, "WEBSOCKET", full_path)
@@ -2012,7 +2037,6 @@ class BoltAPI:
             # The router does not get a route that is not routable.
             if _routable:
                 self._routes.append((method, full_path, handler_id, fn))
-            self._handlers[handler_id] = fn
             # A config decorator that runs after this one is above it, and has no effect.
             mark_route_handler(fn)
 
@@ -2553,6 +2577,9 @@ class BoltAPI:
                     return entry["_response_type_handler_sync"](result)
 
                 return serialize_response_sync(result, default_entry)
+
+            # An MCP tool call of the route serializes its result with these, as HTTP does.
+            meta["_multi_response_serializers"] = (_dispatch_multi_async, _dispatch_multi_sync)
 
             async def execute_multi(handler: Callable, request: dict[str, Any]) -> ResponseWireV1:
                 # Rust sets both prebound keys or neither. It sets neither when it
@@ -3966,11 +3993,11 @@ class BoltAPI:
         registrar = OpenAPIRouteRegistrar(self, middleware=middleware)
         registrar.register_routes()
 
-    def _register_admin_routes(self, host: str = "localhost", port: int = 8000) -> None:
+    def _register_admin_routes(self) -> None:
         """Register Django admin as an ASGI mount."""
 
         registrar = AdminRouteRegistrar(self)
-        registrar.register_routes(host, port)
+        registrar.register_routes()
 
     def _register_auth_backends(self) -> None:
         """
@@ -4013,6 +4040,21 @@ class BoltAPI:
         # starts its worker processes.
         _core.check_native_capsule(capsule)
         self._native_routes.append((method, full_path, capsule))
+
+    @property
+    def urls(self) -> tuple[ApiURLConf, str | None, str | None]:
+        """Mount this API in Django's URLconf, as ``admin.site.urls`` does.
+
+        Usage::
+
+            urlpatterns = [path("missions/", api.urls)]
+
+        Bolt then serves each route of this API under ``missions/``, and
+        ``reverse()`` gives the same path. The ``namespace`` of this API is the
+        app and the instance namespace. An enclosing ``include()`` adds its own
+        namespace in front of it.
+        """
+        return ApiURLConf(self), self.namespace, self.namespace
 
     def mount(self, path: str, app: BoltAPI) -> None:
         """
@@ -4086,6 +4128,17 @@ class BoltAPI:
         stripped_path = path.strip("/")
         mount_path = "/" + stripped_path if stripped_path else ""
 
+        self._mount(app, mount_path, lambda route_path: _normalize_path(mount_path + route_path, self.trailing_slash))
+
+    def _mount(self, app: BoltAPI, mount_path: str, join: Callable[[str], str]) -> None:
+        """Copy each endpoint of ``app`` into this API, as ``mount()`` does.
+
+        ``mount_path`` is the path under which ``app`` serves: a leading slash,
+        and no trailing slash. ``join`` gives the path of a route or a native
+        route of ``app``. The other endpoints join ``mount_path`` and their own path.
+        """
+        child_formatter = app._error_formatter
+
         # Prepare MCP definitions before mutating the parent. A mounted child
         # is removed from global discovery below, so its MCP endpoints must be
         # copied just like its HTTP, WebSocket, and ASGI endpoints.
@@ -4109,12 +4162,11 @@ class BoltAPI:
         mounted_paths = [route_path for _method, route_path, *_rest in app._routes + app._native_routes]
         mounted_paths.extend(ws_path for ws_path, _handler_id, _handler in app._websocket_routes)
         for mounted_path in mounted_paths:
-            _refuse_repeated_path_params(mount_path + mounted_path)
+            _refuse_repeated_path_params(join(mounted_path))
 
         # Copy routes from sub-app to this app with path prefix
         for method, route_path, handler_id, handler in app._routes:
-            # Compute new path with mount prefix and normalize using parent's trailing_slash setting
-            new_path = _normalize_path(mount_path + route_path, self.trailing_slash)
+            new_path = join(route_path)
 
             # Create new handler ID in parent's namespace
             new_handler_id = self._next_handler_id
@@ -4122,7 +4174,6 @@ class BoltAPI:
 
             # Register route in parent
             self._routes.append((method, new_path, new_handler_id, handler))
-            self._handlers[new_handler_id] = handler
 
             # Copy handler metadata (now keyed by handler_id for performance)
             if handler_id in app._handler_meta:
@@ -4132,6 +4183,7 @@ class BoltAPI:
                 self._handler_meta[new_handler_id] = {
                     **meta,
                     "include_in_schema": _layer(meta["include_in_schema"], app.include_in_schema),
+                    "mount_namespaces": (app.namespace or "", *meta.get("mount_namespaces", ())),
                 }
 
             # Copy middleware metadata (with path updated)
@@ -4140,25 +4192,23 @@ class BoltAPI:
                 middleware_meta["path"] = new_path
                 self._handler_middleware[new_handler_id] = middleware_meta
 
-            # Track which API owns this handler (for logging, global middleware, etc.).
             # A route that ``app`` mounted from another API keeps that API.
             self._handler_api_map[new_handler_id] = app._handler_api_map.get(handler_id, app)
 
         for method, route_path, capsule in app._native_routes:
-            new_path = _normalize_path(mount_path + route_path, self.trailing_slash)
+            new_path = join(route_path)
             _refuse_typed_native_path_params(new_path)
             self._native_routes.append((method, new_path, capsule))
 
         # Copy WebSocket routes
         for ws_path, handler_id, handler in app._websocket_routes:
             # A WebSocket route path has no trailing slash: see _websocket_decorator.
-            new_path = _normalize_path(mount_path + ws_path, "strip")
+            new_path = _normalize_path(join(ws_path), "strip")
 
             new_handler_id = self._next_handler_id
             self._next_handler_id += 1
 
             self._websocket_routes.append((new_path, new_handler_id, handler))
-            self._handlers[new_handler_id] = handler
 
             # Copy handler metadata, layered as for HTTP routes above.
             if handler_id in app._handler_meta:
@@ -4166,6 +4216,7 @@ class BoltAPI:
                 self._handler_meta[new_handler_id] = {
                     **meta,
                     "include_in_schema": _layer(meta["include_in_schema"], app.include_in_schema),
+                    "mount_namespaces": (app.namespace or "", *meta.get("mount_namespaces", ())),
                 }
 
             if handler_id in app._handler_middleware:
@@ -4173,7 +4224,6 @@ class BoltAPI:
                 middleware_meta["path"] = new_path
                 self._handler_middleware[new_handler_id] = middleware_meta
 
-            # Track which API owns this handler (for logging, global middleware, etc.).
             # A route that ``app`` mounted from another API keeps that API.
             self._handler_api_map[new_handler_id] = app._handler_api_map.get(handler_id, app)
 
@@ -4200,6 +4250,32 @@ class BoltAPI:
         # Last, so that a mount that raises does not change the formatter.
         if child_formatter is not None:
             self._error_formatter = child_formatter
+
+    def _served_at(self, prefixes: Sequence[str]) -> BoltAPI:
+        """Return an API that serves the routes of this API under each URLconf prefix.
+
+        The new API has the settings of this API, so its own routes (the docs
+        routes and the route for a request that matches no route) behave as
+        the routes of this API. It runs the lifespan of this API one time.
+        """
+        served = BoltAPI(**self._init_kwargs)
+        served._compression = self._compression
+        # The docs move with the API, under its first prefix.
+        config = self._openapi_config
+        if config is not None and prefixes[0]:
+            config = dataclasses.replace(config, path="/" + prefixes[0].rstrip("/") + config.path)
+        served._openapi_config = config
+        for prefix in prefixes:
+            if prefix and any(definition.get("verify_token") is not None for definition in self._mcp_mounts):
+                raise ImproperlyConfigured(
+                    f"The URLconf mounts a BoltAPI with an OAuth-protected MCP server under {prefix!r}. "
+                    "The OAuth audience and resource metadata of the server name its own path. "
+                    'Mount this API with path("", api.urls), or move the MCP server to an API at the root.'
+                )
+            mount_path = "/" + prefix.rstrip("/") if prefix else ""
+            _refuse_mount_path_arguments(mount_path, self)
+            served._mount(self, mount_path, functools.partial(join_mount_path, prefix))
+        return served
 
     def mount_asgi(self, path: str, app: Callable[..., Any]) -> None:
         """Mount an ASGI app at a static prefix (evaluated after Bolt route miss)."""

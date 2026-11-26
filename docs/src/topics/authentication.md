@@ -520,8 +520,12 @@ Without `exp`, the entry lives for the `default_ttl` of the store: 7 days.
 | `DjangoORMRevocation()` | Yes | Add `"django_bolt.auth.revocation_db"` to `INSTALLED_APPS` and run `migrate` |
 
 Refresh rotation and `bump_user_version()` need an atomic `add` and `incr` in the cache. `DjangoCacheRevocation` refuses the file, database and dummy cache backends for them.
+On a database cache, `DjangoCacheRevocation` uses the async cache API, so each check runs its query in a thread.
+On each other cache, the store calls the cache on the event loop, with no thread.
 `DjangoORMRevocation` does not delete old rows. Delete rows with `expires_at` in the past from a periodic task. Keep the rows whose `jti` starts with `version:`.
 A token `jti` cannot start with `family:` or `version:`. The store raises `ReservedJtiError` for it, and the request gets a 401.
+A database collation can compare text without case or accents, for example the default collation of MySQL.
+Thus the store also refuses a `jti` such as `VERSION:u` or `vérsion:u`. See [RevocationStore](../ref/auth.md#revocationstore).
 A `jti` longer than the `max_length` of the `jti` field of the model also gets a 401. For the `RevokedToken` model of Bolt, this limit is 255 characters. On a memcached backend, a `jti` with a space also gets a 401.
 
 When you change the `leeway` of the backend, give the store the same value: `DjangoCacheRevocation(leeway=120)`. A store `leeway` smaller than the backend `leeway` raises `ImproperlyConfigured`.

@@ -23,6 +23,7 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
+from django_bolt._urlconf import served_apis
 from django_bolt.api import (
     BoltAPI,
     _routes_and_native_routes,
@@ -596,13 +597,45 @@ def _validate_option_ranges(options) -> None:
             raise CommandError(f"{flag} must be at most {highest}, got {value}")
 
 
-def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int, handler) -> None:
-    """Copy one handler of ``api`` into ``merged`` with a new handler id.
+def _option_that_splits_mcp_tasks(options) -> str | None:
+    """Return the option that lets another process get a ``tasks/get``, if one is set.
 
-    The handler keeps the API that owns it, so it keeps the logging, auth and
-    middleware of that API. A route that ``api`` mounted keeps its sub-app.
+    MCP tasks live in the memory of the process that runs them. With
+    ``SO_REUSEPORT``, the kernel can give the next request to another process.
+    Worker recycling starts the new worker before the old one stops, with the same result.
     """
-    merged._handlers[new_handler_id] = handler
+    if options["processes"] > 1:
+        return f"--processes {options['processes']}"
+    if options["max_rss"]:
+        return "--max-rss"
+    if options["workers_lifetime"]:
+        return "--workers-lifetime"
+    return None
+
+
+def _reject_mcp_task_tools(mcp_mounts: list[dict], option: str) -> None:
+    """Stop startup when an MCP mount has a tool with ``task=True`` and ``option`` is set."""
+    mounts = []
+    for mount in mcp_mounts:
+        task_tools = sorted(name for name, tool in mount["tools"].items() if tool["task"] is not None)
+        if task_tools:
+            mounts.append(f"{mount['path']!r} has task tools ({', '.join(task_tools)})")
+    if mounts:
+        raise CommandError(
+            f"The MCP mount at {'; the MCP mount at '.join(mounts)}. "
+            "MCP tasks live in the memory of one process, so tasks/get must reach that process. "
+            f"With {option}, another process can get the request. "
+            "Run one process with no --max-rss and no --workers-lifetime, or remove task=True."
+        )
+
+
+def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int) -> None:
+    """Copy the metadata of one handler of ``api`` into ``merged`` with a new handler id.
+
+    The metadata keeps the logging, auth and middleware of ``api``. A route
+    that ``api`` mounted keeps those of its sub-app. The handler keeps its owner
+    API, because the mount cycle check of ``mount()`` reads it.
+    """
     merged._handler_api_map[new_handler_id] = api._handler_api_map.get(old_handler_id, api)
     if old_handler_id in api._handler_meta:
         merged._handler_meta[new_handler_id] = api._handler_meta[old_handler_id]
@@ -791,7 +824,11 @@ class Command(BaseCommand):
 
         # Run autodiscovery + banner once in the parent before forking so the
         # user sees a single clean banner instead of N copies.
-        self._print_multiprocess_banner(options)
+        apis, merged_api = self._discover_multiprocess_apis()
+        split_option = _option_that_splits_mcp_tasks(options)
+        if split_option is not None:
+            _reject_mcp_task_tools(merged_api._mcp_mounts, split_option)
+        self._print_multiprocess_banner(options, apis, merged_api)
 
         def spawn_worker(slot: int) -> int:
             # A forked worker inherits the sockets of the parent's open database
@@ -857,22 +894,22 @@ class Command(BaseCommand):
         if exit_code:
             sys.exit(exit_code)
 
-    def _print_multiprocess_banner(self, options):
-        """Perform a dry-run of autodiscovery to collect route/feature info,
-        then print the startup banner once from the parent process."""
+    def _discover_multiprocess_apis(self):
+        """Run autodiscovery once in the parent process. Return ``(apis, merged_api)``."""
         # Setup logging/file-response just like start_single_process
         if setup_django_logging is not None:
             setup_django_logging()
         if initialize_file_response_settings is not None:
             initialize_file_response_settings()
-        banner_base_url = _build_display_url(options["host"], options["port"], dev_mode=False)
-
-        apis = self.autodiscover_apis()
+        apis = served_apis(self.autodiscover_apis())
         if not apis:
             # Stop before the fork. A worker has nothing to serve.
             raise CommandError(_NO_API_MESSAGE)
+        return apis, self.merge_apis(apis)
 
-        merged_api = self.merge_apis(apis)
+    def _print_multiprocess_banner(self, options, apis, merged_api):
+        """Print the startup banner once from the parent process, with the route and feature info."""
+        banner_base_url = _build_display_url(options["host"], options["port"], dev_mode=False)
         _user_route_count = len(merged_api._routes) + len(merged_api._native_routes)
 
         features: list[tuple[str, str]] = []
@@ -891,7 +928,7 @@ class Command(BaseCommand):
         # Check admin
         admin_enabled = not options.get("no_admin", False)
         if admin_enabled and detect_admin_url_prefix is not None:
-            merged_api._register_admin_routes(options["host"], options["port"])
+            merged_api._register_admin_routes()
             # The root mount for an admin site behind a path parameter has no admin URL to print.
             if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():
                 admin_prefix = detect_admin_url_prefix()
@@ -956,7 +993,7 @@ class Command(BaseCommand):
             initialize_file_response_settings()
 
         # Autodiscover BoltAPI instances
-        apis = self.autodiscover_apis()
+        apis = served_apis(self.autodiscover_apis())
 
         if not apis:
             # A server with no API has nothing to serve. Stop with exit status 1.
@@ -997,7 +1034,7 @@ class Command(BaseCommand):
 
         if admin_enabled and detect_admin_url_prefix is not None:
             # Register admin routes
-            merged_api._register_admin_routes(options["host"], options["port"])
+            merged_api._register_admin_routes()
 
             # The root mount for an admin site behind a path parameter has no admin URL to print.
             if merged_api._admin_routes_registered and not admin_url_needs_path_parameter():
@@ -1430,9 +1467,6 @@ class Command(BaseCommand):
         merged.trailing_slash = apis[0][1].trailing_slash
         route_map = {}  # Track conflicts
 
-        # Map handler_id -> original API instance (preserves per-API context)
-        merged._handler_api_map = {}
-
         # Track next available handler_id to avoid collisions
         next_handler_id = 0
 
@@ -1454,7 +1488,7 @@ class Command(BaseCommand):
 
                 route_map[route_key] = api_path
                 merged._routes.append((method, path, new_handler_id, handler))
-                _merge_handler(merged, api, old_handler_id, new_handler_id, handler)
+                _merge_handler(merged, api, old_handler_id, new_handler_id)
 
             # Merge WebSocket routes from this API
             for path, old_ws_handler_id, ws_handler in api._websocket_routes:
@@ -1473,7 +1507,7 @@ class Command(BaseCommand):
 
                 route_map[ws_route_key] = api_path
                 merged._websocket_routes.append((path, new_ws_handler_id, ws_handler))
-                _merge_handler(merged, api, old_ws_handler_id, new_ws_handler_id, ws_handler)
+                _merge_handler(merged, api, old_ws_handler_id, new_ws_handler_id)
 
             # Merge HTTP ASGI mounts from this API
             for asgi_prefix, asgi_app in getattr(api, "_asgi_mounts", []):
@@ -1531,7 +1565,7 @@ class Command(BaseCommand):
         first_api = apis[0][1]
         no_route_id, no_route_handler = first_api._no_route_handler()
         merged._no_route = (next_handler_id, no_route_handler)
-        _merge_handler(merged, first_api, no_route_id, next_handler_id, no_route_handler)
+        _merge_handler(merged, first_api, no_route_id, next_handler_id)
         next_handler_id += 1
 
         # Update next handler ID
