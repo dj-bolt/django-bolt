@@ -110,7 +110,10 @@ fn invalid_request_detail(error: &PyErr) -> Option<String> {
             .and_then(|detail| detail.call1(py, (error.value(py),)))
             .and_then(|detail| detail.extract::<Option<String>>(py));
         detail.unwrap_or_else(|e| {
-            eprintln!("[django-bolt] WebSocket invalid_request_detail error: {}", e);
+            eprintln!(
+                "[django-bolt] WebSocket invalid_request_detail error: {}",
+                e
+            );
             None
         })
     })

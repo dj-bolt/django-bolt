@@ -892,7 +892,9 @@ def _create_param_struct_extractor(
     # Empty for a model with no bytes field, so such a model has no cost for each request.
     _bytes_fields = _bytes_field_plan(struct_type)
     # The sequence fields whose text items Rust converts. Empty for most models.
-    _item_fields = _item_fields_plan((f.encode_name, f.encode_name, f.type) for f in msgspec.structs.fields(struct_type))
+    _item_fields = _item_fields_plan(
+        (f.encode_name, f.encode_name, f.type) for f in msgspec.structs.fields(struct_type)
+    )
     _item_keys = frozenset(key for key, *_ in _item_fields)
     # A struct that forbids unknown fields must not get the keys of other parameters.
     # For any other struct, the set is empty and the request path does not change.

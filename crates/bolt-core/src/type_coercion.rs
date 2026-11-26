@@ -1523,10 +1523,7 @@ mod tests {
             ("9223372036854775808", "2**63"),
             ("-9223372036854775809", "-(2**63) - 1"),
             ("+18446744073709551616", "2**64"),
-            (
-                "-340282366920938463463374607431768211457",
-                "-(2**128) - 1",
-            ),
+            ("-340282366920938463463374607431768211457", "-(2**128) - 1"),
             (longest.as_str(), "10**4300 - 1"),
             (negative_longest.as_str(), "1 - 10**4300"),
             (zeros.as_str(), "1"),
@@ -1774,7 +1771,10 @@ mod tests {
         for zone in zones {
             assert_refused(TYPE_DATETIME, &[&format!("2024-01-15T10:30:00{zone}")]);
             assert_refused(TYPE_DATETIME, &[&format!("20240115T1030{zone}")]);
-            assert_refused(TYPE_TIME, &[&format!("10:30:00{zone}"), &format!("10{zone}")]);
+            assert_refused(
+                TYPE_TIME,
+                &[&format!("10:30:00{zone}"), &format!("10{zone}")],
+            );
         }
         assert_python_values(
             TYPE_TIME,

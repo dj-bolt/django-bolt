@@ -625,7 +625,9 @@ def test_each_sequence_type_holds_the_converted_items():
         return [[type(value).__name__, sorted(value)] for value in (a, b, c, d, e)]
 
     with TestClient(api) as client:
-        response = client.get("/sequences", params={"a": ["+1", "2"], "b": ["2", "+2"], "c": "3", "d": ["4", "5"], "e": "6"})
+        response = client.get(
+            "/sequences", params={"a": ["+1", "2"], "b": ["2", "+2"], "c": "3", "d": ["4", "5"], "e": "6"}
+        )
 
     assert response.status_code == 200, response.text
     assert response.json() == [
