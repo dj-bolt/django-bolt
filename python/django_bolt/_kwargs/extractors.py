@@ -930,13 +930,18 @@ def _create_param_struct_extractor(
 
             # Wrap scalar values for list[T]-typed fields so a single
             # form occurrence still produces a one-element list.
+            # A request with no field of text items does no other work for them.
+            has_items = False
             for name in _seq_field_names:
                 value = merged.get(name)
-                if value is not None and not isinstance(value, list):
-                    merged[name] = [value]
+                if value is not None:
+                    if not isinstance(value, list):
+                        merged[name] = [value]
+                    if name in _item_keys:
+                        has_items = True
 
             values = _encode_bytes_fields(merged, _bytes_fields) if _bytes_fields else merged
-            if _item_fields:
+            if has_items:
                 refused = _convert_item_fields(values, _item_fields, source)
                 if refused is not None:
                     raise RequestValidationError(
@@ -985,19 +990,24 @@ def _create_param_struct_extractor(
                 RequestValidationError: If msgspec conversion fails and detailed per-field errors are collected.
                 msgspec.ValidationError: If msgspec conversion fails but no per-field errors were produced.
             """
+            # Only allocate a copy when there's actual wrapping to do, or text items to convert.
+            # A request with no field of text items does no other work for them.
+            wrapped: dict[str, Any] | None = None
+            has_items = False
             if _seq_field_names:
-                # Only allocate a copy when there's actual wrapping to do, or text items to convert.
-                wrapped: dict[str, Any] | None = None
                 for name in _seq_field_names:
                     value = param_map.get(name)
                     if value is None:
                         continue
-                    is_list = isinstance(value, list)
-                    if not is_list or name in _item_keys:
-                        if wrapped is None:
-                            wrapped = dict(param_map)
-                        if not is_list:
-                            wrapped[name] = [value]
+                    is_items = name in _item_keys
+                    if not isinstance(value, list):
+                        value = [value]
+                    elif not is_items:
+                        continue
+                    has_items = has_items or is_items
+                    if wrapped is None:
+                        wrapped = dict(param_map)
+                    wrapped[name] = value
                 param_map = wrapped if wrapped is not None else param_map
 
             if _other_keys:
@@ -1008,7 +1018,7 @@ def _create_param_struct_extractor(
                         break
 
             values = _encode_bytes_fields(param_map, _bytes_fields) if _bytes_fields else param_map
-            if _item_fields:
+            if has_items:
                 # A field with text items made `param_map` a copy above.
                 refused = _convert_item_fields(values, _item_fields, source)
                 if refused is not None:
@@ -1121,16 +1131,24 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     item_fields = _item_fields_plan(
         (encoded_name, header_name, field_type) for header_name, encoded_name, field_type, _ in header_fields
     )
+    item_keys = frozenset(key for key, *_ in item_fields)
+    header_plan = tuple(
+        (header_name, encoded_name, wrap, encoded_name in item_keys)
+        for header_name, encoded_name, wrap in header_to_encoded
+    )
 
     def extract(headers_map: dict[str, str]) -> Any:
         converted = {}
-        for header_name, encoded_name, wrap in header_to_encoded:
+        # A request with no field of text items does no other work for them.
+        has_items = False
+        for header_name, encoded_name, wrap, is_items in header_plan:
             value = headers_map.get(header_name)
             if value is not None:
                 converted[encoded_name] = [value] if wrap else value
+                has_items = has_items or is_items
 
         values = _encode_bytes_fields(converted, bytes_fields) if bytes_fields else converted
-        if item_fields:
+        if has_items:
             refused = _convert_item_fields(values, item_fields, "header")
             if refused is not None:
                 raise RequestValidationError(
