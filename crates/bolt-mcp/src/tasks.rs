@@ -113,10 +113,16 @@ impl Entry {
     }
 
     /// Move a running task to `outcome`. A settled task does not change.
+    /// Past the TTL, the task fails, whatever the outcome.
     fn settle(&mut self, outcome: Outcome, now: Instant) {
         if !matches!(self.phase, Phase::Running(_)) {
             return;
         }
+        let outcome = if now >= self.created + self.ttl {
+            Outcome::failed(&expired_error())
+        } else {
+            outcome
+        };
         if let Outcome::Failed(error) = &outcome
             && let Some(Value::String(message)) = error.get("message")
         {
@@ -585,6 +591,22 @@ mod tests {
             store.get(handle.task_id(), "alice").unwrap_err(),
             unknown_task(handle.task_id())
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_result_after_the_ttl_fails_the_task() {
+        let store = TaskStore::new(10);
+        let (_task, late) = store.create("alice".into(), OPTIONS).unwrap();
+        let (_task, early) = store.create("alice".into(), OPTIONS).unwrap();
+        tokio::time::advance(Duration::from_millis(999)).await;
+        early.settle(result("in time"));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        // No tasks/get ran since the deadline, so no sweep failed the task first.
+        late.settle(result("too late"));
+        assert_eq!(status(&store, &early, "alice"), TaskStatus::Completed);
+        let detailed = store.get(late.task_id(), "alice").unwrap();
+        assert_eq!(detailed.status(), TaskStatus::Failed);
+        assert!(detailed.task.status_message.unwrap().contains("TTL"));
     }
 
     #[tokio::test(start_paused = true)]
