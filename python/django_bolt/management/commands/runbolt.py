@@ -31,7 +31,7 @@ from django_bolt.api import (
     _validate_mcp_mount_conflicts,
     serve_with_lifespan,
 )
-from django_bolt.concurrency import close_connections_and_pools, configure_script_prefix
+from django_bolt.concurrency import close_connections_and_pools
 from django_bolt.middleware.compression import compression_setting
 from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.workers import MIB, WORKER_BOOT_ERROR, WorkerSupervisor
@@ -955,9 +955,6 @@ class Command(BaseCommand):
         # Initialize FileResponse settings cache once at server startup
         if initialize_file_response_settings is not None:
             initialize_file_response_settings()
-
-        # The dispatch of each route sets the script prefix of its thread.
-        configure_script_prefix()
 
         # Autodiscover BoltAPI instances
         apis = served_apis(self.autodiscover_apis())

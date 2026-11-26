@@ -306,7 +306,6 @@ mod tests {
                 media_files_config: None,
                 access_loggers: Vec::new(),
                 error_renderer: None,
-                script_name: None,
             })
         })
     }

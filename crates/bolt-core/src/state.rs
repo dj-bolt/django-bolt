@@ -164,9 +164,6 @@ pub struct AppState {
     /// `error_handlers.render_core_error` bound to the error formatter of the
     /// app. None when the app has no formatter. Called on error responses only.
     pub error_renderer: Option<Py<PyAny>>,
-    /// `FORCE_SCRIPT_NAME`, read at startup. None when it is not set or empty.
-    /// The proxy removes it from the path, so the router never sees it.
-    pub script_name: Option<Arc<str>>,
 }
 
 pub static GLOBAL_ROUTER: OnceCell<Arc<Router>> = OnceCell::new();

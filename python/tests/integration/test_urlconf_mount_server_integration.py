@@ -55,18 +55,3 @@ def test_runbolt_serves_the_apis_of_django_bolt_urls_under_its_prefix(make_serve
         assert server.wait_for_text("/api/render", 'href="/api/missions/42"') == '<a href="/api/missions/42">go</a>'
         assert server.get("/api/missions/42").json() == {"id": 42}
         assert server.get("/missions/42").status_code == 404
-
-
-@pytest.mark.server_integration
-def test_runbolt_under_force_script_name_serves_the_stripped_path_and_reverses_with_the_prefix(make_server_project):
-    module = app_module("urlconf_mount")
-    project = make_server_project(
-        api_module=module,
-        urls_content=_URLS,
-        # The proxy removes /myapp from the path, as for Django's WSGIHandler.
-        settings_extra='FORCE_SCRIPT_NAME = "/myapp"',
-    )
-    with project.start() as server:
-        assert server.wait_for_json("/missions/42", lambda body: body == {"id": 42}) == {"id": 42}
-        assert server.get("/link").json() == {"url": "/myapp/missions/42"}
-        assert server.get("/myapp/missions/42").status_code == 404

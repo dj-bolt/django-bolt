@@ -200,7 +200,6 @@ pub async fn handle_mcp_request(
                 query_string: req.query_string().to_owned(),
                 conn_scheme,
                 conn_remote_addr,
-                script_name: state.script_name.clone(),
             })));
     }
 

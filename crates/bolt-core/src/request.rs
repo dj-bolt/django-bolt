@@ -5,7 +5,7 @@ use pyo3::types::{PyBytes, PyDict, PyString};
 use ahash::AHashMap;
 use std::borrow::Cow;
 use std::net::IpAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 /// `django_bolt.auth.anonymous.new_anonymous_user`, imported on the first read of an unset `request.user`.
 static NEW_ANONYMOUS_USER: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -95,9 +95,6 @@ pub struct PyRequest {
     /// The ResponseWireV1 of a response that Rust gave before the handler.
     /// The middleware chain returns it, and the handler does not run.
     pub rust_answer: Option<Py<PyAny>>,
-    /// `FORCE_SCRIPT_NAME` of the app. `path` above is the path info: the
-    /// proxy removed the script name. `request.path` puts it back, as Django does.
-    pub script_name: Option<Arc<str>>,
 }
 
 impl PyRequest {
@@ -109,18 +106,6 @@ impl PyRequest {
             "http"
         } else {
             self.conn_scheme
-        }
-    }
-
-    /// The path with the script name first, as Django's `WSGIRequest.path`.
-    fn full_path(&self) -> Cow<'_, str> {
-        match &self.script_name {
-            None => Cow::Borrowed(&self.path),
-            Some(script_name) => Cow::Owned(format!(
-                "{}{}",
-                script_name.trim_end_matches('/'),
-                self.path
-            )),
         }
     }
 
@@ -142,17 +127,9 @@ impl PyRequest {
         &self.method
     }
 
-    /// The path that the client sees: `SCRIPT_NAME`, then the path info (Django-compatible).
     #[getter]
     #[inline]
-    fn path(&self) -> Cow<'_, str> {
-        self.full_path()
-    }
-
-    /// The path without the script name. The router matches it (Django-compatible).
-    #[getter]
-    #[inline]
-    fn path_info(&self) -> &str {
+    fn path(&self) -> &str {
         &self.path
     }
 
@@ -409,8 +386,8 @@ impl PyRequest {
         meta.set_item("REMOTE_ADDR", &remote_addr)?;
         meta.set_item("REMOTE_HOST", &remote_addr)?;
 
-        // FORCE_SCRIPT_NAME, as Django's WSGIRequest sets it. Empty when it is not set.
-        meta.set_item("SCRIPT_NAME", self.script_name.as_deref().unwrap_or(""))?;
+        // SCRIPT_NAME is usually empty for Django apps
+        meta.set_item("SCRIPT_NAME", "")?;
 
         // Convert headers to HTTP_* format
         // Header keys are already lowercase (normalized by http crate)
@@ -496,11 +473,10 @@ impl PyRequest {
     /// This matches Django's HttpRequest.get_full_path() method.
     /// The query stays encoded, as the client sent it.
     fn get_full_path(&self) -> String {
-        let path = self.full_path();
         if self.query_string.is_empty() {
-            path.into_owned()
+            self.path.clone()
         } else {
-            format!("{}?{}", path, self.query_string)
+            format!("{}?{}", self.path, self.query_string)
         }
     }
 
@@ -522,7 +498,7 @@ impl PyRequest {
             .getattr("build_absolute_uri")?
             .call1((
                 self.META(py)?,
-                self.full_path(),
+                &self.path,
                 self.get_full_path(),
                 scheme,
                 location,

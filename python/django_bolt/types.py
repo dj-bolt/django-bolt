@@ -269,17 +269,6 @@ class Request(Protocol):
             ```python
             path = request.path  # "/api/users/123"
             ```
-
-        With ``FORCE_SCRIPT_NAME``, the script name comes first, as in Django.
-        """
-        ...
-
-    @property
-    def path_info(self) -> str:
-        """
-        Request path without the script name (``FORCE_SCRIPT_NAME``).
-
-        The router matches this path. Without the setting, it is ``path``.
         """
         ...
 

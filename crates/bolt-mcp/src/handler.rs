@@ -255,7 +255,6 @@ fn tool_request(
         conn_scheme: parts.conn_scheme,
         conn_remote_addr: parts.conn_remote_addr,
         rust_answer: None,
-        script_name: parts.script_name.clone(),
     };
     Ok(Py::new(py, request)?.into_any())
 }

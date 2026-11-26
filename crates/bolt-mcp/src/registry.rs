@@ -369,7 +369,6 @@ mod tests {
             query_string: String::new(),
             conn_scheme: "http",
             conn_remote_addr: None,
-            script_name: None,
         }
     }
 

@@ -185,6 +185,5 @@ fn error_request(py: Python<'_>, req: &HttpRequest, state: &AppState) -> PyResul
         conn_scheme,
         conn_remote_addr,
         rust_answer: None,
-        script_name: state.script_name.clone(),
     })
 }
