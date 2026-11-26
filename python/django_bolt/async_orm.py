@@ -59,6 +59,9 @@ DEFAULT_CONNECTIONS = 4
 IDLE_VARIABLE = "DJANGO_BOLT_LOOP_IDLE_SECONDS"
 DEFAULT_IDLE_SECONDS = 300.0
 
+# The time that a read waits for a connection before the pool has timed a query.
+_FIRST_WAIT_SECONDS = 0.005
+
 # The module of the backend that Bolt supports. A subclass can change how a
 # connection opens or how a cursor runs a query, and a loop connection would
 # not have that behavior.
@@ -143,19 +146,27 @@ class _Pool:
     A query takes the cursor that came back last. Thus a pool with more
     connections than its load needs leaves the others idle, and they close
     after the idle time.
+
+    A read with no free connection waits for one. The pool opens a new
+    connection only for a read that waited for the time of one query: the
+    connections then come back too slowly for the load. The first connection
+    opens at once.
     """
 
     __slots__ = (
         "alias",
         "closed",
         "database",
+        "grower",
         "idle",
         "idle_since",
         "opened",
+        "query_seconds",
         "preparing",
         "reaper",
         "template",
         "waiters",
+        "waiting_since",
     )
 
     def __init__(self, alias: str, database: Any) -> None:
@@ -166,7 +177,14 @@ class _Pool:
         self.idle_since: collections.deque[float] = collections.deque()
         # The timer that closes idle connections, or None when no connection is idle.
         self.reaper: asyncio.TimerHandle | None = None
-        self.waiters: collections.deque[asyncio.Future[None]] = collections.deque()
+        # A waiter gets True when it must open a connection, and None when one came back.
+        self.waiters: collections.deque[asyncio.Future[bool | None]] = collections.deque()
+        # The loop time at which each waiter started to wait, in the order of ``waiters``.
+        self.waiting_since: collections.deque[float] = collections.deque()
+        # The timer that lets the oldest waiter open a connection, or None.
+        self.grower: asyncio.TimerHandle | None = None
+        # The time for which a query holds its connection: a moving average. 0 before the first query.
+        self.query_seconds = 0.0
         self.opened = 0
         self.closed = False
         # None until ``prepare`` runs.
@@ -189,26 +207,55 @@ class _Pool:
 
     async def acquire(self) -> Any:
         """Return a cursor that no other query uses. Wait when each connection is in use."""
+        must_open = not self.opened
         while True:
             if self.idle:
                 self.idle_since.pop()
                 return self.idle.pop()
-            if self.opened < _connection_limit:
+            if must_open and self.opened < _connection_limit:
                 self.opened += 1
                 try:
                     return await self._open()
                 except BaseException:
                     self._closed_one()
                     raise
-            waiter = asyncio.get_running_loop().create_future()
+            loop = asyncio.get_running_loop()
+            waiter = loop.create_future()
             self.waiters.append(waiter)
+            self.waiting_since.append(loop.time())
+            if self.grower is None and self.opened < _connection_limit:
+                self.grower = loop.call_later(self._patience(), self._grow, loop)
             try:
-                await waiter
+                must_open = await waiter
             except BaseException:
                 # A waiter that got its turn and then stops gives the turn to the next one.
                 if waiter.done() and not waiter.cancelled():
                     self._wake()
                 raise
+
+    def _patience(self) -> float:
+        """The time that a read waits for a connection before the pool opens one for it."""
+        return self.query_seconds or _FIRST_WAIT_SECONDS
+
+    def _grow(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Let the oldest waiter open a connection when it waited for the time of one query."""
+        self.grower = None
+        waiters = self.waiters
+        waiting_since = self.waiting_since
+        while waiters and waiters[0].done():
+            waiters.popleft()
+            waiting_since.popleft()
+        if not waiters or self.opened >= _connection_limit:
+            return
+        patience = self._patience()
+        remaining = waiting_since[0] + patience - loop.time()
+        if remaining <= 0:
+            waiting_since.popleft()
+            waiters.popleft().set_result(True)
+            if not waiters:
+                return
+            remaining = max(waiting_since[0] + patience - loop.time(), 0.0)
+        self.grower = loop.call_later(remaining, self._grow, loop)
 
     async def _open(self) -> Any:
         template = self.template
@@ -275,10 +322,11 @@ class _Pool:
     def close(self) -> None:
         self.closed = True
         self.discard_idle()
-        reaper = self.reaper
-        if reaper is not None:
-            reaper.cancel()
-            self.reaper = None
+        for name in ("reaper", "grower"):
+            timer = getattr(self, name)
+            if timer is not None:
+                timer.cancel()
+                setattr(self, name, None)
 
     def _closed_one(self) -> None:
         self.opened -= 1
@@ -286,8 +334,10 @@ class _Pool:
 
     def _wake(self) -> None:
         waiters = self.waiters
+        waiting_since = self.waiting_since
         while waiters:
             waiter = waiters.popleft()
+            waiting_since.popleft()
             if not waiter.done():
                 waiter.set_result(None)
                 return
@@ -301,11 +351,13 @@ class _Pool:
         new connection.
         """
         database_error = self.database.Error
+        loop = asyncio.get_running_loop()
         for first_try in (True, False):
             try:
                 cursor = await self.acquire()
             except database_error as error:
                 raise _django_error(self.database, error) from error
+            started = loop.time()
             try:
                 await cursor.execute(sql, params)
                 rows = await cursor.fetchall()
@@ -323,6 +375,9 @@ class _Pool:
                 self._give_back(cursor)
                 raise
             else:
+                seconds = loop.time() - started
+                average = self.query_seconds
+                self.query_seconds = average * 0.8 + seconds * 0.2 if average else seconds
                 self.release(cursor)
                 return rows
         raise AssertionError("unreachable")  # pragma: no cover

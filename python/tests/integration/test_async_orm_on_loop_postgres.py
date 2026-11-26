@@ -268,9 +268,20 @@ async def _probe_threads_on_this_loop() -> list[str]:
     return [probe.built_on async for probe in LoopProbe.objects.using(ALIAS).order_by("id")]
 
 
+async def _fast_backend_pid() -> int:
+    return (await LoopProbe.objects.using(ALIAS).annotate(pid=RawSQL("pg_backend_pid()", [])).aget(label="a")).pid
+
+
 def _api() -> BoltAPI:
     api = BoltAPI()
     _probe_threads_route(api)
+
+    @api.get("/fast-queries-at-once")
+    async def fast_queries_at_once():
+        # This query takes 50 ms. The loop then knows how long a query can take here.
+        await _backend_pid()
+        pids = await asyncio.gather(*(_fast_backend_pid() for _ in range(6)))
+        return {"connections": len(set(pids))}
 
     @api.get("/compiled/{name}")
     async def compiled(name: str):
@@ -558,6 +569,15 @@ def test_reads_that_start_together_open_one_django_connection(on_loop):
 
     assert first != second
     assert len(opened) == 1, opened
+
+
+def test_a_read_waits_for_a_connection_that_comes_back_soon(on_loop):
+    """A new connection costs more than a short wait. The limit of the loop allows 4 connections here."""
+    with TestClient(_api()) as client:
+        response = client.get("/fast-queries-at-once")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"connections": 1}
 
 
 def test_a_query_waits_when_each_connection_is_in_use(on_loop, monkeypatch):
