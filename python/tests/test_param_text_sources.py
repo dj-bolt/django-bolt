@@ -377,6 +377,27 @@ async def form_model(lists: Annotated[QueryLists, Form()]):
     return first_item(lists)
 
 
+class BoundedLists(msgspec.Struct):
+    ids: list[Annotated[int, msgspec.Meta(le=10)]] = []
+    fl: list[Annotated[float, msgspec.Meta(le=10)]] = []
+    when: list[Annotated[datetime.datetime, msgspec.Meta(tz=True)]] = []
+
+
+@api.get("/bounded-query-model")
+async def bounded_query_model(lists: Annotated[BoundedLists, Query()]):
+    return first_item(lists)
+
+
+@api.get("/bounded-header-model")
+async def bounded_header_model(lists: Annotated[BoundedLists, Header()]):
+    return first_item(lists)
+
+
+@api.post("/bounded-form-model")
+async def bounded_form_model(lists: Annotated[BoundedLists, Form()]):
+    return first_item(lists)
+
+
 @api.websocket("/ws")
 async def socket(websocket: WebSocket, int_: int | None = None, datetime_: datetime.datetime | None = None):
     await websocket.accept()
@@ -757,3 +778,47 @@ async def test_each_form_of_a_websocket_validation_error_gives_a_detail(item, de
             pass
     assert str(excinfo.value) == detail
 
+
+BOUND_ERRORS = {
+    "ids": "Expected `int` <= 10 - at `$[0]`",
+    "fl": "Expected `float` <= 10.0 - at `$[0]`",
+    "when": "Expected `datetime` with a timezone component - at `$[0]`",
+}
+
+
+def send_bounded_model(client, source: str, fields: dict[str, str]):
+    if source == "query":
+        return client.get("/bounded-query-model", params=fields)
+    if source == "header":
+        return client.get("/bounded-header-model", headers=fields)
+    return client.post("/bounded-form-model", data=fields)
+
+
+@pytest.mark.parametrize("source", ["query", "header", "form"])
+@pytest.mark.parametrize(("key", "text"), [("ids", "11"), ("fl", "inf"), ("when", "2024-01-15 10:30")])
+def test_a_model_item_that_breaks_a_constraint_gives_the_text_as_input(client, source, key, text):
+    """The 422 shows the text that the client sent, not the converted item."""
+    response = send_bounded_model(client, source, {key: text})
+
+    assert response.status_code == 422, response.text
+    loc = "body" if source == "form" else source
+    assert response.json()["detail"] == [
+        {"type": "validation_error", "loc": [loc, key], "msg": BOUND_ERRORS[key], "input": [text]}
+    ]
+
+
+@pytest.mark.parametrize("source", ["query", "header", "form"])
+def test_a_refused_item_and_a_constraint_error_give_the_text_as_input(client, source):
+    response = send_bounded_model(client, source, {"ids": "x", "fl": "11.5"})
+
+    assert response.status_code == 422, response.text
+    loc = "body" if source == "form" else source
+    assert response.json()["detail"] == [
+        {
+            "type": "validation_error",
+            "loc": [loc, "ids"],
+            "msg": INT_ERROR.replace("5.0", "x") + " - at `$[0]`",
+            "input": ["x"],
+        },
+        {"type": "validation_error", "loc": [loc, "fl"], "msg": BOUND_ERRORS["fl"], "input": ["11.5"]},
+    ]

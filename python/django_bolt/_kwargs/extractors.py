@@ -201,6 +201,23 @@ def _convert_item_fields(
     return refused
 
 
+def _item_text_inputs(
+    inputs: dict[str, Any], request_values: Any, fields: tuple[tuple[str, str, int, int, int], ...]
+) -> dict[str, Any]:
+    """Give a copy of ``inputs`` with the request text of each typed sequence field, for the "input" of an error.
+
+    ``_convert_item_fields`` puts the converted items in place of the text.
+    The request still holds the text, under the ``loc`` name of the field.
+    Only the error path calls this function.
+    """
+    texts = dict(inputs)
+    for key, name, *_ in fields:
+        value = request_values.get(name)
+        if value is not None:
+            texts[key] = value if isinstance(value, list) else [value]
+    return texts
+
+
 def _holds_one_item(annotation: Any) -> bool:
     """Return True when msgspec accepts a sequence of exactly one item for this type."""
     node = msgspec.inspect.type_info(annotation)
@@ -946,13 +963,20 @@ def _create_param_struct_extractor(
                 if refused is not None:
                     raise RequestValidationError(
                         errors=_collect_struct_errors(
-                            struct_type, values, param_type, source, has_files=True, inputs=merged, refused=refused
+                            struct_type,
+                            values,
+                            param_type,
+                            source,
+                            has_files=True,
+                            inputs=_item_text_inputs(merged, param_map, _item_fields),
+                            refused=refused,
                         )
                     )
             try:
                 result = msgspec.convert(values, struct_type, strict=False, dec_hook=_upload_file_dec_hook)
             except msgspec.ValidationError as e:
-                errors = _collect_struct_errors(struct_type, values, param_type, source, has_files=True, inputs=merged)
+                inputs = _item_text_inputs(merged, param_map, _item_fields) if has_items else merged
+                errors = _collect_struct_errors(struct_type, values, param_type, source, has_files=True, inputs=inputs)
                 if not errors and forbids_unknown:
                     errors = _unknown_field_errors(merged, known, param_type, source, files_map)
                 if errors:
@@ -1006,6 +1030,8 @@ def _create_param_struct_extractor(
                         continue
                     has_items = has_items or is_items
                     if wrapped is None:
+                        # The request values keep the text of each item, for the "input" of an error.
+                        request_map = param_map
                         wrapped = dict(param_map)
                     wrapped[name] = value
                 param_map = wrapped if wrapped is not None else param_map
@@ -1022,15 +1048,17 @@ def _create_param_struct_extractor(
                 # A field with text items made `param_map` a copy above.
                 refused = _convert_item_fields(values, _item_fields, source)
                 if refused is not None:
+                    inputs = _item_text_inputs(param_map, request_map, _item_fields)
                     raise RequestValidationError(
                         errors=_collect_struct_errors(
-                            struct_type, values, param_type, source, inputs=param_map, refused=refused
+                            struct_type, values, param_type, source, inputs=inputs, refused=refused
                         )
                     )
             try:
                 return msgspec.convert(values, struct_type, strict=False)
             except msgspec.ValidationError as e:
-                errors = _collect_struct_errors(struct_type, values, param_type, source, inputs=param_map)
+                inputs = _item_text_inputs(param_map, request_map, _item_fields) if has_items else param_map
+                errors = _collect_struct_errors(struct_type, values, param_type, source, inputs=inputs)
                 if not errors and forbids_unknown:
                     errors = _unknown_field_errors(param_map, known, param_type, source)
                 if errors:
@@ -1151,13 +1179,15 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
         if has_items:
             refused = _convert_item_fields(values, item_fields, "header")
             if refused is not None:
+                inputs = _item_text_inputs(converted, headers_map, item_fields)
                 raise RequestValidationError(
-                    errors=_collect_header_struct_errors(error_fields, values, converted, strict, refused)
+                    errors=_collect_header_struct_errors(error_fields, values, inputs, strict, refused)
                 )
         try:
             return msgspec.convert(values, struct_type, strict=strict)
         except msgspec.ValidationError as e:
-            errors = _collect_header_struct_errors(error_fields, values, converted, strict)
+            inputs = _item_text_inputs(converted, headers_map, item_fields) if has_items else converted
+            errors = _collect_header_struct_errors(error_fields, values, inputs, strict)
             if errors:
                 raise RequestValidationError(errors=errors) from e
             raise
