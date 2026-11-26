@@ -42,7 +42,7 @@ from django.utils.functional import SimpleLazyObject, empty
 from ..concurrency import run_in_orm_executor, run_orm_blocking
 from ..exceptions import Unauthorized
 from .backends import BaseAuthentication, JWTAuthentication
-from .pk_loader import load_user_by_pk_sync
+from .pk_loader import load_user_by_pk, load_user_by_pk_sync
 
 __all__ = [
     "LazyUser",
@@ -174,8 +174,18 @@ def resolve_user_loader(backend: Any) -> UserLoaders | None:
         def load_via_sync(user_id: str, auth_context: dict | None) -> Any:
             return run_orm_blocking(get_user_sync, user_id)
 
-        async def aload_via_sync(user_id: str, auth_context: dict | None) -> Any:
-            return await run_in_orm_executor(get_user_sync, user_id)
+        if custom_sync:
+
+            async def aload_via_sync(user_id: str, auth_context: dict | None) -> Any:
+                return await run_in_orm_executor(get_user_sync, user_id)
+
+        else:
+            # The loader of the framework. It runs ``get_user_sync`` on the ORM
+            # pool, or its query on the event loop (BOLT_ASYNC_ORM_ON_LOOP).
+            framework_get_user = backend.get_user
+
+            async def aload_via_sync(user_id: str, auth_context: dict | None) -> Any:
+                return await framework_get_user(user_id, auth_context or {})
 
         return load_via_sync, aload_via_sync
 
@@ -218,7 +228,7 @@ def default_django_user_loader(user_id: str, auth_context: dict | None) -> Any:
 
 async def default_django_user_aloader(user_id: str, auth_context: dict | None) -> Any:
     """Async form of :func:`default_django_user_loader`, for ``await request.auser()``."""
-    return await run_in_orm_executor(load_user_by_pk_sync, get_user_model(), user_id)
+    return await load_user_by_pk(get_user_model(), user_id)
 
 
 DEFAULT_USER_LOADERS: UserLoaders = (default_django_user_loader, default_django_user_aloader)

@@ -28,6 +28,9 @@ from typing import Any
 from django.core.exceptions import ValidationError
 from django.db import DEFAULT_DB_ALIAS, connections, models, router
 
+from .. import async_orm
+from ..concurrency import run_in_orm_executor
+
 # (column position, converters, expression) for each column that the database
 # converts, as SQLCompiler.get_converters gives them.
 _Converters = tuple[tuple[int, list[Any], Any], ...]
@@ -114,6 +117,43 @@ def load_user_by_pk_sync(model: type, user_id: Any) -> Any | None:
             # sqlite3 cannot above 64 bits. No row has this pk.
             return None
         row = cursor.fetchone()
+    return _user_from_row(model, alias, fields, converters, row, connection)
+
+
+async def load_user_by_pk(model: type, user_id: Any) -> Any | None:
+    """
+    Load a user by primary key from async code: ``load_user_by_pk_sync`` with the query awaited.
+
+    With ``BOLT_ASYNC_ORM_ON_LOOP``, the compiled statement runs on the event
+    loop. Each other load runs ``load_user_by_pk_sync`` on the ORM pool: the
+    setting is off, the manager of the model builds its own QuerySet, or the
+    read needs the connection of Django.
+    """
+    if async_orm.enabled:
+        pk_field = model._meta.pk
+        try:
+            pk_python = pk_field.to_python(user_id)
+        except ValidationError:
+            return None
+        alias = router.db_for_read(model) or DEFAULT_DB_ALIAS
+        compiled = _compiled_pk_query(model, alias)
+        if compiled is not None:
+            connection = connections[alias]
+            try:
+                pk_value = pk_field.get_db_prep_value(pk_python, connection)
+            except (ValueError, TypeError):
+                return None
+            sql, fields, converters = compiled
+            rows = await async_orm.fetch(alias, sql, (pk_value,))
+            if rows is not None:
+                return _user_from_row(model, alias, fields, converters, rows[0] if rows else None, connection)
+    return await run_in_orm_executor(load_user_by_pk_sync, model, user_id)
+
+
+def _user_from_row(
+    model: type, alias: str, fields: list[str], converters: _Converters, row: Any, connection: Any
+) -> Any | None:
+    """Build the user from the row of the compiled statement, as a QuerySet builds an instance."""
     if row is None:
         return None
     if converters:

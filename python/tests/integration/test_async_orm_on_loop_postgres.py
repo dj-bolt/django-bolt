@@ -27,6 +27,9 @@ from typing import Any, NamedTuple
 import msgspec
 import psycopg
 import pytest
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group, Permission
+from django.contrib.contenttypes.models import ContentType
 from django.db import connections, models, transaction
 from django.db.backends.signals import connection_created
 from django.db.models import Count, Func, IntegerField
@@ -35,7 +38,9 @@ from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils.deprecation import MiddlewareMixin
 
-from django_bolt import BoltAPI, concurrency
+from django_bolt import BoltAPI, Request, concurrency
+from django_bolt.auth import IsAuthenticated, JWTAuthentication
+from django_bolt.auth.jwt_utils import create_jwt_for_user
 from django_bolt.middleware import DjangoMiddlewareStack
 from django_bolt.serializers import Serializer, computed_field
 from django_bolt.testing import TestClient
@@ -1110,6 +1115,115 @@ def test_a_handler_reads_the_uncommitted_rows_of_the_test(on_loop):
         transaction.set_rollback(True, using=ALIAS)
 
     assert response.json() == ["Ada", "Bob", "Cy", "Uncommitted"]
+
+
+class _AuthModelsOnTheTestDatabase:
+    """A database router: the user model is in the PostgreSQL database of the test."""
+
+    def db_for_read(self, model: Any, **hints: Any) -> str | None:
+        return ALIAS if model._meta.app_label in ("auth", "contenttypes") else None
+
+    db_for_write = db_for_read
+
+
+class _FilteredUserManager(models.Manager):
+    """A manager with its own QuerySet. The user loader must ask it for each user."""
+
+    def get_queryset(self) -> Any:
+        return super().get_queryset().filter(is_staff=False)
+
+
+@pytest.fixture
+def users(loop_db):
+    """The tables of the user model in the test database, with an active and an inactive user."""
+    user_model = get_user_model()
+    with connections[ALIAS].schema_editor() as editor:
+        for model in (ContentType, Permission, Group, user_model):
+            editor.create_model(model)
+    with override_settings(DATABASE_ROUTERS=[_AuthModelsOnTheTestDatabase()]):
+        yield {
+            "active": user_model.objects.create(username="ada"),
+            "inactive": user_model.objects.create(username="bob", is_active=False),
+        }
+
+
+def _auth_api() -> BoltAPI:
+    api = BoltAPI()
+
+    @api.get("/me", auth=[JWTAuthentication()], guards=[IsAuthenticated()])
+    async def me(request: Request):
+        user = await request.auser()
+        return {"username": getattr(user, "username", None), "is_user": isinstance(user, get_user_model())}
+
+    @api.get("/warm-up")
+    async def warm_up():
+        return [name async for name in Author.objects.using(ALIAS).values_list("name", flat=True)]
+
+    return api
+
+
+def _me(client: TestClient, user: Any) -> Any:
+    response = client.get("/me", headers={"Authorization": f"Bearer {create_jwt_for_user(user)}"})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_auser_loads_the_user_with_no_django_connection(users):
+    """The user load of the thread path opens a connection of Django on an ORM thread. The loop opens none."""
+    opened = []
+
+    def count(sender: Any, connection: Any, **kwargs: Any) -> None:
+        if connection.alias == ALIAS:
+            opened.append(threading.current_thread().name)
+
+    connections[ALIAS].close()
+    with override_settings(BOLT_ASYNC_ORM_ON_LOOP=True), TestClient(_auth_api()) as client:
+        # The first read of a loop reads the state of a Django connection, and closes that connection.
+        assert client.get("/warm-up").status_code == 200
+        connection_created.connect(count)
+        try:
+            me = _me(client, users["active"])
+        finally:
+            connection_created.disconnect(count)
+    concurrency.check_pool_environment()
+
+    assert me == {"username": "ada", "is_user": True}
+    assert opened == []
+
+
+@pytest.mark.parametrize("case", ["active", "inactive", "deleted"])
+def test_auser_gives_the_user_of_the_thread_path(users, case, capfd):
+    # The token of the deleted case names a user that is not in the table.
+    token_user = get_user_model()(pk=10_000, username="gone") if case == "deleted" else users[case]
+
+    with TestClient(_auth_api()) as client:
+        threads = _me(client, token_user)
+    with override_settings(BOLT_ASYNC_ORM_ON_LOOP=True), TestClient(_auth_api()) as client:
+        loop = _me(client, token_user)
+    concurrency.check_pool_environment()
+
+    assert loop == threads
+    assert loop == ({"username": "ada", "is_user": True} if case == "active" else {"username": None, "is_user": False})
+    # The backend reports an error of the load and gives no user. A missing user is not an error.
+    assert "Error loading user" not in capfd.readouterr().err
+
+
+def test_auser_asks_a_manager_that_builds_its_own_queryset(users, monkeypatch):
+    """Bolt does not compile the statement of such a manager one time, so its load stays on the ORM pool."""
+    user_model = get_user_model()
+    manager = _FilteredUserManager()
+    manager.model = user_model
+    # ``Model._default_manager`` reads this value of the model options.
+    monkeypatch.setitem(user_model._meta.__dict__, "default_manager", manager)
+    staff = user_model.objects.create(username="staff", is_staff=True)
+
+    with override_settings(BOLT_ASYNC_ORM_ON_LOOP=True), TestClient(_auth_api()) as client:
+        hidden = _me(client, staff)
+        shown = _me(client, users["active"])
+    concurrency.check_pool_environment()
+
+    assert hidden == {"username": None, "is_user": False}
+    assert shown == {"username": "ada", "is_user": True}
 
 
 def test_a_dead_connection_fails_no_request(on_loop):

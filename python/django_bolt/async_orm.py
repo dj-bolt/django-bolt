@@ -458,9 +458,13 @@ def _pool_for(queryset: QuerySet) -> _Pool | None:
         return None
     if queryset._prefetch_related_lookups:
         return None
+    return _pool_of(loop, queryset.db)
+
+
+def _pool_of(loop: WorkerLoop, alias: str) -> _Pool | None:
+    """The part of ``_pool_for`` that does not need the QuerySet."""
     if in_lane_mode() or _thread_sensitive_context.get(None) is not None:
         return None
-    alias = queryset.db
     pools = loop._query_pools
     pool = pools.get(alias, _MISSING)
     if pool is _MISSING:
@@ -472,24 +476,51 @@ def _pool_for(queryset: QuerySet) -> _Pool | None:
     return pool
 
 
-async def _rows(pool: _Pool, compiler: Any) -> Any:
-    """Compile the query of ``compiler`` and return its rows from the database.
+async def _prepare(pool: _Pool, wrapper: Any) -> None:
+    """Prepare the connection wrapper of this request for a read of ``pool``.
 
-    Returns None when an expression needed the database to compile. The thread
-    path gives such an expression a connection.
+    On an event loop thread, Django keeps one connection wrapper for each
+    request, so each read prepares the wrapper of its request.
     """
     if pool.template is None:
         await pool.prepare()
     template = pool.template
-    # On an event loop thread, Django keeps one connection wrapper for each
-    # request, so each read prepares the wrapper of its request.
-    wrapper = compiler.connection
     # The compile step reads the server version for some expressions. Without
     # this value, the wrapper would open a sync connection to read it.
     wrapper.__dict__.setdefault("pg_version", template.pg_version)
     if template.execute_wrappers:
         installed = wrapper.execute_wrappers
         installed.extend(added for added in template.execute_wrappers if added not in installed)
+
+
+async def fetch(alias: str, sql: str, params: Any) -> list[tuple[Any, ...]] | None:
+    """Run one read statement of the framework on the event loop, and return its rows.
+
+    Returns None for a read that must use the ORM thread pool (see
+    ``_pool_for``). Call this function only when ``enabled`` is true.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    if type(loop) is not WorkerLoop:
+        return None
+    pool = _pool_of(loop, alias)
+    if pool is None:
+        return None
+    wrapper = connections[alias]
+    await _prepare(pool, wrapper)
+    return await pool.fetch(wrapper, sql, params)
+
+
+async def _rows(pool: _Pool, compiler: Any) -> Any:
+    """Compile the query of ``compiler`` and return its rows from the database.
+
+    Returns None when an expression needed the database to compile. The thread
+    path gives such an expression a connection.
+    """
+    wrapper = compiler.connection
+    await _prepare(pool, wrapper)
     try:
         sql, params = compiler.as_sql()
     except EmptyResultSet:

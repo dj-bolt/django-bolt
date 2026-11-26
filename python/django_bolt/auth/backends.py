@@ -33,8 +33,9 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
 from django.db import InterfaceError, OperationalError
 
+from .. import async_orm
 from ..concurrency import run_in_orm_executor
-from .pk_loader import load_user_by_pk_sync
+from .pk_loader import load_user_by_pk, load_user_by_pk_sync
 from .revocation import create_revocation_handler
 
 # Rust logs here too: a JWKS refresh that it cannot use.
@@ -448,11 +449,21 @@ class JWTAuthentication(BaseAuthentication):
         request.auser()`` does. The pool runs loads in parallel, and Bolt
         drops a dead connection of a pool thread when the query raises.
         ``User.objects.aget`` compiles the SQL again on each call.
+        With ``BOLT_ASYNC_ORM_ON_LOOP``, the query runs on the event loop.
         """
         if not user_id:
             return None
 
-        return await run_in_orm_executor(self.get_user_sync, user_id)
+        if not async_orm.enabled or type(self).get_user_sync is not JWTAuthentication.get_user_sync:
+            return await run_in_orm_executor(self.get_user_sync, user_id)
+        # With BOLT_ASYNC_ORM_ON_LOOP, the query of ``get_user_sync`` runs on the event loop.
+        try:
+            return await load_user_by_pk(self._get_user_model(), user_id)
+        except (OperationalError, InterfaceError):
+            raise
+        except Exception as e:
+            print(f"Error loading user {user_id} in JWTAuthentication: {type(e).__name__}: {e}", file=sys.stderr)
+            return None
 
     def get_user_sync(self, user_id: str | None) -> Any | None:
         """
