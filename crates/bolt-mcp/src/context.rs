@@ -47,6 +47,9 @@ pub enum CtxEvent {
         params_json: String,
         reply: Py<PyAny>,
     },
+    /// The tool stopped waiting for the input request `key` of its task,
+    /// for example after its own timeout.
+    InputClosed { key: String },
 }
 
 pub const METHOD_ELICIT: &str = "elicitation/create";
@@ -175,6 +178,13 @@ impl McpPyContext {
     /// answered it on a previous round trip.
     fn input_response(&self, key: &str) -> Option<String> {
         self.input_responses.lock().unwrap().get(key).cloned()
+    }
+
+    /// Close the input request `key` of a task: the tool stopped waiting for
+    /// it. The task is working again when no input request is open.
+    fn input_closed(&self, key: String) {
+        // A closed channel means that the call ended: nothing is open then.
+        let _ = self.tx.send(CtxEvent::InputClosed { key });
     }
 
     /// Live path (legacy peers) and task path: send a server->client request

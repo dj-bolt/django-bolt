@@ -28,10 +28,10 @@ use rmcp::RoleServer;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock,
     CreateTaskResult, DiscoverResult, ErrorCode, ErrorData as McpError, GetPromptRequestParams,
-    GetPromptResponse, GetPromptResult, GetTaskParams, GetTaskResult, InputRequest, InputRequests,
-    InputRequiredResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, ResultType, ServerConfig, Tool, UpdateTaskParams,
+    GetPromptResponse, GetPromptResult, GetTaskParams, GetTaskResult, InputRequest, InputRequests, InputRequiredResult, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+    ResultType, ServerConfig, Tool, UpdateTaskParams,
 };
 use rmcp::service::RequestContext;
 use serde_json::Value;
@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::context::{CtxEvent, McpPyContext, ProtocolMode};
 use crate::registry::{McpRegistry, McpToolEntry};
 use crate::state_codec;
-use crate::tasks::{InputError, Outcome, TaskHandle, TaskOptions, TaskStore};
+use crate::tasks::{InputError, Outcome, Refusal, TaskHandle, TaskOptions, TaskStore};
 use crate::{McpAuthExt, McpRouteRequest, McpRouteRequestExt};
 use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
 use bolt_core::permissions::{GuardResult, evaluate_guards};
@@ -392,11 +392,15 @@ fn spawn_task(
     auth: Option<Arc<AuthContext>>,
 ) -> CallToolResponse {
     let owner = state_codec::principal_hash(auth.as_deref());
-    let Some((task, handle)) = store.create(owner, options) else {
-        return CallToolResult::error(vec![ContentBlock::text(
-            "Too many tasks on this server. Try again later.",
-        )])
-        .into();
+    let (task, handle) = match store.create(owner, options) {
+        Ok(created) => created,
+        Err(refusal) => {
+            let message = match refusal {
+                Refusal::StoreFull => "Too many tasks on this server. Try again later.",
+                Refusal::PrincipalFull => "Too many tasks for this caller. Try again later.",
+            };
+            return CallToolResult::error(vec![ContentBlock::text(message)]).into();
+        }
     };
     let call = prepare_call(
         entry,
@@ -480,6 +484,7 @@ fn task_event(handle: &TaskHandle, inputs: &FuturesUnordered<PendingInput>, even
                 Err(InputError::NotRunning) => {}
             }
         }
+        CtxEvent::InputClosed { key } => handle.close_input(&key),
     }
 }
 
@@ -767,6 +772,8 @@ impl McpHandler {
                 let envelope = self.live_server_request(ctx, method, &params_json).await;
                 crate::context::resolve_reply_future(&reply, &envelope);
             }
+            // Only a task tracks its open input requests.
+            CtxEvent::InputClosed { .. } => {}
         }
     }
 

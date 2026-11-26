@@ -160,7 +160,15 @@ class Context:
                 )
             future: asyncio.Future = asyncio.get_running_loop().create_future()
             self._rust.server_request_send(kind, key, json_encode(params).decode(), future)
-            envelope = json_decode(await future)
+            try:
+                raw = await future
+            except asyncio.CancelledError:
+                # The tool stopped waiting, for example after its own timeout.
+                # The task must not stay input_required for this request.
+                if self._rust.task_id is not None:
+                    self._rust.input_closed(key)
+                raise
+            envelope = json_decode(raw)
         else:
             raw = self._rust.input_response(key)
             if raw is None:

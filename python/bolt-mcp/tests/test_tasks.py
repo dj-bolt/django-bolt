@@ -31,17 +31,21 @@ class Probe:
     """What the tools of the test server saw, read from the test thread."""
 
     def __init__(self) -> None:
-        self.cancelled = {name: threading.Event() for name in ("slow", "expiring", "progress", "ask")}
+        names = ("slow", "held", "expiring", "progress", "ask")
+        self.started = {name: threading.Event() for name in names}
+        self.cancelled = {name: threading.Event() for name in names}
+        self.gave_up = threading.Event()
         self.ask_runs = 0
         self.sync_threads: list[str] = []
 
 
-def _build(*, auth=None, max_tasks: int | None = None) -> tuple[BoltAPI, Probe]:
+def _build(*, auth=None, **limits: int) -> tuple[BoltAPI, Probe]:
     api = BoltAPI()
-    mcp = MCP("task-server") if max_tasks is None else MCP("task-server", max_tasks=max_tasks)
+    mcp = MCP("task-server", **limits)
     probe = Probe()
 
     async def wait_for_cancel(name: str) -> dict:
+        probe.started[name].set()
         try:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
@@ -70,6 +74,19 @@ def _build(*, auth=None, max_tasks: int | None = None) -> tuple[BoltAPI, Probe]:
     @mcp.tool(task=True)
     async def slow() -> dict:
         return await wait_for_cancel("slow")
+
+    @mcp.tool(task=True, ttl_ms=2000)
+    async def held() -> dict:
+        return await wait_for_cancel("held")
+
+    @mcp.tool(task=True)
+    async def impatient(ctx: Context) -> dict:
+        try:
+            await asyncio.wait_for(ctx.elicit("Quick?"), 0.2)
+        except TimeoutError:
+            probe.gave_up.set()
+        await asyncio.sleep(30)
+        return {}
 
     @mcp.tool(task=True, ttl_ms=1000)
     async def expiring() -> dict:
@@ -219,6 +236,8 @@ def test_cancel_while_running_cancels_the_coroutine():
     api, probe = _build()
     with TestClient(api) as client:
         created = _create(client, "slow")
+        # Cancel a running coroutine: before its first step, it has no handler to run.
+        assert probe.started["slow"].wait(5)
         ack = _rpc(client, "tasks/cancel", {"taskId": created["taskId"]})["result"]
         assert ack == {"resultType": "complete"}
         assert _get(client, created["taskId"])["status"] == "cancelled"
@@ -395,6 +414,20 @@ def test_cancel_wakes_a_task_that_waits_for_input():
         assert probe.cancelled["ask"].wait(5)
 
 
+def test_an_elicit_that_the_tool_gave_up_on_leaves_input_required():
+    api, probe = _build()
+    with TestClient(api) as client:
+        task_id = _create(client, "impatient", capabilities=TASK_ELICIT_CAPS)["taskId"]
+        assert probe.gave_up.wait(5), "the elicit did not time out"
+        result = _poll(client, task_id, until=lambda r: r["status"] == "working", capabilities=TASK_ELICIT_CAPS)
+        assert "inputRequests" not in result
+        # A late answer to the request has no effect.
+        late = {"taskId": task_id, "inputResponses": {"input-1": {"action": "accept", "content": {}}}}
+        _rpc(client, "tasks/update", late, capabilities=TASK_ELICIT_CAPS)
+        assert _get(client, task_id, capabilities=TASK_ELICIT_CAPS)["status"] == "working"
+        _rpc(client, "tasks/cancel", {"taskId": task_id}, capabilities=TASK_ELICIT_CAPS)
+
+
 def test_progress_sets_the_status_message():
     api, _ = _build()
     with TestClient(api) as client:
@@ -446,10 +479,40 @@ def test_a_full_store_answers_with_a_tool_error():
             _rpc(client, "tasks/cancel", {"taskId": created["taskId"]})
 
 
+def test_one_principal_cannot_take_every_task_slot():
+    api, probe = _build(auth=[JWTAuthentication(secret=SECRET)], max_tasks_per_principal=2)
+    alice = f"Bearer {mint_jwt(SECRET, sub='alice')}"
+    bob = f"Bearer {mint_jwt(SECRET, sub='bob')}"
+    with TestClient(api) as client:
+        held = [_create(client, "held", authorization=alice)["taskId"] for _ in range(2)]
+        refused = _call(client, "held", authorization=alice)
+        assert refused["isError"] is True
+        assert "taskId" not in refused
+        assert refused["content"][0]["text"] == "Too many tasks for this caller. Try again later."
+        # Another principal still gets a task.
+        assert _create(client, "held", authorization=bob)["status"] == "working"
+        # A finished task holds its slot until Bolt deletes it, one TTL (2 s) after the end.
+        _rpc(client, "tasks/cancel", {"taskId": held[0]}, authorization=alice)
+        assert _call(client, "held", authorization=alice)["isError"] is True
+        deadline = time.monotonic() + 10
+        while "error" not in _rpc_or_error(client, held[0], alice):
+            assert time.monotonic() < deadline, "the cancelled task was not deleted"
+            time.sleep(0.05)
+        assert _create(client, "held", authorization=alice)["status"] == "working"
+
+
+def _rpc_or_error(client, task_id, authorization):
+    resp = post_rpc_modern(
+        client, "tasks/get", {"taskId": task_id}, capabilities=TASK_CAPS, authorization=authorization
+    )
+    return parse_rpc(resp)
+
+
 def test_closing_the_client_cancels_running_tasks():
     api, probe = _build()
     with TestClient(api) as client:
         _create(client, "slow")
+        assert probe.started["slow"].wait(5)
     assert probe.cancelled["slow"].wait(5), "a running task outlived its TestClient"
 
 
@@ -472,7 +535,8 @@ def test_task_options_are_checked(kwargs, message):
             return {}
 
 
-@pytest.mark.parametrize("max_tasks", [0, -1, True, 1.5])
-def test_max_tasks_is_checked(max_tasks):
-    with pytest.raises(ValueError, match="max_tasks"):
-        MCP("bad", max_tasks=max_tasks)
+@pytest.mark.parametrize("name", ["max_tasks", "max_tasks_per_principal"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_task_limits_are_checked(name, value):
+    with pytest.raises(ValueError, match=name):
+        MCP("bad", **{name: value})

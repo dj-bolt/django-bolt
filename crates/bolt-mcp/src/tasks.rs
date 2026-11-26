@@ -11,24 +11,30 @@
 //! | (none) | `TaskStore::create` | working |
 //! | working | the tool asks for input (`TaskHandle::open_input`) | input_required |
 //! | input_required | `tasks/update` answers each open request | working |
+//! | input_required | the tool stops waiting for each open request (`TaskHandle::close_input`) | working |
 //! | working, input_required | the tool returns a result | completed |
 //! | working, input_required | the call fails with a JSON-RPC error | failed |
-//! | working, input_required | the TTL elapses | failed, and the tool is cancelled |
+//! | working, input_required | the TTL elapses, or a result comes after it | failed, and the tool is cancelled |
 //! | working, input_required | `tasks/cancel` | cancelled, and the tool is cancelled |
-//! | completed, failed, cancelled | one TTL after the change | removed |
+//! | working, input_required | the server stops (`TaskStore::cancel_running`) | cancelled, and the tool is cancelled |
+//! | completed, failed, cancelled | the next store call one TTL after the change | removed |
 //!
 //! completed, failed and cancelled are terminal: no event changes them.
 //! working and input_required are one phase, `Running`. The status is
-//! input_required while an input request is open.
+//! input_required while an input request is open. The task fails at its TTL
+//! by its own timer, or at the next store call. No timer removes a settled
+//! task: the next store call does.
 //!
 //! Each task belongs to the principal that created it. A call from another
 //! principal gets the error of an unknown task id. Thus it cannot learn that
-//! the task exists.
+//! the task exists. A store holds at most `max_tasks` tasks, and at most
+//! `max_per_principal` of one principal, running or settled.
 //!
 //! The store lives in the memory of one process. With more than one
 //! process, a `tasks/get` can reach a process that does not have the task.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -69,6 +75,15 @@ impl Outcome {
         };
         Self::Failed(object)
     }
+}
+
+/// Why the store refuses a new task.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The store holds `max_tasks` tasks.
+    StoreFull,
+    /// The principal holds `max_per_principal` tasks.
+    PrincipalFull,
 }
 
 /// Why a tool cannot open an input request.
@@ -166,11 +181,21 @@ type Entries = HashMap<String, Entry>;
 struct Shared {
     entries: Mutex<Entries>,
     max_tasks: usize,
+    max_per_principal: usize,
+    /// The `TaskHandle`s alive: the task bodies that did not end yet.
+    bodies: AtomicUsize,
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Entries> {
         self.entries.lock().expect("MCP task store lock poisoned")
+    }
+
+    /// Lock, then read the clock. A time read before the wait for the lock
+    /// can be earlier than the deadline of a task that expired meanwhile.
+    fn lock_now(&self) -> (MutexGuard<'_, Entries>, Instant) {
+        let entries = self.lock();
+        (entries, Instant::now())
     }
 }
 
@@ -203,24 +228,37 @@ pub struct TaskStore {
 }
 
 impl TaskStore {
-    /// A store that holds at most `max_tasks` tasks, running or finished.
-    pub fn new(max_tasks: usize) -> Self {
+    /// A store that holds at most `max_tasks` tasks, and at most
+    /// `max_per_principal` tasks of one principal, running or finished.
+    pub fn new(max_tasks: usize, max_per_principal: usize) -> Self {
         Self {
             shared: Arc::new(Shared {
                 entries: Mutex::new(HashMap::new()),
                 max_tasks,
+                max_per_principal,
+                bodies: AtomicUsize::new(0),
             }),
         }
     }
 
     /// Create a working task of `owner`. A `tasks/get` finds it before this
-    /// returns. Returns `None` when the store is full.
-    pub fn create(&self, owner: String, options: TaskOptions) -> Option<(Task, TaskHandle)> {
-        let now = Instant::now();
-        let mut entries = self.shared.lock();
+    /// returns.
+    pub fn create(
+        &self,
+        owner: String,
+        options: TaskOptions,
+    ) -> Result<(Task, TaskHandle), Refusal> {
+        let (mut entries, now) = self.shared.lock_now();
         sweep(&mut entries, now);
         if entries.len() >= self.shared.max_tasks {
-            return None;
+            return Err(Refusal::StoreFull);
+        }
+        let held = entries
+            .values()
+            .filter(|entry| entry.owner == owner)
+            .count();
+        if held >= self.shared.max_per_principal {
+            return Err(Refusal::PrincipalFull);
         }
         let task_id = uuid::Uuid::new_v4().to_string();
         let stamp = current_timestamp();
@@ -243,13 +281,14 @@ impl TaskStore {
                 }),
             },
         );
+        self.shared.bodies.fetch_add(1, Ordering::SeqCst);
         let handle = TaskHandle {
             task_id,
             shared: self.shared.clone(),
             cancel,
             deadline: now + ttl,
         };
-        Some((task, handle))
+        Ok((task, handle))
     }
 
     /// Run `f` on the entry of `task_id` when `owner` created it.
@@ -259,8 +298,7 @@ impl TaskStore {
         owner: &str,
         f: impl FnOnce(&mut Entry, Instant) -> R,
     ) -> Result<R, McpError> {
-        let now = Instant::now();
-        let mut entries = self.shared.lock();
+        let (mut entries, now) = self.shared.lock_now();
         sweep(&mut entries, now);
         match entries.get_mut(task_id) {
             Some(entry) if entry.owner == owner => Ok(f(entry, now)),
@@ -306,17 +344,26 @@ impl TaskStore {
             entry.settle(Outcome::Cancelled, now);
         })
     }
+
+    /// Cancel each running task, for a stop of the server. Each task body
+    /// then cancels its coroutine and ends.
+    pub fn cancel_running(&self) {
+        let (mut entries, now) = self.shared.lock_now();
+        for entry in entries.values_mut() {
+            entry.settle(Outcome::Cancelled, now);
+        }
+    }
+
+    /// The task bodies that did not end yet.
+    pub fn running_bodies(&self) -> usize {
+        self.shared.bodies.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for TaskStore {
     fn drop(&mut self) {
-        let mut entries = self.shared.lock();
-        for entry in entries.values() {
-            if let Phase::Running(running) = &entry.phase {
-                running.cancel.cancel();
-            }
-        }
-        entries.clear();
+        self.cancel_running();
+        self.shared.lock().clear();
     }
 }
 
@@ -382,6 +429,20 @@ impl TaskHandle {
         .unwrap_or(Err(InputError::NotRunning))
     }
 
+    /// Close an open input request that the tool stopped waiting for. The
+    /// task is working again when no input request is open. The key stays
+    /// used, so a late answer to it has no effect.
+    pub fn close_input(&self, key: &str) {
+        self.with_running(|entry| {
+            let Phase::Running(running) = &mut entry.phase else {
+                return;
+            };
+            if running.inputs.remove(key).is_some() {
+                entry.touch();
+            }
+        });
+    }
+
     /// Fail the task because its TTL elapsed.
     pub fn expire(&self) {
         self.settle(Outcome::failed(&expired_error()));
@@ -389,9 +450,9 @@ impl TaskHandle {
 
     /// Move the task to `outcome`. A settled task does not change.
     pub fn settle(&self, outcome: Outcome) {
-        let mut entries = self.shared.lock();
+        let (mut entries, now) = self.shared.lock_now();
         if let Some(entry) = entries.get_mut(&self.task_id) {
-            entry.settle(outcome, Instant::now());
+            entry.settle(outcome, now);
         }
     }
 }
@@ -403,6 +464,7 @@ impl Drop for TaskHandle {
             "The task stopped before it finished",
             None,
         )));
+        self.shared.bodies.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -441,7 +503,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_new_task_is_working_and_found_at_once() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (task, handle) = store.create("alice".into(), OPTIONS).unwrap();
         assert_eq!(task.status, TaskStatus::Working);
         assert_eq!(task.ttl_ms, Some(1_000));
@@ -453,7 +515,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn another_principal_gets_the_error_of_an_unknown_id() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (task, _handle) = store.create("alice".into(), OPTIONS).unwrap();
         let id = task.task_id.as_str();
         let foreign = [
@@ -478,7 +540,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_input_request_waits_for_its_answer() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (_task, handle) = store.create("alice".into(), OPTIONS).unwrap();
         let receiver = handle.open_input("name".into(), elicit("Name?")).unwrap();
         match store.get(handle.task_id(), "alice").unwrap().payload {
@@ -512,7 +574,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_result_completes_the_task_and_cancel_after_it_changes_nothing() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (_task, handle) = store.create("alice".into(), OPTIONS).unwrap();
         handle.settle(result("42"));
         assert!(handle.cancel_token().is_cancelled());
@@ -539,7 +601,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancel_settles_the_task_and_wakes_the_tool() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (_task, handle) = store.create("alice".into(), OPTIONS).unwrap();
         let receiver = handle.open_input("k".into(), elicit("Wait")).unwrap();
         store.cancel(handle.task_id(), "alice").unwrap();
@@ -553,7 +615,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_failure_keeps_its_json_rpc_error() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (_task, handle) = store.create("alice".into(), OPTIONS).unwrap();
         handle.settle(Outcome::failed(&McpError::invalid_params("bad", None)));
         let detailed = store.get(handle.task_id(), "alice").unwrap();
@@ -569,7 +631,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_ttl_fails_a_running_task_then_removes_it() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (_task, handle) = store.create("alice".into(), OPTIONS).unwrap();
         assert_eq!(
             handle.deadline(),
@@ -595,7 +657,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_result_after_the_ttl_fails_the_task() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (_task, late) = store.create("alice".into(), OPTIONS).unwrap();
         let (_task, early) = store.create("alice".into(), OPTIONS).unwrap();
         tokio::time::advance(Duration::from_millis(999)).await;
@@ -611,21 +673,92 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_full_store_refuses_until_a_task_is_removed() {
-        let store = TaskStore::new(2);
+        let store = TaskStore::new(2, 2);
         let (_a, first) = store.create("alice".into(), OPTIONS).unwrap();
         let (_b, _second) = store.create("bob".into(), OPTIONS).unwrap();
-        assert!(store.create("carol".into(), OPTIONS).is_none());
+        assert_eq!(
+            store.create("carol".into(), OPTIONS).err(),
+            Some(Refusal::StoreFull)
+        );
         // A finished task still counts until the store removes it.
         first.settle(result("done"));
-        assert!(store.create("carol".into(), OPTIONS).is_none());
+        assert!(store.create("carol".into(), OPTIONS).is_err());
         tokio::time::advance(Duration::from_millis(1_000)).await;
         // The TTL failed the second task, and removed the first one.
-        assert!(store.create("carol".into(), OPTIONS).is_some());
+        assert!(store.create("carol".into(), OPTIONS).is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_principal_cannot_take_every_slot() {
+        let store = TaskStore::new(10, 2);
+        let (_a, first) = store.create("alice".into(), OPTIONS).unwrap();
+        let (_b, _second) = store.create("alice".into(), OPTIONS).unwrap();
+        assert_eq!(
+            store.create("alice".into(), OPTIONS).err(),
+            Some(Refusal::PrincipalFull)
+        );
+        // Another principal still gets a slot.
+        assert!(store.create("bob".into(), OPTIONS).is_ok());
+        // A settled task holds its slot until the store removes it.
+        store.cancel(first.task_id(), "alice").unwrap();
+        assert_eq!(
+            store.create("alice".into(), OPTIONS).err(),
+            Some(Refusal::PrincipalFull)
+        );
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert!(store.create("alice".into(), OPTIONS).is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        // The store removed the cancelled task, and the TTL failed the other one.
+        assert!(store.create("alice".into(), OPTIONS).is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_input_request_leaves_input_required() {
+        let store = TaskStore::new(10, 10);
+        let (_task, handle) = store.create("alice".into(), OPTIONS).unwrap();
+        let first = handle.open_input("a".into(), elicit("A?")).unwrap();
+        let _second = handle.open_input("b".into(), elicit("B?")).unwrap();
+        handle.close_input("a");
+        assert!(
+            first.await.is_err(),
+            "the closed request must wake its waiter"
+        );
+        assert_eq!(status(&store, &handle, "alice"), TaskStatus::InputRequired);
+        handle.close_input("unknown");
+        handle.close_input("b");
+        assert_eq!(status(&store, &handle, "alice"), TaskStatus::Working);
+        // A late answer to a closed key has no effect, and the key stays used.
+        store
+            .update(handle.task_id(), "alice", [("a".to_owned(), Value::Null)])
+            .unwrap();
+        assert_eq!(status(&store, &handle, "alice"), TaskStatus::Working);
+        assert_eq!(
+            handle
+                .open_input("a".into(), elicit("A again?"))
+                .unwrap_err(),
+            InputError::KeyUsed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_running_cancels_each_running_task_only() {
+        let store = TaskStore::new(10, 10);
+        let (_a, running) = store.create("alice".into(), OPTIONS).unwrap();
+        let (_b, done) = store.create("bob".into(), OPTIONS).unwrap();
+        done.settle(result("done"));
+        assert_eq!(store.running_bodies(), 2);
+        store.cancel_running();
+        assert!(running.cancel_token().is_cancelled());
+        assert_eq!(status(&store, &running, "alice"), TaskStatus::Cancelled);
+        assert_eq!(status(&store, &done, "bob"), TaskStatus::Completed);
+        drop(running);
+        drop(done);
+        assert_eq!(store.running_bodies(), 0);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_dropped_handle_fails_its_running_task() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (task, handle) = store.create("alice".into(), OPTIONS).unwrap();
         let token = handle.cancel_token().clone();
         drop(handle);
@@ -636,7 +769,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dropping_the_store_cancels_each_running_task() {
-        let store = TaskStore::new(10);
+        let store = TaskStore::new(10, 10);
         let (_a, running) = store.create("alice".into(), OPTIONS).unwrap();
         let (_b, done) = store.create("alice".into(), OPTIONS).unwrap();
         done.settle(result("done"));
@@ -654,6 +787,7 @@ mod tests {
         Update(usize, usize, usize),
         Cancel(usize, usize),
         OpenInput(usize, usize),
+        CloseInput(usize, usize),
         Settle(usize, bool),
         Advance(u64),
     }
@@ -665,6 +799,7 @@ mod tests {
             (0..6usize, 0..2usize, 0..3usize).prop_map(|(t, o, k)| Step::Update(t, o, k)),
             (0..6usize, 0..2usize).prop_map(|(t, o)| Step::Cancel(t, o)),
             (0..6usize, 0..3usize).prop_map(|(t, k)| Step::OpenInput(t, k)),
+            (0..6usize, 0..3usize).prop_map(|(t, k)| Step::CloseInput(t, k)),
             (0..6usize, any::<bool>()).prop_map(|(t, ok)| Step::Settle(t, ok)),
             (0..700u64).prop_map(Step::Advance),
         ]
@@ -721,14 +856,14 @@ mod tests {
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let store = TaskStore::new(4);
+                let store = TaskStore::new(4, 3);
                 let mut tasks: Vec<(TaskHandle, usize)> = Vec::new();
                 let mut seen: Vec<(Option<DetailedTask>, bool)> = Vec::new();
                 let mut waiting = Vec::new();
                 for step in steps {
                     match step {
                         Step::Create(owner) => {
-                            if let Some((_, handle)) = store.create(OWNERS[owner].into(), OPTIONS) {
+                            if let Ok((_, handle)) = store.create(OWNERS[owner].into(), OPTIONS) {
                                 tasks.push((handle, owner));
                                 seen.push((None, false));
                             }
@@ -755,6 +890,11 @@ mod tests {
                                 waiting.push(receiver);
                             }
                         }
+                        Step::CloseInput(t, key) => {
+                            if let Some((handle, _)) = tasks.get(t) {
+                                handle.close_input(KEYS[key]);
+                            }
+                        }
                         Step::Settle(t, ok) => {
                             if let Some((handle, _)) = tasks.get(t) {
                                 handle.settle(if ok { result("ok") } else { Outcome::Cancelled });
@@ -765,6 +905,10 @@ mod tests {
                     check(&store, &tasks, &mut seen);
                     let entries = store.shared.lock();
                     assert!(entries.len() <= 4, "the store holds more than max_tasks");
+                    for owner in OWNERS {
+                        let held = entries.values().filter(|entry| entry.owner == owner).count();
+                        assert!(held <= 3, "{owner} holds more than max_per_principal");
+                    }
                     for entry in entries.values() {
                         if let Phase::Running(running) = &entry.phase {
                             let detailed = entry.detailed();

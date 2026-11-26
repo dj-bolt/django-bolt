@@ -152,4 +152,5 @@ def build_mount_definition(
         "www_authenticate": www_authenticate,
         "state_key": derive_state_key(secret_key),
         "max_tasks": mcp.max_tasks,
+        "max_tasks_per_principal": mcp.max_tasks_per_principal,
     }

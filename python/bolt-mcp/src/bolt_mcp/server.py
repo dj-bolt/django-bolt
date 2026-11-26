@@ -116,6 +116,7 @@ class MCP:
         list_cache_scope: str = "private",
         mask_error_details: bool = True,
         max_tasks: int = 1000,
+        max_tasks_per_principal: int = 100,
     ) -> None:
         """Declare an MCP server.
 
@@ -135,8 +136,10 @@ class MCP:
         development.
 
         ``max_tasks`` limits the tasks that the mount keeps in memory, running
-        or finished (see ``@mcp.tool(task=True)``). A call over the limit
-        gets an error result.
+        or finished (see ``@mcp.tool(task=True)``). ``max_tasks_per_principal``
+        limits the tasks of one principal, so that one caller cannot take each
+        slot. All callers without a user id share one principal. A call over a
+        limit gets an error result.
         """
         if list_cache_scope not in _CACHE_SCOPES:
             raise ValueError(f"list_cache_scope must be 'public' or 'private', got {list_cache_scope!r}")
@@ -154,6 +157,7 @@ class MCP:
         self.list_cache_scope = list_cache_scope
         self.mask_error_details = mask_error_details
         self.max_tasks = _positive_int("max_tasks", max_tasks)
+        self.max_tasks_per_principal = _positive_int("max_tasks_per_principal", max_tasks_per_principal)
         self._tools: dict[str, ToolDef] = {}
         self._resources: dict[str, ResourceDef] = {}
         self._resource_templates: dict[str, ResourceTemplateDef] = {}

@@ -317,10 +317,16 @@ impl McpRegistry {
             .get_item("max_tasks")?
             .ok_or_else(|| PyValueError::new_err("MCP mount config missing 'max_tasks'"))?
             .extract()?;
+        let max_tasks_per_principal: usize = config
+            .get_item("max_tasks_per_principal")?
+            .ok_or_else(|| {
+                PyValueError::new_err("MCP mount config missing 'max_tasks_per_principal'")
+            })?
+            .extract()?;
         let tasks = tools
             .values()
             .any(|entry| entry.task.is_some())
-            .then(|| TaskStore::new(max_tasks));
+            .then(|| TaskStore::new(max_tasks, max_tasks_per_principal));
 
         // Logging capability is deprecated in 2026-07-28 but stays advertised
         // for legacy session clients that use `ctx.log()` streams.
