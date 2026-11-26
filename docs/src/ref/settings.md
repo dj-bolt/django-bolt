@@ -332,7 +332,7 @@ See [runbolt](runbolt.md#development-mode).
 | `DEBUG` | Turns on the staticfiles finders for static files, error details in responses, and the `DEBUG` level of the default logging. |
 | `ROOT_URLCONF` | `runbolt` looks for the project API next to it, and finds the admin prefix in it. |
 | `MIDDLEWARE` | `BoltAPI(django_middleware=True)` loads it. See [Middleware](../topics/middleware.md). |
-| `FORCE_SCRIPT_NAME` | The sub-path that a proxy removes. `request.path`, `WebSocket.path`, `reverse()`, redirects and the docs put it first. Bolt serves `STATIC_URL` and `MEDIA_URL` without it. Bolt reads it at startup, and refuses a value that is not a `str` or that Django percent-encodes. See [Deployment](../topics/deployment.md#serve-under-a-sub-path). |
+| `FORCE_SCRIPT_NAME` | The sub-path that a proxy removes. `request.path`, `WebSocket.path`, `reverse()`, redirects and the docs put it first. Bolt serves `STATIC_URL` and `MEDIA_URL` without it. Bolt reads it at startup, and refuses a value that Django percent-encodes. See [Deployment](../topics/deployment.md#serve-under-a-sub-path). |
 | `DATABASES` | Sets the default size of the ORM thread pool. `OPTIONS["pool"]`, `CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` change how Bolt keeps connections. See [Deployment](../topics/deployment.md#configure-database-connections). |
 
 ## Environment variables

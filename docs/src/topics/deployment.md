@@ -329,11 +329,15 @@ The admin mount of `runbolt` works in this way.
 URL patterns without the mount path give 404.
 Bolt does not change the `Location` of a redirect from the app.
 
-Bolt refuses these values at startup with `ImproperlyConfigured`:
+Bolt refuses these values at startup with `ImproperlyConfigured`, before a lifespan runs and before the startup banner:
 
-- A `FORCE_SCRIPT_NAME` that is not a `str`.
 - A `FORCE_SCRIPT_NAME` with a character that Django percent-encodes in a URL, for example a space or `é`.
-- A `STATIC_URL` or `MEDIA_URL` that is the sub-path, such as `"/blog/"`, when Bolt serves those files. The files would be at `/`, and hide each route.
+- A `STATIC_URL` or `MEDIA_URL` that you set to the sub-path, such as `"/blog/"`, when Bolt serves those files. The files would be at `/`, and hide each route.
+
+Django also gives a relative `STATIC_URL` or `MEDIA_URL`, such as the default `MEDIA_URL` `""`, the sub-path.
+Bolt serves no files for such a value, as without `FORCE_SCRIPT_NAME`.
+
+A `FORCE_SCRIPT_NAME` that is not a `str` stops `runbolt` and each `manage.py` command in `django.setup()`, with an error of Django, for example `AttributeError`.
 
 Bolt reads no request header for the sub-path.
 `TestClient` sends each path to Bolt as you give it, with no proxy. It follows a redirect to `/blog/...` as it is, and Bolt gives 404, as Django's test client does. Pass `follow_redirects=False` to check such a redirect.
