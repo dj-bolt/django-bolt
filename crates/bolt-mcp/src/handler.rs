@@ -45,7 +45,7 @@ use crate::tasks::{InputError, Outcome, Refusal, TaskHandle, TaskOptions, TaskSt
 use crate::{McpAuthExt, McpRouteRequest, McpRouteRequestExt};
 use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
 use bolt_core::permissions::{GuardResult, evaluate_guards};
-use bolt_core::request::PyRequest;
+use bolt_core::request::{PyRequest, client_path};
 use bolt_core::router::parse_query_string;
 use bolt_core::type_coercion::string_map_to_py_dict;
 use bolt_core::validation::parse_cookies_inline;
@@ -245,7 +245,7 @@ fn tool_request(
     let cookies = parse_cookies_inline(parts.headers.get("cookie").map(String::as_str));
     let request = PyRequest {
         method: parts.method.clone().into(),
-        path: parts.path.clone(),
+        path: client_path(parts.script_name.as_deref(), parts.path.clone()),
         body: Vec::new(),
         path_params: None,
         query_params: Some(
@@ -267,6 +267,7 @@ fn tool_request(
         conn_scheme: parts.conn_scheme,
         conn_remote_addr: parts.conn_remote_addr,
         rust_answer: None,
+        script_name: parts.script_name.clone(),
     };
     Ok(Py::new(py, request)?.into_any())
 }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use bolt_core::error::ErrorInfo;
 use bolt_core::middleware::client_ip;
-use bolt_core::request::PyRequest;
+use bolt_core::request::{PyRequest, client_path};
 use bolt_core::request_pipeline::insert_header_line;
 use bolt_core::state::AppState;
 use bolt_core::type_coercion::string_map_to_py_dict;
@@ -165,7 +165,7 @@ fn error_request(py: Python<'_>, req: &HttpRequest, state: &AppState) -> PyResul
     let headers_py = string_map_to_py_dict(py, &headers, &[])?.unbind();
     Ok(PyRequest {
         method: req.method().as_str().to_owned().into(),
-        path: req.path().to_owned(),
+        path: client_path(state.script_name.as_deref(), req.path().to_owned()),
         body: Vec::new(),
         path_params: None,
         query_params: None,
@@ -185,5 +185,6 @@ fn error_request(py: Python<'_>, req: &HttpRequest, state: &AppState) -> PyResul
         conn_scheme,
         conn_remote_addr,
         rust_answer: None,
+        script_name: state.script_name.clone(),
     })
 }

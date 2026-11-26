@@ -75,6 +75,10 @@ Thus `urlpatterns` in the example have no `legacy/` part, and `reverse()` adds t
 A redirect to a path that starts with `/` gets the prefix.
 In the example, `/legacy/old/3/` redirects to `/legacy/articles/3/`.
 
+With `FORCE_SCRIPT_NAME`, Django takes the setting as the script name and ignores the prefix.
+Then the URL patterns must contain the prefix, as in the next section, and Bolt does not change a redirect.
+See [Serve under a sub-path](deployment.md#serve-under-a-sub-path).
+
 ### Keep the prefix in the URL patterns
 
 Set `clear_root_path=True` when the URL patterns already contain the prefix:
@@ -173,6 +177,7 @@ For an HTTP request, the scope has these values:
 | `headers` | The request headers as a list of byte pairs |
 
 `mount_django()` puts the prefix back in `path` before Django reads the scope.
+With `FORCE_SCRIPT_NAME`, `root_path` starts with the script name, and `reverse()` in the app gives the URLs of the project under the script name.
 
 Bolt does not send lifespan events to a mounted app.
 Thus the startup and shutdown handlers of a Starlette or FastAPI app do not run.

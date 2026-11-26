@@ -1,0 +1,176 @@
+"""A real runbolt under ``FORCE_SCRIPT_NAME``, behind a proxy that removes the sub-path.
+
+The proxy removes ``/myapp``, so the server gets ``/sync`` for ``/myapp/sync``.
+The test client cannot show these: the script prefix of ``django.setup()`` on
+the main thread, the worker threads and request lanes of the server, a sync
+streaming body on its own thread, and a WebSocket handshake.
+"""
+
+from __future__ import annotations
+
+import itertools
+import json
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
+import pytest
+
+from .apps import app_module
+from .apps.script_prefix import LIFESPAN_MARKER
+from .helpers import SimpleWebSocketClient, _terminate_process
+
+pytestmark = pytest.mark.server_integration
+
+_ROUTES = ["/sync", "/async", "/orm", "/async-orm", "/hops", "/stream-sync", "/stream-async"]
+_ALL_ROUTES = [*_ROUTES, *(f"/dj{route}" for route in _ROUTES)]
+
+
+def _project(make_server_project, tmp_path, script_name: str | None):
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    (static_root / "site.css").write_text("body {}")
+    settings = f"STATIC_URL = 'static/'\nSTATIC_ROOT = {str(static_root)!r}\n"
+    if script_name is not None:
+        settings += f"FORCE_SCRIPT_NAME = {script_name!r}\n"
+    project = make_server_project(api_module=app_module("script_prefix"), settings_extra=settings)
+    project.manage("migrate", "--run-syncdb")
+    return project
+
+
+def _prefixes(response: httpx.Response) -> set[str]:
+    """Every script prefix in a response: the values of the body, and the header of the Django middleware."""
+    found = {value for value in response.json().values() if value.endswith("/")}
+    if "x-django-prefix" in response.headers:
+        found.add(response.headers["x-django-prefix"])
+    return found
+
+
+def test_runbolt_gives_the_script_name_where_user_code_runs(make_server_project, tmp_path):
+    project = _project(make_server_project, tmp_path, "/myapp")
+
+    with project.start() as server:
+        seen = {route: _prefixes(server.get(route)) for route in _ALL_ROUTES}
+        sync = server.get("/sync").json()
+        lane = server.get("/dj/sync")
+        missing = server.get("/missing")
+        lifespan = server.get("/lifespan").json()
+        schema = server.get("/docs/openapi.json").json()
+        static = server.get("/static/site.css")
+        unstripped_static = server.get("/myapp/static/site.css").status_code
+        asgi = server.get("/asgi/page").json()
+        with SimpleWebSocketClient(server.host, server.port, "/ws") as websocket:
+            message = json.loads(websocket.receive_text())
+
+    assert seen == {route: {"/myapp/"} for route in _ALL_ROUTES}
+    assert sync == {"prefix": "/myapp/", "path": "/myapp/sync", "path_info": "/sync"}
+    assert lane.headers["x-django-path"] == "/myapp/dj/sync"
+    # The formatter of an error that Rust makes.
+    assert (missing.status_code, missing.json()) == (404, {"prefix": "/myapp/", "path": "/myapp/missing"})
+    # django.setup() gives the main thread the prefix, and the lifespan runs there.
+    assert lifespan == {"prefix": "/myapp/"}
+    assert schema["servers"] == [{"url": "/myapp"}]
+    # Django puts the script name in front of a relative STATIC_URL. The proxy removes it.
+    assert (static.text, unstripped_static) == ("body {}", 404)
+    assert asgi == {"prefix": "/myapp/", "root_path": "/myapp/asgi"}
+    assert message == {"handler": "/myapp/", "dependency": "/myapp/", "path": "/myapp/ws", "path_info": "/ws"}
+
+
+def _hammer(base_url: str, requests: int, concurrency: int) -> set[str]:
+    """Send ``requests`` requests over every route from ``concurrency`` threads. Return every prefix that they saw."""
+    seen: set[str] = set()
+    lock = threading.Lock()
+    routes = itertools.cycle(_ALL_ROUTES)
+    # Each thread has its own client. The connection pool of one client is not
+    # safe to share between threads on free-threaded Python.
+    local = threading.local()
+    clients: list[httpx.Client] = []
+
+    def thread_client() -> httpx.Client:
+        client = getattr(local, "client", None)
+        if client is None:
+            client = local.client = httpx.Client(base_url=base_url, timeout=30)
+            with lock:
+                clients.append(client)
+        return client
+
+    def one(route: str) -> None:
+        response = thread_client().get(route)
+        response.raise_for_status()
+        found = _prefixes(response)
+        with lock:
+            seen.update(found)
+
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            list(pool.map(one, [next(routes) for _ in range(requests)]))
+    finally:
+        for client in clients:
+            client.close()
+    return seen
+
+
+@pytest.mark.parametrize(("script_name", "prefix"), [("/myapp", "/myapp/"), (None, "/")])
+def test_runbolt_gives_each_request_the_prefix_of_its_server_under_load(
+    make_server_project, tmp_path, script_name, prefix
+):
+    project = _project(make_server_project, tmp_path, script_name)
+
+    with project.start(extra_args=["--workers", "4"]) as server:
+        base_url = f"http://{server.host}:{server.port}"
+        rounds = [_hammer(base_url, requests=700, concurrency=200) for _ in range(3)]
+
+    assert rounds == [{prefix}] * 3
+
+
+def test_runbolt_serves_files_under_a_script_name_with_two_slashes(make_server_project, tmp_path):
+    # Django gives STATIC_URL "static/" the value "/myapp//static/". The proxy removes "/myapp/".
+    for name in ("static", "media"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "site.css").write_text(name)
+    settings = (
+        "FORCE_SCRIPT_NAME = '/myapp//'\nSTATIC_URL = 'static/'\nMEDIA_URL = 'media/'\n"
+        f"STATIC_ROOT = {str(tmp_path / 'static')!r}\nMEDIA_ROOT = {str(tmp_path / 'media')!r}\n"
+    )
+    project = make_server_project(api_module=app_module("hello"), settings_extra=settings)
+
+    with project.start() as server:
+        bodies = [server.get(path).text for path in ("/static/site.css", "/media/site.css")]
+
+    assert bodies == ["static", "media"]
+
+
+@pytest.mark.parametrize("script_name", ["/myapp", None])
+def test_runbolt_serves_no_media_for_the_default_media_url(make_server_project, tmp_path, script_name):
+    # Django gives the default MEDIA_URL "" the script prefix. Bolt serves no media for it, as without the setting.
+    (tmp_path / "m.txt").write_text("m")
+    settings = f"MEDIA_ROOT = {str(tmp_path)!r}\n"
+    if script_name is not None:
+        settings += f"FORCE_SCRIPT_NAME = {script_name!r}\n"
+    project = make_server_project(api_module=app_module("hello"), settings_extra=settings)
+
+    with project.start() as server:
+        statuses = [server.get(path).status_code for path in ("/health", "/m.txt", "/media/m.txt", "/myapp/m.txt")]
+
+    assert statuses == [200, 404, 404, 404]
+
+
+@pytest.mark.parametrize("processes", [1, 2])
+def test_runbolt_refuses_media_at_the_script_name_before_the_lifespan_and_the_banner(
+    make_server_project, tmp_path, processes
+):
+    settings = f"FORCE_SCRIPT_NAME = '/myapp'\nMEDIA_URL = '/myapp/'\nMEDIA_ROOT = {str(tmp_path)!r}\n"
+    project = make_server_project(api_module=app_module("script_prefix"), settings_extra=settings)
+
+    process, _port = project.spawn(processes=processes)
+    try:
+        stdout, stderr = process.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _terminate_process(process)
+        pytest.fail(f"runbolt kept running\nstdout:\n{stdout}\nstderr:\n{stderr}")
+
+    assert process.returncode != 0, stderr
+    assert 'MEDIA_URL "/myapp/" is FORCE_SCRIPT_NAME "/myapp"' in stderr, stderr
+    assert LIFESPAN_MARKER not in stdout + stderr
+    assert "Django Bolt" not in stdout, stdout
