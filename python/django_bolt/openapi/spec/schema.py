@@ -4,6 +4,7 @@ from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import TYPE_CHECKING, Any, cast
 
+from ..._deprecation import warn_deprecated
 from .base import BaseSchemaObject
 
 
@@ -700,9 +701,12 @@ class ReferenceWithKeywords(Schema):
 
 @dataclass
 class SchemaDataContainer(Schema):
-    """Special class that allows using python data containers, e.g. dataclasses or pydantic models, to represent a
+    """Deprecated. Special class that allows using python data containers, e.g. dataclasses or pydantic models, to represent a
     schema
     """
 
     data_container: Any = None
     """A data container instance that will be used to generate the schema."""
+
+    def __post_init__(self) -> None:
+        warn_deprecated("SchemaDataContainer")

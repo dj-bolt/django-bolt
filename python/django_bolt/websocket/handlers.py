@@ -7,6 +7,8 @@ import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from .._deprecation import warn_deprecated
+
 if TYPE_CHECKING:
     from .types import WebSocket
 
@@ -50,7 +52,8 @@ def build_websocket_request(scope: dict[str, Any]) -> dict[str, Any]:
 
 
 def is_websocket_handler(func: Callable[..., Any]) -> bool:
-    """Check if a function is a WebSocket handler."""
+    """Deprecated. Check if a function is a WebSocket handler."""
+    warn_deprecated("is_websocket_handler()")
     return getattr(func, "_is_websocket_handler", False)
 
 
@@ -106,7 +109,7 @@ async def run_websocket_handler(
     **extra_kwargs: Any,
 ) -> None:
     """
-    Run a WebSocket handler with proper parameter injection.
+    Deprecated. Run a WebSocket handler with proper parameter injection.
 
     Args:
         handler: The WebSocket handler function
@@ -114,6 +117,7 @@ async def run_websocket_handler(
         path_params: Path parameters from URL matching
         extra_kwargs: Additional keyword arguments
     """
+    warn_deprecated("run_websocket_handler()", "Register the handler with `@api.websocket()`.")
     kwargs: dict[str, Any] = {}
 
     # Find the WebSocket parameter name

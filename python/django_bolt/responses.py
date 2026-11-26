@@ -22,6 +22,7 @@ except ImportError:
 
 from . import _json
 from ._core import resolve_response_file
+from ._deprecation import warn_deprecated
 from .cookies import Cookie, make_delete_cookie
 
 if TYPE_CHECKING:
@@ -197,6 +198,8 @@ class Response(CookieMixin):
         self.media_type = media_type
 
     def to_bytes(self) -> bytes:
+        """Deprecated. Return the body of the response as bytes."""
+        warn_deprecated("Response.to_bytes()")
         # Bytes-like content is a pre-encoded body. Pass it through verbatim,
         # even for the JSON media type — JSON-encoding bytes would base64-wrap
         # them and corrupt pre-compressed payloads (issue #305).

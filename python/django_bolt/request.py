@@ -14,6 +14,7 @@ from typing import (
 )
 
 from ._core import PyRequest
+from ._deprecation import warn_deprecated
 
 if TYPE_CHECKING:
     from django.contrib.sessions.backends.base import SessionBase
@@ -117,6 +118,8 @@ class Request(Protocol):
 
 
 def is_request(request: Any):
+    """Deprecated. Return True when ``request`` is a request of Bolt."""
+    warn_deprecated("is_request()")
     return isinstance(request, PyRequest)
 
 

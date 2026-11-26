@@ -3969,7 +3969,7 @@ class BoltAPI:
         """Register Django admin as an ASGI mount."""
 
         registrar = AdminRouteRegistrar(self)
-        registrar.register_routes(host, port)
+        registrar.register_routes()
 
     def _register_auth_backends(self) -> None:
         """

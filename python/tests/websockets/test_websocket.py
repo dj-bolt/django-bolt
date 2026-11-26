@@ -1004,7 +1004,8 @@ async def test_websocket_handler_may_be_a_callable_object_or_a_bound_method(kind
 
     assert api.websocket("/ws/{room}")(handler) is handler
     # The mark is on the method that the route registered.
-    assert is_websocket_handler(handlers.__call__ if kind == "call" else handler)
+    with pytest.warns(DeprecationWarning):
+        assert is_websocket_handler(handlers.__call__ if kind == "call" else handler)
 
     async with WebSocketTestClient(api, "/ws/blue") as ws:
         assert await ws.receive_text() == f"{kind}:blue"

@@ -15,6 +15,8 @@ from django.urls import NoReverseMatch, get_resolver, get_script_prefix, reverse
 from django.utils import translation
 from django.utils.module_loading import import_string
 
+from .._deprecation import warn_deprecated
+
 logger = logging.getLogger(__name__)
 
 
@@ -164,12 +166,13 @@ def admin_url_needs_path_parameter() -> bool:
 
 def get_admin_route_patterns() -> list[tuple[str, list[str]]]:
     """
-    Get route patterns to register for Django admin.
+    Deprecated. Get route patterns to register for Django admin.
 
     Returns:
         List of (path_pattern, methods) tuples for admin routes
         Example: [('/admin/{path:path}', ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])]
     """
+    warn_deprecated("get_admin_route_patterns()", "Bolt mounts the admin site as an ASGI app.")
     if not is_admin_installed():
         return []
 
@@ -202,11 +205,16 @@ def get_admin_route_patterns() -> list[tuple[str, list[str]]]:
 
 def get_static_url_prefix() -> str | None:
     """
-    Get the STATIC_URL prefix from Django settings.
+    Deprecated. Get the STATIC_URL prefix from Django settings.
 
     Returns:
         Static URL prefix (e.g., 'static') or None if not configured
     """
+    warn_deprecated("get_static_url_prefix()", "Read `settings.STATIC_URL`.")
+    return _static_url_prefix()
+
+
+def _static_url_prefix() -> str | None:
     try:
         if hasattr(settings, "STATIC_URL") and settings.STATIC_URL:
             static_url = settings.STATIC_URL
@@ -272,14 +280,18 @@ def should_enable_admin() -> bool:
 
 def get_admin_info() -> dict:
     """
-    Get information about Django admin configuration.
+    Deprecated. Get information about Django admin configuration.
 
     Returns:
         Dict with admin configuration details
     """
+    warn_deprecated(
+        "get_admin_info()",
+        "Use `is_admin_installed()`, `should_enable_admin()` and `detect_admin_url_prefix()`.",
+    )
     return {
         "installed": is_admin_installed(),
         "enabled": should_enable_admin(),
         "url_prefix": detect_admin_url_prefix(),
-        "static_url": get_static_url_prefix(),
+        "static_url": _static_url_prefix(),
     }
