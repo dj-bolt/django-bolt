@@ -9,6 +9,7 @@ responses of the test clients.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import itertools
 import json
 import sys
@@ -700,6 +701,26 @@ def test_a_user_that_loads_on_the_lane_of_the_request_has_the_script_prefix(sett
         assert client.get("/user", headers={"Authorization": f"Bearer {token}"}).json() == {"prefix": "/myapp/"}
 
 
+_HANDLER_VARIABLE: contextvars.ContextVar[str] = contextvars.ContextVar("handler_variable", default="unset")
+
+
+def test_under_the_setting_a_context_variable_of_a_sync_handler_ends_with_its_request(settings):
+    api = BoltAPI()
+
+    @api.get("/set/{value}")
+    def set_value(value: str) -> dict:
+        before = _HANDLER_VARIABLE.get()
+        _HANDLER_VARIABLE.set(value)
+        return {"before": before}
+
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    with TestClient(api) as client:
+        # The requests of one test thread go to one worker thread.
+        seen = [client.get(f"/set/{value}").json()["before"] for value in ("a", "b", "c")]
+
+    assert seen == ["unset"] * 3
+
+
 # --- No leak ----------------------------------------------------------------------
 
 _LEAK_ROUTES = [
@@ -712,6 +733,7 @@ _LEAK_ROUTES = [
     "/hops",
     "/stream-sync",
     "/stream-async",
+    "/missing",
 ]
 
 
@@ -724,7 +746,9 @@ def _hammer(api: BoltAPI, requests: int, concurrency: int) -> set[str]:
 
         def one(route: str) -> None:
             response = client.get(route)
-            found = _prefixes(response.json()) | {response.headers["x-before"], response.headers["x-after"]}
+            found = _prefixes(response.json())
+            # The middleware of the client, if it has one, sends what it saw.
+            found.update(value for name, value in response.headers.items() if name in ("x-before", "x-after"))
             with lock:
                 seen.update(found)
 
@@ -736,16 +760,19 @@ def _hammer(api: BoltAPI, requests: int, concurrency: int) -> set[str]:
 @pytest.mark.django_db(transaction=True)
 def test_the_script_prefix_of_one_client_never_reaches_another(settings):
     User.objects.create(username="row")
+    configs = {
+        "plain": {"error_formatter": _formatter},
+        "python": {"middleware": [_PyMiddleware], "error_formatter": _formatter},
+        "django": {"django_middleware": [f"{__name__}._DjangoMiddleware"], "error_formatter": _formatter},
+    }
+    # Each client with a script name comes between two without one, on each kind of thread.
+    order = [("/myapp", "plain"), (None, "plain"), ("/myapp", "python"), (None, "django"), ("/other", "django")]
+    order += [(None, "python"), ("/other", "plain"), (None, "django")]
     rounds = []
     for _ in range(3):
-        for script_name, middleware in (("/myapp", "python"), (None, "django"), ("/other", "django"), (None, "python")):
+        for script_name, config in order:
             settings.FORCE_SCRIPT_NAME = script_name
-            config = (
-                {"middleware": [_PyMiddleware]}
-                if middleware == "python"
-                else {"django_middleware": [f"{__name__}._DjangoMiddleware"]}
-            )
-            rounds.append((script_name, _hammer(_build(**config), requests=700, concurrency=200)))
+            rounds.append((script_name, _hammer(_build(**configs[config]), requests=700, concurrency=200)))
 
     assert rounds == [
         (script_name, {"/" if script_name is None else f"{script_name}/"}) for script_name, _seen_set in rounds
