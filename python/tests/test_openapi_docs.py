@@ -1248,6 +1248,38 @@ def test_openapi_auth_errors_follow_include_error_responses_and_a_declared_respo
     assert "401" in responses
 
 
+def test_openapi_auth_errors_follow_the_order_of_the_guards_and_keep_the_challenge_of_a_declared_401():
+    """The first guard that needs a user gives the 401, also before AllowAny. A declared 401 keeps the challenge."""
+
+    class Locked(msgspec.Struct):
+        reason: str
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Auth Test API", version="1.0.0"))
+    api_key = APIKeyAuthentication(api_keys={"test-key"})
+
+    @api.get("/first-guard", auth=[api_key], guards=[IsAuthenticated(), AllowAny()])
+    async def first_guard() -> dict:
+        return {}
+
+    @api.get("/declared", auth=[api_key], guards=[IsAuthenticated()], response_model={200: dict, 401: Locked})
+    async def declared():
+        return {}
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        responses = {path: item["get"]["responses"] for path, item in _document(client)["paths"].items()}
+        first_guard_response = client.get("/first-guard")
+        declared_response = client.get("/declared")
+
+    assert first_guard_response.status_code == 401
+    assert responses["/first-guard"]["401"]["headers"] == {"WWW-Authenticate": WWW_AUTHENTICATE_HEADER}
+    assert declared_response.headers["www-authenticate"] == "ApiKey"
+    assert responses["/declared"]["401"]["headers"] == {"WWW-Authenticate": WWW_AUTHENTICATE_HEADER}
+    assert responses["/declared"]["401"]["content"] == {
+        "application/json": {"schema": {"anyOf": [{"$ref": "#/components/schemas/Locked"}, ERROR_DETAIL_SCHEMA]}}
+    }
+
+
 @pytest.mark.django_db
 def test_openapi_session_route_with_login_url_documents_the_redirect():
     """A session backend with ``login_url`` redirects a request with no user. It does not send a 401."""
