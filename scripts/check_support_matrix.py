@@ -12,7 +12,8 @@ It reports drift in either direction:
 
 * a declared version upstream no longer supports (it went EOL -- drop it),
 * a maintained Django series that is not declared (a new release shipped),
-* a ``Django>=`` floor that disagrees with the oldest declared series,
+* a ``Django>=`` floor outside the oldest declared series (a patch floor
+  such as ``5.2.19`` in series 5.2 is not drift),
 * a Django/Python pairing the derived CI matrix runs that upstream does not
   support, which would fail CI while looking fine here.
 
@@ -90,19 +91,6 @@ def die(message: str) -> NoReturn:
 
 def _version_key(v: str) -> tuple[int, ...]:
     return tuple(int(part) for part in v.split("."))
-
-
-def _release_key(v: str) -> tuple[int, ...]:
-    """Ordering key with trailing zero components dropped.
-
-    `Django>=5.2.0` and the `Framework :: Django :: 5.2` classifier name the
-    same release, so an equality test between them must not see (5, 2, 0) and
-    (5, 2) as different.
-    """
-    parts = list(_version_key(v))
-    while len(parts) > 1 and parts[-1] == 0:
-        parts.pop()
-    return tuple(parts)
 
 
 def _retry_after_seconds(value: str | None) -> float | None:
@@ -313,16 +301,18 @@ def check(pyproject: Path, max_attempts: int = MAX_ATTEMPTS) -> tuple[list[Drift
                 )
             )
 
-    # --- the Django>= floor must match the oldest declared series ---
+    # --- the Django>= floor must be in the oldest declared series ---
+    # A patch floor such as 5.2.19 is not drift. It keeps out older 5.2
+    # releases with known CVEs, and the 5.2 series stays supported.
     oldest_declared = djangos[0]
     if floor is None:
         notes.append("could not find a `Django>=X.Y` entry in [project].dependencies; floor not checked")
-    elif _release_key(floor) != _release_key(oldest_declared):
+    elif (*_version_key(floor), 0)[:2] != _version_key(oldest_declared):  # Django>=6 means 6.0
         drift.append(
             Drift(
                 f"Django>={floor}",
-                f"disagrees with the oldest declared series (Django {oldest_declared})",
-                f'set the dependency to "Django>={oldest_declared}"',
+                f"is not in the oldest declared series (Django {oldest_declared})",
+                f'set the dependency to "Django>={oldest_declared}" or to a patch release of it',
             )
         )
 
