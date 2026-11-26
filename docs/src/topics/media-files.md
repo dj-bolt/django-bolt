@@ -182,30 +182,32 @@ Bolt can serve media in production. A reverse proxy, a CDN or an object store is
 - A separate domain for user files keeps the files away from the cookies of your site.
 
 When nginx serves `MEDIA_ROOT`, the rules of Bolt do not apply. Add them yourself.
-The `map` reads the content type that nginx sends, so it covers each extension of `mime.types`.
-The first `location` refuses hidden files, such as `/media/.env`:
+nginx cannot change the content type of a file by the type that it would send. Thus the safe form is a list of the types that can show in the browser, and each other file is a download.
+The first `location` refuses hidden files, such as `/media/.env`. The second `location` keeps the content type of the safe types. The third `location` sends each other file as `application/octet-stream`:
 
 ```nginx
-map $sent_http_content_type $media_disposition {
-    default "";
-    "~*^(text/html|text/xml|application/xml|[^;]+\+xml|[^;]*(java|ecma)script|application/wasm|text/x-component|application/hta)\s*(;|$)" attachment;
+location ~ ^/media/(.*/)?\. {
+    return 404;
 }
 
-server {
-    location ~ ^/media/(.*/)?\. {
-        return 404;
-    }
+location ~* ^/media/(.+\.(?:png|jpe?g|gif|webp|avif|ico|mp3|ogg|wav|mp4|webm|pdf|txt|csv))$ {
+    disable_symlinks on;
+    alias /srv/blog/media/$1;
+    add_header X-Content-Type-Options nosniff always;
+}
 
-    location /media/ {
-        disable_symlinks on;
-        alias /srv/blog/media/;
-        add_header Content-Disposition $media_disposition always;
-        add_header X-Content-Type-Options nosniff always;
-    }
+location /media/ {
+    disable_symlinks on;
+    alias /srv/blog/media/;
+    types { }
+    default_type application/octet-stream;
+    add_header Content-Disposition attachment always;
+    add_header X-Content-Type-Options nosniff always;
 }
 ```
 
-nginx does not add a header with an empty value. Thus other files show in the browser.
+Do not send a file with its JavaScript or XML content type and only add `Content-Disposition: attachment`. A browser ignores that header when a page loads the file with `<script src>`, so an uploaded `.js` file runs.
+Add an extension to the list only when its content type cannot run script. Do not add `svg`, `html`, `xml` or `js`.
 
 ## See also
 
