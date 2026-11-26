@@ -16,13 +16,15 @@ import pytest
 from django.conf.urls.i18n import i18n_patterns
 from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpResponse
-from django.urls import include, path, re_path, register_converter
+from django.test import Client as DjangoClient
+from django.urls import NoReverseMatch, include, path, re_path, register_converter, resolve, reverse
 from django.utils.translation import gettext_lazy
 
 from django_bolt import BoltAPI
-from django_bolt._urlconf import UrlconfMount, join_mount_path, served_apis, urlconf_mounts
+from django_bolt._urlconf import REVERSE_ONLY_URLCONF, UrlconfMount, join_mount_path, served_apis, urlconf_mounts
 from django_bolt.management.commands.runbolt import Command
 from django_bolt.testing import TestClient
+from django_bolt.urls import _LazyUrlpatterns
 
 _names = itertools.count()
 
@@ -418,3 +420,154 @@ def test_runbolt_serves_a_found_and_mounted_api_once_and_a_mounted_api_that_it_d
         assert client.get("/found/1").json() == {"id": 1}
         assert client.get("/mounted/2").json() == {"id": 2}
         assert client.get("/1").status_code == 404
+
+
+# --- Names and reverse() -------------------------------------------------
+
+
+def test_reverse_gives_the_served_path(mount_urlconf):
+    api = _api()
+    mount_urlconf([path("missions/", api.urls)])
+
+    url = reverse("detail", kwargs={"mission_id": 42})
+
+    assert url == "/missions/42"
+    with TestClient(api) as client:
+        assert client.get(url).json() == {"id": 42}
+
+
+def test_the_namespace_of_the_api_names_its_routes(mount_urlconf):
+    api = _api(namespace="missions")
+    mount_urlconf([path("missions/", api.urls)])
+
+    assert reverse("missions:detail", kwargs={"mission_id": 42}) == "/missions/42"
+    with pytest.raises(NoReverseMatch):
+        reverse("detail", kwargs={"mission_id": 42})
+
+
+@pytest.mark.parametrize(
+    ("patterns", "name", "expected"),
+    [
+        pytest.param(
+            lambda api: [path("myapp/", include(([path("api/", api.urls)], "myapp")))],
+            "myapp:api:detail",
+            "/myapp/api/7",
+            id="two-levels",
+        ),
+        pytest.param(
+            lambda api: [
+                path("project/", include(([path("v1/", include(([path("api/", api.urls)], "inner")))], "outer")))
+            ],
+            "outer:inner:api:detail",
+            "/project/v1/api/7",
+            id="three-levels",
+        ),
+    ],
+)
+def test_reverse_through_nested_namespaces_gives_the_served_path(mount_urlconf, patterns, name, expected):
+    api = _api(namespace="api")
+    mount_urlconf(patterns(api))
+
+    url = reverse(name, kwargs={"mission_id": 7})
+
+    assert url == expected
+    with TestClient(api) as client:
+        assert client.get(url).json() == {"id": 7}
+
+
+def test_the_same_route_name_in_two_namespaces(mount_urlconf):
+    first, second = _api(namespace="first"), _api(namespace="second")
+    mount_urlconf([path("a/", first.urls), path("b/", second.urls)])
+
+    first_url = reverse("first:detail", kwargs={"mission_id": 1})
+    second_url = reverse("second:detail", kwargs={"mission_id": 1})
+
+    assert (first_url, second_url) == ("/a/1", "/b/1")
+    with TestClient(first) as client:
+        assert client.get(first_url).json() == {"id": 1}
+    with TestClient(second) as client:
+        assert client.get(second_url).json() == {"id": 1}
+
+
+def test_a_prefix_parameter_reverses_from_its_kwarg(mount_urlconf):
+    api = BoltAPI(namespace="missions")
+
+    @api.get("/{mission_id}", name="detail")
+    async def detail(request, mission_id: int) -> dict:
+        return {"org": request.params["org"], "id": mission_id}
+
+    mount_urlconf([path("org/<str:org>/missions/", api.urls)])
+
+    url = reverse("missions:detail", kwargs={"org": "acme", "mission_id": 3})
+
+    assert url == "/org/acme/missions/3"
+    with TestClient(api) as client:
+        assert client.get(url).json() == {"org": "acme", "id": 3}
+
+
+def test_a_django_view_next_to_a_mounted_api_reverses_and_resolves_by_the_same_rules(mount_urlconf):
+    api = _api(namespace="api")
+    app = ([path("api/", api.urls), path("page/<int:pk>/", _django_view, name="page")], "myapp")
+    mount_urlconf([path("myapp/", include(app))])
+
+    bolt_url = reverse("myapp:api:detail", kwargs={"mission_id": 3})
+    django_url = reverse("myapp:page", kwargs={"pk": 3})
+
+    assert (bolt_url, django_url) == ("/myapp/api/3", "/myapp/page/3/")
+    bolt_match, django_match = resolve(bolt_url), resolve(django_url)
+    assert (bolt_match.namespaces, bolt_match.url_name) == (["myapp", "api"], "detail")
+    assert (django_match.namespaces, django_match.url_name) == (["myapp"], "page")
+    assert DjangoClient().get(django_url).content == b"django"
+    with TestClient(api) as client:
+        assert client.get(bolt_url).json() == {"id": 3}
+
+
+def test_a_route_of_a_mounted_sub_api_keeps_its_own_namespace(mount_urlconf):
+    sub = _api(namespace="sub")
+    api = BoltAPI(namespace="outer")
+    api.mount("/sub", sub)
+    mount_urlconf([path("missions/", api.urls)])
+
+    url = reverse("outer:sub:detail", kwargs={"mission_id": 5})
+
+    assert url == "/missions/sub/5"
+    with TestClient(api) as client:
+        assert client.get(url).json() == {"id": 5}
+
+
+# --- django_bolt.urls ------------------------------------------------------
+
+UNMOUNTED = BoltAPI()
+MOUNTED = BoltAPI(namespace="mounted")
+
+
+@UNMOUNTED.get("/own/{mission_id}", name="own_detail")
+async def own_detail(mission_id: int) -> dict:
+    return {"id": mission_id}
+
+
+@MOUNTED.get("/{mission_id}", name="detail")
+async def mounted_detail(mission_id: int) -> dict:
+    return {"id": mission_id}
+
+
+def _reverse_only_module() -> types.ModuleType:
+    """A new module that works as ``django_bolt.urls``, with its own lazy patterns."""
+    module = types.ModuleType(REVERSE_ONLY_URLCONF)
+    module.urlpatterns = _LazyUrlpatterns()
+    return module
+
+
+def test_django_bolt_urls_leaves_out_an_api_that_the_urlconf_mounts(mount_urlconf, settings):
+    settings.BOLT_API = [f"{__name__}:UNMOUNTED", f"{__name__}:MOUNTED"]
+    mount_urlconf([path("", include(_reverse_only_module())), path("missions/", MOUNTED.urls)])
+
+    assert reverse("own_detail", kwargs={"mission_id": 1}) == "/own/1"
+    assert reverse("mounted:detail", kwargs={"mission_id": 1}) == "/missions/1"
+
+
+def test_django_bolt_urls_under_a_prefix_is_refused(mount_urlconf):
+    mount_urlconf([path("api/", include(_reverse_only_module()))])
+
+    with pytest.raises(ImproperlyConfigured, match="includes django_bolt.urls under 'api/'"):
+        TestClient(_api())

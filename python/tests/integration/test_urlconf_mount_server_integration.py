@@ -32,3 +32,5 @@ def test_runbolt_serves_a_mounted_api_under_its_prefix_one_time(make_server_proj
         assert server.wait_for_json("/missions/42", lambda body: body == {"id": 42}) == {"id": 42}
         assert server.get("/42").status_code == 404
         assert server.get("/health").json() == {"status": "ok"}
+        # reverse() in a handler gives the served path.
+        assert server.get("/link").json() == {"url": "/missions/42"}
