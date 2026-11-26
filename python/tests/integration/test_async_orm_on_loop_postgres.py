@@ -37,7 +37,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import connections, models, transaction
 from django.db.backends.signals import connection_created
 from django.db.backends.utils import CursorWrapper
-from django.db.models import Count, Func, IntegerField, QuerySet
+from django.db.models import Avg, Count, Func, IntegerField, Max, Min, QuerySet, Sum
 from django.db.models.expressions import RawSQL
 from django.db.models.query import ModelIterable
 from django.db.models.signals import post_init
@@ -45,7 +45,7 @@ from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils.deprecation import MiddlewareMixin
 
-from django_bolt import BoltAPI, Request, async_orm, concurrency
+from django_bolt import BoltAPI, LimitOffsetPagination, Request, async_orm, concurrency, paginate
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.auth.jwt_utils import create_jwt_for_user
 from django_bolt.middleware import DjangoMiddlewareStack
@@ -442,6 +442,56 @@ ONE_ROW_QUERIES: dict[str, Callable[[], Any]] = {
 }
 
 
+# Name -> the QuerySet, and the arguments of ``aggregate``.
+AGGREGATES: dict[str, Callable[[], tuple[Any, tuple[Any, ...], dict[str, Any]]]] = {
+    "count": lambda: (_posts(), (), {"posts": Count("id")}),
+    "positional": lambda: (_posts(), (Count("id"),), {}),
+    "several": lambda: (_posts(), (), {"first": Min("title"), "last": Max("title"), "ids": Sum("id")}),
+    "average": lambda: (_posts(), (), {"mean": Avg("author_id")}),
+    "filtered": lambda: (_posts().filter(published=True), (), {"posts": Count("id")}),
+    "no_rows": lambda: (_posts().filter(title="No such post"), (), {"total": Sum("id"), "posts": Count("id")}),
+    "no_rows_with_a_default": lambda: (_posts().filter(title="No such post"), (), {"total": Sum("id", default=7)}),
+    # Django sends no statement for a QuerySet that can match nothing.
+    "empty_in": lambda: (_posts().filter(id__in=[]), (), {"total": Sum("id", default=7), "posts": Count("id")}),
+    "none": lambda: (_posts().none(), (), {"posts": Count("id")}),
+    # Django puts each of these QuerySets in a subquery.
+    "sliced": lambda: (_posts().order_by("id")[:2], (), {"posts": Count("id")}),
+    "distinct": lambda: (_posts().values("published").distinct(), (), {"kinds": Count("published")}),
+    "over_an_annotation": lambda: (
+        Author.objects.using(ALIAS).annotate(written=Count("posts")),
+        (),
+        {"most": Max("written")},
+    ),
+    "union": lambda: (
+        _posts().filter(published=True).union(_posts().filter(published=False)),
+        (),
+        {"posts": Count("id")},
+    ),
+    "no_expression": lambda: (_posts(), (), {}),
+    "prefetch": lambda: (_posts().prefetch_related("tags"), (), {"posts": Count("id")}),
+    # Errors of Django, before the statement.
+    "no_alias": lambda: (_posts(), (Count("id") + 1,), {}),
+    "unknown_field": lambda: (_posts(), (), {"total": Sum("no_such_field")}),
+    "distinct_fields": lambda: (_posts().distinct("title"), (), {"posts": Count("id")}),
+    # An error of the database.
+    "division_by_zero": lambda: (_posts(), (), {"total": Sum(RawSQL("1 / (id - id)", []))}),
+    # Django needs a connection to compile this QuerySet, so its query runs on the thread path.
+    "needs_a_connection_to_compile": lambda: (_probes().annotate(value=_OpensConnection()), (), {"most": Max("value")}),
+}
+
+
+def _aggregate_call(name: str, method: str) -> Callable[[], Any]:
+    queryset, args, kwargs = AGGREGATES[name]()
+    return lambda: getattr(queryset, method)(*args, **kwargs)
+
+
+def _aggregate_outcome(error: Exception | None, result: dict[str, Any] | None) -> Any:
+    """The result of ``aggregate`` with the type of each value, or the error of the call."""
+    if error is not None:
+        return {"error": type(error).__qualname__, "message": str(error)}
+    return {name: repr(value) for name, value in result.items()}
+
+
 def _one_row_outcome(call: Callable[[], Any]) -> Any:
     """The plain form of a row, or of the error of the call."""
     try:
@@ -671,6 +721,8 @@ OWN_METHODS: dict[str, Callable[[QuerySet], Any]] = {
     "last": lambda authors: authors.alast(),
     "exists": lambda authors: authors.aexists(),
     "exists_with_rows": lambda authors: _exists_with_rows(authors),
+    "count": lambda authors: authors.acount(),
+    "aggregate": lambda authors: authors.aaggregate(authors=Count("id")),
 }
 
 
@@ -808,6 +860,11 @@ def _api() -> BoltAPI:
         probes = [probe async for probe in LoopProbe.objects.order_by("label").distinct("label")]
         return {"databases": [probe._state.db for probe in probes], "labels": [probe.label for probe in probes]}
 
+    @api.get("/routed-count")
+    async def routed_count():
+        _AnotherDatabaseForEachCall.calls = 0
+        return {"count": await LoopProbe.objects.acount()}
+
     @api.get("/slow-read-outcome")
     async def slow_read_outcome():
         try:
@@ -884,6 +941,23 @@ def _api() -> BoltAPI:
     async def exists(name: str):
         return {"outcome": await _one_row_outcome_async(ONE_ROW_QUERIES[name]().aexists)}
 
+    @api.get("/count/{name}")
+    async def count(name: str):
+        return {"outcome": await _one_row_outcome_async(ONE_ROW_QUERIES[name]().acount)}
+
+    @api.get("/aggregate/{name}")
+    async def aggregate(name: str):
+        try:
+            result = await _aggregate_call(name, "aaggregate")()
+        except Exception as error:
+            return {"outcome": _aggregate_outcome(error, None)}
+        return {"outcome": _aggregate_outcome(None, result)}
+
+    @api.get("/authors-after/{offset}")
+    @paginate(LimitOffsetPagination)
+    async def authors_after(request, offset: int):
+        return Author.objects.using(ALIAS).order_by("id")
+
     @api.get("/cached")
     async def cached():
         posts = _posts().filter(published=True).order_by("id")
@@ -897,6 +971,7 @@ def _api() -> BoltAPI:
         return {
             # The row is gone from the table, and the QuerySet still has it.
             "exists": await probes.aexists(),
+            "count": await probes.acount(),
             "first_is_cached": await posts.afirst() is rows[0],
             "last_is_cached": last is rows[-1],
             "last_is_the_last_row": last.pk == rows[-1].pk,
@@ -1435,6 +1510,58 @@ def test_afirst_alast_and_aexists_give_the_result_or_the_error_of_the_sync_call(
     assert response.json() == expected
 
 
+@pytest.mark.parametrize("name", sorted(ONE_ROW_QUERIES))
+def test_acount_gives_the_result_or_the_error_of_the_sync_call(on_loop, name):
+    expected = {"outcome": _one_row_outcome(ONE_ROW_QUERIES[name]().count)}
+
+    with TestClient(_api()) as client:
+        response = client.get(f"/count/{name}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+@pytest.mark.parametrize("name", sorted(AGGREGATES))
+def test_aaggregate_gives_the_result_or_the_error_of_the_sync_call(on_loop, name):
+    try:
+        expected = {"outcome": _aggregate_outcome(None, _aggregate_call(name, "aggregate")())}
+    except Exception as error:
+        expected = {"outcome": _aggregate_outcome(error, None)}
+
+    with TestClient(_api()) as client:
+        response = client.get(f"/aggregate/{name}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "sync_call"),
+    [
+        ("/count/ordered", lambda: ONE_ROW_QUERIES["ordered"]().count()),
+        # Django counts the rows of a slice in a subquery.
+        ("/count/sliced", lambda: ONE_ROW_QUERIES["sliced"]().count()),
+        ("/aggregate/several", lambda: _aggregate_call("several", "aggregate")()),
+        ("/aggregate/over_an_annotation", lambda: _aggregate_call("over_an_annotation", "aggregate")()),
+    ],
+    ids=["count", "count_of_a_slice", "aggregate", "aggregate_over_a_subquery"],
+)
+def test_acount_and_aaggregate_send_the_sql_of_the_sync_call(on_loop, path, sync_call):
+    sync_call()
+    expected = _last_statement(on_loop, connections[ALIAS].connection.info.backend_pid)
+    connections[ALIAS].close()
+
+    with TestClient(_api()) as client:
+        assert client.get(path).status_code == 200
+        with psycopg.connect(**on_loop.params, autocommit=True) as admin:
+            (sent,) = admin.execute(
+                "SELECT query FROM pg_stat_activity WHERE application_name = %s ORDER BY query_start DESC LIMIT 1",
+                (on_loop.application_name,),
+            ).fetchone()
+
+    assert sent == expected
+
+
 def test_aexists_sends_the_sql_of_exists(on_loop):
     """``exists`` selects no column and limits the rows to one. The database must get the same statement."""
     assert ONE_ROW_QUERIES["ordered"]().exists()
@@ -1460,6 +1587,58 @@ def test_afirst_and_alast_build_their_row_on_the_thread_of_the_handler(on_loop):
     handler = threads["handler"]
     assert not handler.startswith(ORM_THREAD)
     assert threads == {"handler": handler, "afirst": handler, "alast": handler}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/count/ordered",
+        "/count/sliced",
+        "/aggregate/several",
+        "/aggregate/over_an_annotation",
+        # The offset is after the last row, so the pagination sends only the statement of the count.
+        "/authors-after/0?offset=50",
+    ],
+)
+def test_a_count_and_an_aggregate_open_no_django_connection(on_loop, path):
+    """A read on the thread path opens a connection of Django on an ORM thread. A read on the loop opens none."""
+    opened = []
+
+    def count(sender: Any, connection: Any, **kwargs: Any) -> None:
+        if connection.alias == ALIAS:
+            opened.append(threading.current_thread().name)
+
+    with TestClient(_api()) as client:
+        # The first read of a loop reads the state of a Django connection, and closes that connection.
+        assert client.get("/authors").status_code == 200
+        connection_created.connect(count)
+        try:
+            response = client.get(path)
+        finally:
+            connection_created.disconnect(count)
+
+    assert response.status_code == 200, response.text
+    assert opened == []
+
+
+def test_the_pagination_of_bolt_counts_the_rows_as_with_the_setting_off(on_loop):
+    expected = _with_the_setting_off(_api, "/authors-after/0?limit=2&offset=1")
+    assert expected["total"] == 3
+    assert [author["name"] for author in expected["items"]] == ["Bob", "Cy"]
+
+    with TestClient(_api()) as client:
+        response = client.get("/authors-after/0?limit=2&offset=1")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+def test_acount_uses_one_database_when_the_router_gives_another_for_each_call(on_loop):
+    with override_settings(DATABASE_ROUTERS=[_AnotherDatabaseForEachCall()]), TestClient(_api()) as client:
+        response = client.get("/routed-count")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"count": 2}
 
 
 def test_aexists_opens_no_django_connection(on_loop):
@@ -1490,6 +1669,7 @@ def test_a_queryset_that_has_its_rows_answers_from_them(on_loop):
     assert response.status_code == 200, response.text
     assert response.json() == {
         "exists": True,
+        "count": 1,
         "first_is_cached": True,
         "last_is_cached": False,
         "last_is_the_last_row": True,
@@ -2332,7 +2512,8 @@ def test_debug_logs_a_statement_that_psycopg_cannot_build_as_django_logs_it(on_l
             Author.objects.using(ALIAS).filter(name="a\x00b").exists()
         expected = {"error": type(sync_error.value).__qualname__, "sql": captured[-1]["sql"]}
         assert expected["error"] == "DataError"
-        assert expected["sql"].startswith("QUERY = ")
+        # Django 6.1 logs the statement and its parameters. The versions before log no statement.
+        assert expected["sql"] is None or expected["sql"].startswith("QUERY = ")
 
         with TestClient(_api()) as client:
             response = client.get("/query-log-of-a-statement-with-no-sql")

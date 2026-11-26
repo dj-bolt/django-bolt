@@ -145,7 +145,7 @@ curl localhost:8000/articles/99
 A sync ORM call in an `async def` handler raises Django's `SynchronousOnlyOperation`, and the client gets a `500` response. This also applies to a relation that is not loaded, for example `article.author` after `aget()`.
 
 Bolt sends each async ORM call to the ORM thread pool. Thus `DJANGO_BOLT_ORM_THREADS` limits the queries in flight. See [Tune the thread pools](#tune-the-thread-pools).
-On PostgreSQL, a returned QuerySet, `async for`, `aget()`, `afirst()`, `alast()`, `aexists()` and `await request.auser()` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
+On PostgreSQL, a returned QuerySet, `async for`, `aget()`, `afirst()`, `alast()`, `aexists()`, `acount()`, `aaggregate()` and `await request.auser()` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
 
 ## Iterate over a QuerySet
 
@@ -178,6 +178,8 @@ Django's async ORM runs each call on a thread, and Bolt loads a QuerySet that a 
 - a QuerySet that a handler returns,
 - `async for` over a QuerySet,
 - `aget()`, `afirst()`, `alast()` and `aexists()`,
+- `acount()` and `aaggregate()`,
+- the count of the rows for `@paginate`,
 - `await request.auser()`, when the auth backend loads the user by primary key.
 
 Add the setting:
@@ -219,11 +221,12 @@ Some reads need the database connection of a thread, or sync code. For these rea
 | A database with another `ENGINE`, for example PostGIS or django-tenants | Another backend can change how a connection opens. |
 | A database with `OPTIONS["server_side_binding"]` or `OPTIONS["cursor_factory"]`, or with `AUTOCOMMIT` off | Bolt sends a statement with its parameters in it, outside a transaction. The cursor of Django puts the parameters in. |
 | A database whose connections have an execute wrapper from a `connection_created` receiver | A wrapper of `connection.execute_wrapper()` is sync code around the query. It measures the time of the query and gets its error. |
-| A QuerySet class with its own `get()`, `first()`, `last()`, `exists()` or `_fetch_all()`, or with its own iterable class | Your code runs in place of Django's code, and it can query. |
+| A QuerySet class with its own `get()`, `first()`, `last()`, `exists()`, `count()`, `aggregate()` or `_fetch_all()`, or with its own iterable class | Your code runs in place of Django's code, and it can query. |
 | A model whose rows need a query, for example in `from_db()` or in a `post_init` receiver | Sync code cannot query on the event loop. Bolt finds this at the first read of the model. That read runs two times. |
 | A returned QuerySet with the return type `list[SomeSerializer]`, when the Serializer reads model instances | On the ORM pool, a relation that the QuerySet did not load can still load. A plain Serializer reads `.values()` rows, and its QuerySet loads on the event loop. |
 | `await request.auser()` with a `get_user` or a `get_user_sync` of your own, or with a user model whose default manager has its own `get_queryset()` | Bolt runs your code, or the manager, for each load. |
-| The other async calls, for example `acount()`, `aaggregate()`, `acreate()` and `asave()` | Bolt replaces only the reads above. |
+| The rows of a page of `@paginate` | Bolt moved only the count of the rows to the event loop. |
+| The other async calls, for example `acontains()`, `ain_bulk()`, `acreate()` and `asave()` | Bolt replaces only the reads above. |
 
 ### Connections of the event loop
 

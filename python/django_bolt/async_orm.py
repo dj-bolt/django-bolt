@@ -3,7 +3,7 @@
 Django's async ORM API is ``sync_to_async`` around the sync API, so each call
 runs on a thread. With ``BOLT_ASYNC_ORM_ON_LOOP = True``, Bolt replaces these
 read calls of ``QuerySet``: ``async for`` (``__aiter__``), ``aget()``,
-``afirst()``, ``alast()`` and ``aexists()``.
+``afirst()``, ``alast()``, ``aexists()``, ``acount()`` and ``aaggregate()``.
 
 The flow of one read:
 
@@ -42,6 +42,7 @@ from django.core.exceptions import EmptyResultSet, ImproperlyConfigured, Synchro
 from django.db import connections
 from django.db.backends.utils import CursorDebugWrapper, CursorWrapper
 from django.db.models.query import MAX_GET_RESULTS, QuerySet
+from django.db.models.sql.constants import SINGLE
 from django.db.utils import (
     DatabaseError,
     DataError,
@@ -105,11 +106,15 @@ _django_aget = QuerySet.aget
 _django_afirst = QuerySet.afirst
 _django_alast = QuerySet.alast
 _django_aexists = QuerySet.aexists
+_django_acount = QuerySet.acount
+_django_aaggregate = QuerySet.aaggregate
 _django_fetch_all = QuerySet._fetch_all
 _django_get = QuerySet.get
 _django_first = QuerySet.first
 _django_last = QuerySet.last
 _django_exists = QuerySet.exists
+_django_count = QuerySet.count
+_django_aggregate = QuerySet.aggregate
 
 # The module of the iterable classes of Django. Another iterable class can
 # query while it builds the rows, which only a thread can do.
@@ -904,6 +909,17 @@ def _pool_of(loop: WorkerLoop, alias: str) -> _Pool | None:
     return pool
 
 
+def _pool_on_loop(alias: str) -> _Pool | None:
+    """Return the pool for a read that builds no row of a model, or None: see ``_pool_of``."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    if type(loop) is not WorkerLoop:
+        return None
+    return _pool_of(loop, alias)
+
+
 async def _prepare(pool: _Pool, wrapper: Any) -> bool:
     """Prepare the connection wrapper of this request for a read of ``pool``.
 
@@ -929,13 +945,7 @@ async def fetch(alias: str, sql: str, params: Any) -> list[tuple[Any, ...]] | No
     Returns None for a read that must use the ORM thread pool (see
     ``_pool_of``). Call this function only when ``enabled`` is true.
     """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return None
-    if type(loop) is not WorkerLoop:
-        return None
-    pool = _pool_of(loop, alias)
+    pool = _pool_on_loop(alias)
     if pool is None:
         return None
     wrapper = connections[alias]
@@ -944,8 +954,8 @@ async def fetch(alias: str, sql: str, params: Any) -> list[tuple[Any, ...]] | No
     return await pool.fetch(wrapper, sql, params)
 
 
-async def _rows(pool: _Pool, compiler: Any) -> Any:
-    """Compile the query of ``compiler`` and return its rows from the database.
+async def _all_columns(pool: _Pool, compiler: Any) -> Any:
+    """Compile the query of ``compiler`` and return its rows from the database, with each column of the statement.
 
     Returns None when the read must use a thread: the pool found that after
     its first connection, or an expression needed the database to compile.
@@ -963,8 +973,13 @@ async def _rows(pool: _Pool, compiler: Any) -> Any:
         return None
     if not sql:
         return ()
-    rows = await pool.fetch(wrapper, sql, params)
-    if compiler.has_extra_select:
+    return await pool.fetch(wrapper, sql, params)
+
+
+async def _rows(pool: _Pool, compiler: Any) -> Any:
+    """Return the rows of the query of ``compiler``, as ``execute_sql`` gives them, or None: see ``_all_columns``."""
+    rows = await _all_columns(pool, compiler)
+    if rows and compiler.has_extra_select:
         # ``execute_sql`` removes the columns that the query selects only to order the rows.
         count = compiler.col_count
         rows = [row[:count] for row in rows]
@@ -1179,6 +1194,133 @@ async def _aexists(self: QuerySet) -> bool:
     return bool(rows)
 
 
+class _Reached(Exception):  # noqa: N818 - not an error: it carries a compiler out of a sync method
+    """Sync ORM code reached the point where it sends a statement."""
+
+    def __init__(self, compiler: Any, result_type: Any) -> None:
+        super().__init__()
+        self.compiler = compiler
+        self.result_type = result_type
+
+
+# Compiler class of Django -> its subclass that stops where it would send a statement.
+_stopping_compilers: dict[type, type] = {}
+
+
+def _stop(self: Any, result_type: Any = None, *args: Any, **kwargs: Any) -> Any:
+    """``SQLCompiler.execute_sql`` of a stopping compiler."""
+    raise _Reached(self, result_type)
+
+
+def _to_the_statement(queryset: QuerySet, alias: str, ops: Any, method: Any, args: Any, kwargs: Any) -> Any:
+    """Call ``method(queryset, ...)`` of Django. Raise ``_Reached`` where Django would send a statement.
+
+    ``ops`` is of the connection wrapper of this request, and this function
+    does not wait. Thus no other read gets a stopping compiler.
+    """
+    make = type(ops).compiler
+
+    def compiler(name: str) -> type:
+        real = make(ops, name)
+        stopping = _stopping_compilers.get(real)
+        if stopping is None:
+            stopping = _stopping_compilers[real] = type(
+                real.__name__, (real,), {"execute_sql": _stop, "__module__": __name__}
+            )
+        return stopping
+
+    # A router can give another database for each call of ``queryset.db``. The read uses the database of its pool.
+    database_of_the_queryset = queryset._db
+    queryset._db = alias
+    ops.compiler = compiler
+    try:
+        return method(queryset, *args, **kwargs)
+    finally:
+        del ops.compiler
+        queryset._db = database_of_the_queryset
+
+
+async def _aggregation(queryset: QuerySet, pool: _Pool, method: Any, args: Any, kwargs: Any, key: str | None) -> Any:
+    """Run ``count`` or ``aggregate`` of Django, with the statement on the event loop.
+
+    ``key`` is the entry of the aggregation that the method returns, or None
+    for the whole aggregation. Returns ``_MISSING`` when a thread must run
+    the method.
+
+    Django builds an aggregate query in more than one way, and that code
+    differs between versions. So this function does not copy it. It runs the
+    method of Django to the point where Django would send the statement.
+    That gives the compiler. The event loop reads the row. The last lines
+    are those of ``Query.get_aggregation`` after the statement, which are the
+    same in each supported version of Django.
+    """
+    alias = pool.alias
+    wrapper = connections[alias]
+    if not await _prepare(pool, wrapper):
+        return _MISSING
+    try:
+        # A call that needs no statement returns here, for example ``aggregate()`` with no expression.
+        return _to_the_statement(queryset, alias, wrapper.ops, method, args, kwargs)
+    except _Reached as reached:
+        if reached.result_type != SINGLE:
+            return _MISSING
+        compiler = reached.compiler
+    except SynchronousOnlyOperation:
+        return _MISSING
+    rows = await _all_columns(pool, compiler)
+    if rows is None:
+        return _MISSING
+    annotations = compiler.query.annotation_select
+    if rows:
+        # ``execute_sql`` gives the first row, with the columns that the query asked for.
+        cols = annotations.values()
+        converted = compiler.apply_converters((rows[0][: compiler.col_count],), compiler.get_converters(cols))
+        if compiler.has_composite_fields(cols):
+            converted = compiler.composite_fields_to_tuples(converted, cols)
+        result = next(converted)
+    else:
+        # Django sends no statement for a query that can match nothing.
+        result = [expression.empty_result_set_value for expression in annotations.values()]
+    aggregation = dict(zip(annotations, result, strict=False))
+    return aggregation if key is None else aggregation[key]
+
+
+async def count(queryset: QuerySet) -> int | None:
+    """Count the rows of ``queryset`` from the event loop: ``QuerySet.count``.
+
+    Returns None for a read that must use the ORM thread pool (see
+    ``_pool_of``), and for a QuerySet class with its own ``count``. Call this
+    function only when ``enabled`` is true.
+    """
+    if type(queryset).count is not _django_count:
+        return None
+    pool = _pool_on_loop(queryset.db)
+    if pool is None:
+        return None
+    # ``Query.get_count`` gives this entry of its aggregation.
+    result = await _aggregation(queryset, pool, _django_count, (), {}, "__count")
+    return None if result is _MISSING else result
+
+
+async def _acount(self: QuerySet) -> int:
+    """``QuerySet.acount``."""
+    result = await count(self)
+    if result is None:
+        return await _django_acount(self)
+    return result
+
+
+async def _aaggregate(self: QuerySet, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """``QuerySet.aaggregate``."""
+    pool = _pool_on_loop(self.db) if type(self).aggregate is _django_aggregate else None
+    if pool is None:
+        return await _django_aaggregate(self, *args, **kwargs)
+    result = await _aggregation(self, pool, _django_aggregate, args, kwargs, None)
+    if result is _MISSING:
+        return await _django_aaggregate(self, *args, **kwargs)
+    return result
+
+
 def configure() -> None:
     """Read the setting and the limits of the pools. The server calls this function at startup.
 
@@ -1221,6 +1363,8 @@ def configure() -> None:
         ("afirst", _afirst, _django_afirst),
         ("alast", _alast, _django_alast),
         ("aexists", _aexists, _django_aexists),
+        ("acount", _acount, _django_acount),
+        ("aaggregate", _aaggregate, _django_aaggregate),
     ):
         if enabled:
             setattr(QuerySet, name, method)
