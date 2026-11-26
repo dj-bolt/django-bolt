@@ -7,9 +7,12 @@ Revocation is OPTIONAL - only checked if user provides a handler.
 
 from __future__ import annotations
 
+import itertools
 import time
+import unicodedata
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
 from django.apps import apps
 from django.core.cache import caches
@@ -22,27 +25,123 @@ from django.db.models import F
 _DEFAULT_TTL_SECONDS = 86400 * 7  # 7 days — fallback when caller doesn't pass `exp`
 # A user version row must stay, so the cleanup task of expired rows must not find it.
 _NEVER_EXPIRES = datetime(9999, 1, 1, tzinfo=UTC)
-# The key of a family or of a user version starts with one of these prefixes.
-# A jti with such a prefix would read or write that key, so the stores refuse it.
-_CACHE_RESERVED_PREFIXES = ("fam:", "ver:")
-_ORM_RESERVED_PREFIXES = ("family:", "version:")
 
 
 class ReservedJtiError(ValueError):
     """A store refuses a ``jti``, a family or a user id that it cannot keep.
 
-    A ``jti`` that starts with a reserved prefix gets this error. A key that the
-    storage cannot keep also gets it, for example a key longer than the column.
-    Authentication and ``JWTAuthViews`` count such a token as revoked.
+    A ``jti`` that starts with a reserved prefix gets this error. A ``jti`` that a
+    database collation can read with a reserved prefix also gets it, for example
+    ``VERSION:u``. A key that the storage cannot keep also gets it, for example a
+    key longer than the column. Authentication and ``JWTAuthViews`` count such a
+    token as revoked.
     """
 
 
-def _check_jti(jti: str, reserved: tuple[str, ...]) -> None:
-    """Raise ``ReservedJtiError`` when ``jti`` starts with a reserved prefix."""
-    if jti.startswith(reserved):
+# Some collations of MySQL compare two ASCII letters equal: i and j, and u and v, in Latin
+# (utf8mb4_la_0900_ai_ci and utf8mb4_roman_ci), and i and y in Lithuanian and Latvian.
+_SAME_LETTERS = {"j": "i", "y": "i", "u": "v"}
+# utf8mb4_persian_ci gives the letter alef with madda (U+0622) the weight of a.
+_OTHER_SCRIPT_LOOK_ALIKES = frozenset("\u0622")
+
+
+class _ReservedPrefixes(NamedTuple):
+    """The reserved prefixes of a store, in the form that ``_check_jti`` reads."""
+
+    prefixes: tuple[str, ...]
+    # Each lowercase spelling of each prefix with the letters of _SAME_LETTERS.
+    spellings: tuple[str, ...]
+    longest: int
+    # A jti that starts with one of these characters cannot read as a reserved prefix.
+    safe_starts: frozenset[str]
+    # For each prefix: a bit set of positions for each ASCII character, and the bit of a full match.
+    tables: tuple[tuple[dict[str, int], int], ...]
+
+
+def _reserved_prefixes(*prefixes: str) -> _ReservedPrefixes:
+    """Build the tables of ``_check_jti``. Each prefix has only lowercase ASCII letters and ``:``."""
+
+    def letters(char: str) -> list[str]:
+        """Return the lowercase ASCII characters that a collation can compare equal to ``char``."""
+        pair = _SAME_LETTERS.get(char, char)
+        return [pair, *(letter for letter, other in _SAME_LETTERS.items() if other == pair)]
+
+    spellings = tuple("".join(chars) for prefix in prefixes for chars in itertools.product(*map(letters, prefix)))
+    tables = []
+    for prefix in prefixes:
+        table: dict[str, int] = {}
+        for position, char in enumerate(prefix):
+            for letter in letters(char):
+                for variant in (letter, letter.upper()):
+                    table[variant] = table.get(variant, 0) | 1 << position
+        tables.append((table, 1 << len(prefix)))
+    starts = {variant for prefix in prefixes for letter in letters(prefix[0]) for variant in (letter, letter.upper())}
+    printable = frozenset(map(chr, range(0x21, 0x7F)))
+    return _ReservedPrefixes(prefixes, spellings, max(map(len, prefixes)), printable - starts, tuple(tables))
+
+
+# The key of a family or of a user version starts with one of these prefixes.
+# A jti that a database can read with such a prefix would read or write that key, so the stores refuse it.
+_CACHE_RESERVED_PREFIXES = _reserved_prefixes("fam:", "ver:")
+_ORM_RESERVED_PREFIXES = _reserved_prefixes("family:", "version:")
+
+
+def _can_read_as(jti: str, table: dict[str, int], full: int) -> bool:
+    """Return whether a database collation can read ``jti`` so that it starts with the prefix of ``table``.
+
+    Bit ``n`` of ``positions`` is set when the characters so far can read as the first ``n``
+    characters of the prefix. A printable ASCII character other than space reads as itself,
+    in either case, or as a letter of _SAME_LETTERS. Each other character can read as nothing,
+    or as its compatibility decomposition (NFKD). A Latin letter, or a letter of
+    _OTHER_SCRIPT_LOOK_ALIKES, can also read as one character. For example, a collation can
+    skip a soft hyphen or a control character, compare ``ø`` equal to ``o``, and compare
+    ``㏕`` equal to ``mil``. Another letter, such as ``日``, does not read as a Latin letter,
+    so a jti of such letters is not refused.
+    """
+    positions = 1
+    for char in jti:
+        if "!" <= char <= "~":
+            positions = (positions & table.get(char, 0)) << 1
+        else:
+            latin = "LATIN" in unicodedata.name(char, "") or char in _OTHER_SCRIPT_LOOK_ALIKES
+            whole = positions << 1 if latin else 0
+            decomposed = positions
+            for part in unicodedata.normalize("NFKD", char):
+                if "!" <= part <= "~":
+                    decomposed = (decomposed & table.get(part, 0)) << 1
+                elif "LATIN" in unicodedata.name(part, ""):
+                    decomposed |= decomposed << 1
+                if decomposed & full:
+                    return True
+            positions |= whole | decomposed
+        if positions & full:
+            return True
+        if not positions:
+            return False
+    return False
+
+
+def _check_jti(jti: str, reserved: _ReservedPrefixes) -> None:
+    """Raise ``ReservedJtiError`` when a database can read ``jti`` with a reserved prefix.
+
+    A collation can compare text without case or accents, and it can skip some characters.
+    For example, the default collation of MySQL finds the row ``version:u`` for the jti
+    ``VERSION:u`` or ``vérsion:u``. The store then reads or writes the user version.
+    """
+    # A jti is usually a UUID or a hex string. Its first character then ends the check.
+    if jti[:1] in reserved.safe_starts:
+        return
+    head = jti[: reserved.longest]
+    # A head of printable ASCII characters other than space can differ from a prefix only in case,
+    # or in a letter of _SAME_LETTERS.
+    if head.isascii() and head.isprintable() and " " not in head:
+        refused = head.lower().startswith(reserved.spellings)
+    else:
+        refused = any(_can_read_as(jti, table, full) for table, full in reserved.tables)
+    if refused:
         raise ReservedJtiError(
-            f"jti {jti!r} starts with a reserved prefix ({', '.join(reserved)}). "
-            "The store uses these prefixes for families and user versions."
+            f"jti {jti!r} starts with a reserved prefix ({', '.join(reserved.prefixes)}), or a database "
+            "collation can compare its start equal to one. The store uses these prefixes for families and user versions."
         )
 
 
