@@ -26,6 +26,7 @@ from urllib.parse import unquote_to_bytes
 
 import msgspec
 
+from .. import _script_prefix
 from .._core import RequestLane, populate_response_cookies
 from .._template_response import DJANGO_HOOKS, HOOK_ERROR_ATTR, render_template_response
 from ..concurrency import drive_on_lane, in_lane_mode, run_orm_blocking
@@ -1187,13 +1188,15 @@ def _to_django_request(request: Request) -> HttpRequest:
     # Copy basic attributes (direct assignment is faster)
     django_request.method = request.method
     # Django servers give the decoded path. Rust gives the encoded one.
-    path = request.path
-    if "%" in path:
+    path_info = request.path_info
+    if "%" in path_info:
         # An invalid UTF-8 sequence stays percent-encoded, as in Django's WSGI handler.
-        path = repercent_broken_unicode(unquote_to_bytes(path)).decode()
-        request.META["PATH_INFO"] = path
-    django_request.path = path
-    django_request.path_info = path
+        path_info = repercent_broken_unicode(unquote_to_bytes(path_info)).decode()
+        request.META["PATH_INFO"] = path_info
+    django_request.path_info = path_info
+    # As in Django's WSGIRequest: the script name (FORCE_SCRIPT_NAME), then the path info.
+    script_name = _script_prefix.script_name
+    django_request.path = script_name + path_info if script_name else path_info
 
     # One META dict per request. Rust builds it once (REMOTE_ADDR from the
     # client-ip resolver, SERVER_NAME from Host, HTTP_* headers) and caches it,

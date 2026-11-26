@@ -392,7 +392,8 @@ class BaseMiddleware(ABC):
             return True
 
         # Check path exclusion (regex match)
-        return bool(self._exclude_pattern and self._exclude_pattern.match(request.path))
+        # The patterns name route paths, so they match the path without the script name.
+        return bool(self._exclude_pattern and self._exclude_pattern.match(request.path_info))
 
     @abstractmethod
     async def process_request(self, request: Request) -> Response:

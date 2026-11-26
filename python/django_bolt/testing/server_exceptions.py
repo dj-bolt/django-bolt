@@ -124,14 +124,18 @@ async def _record_async(content: Any, held: dict[str, BaseException], token: str
 
 
 def bound_dispatches(
-    api: BoltAPI, handler: Callable, handler_id: int, exceptions: ServerExceptions | None
+    api: BoltAPI,
+    handler: Callable,
+    handler_id: int,
+    exceptions: ServerExceptions | None,
+    script_prefix: str | None = None,
 ) -> tuple[Callable, Callable]:
     """Return the async and the sync dispatch of one route of a test client.
 
     Without ``exceptions``, they are the dispatches of ``runbolt``.
     """
-    dispatch = make_bound_dispatch(api._dispatch, handler, handler_id)
-    dispatch_sync = make_bound_dispatch(api._dispatch_sync, handler, handler_id)
+    dispatch = make_bound_dispatch(api._dispatch, handler, handler_id, script_prefix)
+    dispatch_sync = make_bound_dispatch(api._dispatch_sync, handler, handler_id, script_prefix)
     if exceptions is None:
         return dispatch, dispatch_sync
 

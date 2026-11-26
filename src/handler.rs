@@ -27,7 +27,7 @@ use bolt_core::form_parsing::{
 use bolt_core::metadata::{RustArgBinding, RustArgSource};
 use bolt_core::middleware;
 use bolt_core::middleware::auth::populate_auth_context;
-use bolt_core::request::PyRequest;
+use bolt_core::request::{self, PyRequest};
 use bolt_core::request_pipeline::{
     EMPTY_TYPES, build_validation_error_response, extract_cookie_header, extract_headers,
     query_sequences, set_query_sequences, validate_and_cache_source,
@@ -1062,11 +1062,13 @@ async fn route_request(
                 // The line of the redirect has the filter of the route at the other form.
                 *access_log_route = Some(alternate.handler_id());
                 let query = req.query_string();
-                let location = if query.is_empty() {
-                    alternate_path.clone()
-                } else {
-                    format!("{}?{}", alternate_path, query)
-                };
+                // The client sees the path behind the script name (FORCE_SCRIPT_NAME).
+                let mut location =
+                    request::client_path(state.script_name.as_deref(), alternate_path.clone());
+                if !query.is_empty() {
+                    location.push('?');
+                    location.push_str(query);
+                }
                 return HttpResponse::PermanentRedirect() // 308
                     .insert_header(("Location", location))
                     .finish();
@@ -1713,7 +1715,7 @@ async fn route_request(
         // Error paths reconstruct from req.method()/req.path() (cold path, HttpRequest still alive).
         let request = PyRequest {
             method: method_static,
-            path: path_owned,
+            path: request::client_path(state.script_name.as_deref(), path_owned),
             body,
             path_params: path_params_py,
             query_params: query_params_py,
@@ -1741,6 +1743,7 @@ async fn route_request(
             conn_scheme,
             conn_remote_addr,
             rust_answer,
+            script_name: state.script_name.clone(),
         };
         let request_obj = Py::new(py, request)?;
 

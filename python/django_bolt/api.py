@@ -30,7 +30,7 @@ from django.core.handlers.asgi import ASGIHandler
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
 
-from . import _core, _json
+from . import _core, _json, _script_prefix
 from ._bridge import make_bound_dispatch
 from ._kwargs import (
     compile_argument_injector,
@@ -577,6 +577,24 @@ def _rewrite_scope_for_django_mount(scope: dict[str, Any]) -> dict[str, Any]:
     new_scope["path"] = full_path
     new_scope["raw_path"] = full_raw_path
     return new_scope
+
+
+def _scope_with_script_name(scope: dict[str, Any], script_name: str) -> dict[str, Any]:
+    """Put the script name (``FORCE_SCRIPT_NAME``) in front of the path of a Django scope.
+
+    The proxy removed it. Django's ``ASGIRequest`` then gives the path with it
+    and the path info without it, as ``WSGIRequest`` does.
+    """
+    path = scope["path"]
+    raw_path = scope.get("raw_path")
+    if not isinstance(raw_path, (bytes, bytearray, memoryview)):
+        raw_path = path.encode()
+    return {
+        **scope,
+        "path": script_name + path,
+        "raw_path": script_name.encode() + bytes(raw_path),
+        "root_path": script_name + (scope.get("root_path") or ""),
+    }
 
 
 def _rewrite_django_mount_redirect_message(message: dict[str, Any], root_path: str) -> dict[str, Any]:
@@ -3388,14 +3406,29 @@ class BoltAPI:
         if self._logging_middleware:
             self._logging_middleware.log_exception(request, error, exc_info=True)
 
-    def _rust_error_renderer(self) -> Callable | None:
+    def _rust_error_renderer(self, script_prefix: str | None = None) -> Callable | None:
         """Return the callable that formats the errors of the Rust core, or None.
 
-        Rust calls it only when it makes an error response.
+        Rust calls it only when it makes an error response. With a
+        ``script_prefix``, the formatter runs with that script prefix.
         """
         if self._error_formatter is None:
             return None
-        return functools.partial(render_core_error, self._error_formatter)
+        return _script_prefix.sync_entry(functools.partial(render_core_error, self._error_formatter), script_prefix)
+
+    def _rust_websocket_routes(self, script_prefix: str | None = None) -> list[tuple[str, int, Callable, Any]]:
+        """Return the WebSocket routes in the form of ``_core.register_websocket_routes``.
+
+        Each route has its pre-compiled injector. With a ``script_prefix``, the
+        handler and the sync dependencies of the injector run with that script prefix.
+        """
+        routes = []
+        for path, handler_id, handler in self._websocket_routes:
+            injector = self._handler_meta.get(handler_id, {}).get("injector")
+            if injector is not None:
+                injector = _script_prefix.sync_entry(injector, script_prefix)
+            routes.append((path, handler_id, _script_prefix.async_entry(handler, script_prefix), injector))
+        return routes
 
     def _describe_lane_affinity_error(self, error: LaneAffinityError, handler: Callable, handler_id: int) -> None:
         """Add the route and the handler to the message. In dev mode, log the fix one time per route.
@@ -3730,14 +3763,14 @@ class BoltAPI:
             self._no_route = (handler_id, _no_route)
         return self._no_route
 
-    def _rust_no_route(self) -> tuple[int, Callable, Callable, Callable]:
+    def _rust_no_route(self, script_prefix: str | None = None) -> tuple[int, Callable, Callable, Callable]:
         """Return the route for a request that matches no route, in the form of ``_core.register_routes``."""
         handler_id, handler = self._no_route_handler()
         return (
             handler_id,
             handler,
-            make_bound_dispatch(self._dispatch, handler, handler_id),
-            make_bound_dispatch(self._dispatch_sync, handler, handler_id),
+            make_bound_dispatch(self._dispatch, handler, handler_id, script_prefix),
+            make_bound_dispatch(self._dispatch_sync, handler, handler_id, script_prefix),
         )
 
     async def _dispatch_with_middleware(
@@ -4316,6 +4349,13 @@ class BoltAPI:
                     django_scope = dict(scope)
                 django_scope["root_path"] = ""
             root_path = django_scope.get("root_path") or ""
+            script_name = _script_prefix.script_name
+            if script_name and django_scope.get("type") == "http":
+                django_scope = _scope_with_script_name(django_scope, script_name)
+                # A Location that Django builds has the script name. A rewrite
+                # puts the script name and the mount path in front of one that does not.
+                if root_path:
+                    root_path = django_scope["root_path"]
 
             async def django_send(message):
                 rewritten = _rewrite_django_mount_redirect_message(message, root_path)

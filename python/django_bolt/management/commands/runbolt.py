@@ -23,6 +23,8 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
+from django_bolt._script_prefix import configure as configure_script_prefix
+from django_bolt._script_prefix import mcp_mounts
 from django_bolt._urlconf import served_apis
 from django_bolt.api import (
     BoltAPI,
@@ -1056,6 +1058,9 @@ class Command(BaseCommand):
         # A config decorator above a route decorator has no effect.
         refuse_unread_route_config(merged_api._routes, merged_api._websocket_routes)
 
+        # FORCE_SCRIPT_NAME: the entries from Rust into Python set the script prefix.
+        script_prefix = configure_script_prefix()
+
         # Register routes with Rust. Each route carries per-route bound
         # dispatch callables (partial binding handler + handler_id) so the
         # per-request Rust→Python call passes ONLY the request object —
@@ -1068,13 +1073,15 @@ class Command(BaseCommand):
                     path,
                     handler_id,
                     handler,
-                    make_bound_dispatch(merged_api._dispatch, handler, handler_id),
-                    make_bound_dispatch(merged_api._dispatch_sync, handler, handler_id),
+                    make_bound_dispatch(merged_api._dispatch, handler, handler_id, script_prefix),
+                    make_bound_dispatch(merged_api._dispatch_sync, handler, handler_id, script_prefix),
                 )
             )
 
         try:
-            _core.register_routes(rust_routes, list(merged_api._native_routes), merged_api._rust_no_route())
+            _core.register_routes(
+                rust_routes, list(merged_api._native_routes), merged_api._rust_no_route(script_prefix)
+            )
         except ValueError as e:
             raise CommandError(str(e)) from e
 
@@ -1084,16 +1091,10 @@ class Command(BaseCommand):
 
         # Register MCP mounts with Rust (rmcp protocol core)
         if merged_api._mcp_mounts:
-            _core.register_mcp_mounts(merged_api._mcp_mounts)
+            _core.register_mcp_mounts(mcp_mounts(merged_api._mcp_mounts, script_prefix))
 
         # Register WebSocket routes with Rust (including pre-compiled injectors)
-        ws_routes = []
-        for path, handler_id, handler in merged_api._websocket_routes:
-            # Get pre-compiled injector from handler metadata (handler_id is already in the tuple)
-            meta = merged_api._handler_meta.get(handler_id, {})
-            injector = meta.get("injector")
-            ws_routes.append((path, handler_id, handler, injector))
-
+        ws_routes = merged_api._rust_websocket_routes(script_prefix)
         if ws_routes:
             _core.register_websocket_routes(ws_routes)
 
@@ -1174,7 +1175,7 @@ class Command(BaseCommand):
                     options["host"],
                     options["port"],
                     compression_config,
-                    merged_api._rust_error_renderer(),
+                    merged_api._rust_error_renderer(script_prefix),
                 )
 
             with contextlib.suppress(KeyboardInterrupt):
@@ -1185,7 +1186,7 @@ class Command(BaseCommand):
                 options["host"],
                 options["port"],
                 compression_config,
-                merged_api._rust_error_renderer(),
+                merged_api._rust_error_renderer(script_prefix),
             )
 
     # ------------------------------------------------------------------
