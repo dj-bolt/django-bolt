@@ -153,7 +153,7 @@ msgspec converts `5.0` to an `int` and refuses `+5`.
 - A `date` alone gives a `datetime` at midnight.
 - Bolt keeps the first six digits of a fraction, as Python does.
 - An HTML `<input type="datetime-local">` sends `2024-01-15T10:30`. A `datetime` argument accepts it.
-- An `int` has at most the digits of `sys.get_int_max_str_digits()`: 4300 by default, and never more than 4300. Bolt reads the limit when the server starts. A later `sys.set_int_max_str_digits()` call has no effect.
+- An `int` has at most the digits of `sys.get_int_max_str_digits()`: 4300 by default, and never more than 4300. With the limit 0 (no limit in Python), Bolt uses 4300. Bolt reads the limit when the server starts. A later `sys.set_int_max_str_digits()` call has no effect.
 - A process has one digit limit, as Python has one for each interpreter. The last server or test client that starts sets it.
 
 Bolt refuses some text that Python reads:
