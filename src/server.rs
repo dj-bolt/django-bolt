@@ -191,38 +191,19 @@ fn read_rate_limit_ipv6_prefix(settings: &DjangoSettings<'_>) -> PyResult<u8> {
 /// project under a sub-path often writes it in front itself. The proxy removes
 /// the script name from the path, so Bolt serves the files without it, as
 /// WhiteNoise does.
+///
+/// Django puts the whole script prefix in front, so `FORCE_SCRIPT_NAME`
+/// `"/myapp//"` gives `"/myapp//static/"`. Bolt keeps one slash of the rest,
+/// as for `"/myapp/"`. Python refuses a URL that is the script name at startup,
+/// before this runs (see `_script_prefix.refuse_files_at_script_name`).
 pub(crate) fn without_script_name<'a>(url: &'a str, script_name: Option<&str>) -> &'a str {
     let script_name = script_name.map_or("", |name| name.trim_end_matches('/'));
     match url.strip_prefix(script_name) {
-        Some(rest) if !script_name.is_empty() && rest.starts_with('/') => rest,
+        Some(rest) if !script_name.is_empty() && rest.starts_with('/') => {
+            &rest[rest.len() - rest.trim_start_matches('/').len() - 1..]
+        }
         _ => url,
     }
-}
-
-/// Whether `url` is the script name with a slash. Bolt would serve its files at
-/// `/` then, after the proxy removes the script name. Django gives the default
-/// `MEDIA_URL` of `""` this value under `FORCE_SCRIPT_NAME`.
-fn is_script_name_url(url: &str, script_name: Option<&str>) -> bool {
-    let served = without_script_name(url, script_name);
-    served == "/" && served.len() < url.len()
-}
-
-/// The error for files that Bolt would serve at `/`, where they hide each route.
-fn files_at_script_name(
-    py: Python<'_>,
-    setting: &str,
-    url: &str,
-    script_name: Option<&str>,
-) -> PyErr {
-    improperly_configured(
-        py,
-        format!(
-            "{setting} {url:?} is FORCE_SCRIPT_NAME {:?} with a slash. The proxy removes the \
-             script name, so Bolt would serve the files at \"/\", and that hides each route. \
-             Give the files a path of their own, for example {setting} = \"files/\".",
-            script_name.unwrap_or_default()
-        ),
-    )
 }
 
 /// The scope prefix for a static URL such as `"/static/"`, or None when the
@@ -393,11 +374,10 @@ fn read_cors_and_file_scopes(
             return Ok(None); // No static URL configured
         };
 
-        let at_script_name = is_script_name_url(&static_url, script_name);
-        let url_prefix = static_scope_prefix(without_script_name(&static_url, script_name));
-        if url_prefix.is_none() && !at_script_name {
+        let Some(url_prefix) = static_scope_prefix(without_script_name(&static_url, script_name))
+        else {
             return Ok(None);
-        }
+        };
 
         // Each directory with its URL prefix: only a `(prefix, path)` entry
         // of STATICFILES_DIRS has one.
@@ -430,19 +410,6 @@ fn read_cors_and_file_scopes(
             }
         }
 
-        let Some(url_prefix) = url_prefix else {
-            // STATIC_URL is the script name. Refuse it where Bolt serves static files.
-            if debug || !directories.is_empty() {
-                return Err(files_at_script_name(
-                    py,
-                    "STATIC_URL",
-                    &static_url,
-                    script_name,
-                ));
-            }
-            return Ok(None);
-        };
-
         // Note: empty `directories` is NOT bailed on here. In DEBUG the
         // scope still registers so its staticfiles-finders fallback can
         // serve admin/app static (mirrors Django runserver). The
@@ -458,23 +425,6 @@ fn read_cors_and_file_scopes(
         let Some(media_url) = settings.optional_str("MEDIA_URL")? else {
             return Ok(None); // No media URL configured
         };
-        if is_script_name_url(&media_url, script_name) {
-            // Refuse it where Bolt serves media files: with a MEDIA_ROOT.
-            return match settings.get("MEDIA_ROOT")? {
-                Some(root)
-                    if !root.is_none()
-                        && settings_path_to_string(&root).is_some_and(|root| !root.is_empty()) =>
-                {
-                    Err(files_at_script_name(
-                        py,
-                        "MEDIA_URL",
-                        &media_url,
-                        script_name,
-                    ))
-                }
-                _ => Ok(None),
-            };
-        }
         let media_url = without_script_name(&media_url, script_name);
 
         // MEDIA_URL must be a path-style prefix (e.g. "/media/") — CDN-style
@@ -1390,6 +1340,12 @@ mod tests {
             "/static/"
         );
         assert_eq!(without_script_name("/a/b/media/", Some("/a/b")), "/media/");
+        assert_eq!(
+            without_script_name("/myapp//static/", Some("/myapp//")),
+            "/static/"
+        );
+        assert_eq!(without_script_name("/myapp//", Some("/myapp//")), "/");
+        assert_eq!(without_script_name("/myapp/", myapp), "/");
         assert_eq!(
             without_script_name("/myappx/static/", myapp),
             "/myappx/static/"

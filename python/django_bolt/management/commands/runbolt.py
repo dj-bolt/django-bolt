@@ -23,7 +23,7 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
-from django_bolt._script_prefix import asgi_mounts, mcp_mounts
+from django_bolt._script_prefix import asgi_mounts, mcp_mounts, refuse_files_at_script_name
 from django_bolt._script_prefix import configure as configure_script_prefix
 from django_bolt._urlconf import served_apis
 from django_bolt.api import (
@@ -830,6 +830,8 @@ class Command(BaseCommand):
         split_option = _option_that_splits_mcp_tasks(options)
         if split_option is not None:
             _reject_mcp_task_tools(merged_api._mcp_mounts, split_option)
+        # Refuse the settings here, or each worker refuses them after the banner.
+        refuse_files_at_script_name(configure_script_prefix())
         self._print_multiprocess_banner(options, apis, merged_api)
 
         def spawn_worker(slot: int) -> int:
@@ -1060,6 +1062,7 @@ class Command(BaseCommand):
 
         # FORCE_SCRIPT_NAME: the entries from Rust into Python set the script prefix.
         script_prefix = configure_script_prefix()
+        refuse_files_at_script_name(script_prefix)
 
         # Register routes with Rust. Each route carries per-route bound
         # dispatch callables (partial binding handler + handler_id) so the

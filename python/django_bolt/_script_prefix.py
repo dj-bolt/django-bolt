@@ -50,8 +50,10 @@ def configure() -> str | None:
         or None when the setting adds no prefix.
 
     Raises:
-        ImproperlyConfigured: The setting is not a str, or it has a character
-            that Django percent-encodes in a URL.
+        ImproperlyConfigured: The setting has a character that Django
+            percent-encodes in a URL. For a value that is not a str, Django's
+            ``django.setup()`` raises first, in runbolt; a test client raises
+            this error under ``override_settings``.
     """
     script_name = settings.FORCE_SCRIPT_NAME
     if script_name is None:
@@ -70,6 +72,50 @@ def configure() -> str | None:
         return None
     _carry_in_hops()
     return script_prefix
+
+
+def refuse_files_at_script_name(script_prefix: str | None) -> None:
+    """Refuse a ``STATIC_URL`` or ``MEDIA_URL`` that is the script name, where Bolt serves those files.
+
+    The proxy removes the script name, so Bolt would serve the files at "/",
+    and that hides each route. Django also gives a relative value the script
+    prefix, for example the default ``MEDIA_URL`` "". Bolt serves no files for
+    such a value, as without the setting. Thus only the value in the settings
+    module counts. Call this before a lifespan or the startup banner.
+
+    Raises:
+        ImproperlyConfigured: ``STATIC_URL`` or ``MEDIA_URL`` is the script
+            name with a slash, and Bolt serves those files.
+    """
+    if script_prefix is None:
+        return
+    script_name = script_prefix.rstrip("/")
+    if not script_name:
+        return
+    serves = {
+        "STATIC_URL": lambda: bool(settings.DEBUG) or _is_path(settings.STATIC_ROOT) or bool(settings.STATICFILES_DIRS),
+        "MEDIA_URL": lambda: _is_path(settings.MEDIA_ROOT),
+    }
+    for name, serves_files in serves.items():
+        # settings.STATIC_URL has the script prefix in front of a relative
+        # value. The wrapped settings give the value as the user wrote it.
+        written = getattr(settings._wrapped, name)
+        if (
+            isinstance(written, str)
+            and written != script_name
+            and written.rstrip("/") == script_name
+            and serves_files()
+        ):
+            raise ImproperlyConfigured(
+                f'{name} "{written}" is FORCE_SCRIPT_NAME "{settings.FORCE_SCRIPT_NAME}" with a slash. '
+                'The proxy removes the script name, so Bolt would serve the files at "/", and that hides each route. '
+                f'Give the files a path of their own, for example {name} = "files/".'
+            )
+
+
+def _is_path(value: Any) -> bool:
+    """Whether a ``STATIC_ROOT`` or ``MEDIA_ROOT`` names a directory, as Rust reads it."""
+    return value is not None and str(value) != ""
 
 
 def _carry_in_hops() -> None:
@@ -98,7 +144,7 @@ class _PrefixedContext:
         return self._context.run(_call, self._script_prefix, fn, *args, **kwargs)
 
 
-def _call(script_prefix: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+def _call(script_prefix: str, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
     # The thread that runs the work sets the prefix. With asgiref 3.13, a value
     # that another thread set is not visible here.
     set_script_prefix(script_prefix)
@@ -260,8 +306,17 @@ def _sync_body(content: Any, script_prefix: str) -> Any:
                 item = context.run(iterator.__next__)
             except StopIteration:
                 return
+            if type(item) is not bytes and type(item) is not str and not _is_rust_chunk(item):
+                # Rust would call str() after the step, with no prefix. A lazy
+                # object, such as reverse_lazy(), gives its text only then.
+                item = context.run(str, item)
             yield item
     finally:
         close = getattr(iterator, "close", None)
         if close is not None:
             context.run(close)
+
+
+def _is_rust_chunk(item: Any) -> bool:
+    """Whether Rust takes ``item`` as a chunk with no call to ``str()``. See ``convert_python_chunk``."""
+    return isinstance(item, (bytes, bytearray, str, memoryview)) or hasattr(item, "__bytes__")

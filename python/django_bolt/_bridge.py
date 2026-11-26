@@ -59,7 +59,7 @@ def make_bound_dispatch(dispatch, handler, handler_id, script_prefix=None):
     return bound_sync_dispatch
 
 
-async def _deferred_dispatch(script_prefix, deferred, request):
+async def _deferred_dispatch(script_prefix, deferred, request, /):
     set_script_prefix(script_prefix)
     return await deferred(request)
 

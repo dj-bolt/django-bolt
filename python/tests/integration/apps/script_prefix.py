@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -22,11 +23,13 @@ from django_bolt.concurrency import run_in_orm_executor, sync_to_thread
 from django_bolt.responses import JSON
 
 _LIFESPAN: dict[str, str] = {}
+LIFESPAN_MARKER = "script_prefix lifespan: startup"
 
 
 @asynccontextmanager
 async def lifespan(app):
     _LIFESPAN["startup"] = get_script_prefix()
+    print(LIFESPAN_MARKER, file=sys.stderr, flush=True)
     yield
 
 

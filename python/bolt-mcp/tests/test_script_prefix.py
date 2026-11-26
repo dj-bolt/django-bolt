@@ -92,3 +92,48 @@ def test_mcp_calls_run_with_the_script_prefix_of_the_setting():
         "/",
         "/",
     ]
+
+
+# The names of the parameters of the functions that give a call the script prefix.
+_KEYWORDS = ("fn", "script_prefix", "self", "context", "func", "args", "kwargs")
+
+
+def _keyword_api() -> BoltAPI:
+    api = BoltAPI()
+    mcp = MCP(name="keywords")
+    for name in _KEYWORDS:
+        namespace: dict = {}
+        exec(
+            f"def tool_{name}({name}: str) -> dict:\n    'Give the argument.'\n    return {{'got': {name}}}\n",
+            namespace,
+        )
+        mcp.tool(namespace[f"tool_{name}"])
+
+    @api.get("/search")
+    def search(fn: str, script_prefix: str) -> dict:
+        """Give the query parameters."""
+        return {"got": fn + script_prefix}
+
+    api.mount_mcp(mcp, expose=[search])
+    return api
+
+
+def _keyword_results() -> dict:
+    with TestClient(_keyword_api()) as client:
+        calls = {f"tool_{name}": {name: "v"} for name in _KEYWORDS}
+        calls["search"] = {"fn": "a", "script_prefix": "b"}
+        replies = {
+            tool: parse_rpc(post_rpc_modern(client, "tools/call", {"name": tool, "arguments": arguments}))["result"]
+            for tool, arguments in calls.items()
+        }
+    return {tool: (result.get("isError", False), result.get("structuredContent")) for tool, result in replies.items()}
+
+
+def test_a_sync_tool_gets_each_keyword_argument_with_the_setting():
+    with override_settings(FORCE_SCRIPT_NAME="/myapp"):
+        with_setting = _keyword_results()
+    without_setting = _keyword_results()
+
+    expected = {f"tool_{name}": (False, {"got": "v"}) for name in _KEYWORDS}
+    expected["search"] = (False, {"got": "ab"})
+    assert with_setting == without_setting == expected

@@ -24,7 +24,7 @@ import httpx
 from httpx import Response
 
 from django_bolt import BoltAPI, _core
-from django_bolt._script_prefix import asgi_mounts, lifespan_entry, mcp_mounts
+from django_bolt._script_prefix import asgi_mounts, lifespan_entry, mcp_mounts, refuse_files_at_script_name
 from django_bolt._script_prefix import configure as configure_script_prefix
 from django_bolt._urlconf import served_api
 from django_bolt.api import (
@@ -448,6 +448,8 @@ class TestClient(httpx.Client):
 
         # FORCE_SCRIPT_NAME: the entries from Rust into Python set the script prefix, as in runbolt.
         script_prefix = configure_script_prefix()
+        if read_django_settings:
+            refuse_files_at_script_name(script_prefix)
         # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
             api._dispatch,
@@ -788,6 +790,8 @@ class AsyncTestClient(httpx.AsyncClient):
 
         # FORCE_SCRIPT_NAME: the entries from Rust into Python set the script prefix, as in runbolt.
         script_prefix = configure_script_prefix()
+        if read_django_settings:
+            refuse_files_at_script_name(script_prefix)
         # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
             api._dispatch,

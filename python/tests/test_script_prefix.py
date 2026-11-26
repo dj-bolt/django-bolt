@@ -32,7 +32,7 @@ from django.core.cache.backends.locmem import LocMemCache
 from django.core.exceptions import ImproperlyConfigured
 from django.core.handlers.wsgi import WSGIHandler
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
-from django.urls import get_script_prefix, path, reverse, set_script_prefix
+from django.urls import get_script_prefix, path, reverse, reverse_lazy, set_script_prefix
 from django.utils import translation
 from django.utils.deprecation import MiddlewareMixin
 
@@ -439,6 +439,22 @@ def test_media_files_serve_at_the_path_that_the_proxy_gives(settings, tmp_path):
         "application/octet-stream",
         "attachment",
     )
+
+
+@pytest.mark.parametrize("script_name", ["/myapp", "/myapp/", "/myapp//"])
+def test_files_under_the_script_prefix_serve_at_the_path_that_the_proxy_gives(settings, tmp_path, script_name):
+    # runbolt gets these values from Django for STATIC_URL "static/" and MEDIA_URL "media/".
+    (tmp_path / "site.css").write_text("body {}")
+    prefix = script_name if script_name.endswith("/") else script_name + "/"
+    settings.FORCE_SCRIPT_NAME = script_name
+    settings.STATIC_URL = prefix + "static/"
+    settings.MEDIA_URL = prefix + "media/"
+    settings.STATIC_ROOT = settings.MEDIA_ROOT = str(tmp_path)
+
+    with TestClient(BoltAPI()) as client:
+        statuses = [client.get(path).status_code for path in ("/static/site.css", "/media/site.css")]
+
+    assert statuses == [200, 200]
 
 
 def test_a_mounted_api_reverses_with_the_script_name_and_serves_without_it(mount_urlconf, settings):
@@ -963,6 +979,79 @@ def test_the_body_with_the_script_prefix_steps_as_rust_does(settings, body, expe
     settings.FORCE_SCRIPT_NAME = "/myapp"
     with TestClient(api) as client:
         assert client.get("/stream").content == expected
+
+
+class _WithBytes:
+    """A chunk with ``__bytes__``: Rust sends its bytes, not its text."""
+
+    def __bytes__(self) -> bytes:
+        return b"c"
+
+    def __str__(self) -> str:
+        return "not this"
+
+
+def _chunks() -> list:
+    return [
+        reverse_lazy("page", kwargs={"n": 1}),
+        "|" + reverse("page", kwargs={"n": 2}),
+        "|",
+        bytearray(b"a"),
+        memoryview(b"b"),
+        _WithBytes(),
+        3,
+    ]
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_a_lazy_chunk_of_a_body_has_the_script_prefix(mount_urlconf, settings, is_async):
+    # Rust turns a chunk that is not bytes or str into text after the step of the body.
+    mount_urlconf([path("page/<int:n>", _list_view, name="page")])
+    api = BoltAPI()
+
+    def sync_body():
+        yield from _chunks()
+
+    async def async_body():
+        for chunk in _chunks():
+            yield chunk
+
+    @api.get("/stream")
+    def stream():
+        return StreamingResponse(async_body() if is_async else sync_body())
+
+    bodies = []
+    for script_name in ("/myapp", None):
+        settings.FORCE_SCRIPT_NAME = script_name
+        with TestClient(api) as client:
+            bodies.append(client.get("/stream").content)
+
+    assert bodies == [b"/myapp/page/1|/myapp/page/2|abc3", b"/page/1|/page/2|abc3"]
+
+
+# The names of the parameters of the functions that give a hop the script prefix.
+# sync_to_thread() has a parameter fn of its own, also without the setting.
+_KEYWORDS = ("script_prefix", "self", "context", "func", "args", "kwargs")
+
+
+def _keywords(**kwargs) -> dict:
+    return kwargs
+
+
+def test_a_hop_gives_each_keyword_argument_to_the_function(settings):
+    api = BoltAPI()
+
+    @api.get("/hop")
+    async def hop() -> dict:
+        return await sync_to_thread(_keywords, **{name: name for name in _KEYWORDS})
+
+    results = []
+    for script_name in ("/myapp", None):
+        settings.FORCE_SCRIPT_NAME = script_name
+        with TestClient(api, raise_server_exceptions=False) as client:
+            results.append(client.get("/hop").json())
+
+    assert results == [{name: name for name in _KEYWORDS}] * 2
 
 
 def _ws_dependency() -> str:
