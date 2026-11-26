@@ -25,7 +25,7 @@ from django.db import connections
 from django_bolt import concurrency
 from django_bolt.auth import APIKeyAuthentication, JWTAuthentication, user_loader
 from django_bolt.auth.pk_loader import load_user_by_pk_sync
-from django_bolt.auth.user_loader import default_django_user_loader, resolve_user_loader
+from django_bolt.auth.user_loader import _load_default_user, resolve_user_loader
 from tests.thread_pools import shutdown_closing_connections
 
 # Loads are asserted from other threads, which cannot see rows held open in an
@@ -147,7 +147,7 @@ def test_default_user_loader_runs_on_the_reading_thread(fresh_orm_executor, monk
 
     monkeypatch.setattr(user_loader, "load_user_by_pk_sync", recording_pk_load)
 
-    loaded = _force_on_event_loop(default_django_user_loader, str(user.pk), None)
+    loaded = _force_on_event_loop(_load_default_user, str(user.pk), None)
     assert loaded is not None
     assert loaded.pk == user.pk
 
@@ -200,7 +200,7 @@ def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
 
     def resolve_inside_pool():
         assert concurrency.in_orm_executor_thread()
-        return threading.current_thread().name, default_django_user_loader(str(user.pk), None)
+        return threading.current_thread().name, _load_default_user(str(user.pk), None)
 
     pool_thread, loaded = concurrency._get_orm_executor().submit(resolve_inside_pool).result(timeout=5)
 
@@ -520,26 +520,30 @@ def test_lazy_user_passes_the_auth_context_to_the_backend():
 
 def test_registered_backend_is_found_by_name(backend_registry):
     backend = SyncGetUserAuth()
-    user_loader.register_auth_backend("custom", backend)
+    with pytest.warns(DeprecationWarning):
+        user_loader.register_auth_backend("custom", backend)
 
-    assert user_loader.get_registered_backend("custom") is backend
-    assert user_loader.get_registered_backend("other") is None
+    with pytest.warns(DeprecationWarning):
+        assert user_loader.get_registered_backend("custom") is backend
+        assert user_loader.get_registered_backend("other") is None
 
 
 def test_load_user_sync_calls_the_registered_backend(backend_registry, fresh_orm_executor):
     fresh_orm_executor()
-    user_loader.register_auth_backend("custom", SyncGetUserAuth())
+    user_loader._register_auth_backend("custom", SyncGetUserAuth())
 
-    assert user_loader.load_user_sync("7", "custom", {"role": "a"}) == ("sync", "7", {"role": "a"})
-    # A request with no user ID has no user, also when the backend can load one.
-    assert user_loader.load_user_sync(None, "custom", {"role": "a"}) is None
-    assert user_loader.load_user_sync("", "custom", {"role": "a"}) is None
+    with pytest.warns(DeprecationWarning):
+        assert user_loader.load_user_sync("7", "custom", {"role": "a"}) == ("sync", "7", {"role": "a"})
+        # A request with no user ID has no user, also when the backend can load one.
+        assert user_loader.load_user_sync(None, "custom", {"role": "a"}) is None
+        assert user_loader.load_user_sync("", "custom", {"role": "a"}) is None
 
 
 def test_load_user_sync_gives_none_for_a_backend_without_user_resolution(backend_registry):
-    user_loader.register_auth_backend("api_key", APIKeyAuthentication(api_keys={"k"}))
+    user_loader._register_auth_backend("api_key", APIKeyAuthentication(api_keys={"k"}))
 
-    assert user_loader.load_user_sync("7", "api_key", {}) is None
+    with pytest.warns(DeprecationWarning):
+        assert user_loader.load_user_sync("7", "api_key", {}) is None
 
 
 def test_load_user_sync_loads_the_django_user_for_an_unregistered_backend(backend_registry, fresh_orm_executor):
@@ -547,39 +551,45 @@ def test_load_user_sync_loads_the_django_user_for_an_unregistered_backend(backen
     fresh_orm_executor()
     user = _make_user("session-user")
 
-    loaded = user_loader.load_user_sync(str(user.pk), "session", {})
+    with pytest.warns(DeprecationWarning):
+        loaded = user_loader.load_user_sync(str(user.pk), "session", {})
 
     assert loaded is not None
     assert loaded.pk == user.pk
-    assert user_loader.load_user_sync("999999", "session", {}) is None
+    with pytest.warns(DeprecationWarning):
+        assert user_loader.load_user_sync("999999", "session", {}) is None
 
 
 def test_load_user_awaits_the_registered_backend(backend_registry, fresh_orm_executor):
     fresh_orm_executor()
-    user_loader.register_auth_backend("async", CoroutineGetUserAuth())
-    user_loader.register_auth_backend("sync", SyncGetUserAuth())
+    user_loader._register_auth_backend("async", CoroutineGetUserAuth())
+    user_loader._register_auth_backend("sync", SyncGetUserAuth())
 
-    assert asyncio.run(user_loader.load_user("7", "async", {"role": "a"})) == ("async", "7", {"role": "a"})
-    assert asyncio.run(user_loader.load_user("7", "sync", {"role": "a"})) == ("sync", "7", {"role": "a"})
-    # A request with no user ID has no user, also when the backend can load one.
-    assert asyncio.run(user_loader.load_user(None, "async", {"role": "a"})) is None
-    assert asyncio.run(user_loader.load_user("", "async", {"role": "a"})) is None
+    with pytest.warns(DeprecationWarning):
+        assert asyncio.run(user_loader.load_user("7", "async", {"role": "a"})) == ("async", "7", {"role": "a"})
+        assert asyncio.run(user_loader.load_user("7", "sync", {"role": "a"})) == ("sync", "7", {"role": "a"})
+        # A request with no user ID has no user, also when the backend can load one.
+        assert asyncio.run(user_loader.load_user(None, "async", {"role": "a"})) is None
+        assert asyncio.run(user_loader.load_user("", "async", {"role": "a"})) is None
 
 
 def test_load_user_gives_none_without_a_backend_that_resolves_users(backend_registry):
-    user_loader.register_auth_backend("api_key", APIKeyAuthentication(api_keys={"k"}))
+    user_loader._register_auth_backend("api_key", APIKeyAuthentication(api_keys={"k"}))
 
-    assert asyncio.run(user_loader.load_user("7", "api_key", {})) is None
-    assert asyncio.run(user_loader.load_user("7", "unregistered", {})) is None
-    assert asyncio.run(user_loader.load_user("7", None, {})) is None
+    with pytest.warns(DeprecationWarning):
+        assert asyncio.run(user_loader.load_user("7", "api_key", {})) is None
+        assert asyncio.run(user_loader.load_user("7", "unregistered", {})) is None
+        assert asyncio.run(user_loader.load_user("7", None, {})) is None
 
 
 def test_default_async_loader_loads_the_django_user(fresh_orm_executor):
     fresh_orm_executor()
     user = _make_user("async-default")
 
-    loaded = asyncio.run(user_loader.default_django_user_aloader(str(user.pk), None))
+    with pytest.warns(DeprecationWarning):
+        loaded = asyncio.run(user_loader.default_django_user_aloader(str(user.pk), None))
 
     assert loaded is not None
     assert loaded.pk == user.pk
-    assert asyncio.run(user_loader.default_django_user_aloader("999999", None)) is None
+    with pytest.warns(DeprecationWarning):
+        assert asyncio.run(user_loader.default_django_user_aloader("999999", None)) is None

@@ -574,8 +574,8 @@ Returns an async `handler(jti)` that calls `store.is_revoked(jti)`. `JWTAuthenti
 
 ## User loading
 
-Bolt calls `register_auth_backend(backend_name, backend_instance)` at startup. `get_registered_backend(backend_name)` returns a registered backend.
-`await load_user(user_id, backend_name, auth_context=None)` loads a user with the loader of a registered backend. You do not need these functions in a handler. Use `CurrentUser` or `await request.auser()`.
+`register_auth_backend(backend_name, backend_instance)`, `get_registered_backend(backend_name)` and `await load_user(user_id, backend_name, auth_context=None)` are deprecated. Bolt removes them in the next minor release. Each call gives a `DeprecationWarning`.
+To get the user in a handler, use `CurrentUser`, `request.user` or `await request.auser()`.
 
 ## See also
 

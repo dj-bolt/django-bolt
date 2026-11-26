@@ -325,7 +325,8 @@ class TestGetUserOverrideResolution:
         """The fallback loader (unregistered schemes, e.g. session auth) must
         return None for a deleted user, like the framework backend defaults —
         not raise User.DoesNotExist into the handler."""
-        assert default_django_user_loader("999999", None) is None
+        with pytest.warns(DeprecationWarning):
+            assert default_django_user_loader("999999", None) is None
 
     @pytest.mark.django_db(transaction=True)
     def test_sync_handler_on_async_dispatch_path_loads_user(self):
