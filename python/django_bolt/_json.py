@@ -123,12 +123,11 @@ _ENCODER = msgspec.json.Encoder(enc_hook=default_serializer)
 _DECODER = msgspec.json.Decoder()
 
 
-def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
+def encode(value: Any) -> bytes:
     """Encode a Python object to JSON bytes.
 
     Args:
         value: Object to encode
-        serializer: Optional custom encoder hook (overrides default)
 
     Returns:
         JSON bytes
@@ -137,11 +136,6 @@ def encode(value: Any, serializer: Callable[[Any], Any] | None = None) -> bytes:
         TypeError: If value contains unsupported types
         msgspec.EncodeError: If encoding fails
     """
-    if serializer is not None:
-        # Custom serializer provided - use one-off encoder
-        return msgspec.json.encode(value, enc_hook=serializer)
-
-    # Use module-level singleton encoder with default serializer
     return _ENCODER.encode(value)
 
 
