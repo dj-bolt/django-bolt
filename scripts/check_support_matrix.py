@@ -307,7 +307,7 @@ def check(pyproject: Path, max_attempts: int = MAX_ATTEMPTS) -> tuple[list[Drift
     oldest_declared = djangos[0]
     if floor is None:
         notes.append("could not find a `Django>=X.Y` entry in [project].dependencies; floor not checked")
-    elif _version_key(floor)[:2] != _version_key(oldest_declared):
+    elif (*_version_key(floor), 0)[:2] != _version_key(oldest_declared):  # Django>=6 means 6.0
         drift.append(
             Drift(
                 f"Django>={floor}",
