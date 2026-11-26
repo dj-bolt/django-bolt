@@ -203,11 +203,37 @@ A loop connection is not a connection of Django. Each worker thread has its own 
 - A loop connection opens with the connection parameters of `DATABASES`.
 - A loop connection copies the session settings and the type adapters of a Django connection to the same database. The changes of a `connection_created` receiver are thus on it.
 - `DJANGO_BOLT_LOOP_CONNECTIONS` sets the connections of one worker thread to one database. The default is `4`. A read waits when each connection is in use.
-- The connections stay open. `CONN_MAX_AGE` does not close them, and Django's connection pool (`OPTIONS["pool"]`) does not hold them.
+- A connection that no read used for 300 seconds closes. `DJANGO_BOLT_LOOP_IDLE_SECONDS` sets this time.
+- `CONN_MAX_AGE` does not apply to a loop connection, and Django's connection pool (`OPTIONS["pool"]`) does not hold it.
 - After a database restart, Bolt sends a read that failed on a dead connection one more time, on a new connection.
 - A tool that records queries from the cursor of Django does not see these reads.
 
 Add the loop connections to the connection count of your database. See [Tune the thread pools](#tune-the-thread-pools).
+
+### Set the number of loop connections
+
+One connection runs one query at a time. Thus a worker thread needs this number of connections:
+
+```text
+connections = reads in one second x seconds that one read holds a connection
+```
+
+A read holds its connection for the round trip to the database, and for the time until the event loop reads the answer.
+For a database on the same host, the default of `4` is sufficient. For a database on another host, increase the value and measure.
+
+Measured with one process, one route and a database 2 ms away:
+
+| `DJANGO_BOLT_LOOP_CONNECTIONS` | Requests in one second |
+| --- | --- |
+| `4` | 1,075 |
+| `16` | 2,156 |
+| `64` | 2,250 |
+
+With `4`, the ORM thread pool with 4 threads was faster in this test (1,323). With `16`, it was slower (1,377).
+
+```bash
+DJANGO_BOLT_LOOP_CONNECTIONS=16 python manage.py runbolt --processes 4
+```
 
 ## Avoid N+1 queries
 

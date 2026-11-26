@@ -25,6 +25,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import math
+import os
 import sys
 import threading
 from typing import Any, NamedTuple
@@ -54,6 +56,8 @@ logger = logging.getLogger(__name__)
 SETTING = "BOLT_ASYNC_ORM_ON_LOOP"
 CONNECTIONS_VARIABLE = "DJANGO_BOLT_LOOP_CONNECTIONS"
 DEFAULT_CONNECTIONS = 4
+IDLE_VARIABLE = "DJANGO_BOLT_LOOP_IDLE_SECONDS"
+DEFAULT_IDLE_SECONDS = 300.0
 
 # The module of the backend that Bolt supports. A subclass can change how a
 # connection opens or how a cursor runs a query, and a loop connection would
@@ -81,6 +85,9 @@ _MISSING: Any = object()
 
 # The connections of each loop for each database. ``configure`` sets the limit.
 _connection_limit = DEFAULT_CONNECTIONS
+
+# A connection that no query used for this time closes. ``configure`` sets it.
+_idle_seconds = DEFAULT_IDLE_SECONDS
 
 # alias -> what a loop connection copies from a Django connection.
 _templates: dict[str, _Template] = {}
@@ -132,14 +139,33 @@ class _Pool:
 
     The pool holds cursors. One cursor serves each query of its connection,
     which is cheaper than a new cursor for each query.
+
+    A query takes the cursor that came back last. Thus a pool with more
+    connections than its load needs leaves the others idle, and they close
+    after the idle time.
     """
 
-    __slots__ = ("alias", "closed", "database", "idle", "opened", "preparing", "template", "waiters")
+    __slots__ = (
+        "alias",
+        "closed",
+        "database",
+        "idle",
+        "idle_since",
+        "opened",
+        "preparing",
+        "reaper",
+        "template",
+        "waiters",
+    )
 
     def __init__(self, alias: str, database: Any) -> None:
         self.alias = alias
         self.database = database
         self.idle: collections.deque[Any] = collections.deque()
+        # The loop time at which each idle cursor came back, in the order of ``idle``.
+        self.idle_since: collections.deque[float] = collections.deque()
+        # The timer that closes idle connections, or None when no connection is idle.
+        self.reaper: asyncio.TimerHandle | None = None
         self.waiters: collections.deque[asyncio.Future[None]] = collections.deque()
         self.opened = 0
         self.closed = False
@@ -165,6 +191,7 @@ class _Pool:
         """Return a cursor that no other query uses. Wait when each connection is in use."""
         while True:
             if self.idle:
+                self.idle_since.pop()
                 return self.idle.pop()
             if self.opened < _connection_limit:
                 self.opened += 1
@@ -205,8 +232,22 @@ class _Pool:
         if self.closed:
             self.discard(cursor)
             return
+        loop = asyncio.get_running_loop()
         self.idle.append(cursor)
+        self.idle_since.append(loop.time())
+        if self.reaper is None:
+            self.reaper = loop.call_later(_idle_seconds, self._close_idle, loop)
         self._wake()
+
+    def _close_idle(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Close each connection that was idle for the idle time. The oldest is first in ``idle``."""
+        idle = self.idle
+        idle_since = self.idle_since
+        expired = loop.time() - _idle_seconds
+        while idle and idle_since[0] <= expired:
+            idle_since.popleft()
+            self.discard(idle.popleft())
+        self.reaper = loop.call_later(idle_since[0] - expired, self._close_idle, loop) if idle else None
 
     def _give_back(self, cursor: Any) -> None:
         """Take ``cursor`` back after a query that did not complete.
@@ -227,12 +268,17 @@ class _Pool:
 
     def discard_idle(self) -> None:
         idle = self.idle
+        self.idle_since.clear()
         while idle:
             self.discard(idle.pop())
 
     def close(self) -> None:
         self.closed = True
         self.discard_idle()
+        reaper = self.reaper
+        if reaper is not None:
+            reaper.cancel()
+            self.reaper = None
 
     def _closed_one(self) -> None:
         self.opened -= 1
@@ -412,21 +458,43 @@ async def _aget(self: QuerySet, *args: Any, **kwargs: Any) -> Any:
     )
 
 
+def _idle_time() -> float:
+    """
+    Read the idle time from ``DJANGO_BOLT_LOOP_IDLE_SECONDS``.
+
+    Raises:
+        ImproperlyConfigured: The value is not a number more than 0.
+    """
+    raw = os.environ.get(IDLE_VARIABLE, "")
+    if not raw.strip():
+        return DEFAULT_IDLE_SECONDS
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = 0.0
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ImproperlyConfigured(f"{IDLE_VARIABLE} must be a number more than 0, got {raw!r}.")
+    return seconds
+
+
 def configure() -> None:
-    """Read the setting and the connection limit. The server calls this function at startup.
+    """Read the setting, the connection limit and the idle time. The server calls this function at startup.
 
     With the setting on, ``QuerySet`` gets the two methods of this module.
     With the setting off, it gets Django's methods back.
 
     Raises:
-        ImproperlyConfigured: BOLT_ASYNC_ORM_ON_LOOP is not a bool, or
-            DJANGO_BOLT_LOOP_CONNECTIONS is not an int of 1 or more.
+        ImproperlyConfigured: BOLT_ASYNC_ORM_ON_LOOP is not a bool,
+            DJANGO_BOLT_LOOP_CONNECTIONS is not an int of 1 or more, or
+            DJANGO_BOLT_LOOP_IDLE_SECONDS is not a number more than 0.
     """
-    global _connection_limit
+    global _connection_limit, _idle_seconds
     limit = _thread_count(CONNECTIONS_VARIABLE)
+    idle_seconds = _idle_time()
     if not settings.configured:
         return
     _connection_limit = limit or DEFAULT_CONNECTIONS
+    _idle_seconds = idle_seconds
     # The settings of a database can change between two servers of one process, as in tests.
     _templates.clear()
     enabled = getattr(settings, SETTING, False)

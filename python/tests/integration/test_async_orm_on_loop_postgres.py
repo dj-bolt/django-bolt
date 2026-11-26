@@ -664,6 +664,19 @@ def test_a_dead_connection_fails_no_request(on_loop):
     assert response.json() == ["Ada", "Bob", "Cy"]
 
 
+def test_an_idle_connection_closes_and_the_next_read_opens_one(on_loop, monkeypatch):
+    """A burst must not leave its connections open for the life of the server."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_IDLE_SECONDS", "0.2")
+    with TestClient(_api()) as client:
+        assert client.get("/two-at-once").status_code == 200
+        connections[ALIAS].close()
+
+        on_loop.wait_for_backends(0)
+        after = client.get("/authors")
+
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
 def test_a_closed_client_leaves_no_connection_open(on_loop):
     with TestClient(_api()) as client:
         assert client.get("/authors").status_code == 200
