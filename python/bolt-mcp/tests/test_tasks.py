@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from _helpers import INITIALIZE_PARAMS, mint_jwt, parse_rpc, post_rpc, post_rpc_modern
@@ -408,19 +407,30 @@ def test_progress_sets_the_status_message():
 
 def test_many_tasks_run_at_once_and_each_keeps_its_own_result():
     api, _ = _build()
+    finals: dict[int, dict] = {}
+    errors: list[BaseException] = []
     with TestClient(api) as client:
 
-        def run(n: int) -> tuple[int, dict]:
-            created = _create(client, "add", {"a": n, "b": 1000})
-            return n, _poll(client, created["taskId"])
+        def run(first: int) -> None:
+            try:
+                # Create all tasks of this thread before the first poll, so they overlap.
+                created = {n: _create(client, "add", {"a": n, "b": 1000}) for n in range(first, first + 5)}
+                for n, task in created.items():
+                    finals[n] = _poll(client, task["taskId"])
+            except BaseException as exc:
+                errors.append(exc)
 
-        # Threads spread the calls over the test workers, as connections do.
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            finals = list(pool.map(run, range(40)))
-        assert len({final["taskId"] for _, final in finals}) == 40
-        for n, final in finals:
-            assert final["status"] == "completed"
-            assert final["result"]["structuredContent"] == {"sum": n + 1000}
+        # Each thread sends its requests to its own test worker, as a connection does.
+        threads = [threading.Thread(target=run, args=(first,)) for first in range(0, 40, 5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+    assert not errors, errors
+    assert len({final["taskId"] for final in finals.values()}) == 40
+    for n, final in finals.items():
+        assert final["status"] == "completed"
+        assert final["result"]["structuredContent"] == {"sum": n + 1000}
 
 
 def test_a_full_store_answers_with_a_tool_error():
