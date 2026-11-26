@@ -591,16 +591,33 @@ fn big_int_to_py<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>
     if negative { value.neg() } else { Ok(value) }
 }
 
+/// The largest offset of whole minutes, in minutes: 23:59.
+const MAX_OFFSET_MINUTES: i32 = 24 * 60 - 1;
+
+/// One `timezone` for each offset of whole minutes, made at its first use.
+/// A `timezone` costs a `timedelta` and a constructor call under the GIL.
+static TZINFO_BY_MINUTE: [PyOnceLock<Py<PyTzInfo>>; 2 * MAX_OFFSET_MINUTES as usize + 1] =
+    [const { PyOnceLock::new() }; 2 * MAX_OFFSET_MINUTES as usize + 1];
+
 /// Give the Python `tzinfo` of an offset. UTC is the cached
-/// `datetime.timezone.utc`, as `fromisoformat()` gives.
+/// `datetime.timezone.utc`, as `fromisoformat()` gives. An offset of whole
+/// minutes is cached; an offset with seconds is rare and is not.
 fn tzinfo_to_py(py: Python<'_>, offset: UtcOffset) -> PyResult<Bound<'_, PyTzInfo>> {
+    let new_tzinfo = || {
+        PyTzInfo::fixed_offset(
+            py,
+            PyDelta::new(py, 0, offset.seconds, offset.micros, true)?,
+        )
+    };
     if offset == UtcOffset::UTC {
         return Ok(PyTzInfo::utc(py)?.to_owned());
     }
-    PyTzInfo::fixed_offset(
-        py,
-        PyDelta::new(py, 0, offset.seconds, offset.micros, true)?,
-    )
+    if offset.micros != 0 || offset.seconds % 60 != 0 {
+        return new_tzinfo();
+    }
+    let slot = &TZINFO_BY_MINUTE[(offset.seconds / 60 + MAX_OFFSET_MINUTES) as usize];
+    let tzinfo = slot.get_or_try_init(py, || new_tzinfo().map(Bound::unbind))?;
+    Ok(tzinfo.bind(py).clone())
 }
 
 /// Microseconds of a time that [`parse_clock`] built. No leap second occurs.
@@ -707,21 +724,19 @@ pub fn coerced_value_to_py(py: Python<'_>, value: &CoercedValue) -> PyResult<Py<
 
         // Temporal types: direct C-API construction via pyo3's chrono feature.
         // An aware value keeps the fields and the offset of its text.
-        CoercedValue::DateTime(local, offset) => {
-            PyDateTime::new(
-                py,
-                local.year(),
-                local.month() as u8,
-                local.day() as u8,
-                local.hour() as u8,
-                local.minute() as u8,
-                local.second() as u8,
-                micros(local.time()),
-                Some(&tzinfo_to_py(py, *offset)?),
-            )?
-            .into_any()
-            .unbind()
-        }
+        CoercedValue::DateTime(local, offset) => PyDateTime::new(
+            py,
+            local.year(),
+            local.month() as u8,
+            local.day() as u8,
+            local.hour() as u8,
+            local.minute() as u8,
+            local.second() as u8,
+            micros(local.time()),
+            Some(&tzinfo_to_py(py, *offset)?),
+        )?
+        .into_any()
+        .unbind(),
         CoercedValue::NaiveDateTime(v) => v.into_pyobject(py)?.into_any().unbind(),
         CoercedValue::Date(v) => v.into_pyobject(py)?.into_any().unbind(),
         CoercedValue::Time(v) => v.into_pyobject(py)?.into_any().unbind(),
@@ -1025,7 +1040,8 @@ mod tests {
     }
 
     /// The grammar of the texts that Bolt reads, as regexes.
-    const DATE_GRAMMAR: &str = "[0-9]{4}(-[0-9]{2}-[0-9]{2}|[0-9]{4}|-?W[0-9]{2}|-W[0-9]{2}-[0-9]|W[0-9]{3})";
+    const DATE_GRAMMAR: &str =
+        "[0-9]{4}(-[0-9]{2}-[0-9]{2}|[0-9]{4}|-?W[0-9]{2}|-W[0-9]{2}-[0-9]|W[0-9]{3})";
     const CLOCK_GRAMMAR: &str = concat!(
         "[0-9]{2}(:[0-9]{2}(:[0-9]{2}([.,][0-9]+)?)?|[0-9]{2}([0-9]{2}([.,][0-9]+)?)?)?",
         "(Z|[+-][0-9]{2}(:[0-9]{2}(:[0-9]{2}([.,][0-9]+)?)?|[0-9]{2}([0-9]{2}([.,][0-9]+)?)?)?)?",
@@ -1054,7 +1070,11 @@ mod tests {
             None => (&zone[1..], ""),
         };
         let digits: String = fields.chars().filter(char::is_ascii_digit).collect();
-        let field = |at: usize| digits.get(at..at + 2).map_or(0, |d| d.parse::<i32>().unwrap());
+        let field = |at: usize| {
+            digits
+                .get(at..at + 2)
+                .map_or(0, |d| d.parse::<i32>().unwrap())
+        };
         let seconds = field(0) * 3600 + field(2) * 60 + field(4);
         let micros = micros_of(&format!(".{fraction}")) as i32;
         if seconds == 0 && micros != 0 {
@@ -1404,7 +1424,10 @@ mod tests {
                     "2024-01-15T10:30:00-00:00",
                     "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone.utc)",
                 ),
-                ("2024-01-15T10:30:00", "datetime.datetime(2024, 1, 15, 10, 30)"),
+                (
+                    "2024-01-15T10:30:00",
+                    "datetime.datetime(2024, 1, 15, 10, 30)",
+                ),
             ],
         );
     }
@@ -1438,7 +1461,10 @@ mod tests {
                 " 2024-01-15",
             ],
         );
-        assert_refused(TYPE_TIME, &["\t10:30:00", "1:2:3", "10:3", "10:30:0", "10:30:00 "]);
+        assert_refused(
+            TYPE_TIME,
+            &["\t10:30:00", "1:2:3", "10:3", "10:30:0", "10:30:00 "],
+        );
     }
 
     /// Python reads these texts, but they are not ISO 8601. Bolt refuses them.
@@ -1491,10 +1517,16 @@ mod tests {
         assert_refused(TYPE_TIME, &["24:00", "24:00:00", "24:00:00Z"]);
         assert_refused(TYPE_DATETIME, &["2024-01-15T24:00", "2024-12-31T24:00:00"]);
         // Python 3.14 refuses a fraction of an hour or a minute; 3.12 reads it.
-        assert_refused(TYPE_TIME, &["10.5", "10:30.5", "1030.5", "10:30:00+05:30.5"]);
+        assert_refused(
+            TYPE_TIME,
+            &["10.5", "10:30.5", "1030.5", "10:30:00+05:30.5"],
+        );
         assert_refused(TYPE_DATETIME, &["2024-01-15T10:30.5", "2024-01-15T10.5"]);
         // Python 3.13 keeps the fraction of an offset of zero seconds; 3.12 and 3.14 give UTC.
-        assert_refused(TYPE_TIME, &["10:30:00+00:00:00.5", "10:30:00-00:00:00.000001"]);
+        assert_refused(
+            TYPE_TIME,
+            &["10:30:00+00:00:00.5", "10:30:00-00:00:00.000001"],
+        );
         // Python 3.13 refuses a point with no digit before the offset; 3.12 and 3.14 skip it.
         assert_refused(TYPE_TIME, &["10.+05:00", "10:30:00.+05:00"]);
     }
@@ -1567,14 +1599,14 @@ mod tests {
             TYPE_DATETIME,
             &[
                 // An HTML <input type="datetime-local"> sends this form.
-                (
-                    "2024-01-15T10:30",
-                    "datetime.datetime(2024, 1, 15, 10, 30)",
-                ),
+                ("2024-01-15T10:30", "datetime.datetime(2024, 1, 15, 10, 30)"),
                 ("2024-01-15T10", "datetime.datetime(2024, 1, 15, 10, 0)"),
                 ("2024-01-15 10:30", "datetime.datetime(2024, 1, 15, 10, 30)"),
                 // chrono took any whitespace here, and Python takes any one character.
-                ("2024-01-15\t10:30", "datetime.datetime(2024, 1, 15, 10, 30)"),
+                (
+                    "2024-01-15\t10:30",
+                    "datetime.datetime(2024, 1, 15, 10, 30)",
+                ),
                 (
                     "2024-01-15\u{3000}10:30:00Z",
                     "datetime.datetime(2024, 1, 15, 10, 30, tzinfo=datetime.timezone.utc)",
@@ -1607,7 +1639,10 @@ mod tests {
                 ("20240115T103000", "datetime.datetime(2024, 1, 15, 10, 30)"),
                 ("20240115T1030", "datetime.datetime(2024, 1, 15, 10, 30)"),
                 ("20240115", "datetime.datetime(2024, 1, 15, 0, 0)"),
-                ("20240115T10:30:00", "datetime.datetime(2024, 1, 15, 10, 30)"),
+                (
+                    "20240115T10:30:00",
+                    "datetime.datetime(2024, 1, 15, 10, 30)",
+                ),
                 (
                     "2024-W03-1T10:30:00",
                     "datetime.datetime(2024, 1, 15, 10, 30)",
@@ -1663,8 +1698,18 @@ mod tests {
         assert_refused(
             TYPE_DATE,
             &[
-                "2024-015", "0000-01-01", "2023-02-29", "2024-W53-1", "2024-W00-1", "2024-W01-0",
-                "2024-W01-8", "2024-W031", "2024W03-1", "2024-0115", "202401-15", "2024-01-15Z",
+                "2024-015",
+                "0000-01-01",
+                "2023-02-29",
+                "2024-W53-1",
+                "2024-W00-1",
+                "2024-W01-0",
+                "2024-W01-8",
+                "2024-W031",
+                "2024W03-1",
+                "2024-0115",
+                "202401-15",
+                "2024-01-15Z",
             ],
         );
     }
@@ -1758,8 +1803,20 @@ mod tests {
         assert_refused(
             TYPE_FLOAT,
             &[
-                "", ".", "e5", "1e", "1e+", "0x1p3", "1.5f", "infinit", "infinityy", "1_000.5",
-                " 1.5", "1.5 ", "1.5\n", "\u{0663}.5",
+                "",
+                ".",
+                "e5",
+                "1e",
+                "1e+",
+                "0x1p3",
+                "1.5f",
+                "infinit",
+                "infinityy",
+                "1_000.5",
+                " 1.5",
+                "1.5 ",
+                "1.5\n",
+                "\u{0663}.5",
             ],
         );
         let error = coerce("abc", TYPE_FLOAT).unwrap_err().to_string();
@@ -1792,7 +1849,13 @@ mod tests {
             let refused = PyList::new(py, ["1", "2", "5.0"]).unwrap();
             let error = parse_text_items(&refused, TYPE_INT).unwrap_err();
             assert_eq!(
-                error.value(py).getattr("args").unwrap().repr().unwrap().to_string(),
+                error
+                    .value(py)
+                    .getattr("args")
+                    .unwrap()
+                    .repr()
+                    .unwrap()
+                    .to_string(),
                 "(2, \"Invalid integer '5.0': expected a whole number such as 42 or -7\")"
             );
         });
