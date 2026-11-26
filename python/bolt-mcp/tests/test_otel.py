@@ -26,6 +26,7 @@ TRACE_ID = 0x4BF92F3577B34DA6A3CE929D0E0E4736
 CLIENT_SPAN_ID = 0x00F067AA0BA902B7
 TRACEPARENT = f"00-{TRACE_ID:032x}-{CLIENT_SPAN_ID:016x}-01"
 CAPTURE_CONTENT = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
+SECRET = "hunter2-7f3a"
 
 
 @pytest.fixture
@@ -80,9 +81,17 @@ def _server(provider, *, before=(), after=()):
     def boom() -> str:
         raise RuntimeError("connect to postgres://admin:hunter2@db.internal")
 
+    @mcp.resource("vault://{key}")
+    def vault(key: str) -> str:
+        raise ValueError(f"secret {key}")
+
     @mcp.prompt
     def greet(name: str) -> str:
         return f"Hello {name}"
+
+    @mcp.prompt
+    def unlock(code: str) -> str:
+        raise ValueError(f"secret {code}")
 
     mount_mcp(api, mcp)
     return api
@@ -151,7 +160,9 @@ def test_tool_error_result_sets_error_status(provider, exporter):
     assert span.attributes["error.type"] == "tool_error"
 
 
-def test_exception_inside_the_span_sets_error_status_and_is_recorded(provider, exporter):
+def test_exception_in_middleware_inside_the_span_sets_error_status(provider, exporter, monkeypatch):
+    monkeypatch.delenv(CAPTURE_CONTENT, raising=False)
+
     async def broken(call: ToolCall, call_next) -> dict:
         raise RuntimeError("quota store is down")
 
@@ -160,8 +171,47 @@ def test_exception_inside_the_span_sets_error_status_and_is_recorded(provider, e
     assert body["result"]["isError"] is True
     span = _server_span(exporter)
     assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description is None
     assert span.attributes["error.type"] == "RuntimeError"
-    assert [event.name for event in span.events] == ["exception"]
+    assert span.events == ()
+
+
+FAILING_CALLS = pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("resources/read", {"uri": f"vault://db?sig={SECRET}"}),
+        ("prompts/get", {"name": "unlock", "arguments": {"code": SECRET}}),
+    ],
+)
+
+
+@FAILING_CALLS
+def test_exception_text_stays_out_of_the_span_without_content_capture(provider, exporter, monkeypatch, method, params):
+    monkeypatch.delenv(CAPTURE_CONTENT, raising=False)
+    with TestClient(_server(provider)) as client:
+        body = _rpc(client, method, params)
+    assert "error" in body
+    span = _server_span(exporter)
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description is None
+    assert span.attributes["error.type"] == "ValueError"
+    assert span.events == ()
+    # The name, the attributes, the events and the status of the exported span.
+    assert SECRET not in span.to_json()
+
+
+@FAILING_CALLS
+def test_exception_is_recorded_when_content_capture_is_on(provider, exporter, monkeypatch, method, params):
+    monkeypatch.setenv(CAPTURE_CONTENT, "true")
+    with TestClient(_server(provider)) as client:
+        _rpc(client, method, params)
+    span = _server_span(exporter)
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description is None
+    (event,) = span.events
+    assert event.name == "exception"
+    assert event.attributes["exception.type"] == "ValueError"
+    assert SECRET in event.attributes["exception.message"]
 
 
 def test_input_request_passes_through_the_span_without_an_error(provider, exporter):
@@ -187,6 +237,41 @@ def test_resource_read_gets_a_server_span(provider, exporter):
     assert dict(span.attributes) == {"mcp.method.name": "resources/read", "mcp.resource.uri": "timetable://north"}
     assert span.parent.span_id == CLIENT_SPAN_ID
     assert span.status.status_code is StatusCode.UNSET
+
+
+@pytest.mark.parametrize(
+    ("uri", "recorded"),
+    [
+        ("timetable://north", "timetable://north"),
+        ("note:42", "note:42"),
+        ("vault://admin:hunter2@db.internal/key?day=mon&sig=abc", "vault://db.internal/key?day=mon&sig=REDACTED"),
+        (
+            "files://reports/q3?AWSAccessKeyId=AKIA1&Signature=c2ln&X-Goog-Signature=Z29v&page=2",
+            "files://reports/q3?AWSAccessKeyId=REDACTED&Signature=REDACTED&X-Goog-Signature=REDACTED&page=2",
+        ),
+    ],
+)
+def test_resource_uri_attribute_has_no_credentials(provider, exporter, uri, recorded):
+    with TestClient(_server(provider)) as client:
+        _rpc(client, "resources/read", {"uri": uri})
+    assert _server_span(exporter).attributes["mcp.resource.uri"] == recorded
+
+
+def test_resource_reads_the_uri_as_the_client_sent_it(provider, exporter):
+    with TestClient(_server(provider)) as client:
+        body = _rpc(client, "resources/read", {"uri": "timetable://north?sig=abc"})
+    assert body["result"]["contents"][0]["text"] == "north?sig=abc: every 10 minutes"
+    assert _server_span(exporter).attributes["mcp.resource.uri"] == "timetable://north?sig=REDACTED"
+
+
+def test_resource_uri_that_cannot_be_parsed_is_not_recorded(provider, exporter, monkeypatch):
+    monkeypatch.delenv(CAPTURE_CONTENT, raising=False)
+    with TestClient(_server(provider)) as client:
+        body = _rpc(client, "resources/read", {"uri": "vault://admin:hunter2@[::1/key"})
+    assert body["error"]["message"].startswith("Unknown resource")
+    span = _server_span(exporter)
+    assert "mcp.resource.uri" not in span.attributes
+    assert "hunter2" not in span.to_json()
 
 
 @pytest.mark.parametrize(

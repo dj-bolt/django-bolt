@@ -10,6 +10,9 @@
 The span follows the OpenTelemetry semantic conventions for MCP. Its parent is
 the trace context in the request ``_meta``. ``bolt_mcp`` does not import this
 module, so an app that does not call ``instrument()`` does not load OpenTelemetry.
+
+Request content leaves the process only when the environment variable
+``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is ``true``.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     from opentelemetry import propagate, trace
@@ -37,6 +41,8 @@ if TYPE_CHECKING:
     from .server import MCP
 
 _CAPTURE_MESSAGE_CONTENT = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
+# The OpenTelemetry HTTP conventions redact the values of these query parameters by default.
+_REDACTED_QUERY_KEYS = frozenset({"AWSAccessKeyId", "Signature", "sig", "X-Goog-Signature"})
 
 
 class _MetaGetter(Getter[dict[str, Any]]):
@@ -56,16 +62,55 @@ class _MetaGetter(Getter[dict[str, Any]]):
 _META_GETTER = _MetaGetter()
 
 
+def _redact_query_pair(pair: str) -> str:
+    key = pair.partition("=")[0]
+    return f"{key}=REDACTED" if key in _REDACTED_QUERY_KEYS else pair
+
+
+def _redact_uri(uri: str) -> str | None:
+    """Give ``uri`` with no userinfo, and with ``REDACTED`` as the value of each key in ``_REDACTED_QUERY_KEYS``.
+
+    Give ``None`` for a URI that ``urlsplit`` cannot parse, because such a URI can hold credentials.
+    """
+    if "@" not in uri and "?" not in uri:
+        return uri
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return None
+    netloc = parts.netloc.rpartition("@")[2]
+    query = "&".join(_redact_query_pair(pair) for pair in parts.query.split("&"))
+    if netloc == parts.netloc and query == parts.query:
+        return uri
+    return urlunsplit(parts._replace(netloc=netloc, query=query))
+
+
+def _set_error(span: Span, error_type: str) -> None:
+    span.set_attribute("error.type", error_type)
+    span.set_status(StatusCode.ERROR)
+
+
 @contextmanager
-def _server_span(tracer: Tracer, name: str, meta: dict[str, Any], attributes: dict[str, str]) -> Iterator[Span]:
+def _server_span(
+    tracer: Tracer, name: str, meta: dict[str, Any], attributes: dict[str, str], capture_content: bool
+) -> Iterator[Span]:
     parent = propagate.extract(meta, getter=_META_GETTER)
-    # The span records an Exception and sets the ERROR status. It ignores a BaseException,
-    # for example an MRTR input request.
-    with tracer.start_as_current_span(name, context=parent, kind=SpanKind.SERVER, attributes=attributes) as span:
+    # The exception text can hold request content, so it goes in the span only with content capture.
+    # A BaseException, for example an MRTR input request, is not an error.
+    with tracer.start_as_current_span(
+        name,
+        context=parent,
+        kind=SpanKind.SERVER,
+        attributes=attributes,
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
         try:
             yield span
         except Exception as exc:
-            span.set_attribute("error.type", type(exc).__qualname__)
+            _set_error(span, type(exc).__qualname__)
+            if capture_content:
+                span.record_exception(exc)
             raise
 
 
@@ -76,8 +121,15 @@ def instrument(mcp: MCP, *, tracer_provider: TracerProvider | None = None) -> No
     The tracing middleware takes its place in the middleware order at this call.
     Call ``instrument()`` before you register your own middleware, so that the span contains it.
 
-    The span records the tool arguments and the tool result only when the environment variable
+    An ``isError`` tool result sets ``error.type`` to ``tool_error`` and the ``ERROR`` status.
+    Bolt turns an exception in a tool into such a result before middleware sees it.
+    An exception from a resource, a prompt or middleware in the span sets ``error.type``
+    to the exception class name and the ``ERROR`` status.
+
+    The span records the tool arguments, the tool result and the exception event (with the
+    exception message) only when the environment variable
     ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` is ``true`` at this call.
+    The ``mcp.resource.uri`` attribute has no userinfo and no signature values.
     """
     tracer = trace.get_tracer(__name__, tracer_provider=tracer_provider)
     capture_content = os.environ.get(_CAPTURE_MESSAGE_CONTENT, "").lower() == "true"
@@ -91,11 +143,10 @@ def instrument(mcp: MCP, *, tracer_provider: TracerProvider | None = None) -> No
         }
         if capture_content:
             attributes["gen_ai.tool.call.arguments"] = json_encode(call.arguments).decode()
-        with _server_span(tracer, f"tools/call {call.name}", call.meta, attributes) as span:
+        with _server_span(tracer, f"tools/call {call.name}", call.meta, attributes, capture_content) as span:
             result = await call_next()
             if result.get("isError"):
-                span.set_attribute("error.type", "tool_error")
-                span.set_status(StatusCode.ERROR)
+                _set_error(span, "tool_error")
             if capture_content:
                 span.set_attribute("gen_ai.tool.call.result", json_encode(result).decode())
             return result
@@ -103,8 +154,11 @@ def instrument(mcp: MCP, *, tracer_provider: TracerProvider | None = None) -> No
     @mcp.resource_middleware
     async def trace_resource_read(read: ResourceRead, call_next) -> dict[str, Any]:
         # A URI can hold an id, so it stays out of the span name.
-        attributes = {"mcp.method.name": "resources/read", "mcp.resource.uri": read.uri}
-        with _server_span(tracer, "resources/read", read.meta, attributes):
+        attributes = {"mcp.method.name": "resources/read"}
+        uri = _redact_uri(read.uri)
+        if uri is not None:
+            attributes["mcp.resource.uri"] = uri
+        with _server_span(tracer, "resources/read", read.meta, attributes, capture_content):
             return await call_next()
 
     @mcp.prompt_middleware
@@ -112,5 +166,5 @@ def instrument(mcp: MCP, *, tracer_provider: TracerProvider | None = None) -> No
         # The client chooses the name. Only the name of a registered prompt goes in the span name.
         name = f"prompts/get {get.name}" if get.name in mcp._prompts else "prompts/get"
         attributes = {"mcp.method.name": "prompts/get", "gen_ai.prompt.name": get.name}
-        with _server_span(tracer, name, get.meta, attributes):
+        with _server_span(tracer, name, get.meta, attributes, capture_content):
             return await call_next()

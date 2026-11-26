@@ -102,7 +102,7 @@ otel = [
 requires-dist = [
     { name = "django-bolt", editable = "." },
     { name = "msgspec", specifier = ">=0.20" },
-    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.32" },
+    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.27" },
     { name = "pyjwt", specifier = ">=2.8" },
 ]
 provides-extras = ["otel"]
@@ -548,7 +548,7 @@ dev = [
     { name = "maturin", specifier = ">=1.9.6" },
     { name = "nanodjango", specifier = ">=0.16" },
     { name = "openapi-spec-validator", specifier = ">=0.8.5" },
-    { name = "opentelemetry-sdk", specifier = ">=1.32" },
+    { name = "opentelemetry-sdk", specifier = ">=1.27" },
     { name = "psycopg", specifier = ">=3.3" },
     { name = "psycopg-pool", specifier = ">=3.3" },
     { name = "pydantic", specifier = ">=2" },
