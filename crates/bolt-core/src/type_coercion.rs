@@ -618,10 +618,14 @@ fn micros(time: NaiveTime) -> u32 {
 ///
 /// The extractors call this at most once for each parameter, with the type
 /// hint and the length bounds that the route registration found. A length out
-/// of `min_length..=max_length`, or an item that is not text, gives `items`
-/// itself: msgspec then refuses it with its own error, and it checks the
-/// length before it reads an item. The first refused text raises
-/// `ValueError(index, message)`.
+/// of `min_length..=max_length` gives `items` itself, and no item is read.
+/// msgspec then refuses the list with its own error, as it checks the length
+/// before it reads an item.
+///
+/// The items are read in order. The first text that does not convert raises
+/// `ValueError(index, message)`. An item that is not text gives `items`
+/// itself, for msgspec to refuse, but only when no earlier text was refused.
+/// No request source gives an item that is not text.
 #[pyfunction]
 #[pyo3(signature = (items, type_hint, min_length = 0, max_length = usize::MAX))]
 pub fn parse_text_items<'py>(
@@ -1879,8 +1883,9 @@ mod tests {
         });
     }
 
-    /// A length out of bounds or an item that is not text gives the list
-    /// itself, and no item is read: msgspec gives the error.
+    /// A length out of bounds gives the list itself, and no item is read:
+    /// msgspec gives the error. An item that is not text gives the list
+    /// itself when no earlier text was refused.
     #[test]
     fn parse_text_items_gives_the_list_itself_out_of_bounds_or_for_an_item_that_is_not_text() {
         Python::initialize();
@@ -1898,6 +1903,14 @@ mod tests {
             mixed.append(1i64).unwrap();
             let given = parse_text_items(&mixed, TYPE_DATETIME, 0, usize::MAX).unwrap();
             assert!(given.is(&mixed));
+
+            // A refused text before the item that is not text raises its error.
+            let refused_first = PyList::new(py, ["5.0"]).unwrap();
+            refused_first.append(2i64).unwrap();
+            let error = parse_text_items(&refused_first, TYPE_INT, 0, usize::MAX).unwrap_err();
+            let (index, _): (usize, String) =
+                error.value(py).getattr("args").unwrap().extract().unwrap();
+            assert_eq!(index, 0);
         });
     }
 

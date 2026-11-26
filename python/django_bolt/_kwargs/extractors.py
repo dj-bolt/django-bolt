@@ -333,7 +333,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
                     items = parse_text_items(value, hint)
                 except ValueError as error:
                     raise RequestValidationError(errors=[_item_error(loc, key, error, value)]) from None
-                # The list itself comes back when an item is not text. msgspec then refuses it.
+                # The list itself comes back when an item is not text and no earlier text is refused.
+                # msgspec then refuses it.
                 if items is not value:
                     return items if plain is list else plain(items)
             return convert(value)
