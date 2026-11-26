@@ -246,6 +246,25 @@ A router with a parent registers one time for each `prefix`, with the prefixes o
 
 - `TypeError`: `router` is not a `Router`. Use `mount()` for a `BoltAPI`.
 
+### api.urls
+
+<!-- fragment -->
+```python
+api.urls -> tuple[object, str | None, str | None]
+```
+
+The URLconf module, the app namespace and the instance namespace of the API, as `admin.site.urls` gives them.
+Use it in `path()`, for example `path("blog/", api.urls)`. Bolt then serves each route of the API under `blog/`, and `reverse()` gives the same path.
+The two namespaces are the `namespace` of the API. See [Mount an API in the URLconf](../topics/routing.md#mount-an-api-in-the-urlconf).
+
+**Errors**
+
+- `ImproperlyConfigured`: at startup, `runbolt` and the test clients refuse a prefix that Bolt cannot serve at static paths.
+  Examples are `re_path()`, `i18n_patterns()`, a converter other than `str`, two parameters in one segment, one parameter two times, no trailing slash, and include keyword arguments.
+  They also refuse an ASGI mount, a Django mount or an MCP server of the API under a prefix with a parameter.
+  The message names the URLconf entry. Django alone does not refuse the prefix: `manage.py check` and `reverse()` work. The exception is one parameter name two times in a path: there `reverse()` raises the error of Django itself.
+- `ValueError`: at startup, a handler or a dependency takes a prefix parameter as an argument with no marker. Read it from `request.params` or with `Path()`.
+
 ### api.mount()
 
 <!-- fragment -->
@@ -266,7 +285,7 @@ The lifespan of `app` runs with this API. It starts after the lifespan of this A
 
 - `TypeError`: `app` is not a `BoltAPI`.
 - `ValueError`: `app` is this API, or `app` already has the routes of this API.
-- `ValueError`: a handler of `app` takes a parameter of `path` as an argument. Read it from `request.params`.
+- `ValueError`: a handler or a dependency of `app` takes a parameter of `path` as an argument with no marker. Read it from `request.params` or with `Path()`.
 - `ValueError`: `app` has a different `error_formatter`.
 
 ### api.mount_asgi()

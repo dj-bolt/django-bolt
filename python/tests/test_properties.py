@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import itertools
+import sys
 import time
+import types
 import unicodedata
 import uuid
 from http.cookies import SimpleCookie
@@ -21,13 +24,16 @@ from urllib.parse import quote
 import httpx
 import jwt
 import pytest
-from django.http import QueryDict
+from django.http import HttpResponse, QueryDict
 from django.http.cookie import parse_cookie
 from django.test import override_settings
+from django.urls import include, reverse
+from django.urls import path as django_path
 from hypothesis import example, given
 from hypothesis import strategies as st
 
 from django_bolt import BoltAPI
+from django_bolt._urlconf import join_mount_path, urlconf_mounts
 from django_bolt.auth import JWTAuthentication
 from django_bolt.auth.revocation import DjangoCacheRevocation, DjangoORMRevocation
 from django_bolt.param_functions import Cookie, Form, Query
@@ -438,6 +444,71 @@ def test_a_file_response_status_does_not_show_whether_a_file_out_of_the_allowed_
     finally:
         probe.unlink()
     assert without_file == with_file
+
+
+# A segment of a URLconf prefix or of a route: a static word or a parameter.
+mount_words = st.from_regex(r"[a-z0-9_.~-]{1,6}", fullmatch=True)
+mount_segments = st.lists(st.one_of(mount_words, st.just(None)), max_size=3)
+_urlconf_names = itertools.count()
+
+
+def _django_mount_view(request, **kwargs):
+    return HttpResponse()
+
+
+def _segments(segments: list[str | None], tag: str, django_form: str) -> tuple[str, str, dict[str, str]]:
+    """Return the Django route, the Bolt route, and a value for each parameter of ``segments``."""
+    django_parts, bolt_parts, values = [], [], {}
+    for index, segment in enumerate(segments):
+        if segment is None:
+            name = f"{tag}{index}"
+            django_parts.append(django_form.format(name=name))
+            bolt_parts.append("{" + name + "}")
+            values[name] = f"v{index}"
+        else:
+            django_parts.append(segment)
+            bolt_parts.append(segment)
+    return "/".join(django_parts), "/".join(bolt_parts), values
+
+
+def _urlconf_module(urlpatterns: list) -> str:
+    name = f"tests._property_urlconf_{next(_urlconf_names)}"
+    module = types.ModuleType(name)
+    module.urlpatterns = urlpatterns
+    sys.modules[name] = module
+    return name
+
+
+@given(
+    prefix=mount_segments,
+    route=mount_segments,
+    trailing_slash=st.booleans(),
+    form=st.sampled_from(["<{name}>", "<str:{name}>"]),
+)
+@example(prefix=["missions"], route=[], trailing_slash=False, form="<{name}>")
+@example(prefix=[], route=[], trailing_slash=False, form="<{name}>")
+@example(prefix=[None, "missions"], route=[None], trailing_slash=True, form="<str:{name}>")
+def test_a_mounted_route_path_is_the_path_that_django_reverses(prefix, route, trailing_slash, form):
+    django_prefix, _bolt_prefix, prefix_values = _segments(prefix, "p", form)
+    django_route, bolt_route, route_values = _segments(route, "r", "<{name}>")
+    django_prefix += "/" if prefix else ""
+    if route and trailing_slash:
+        django_route += "/"
+        bolt_route += "/"
+    values = {**prefix_values, **route_values}
+    api = BoltAPI()
+    plain = [django_path(django_prefix, include([django_path(django_route, _django_mount_view, name="r")]))]
+    names = [_urlconf_module(plain), _urlconf_module([django_path(django_prefix, api.urls)])]
+    try:
+        expected = reverse("r", urlconf=names[0], kwargs=values)
+        (mount,) = urlconf_mounts(names[1])
+        served = join_mount_path(mount.prefix, "/" + bolt_route)
+        for name, value in values.items():
+            served = served.replace("{" + name + "}", value)
+    finally:
+        for name in names:
+            sys.modules.pop(name)
+    assert served == expected
 
 
 # A revocation store refuses a jti that a database collation can read as the key

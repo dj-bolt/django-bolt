@@ -23,6 +23,7 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
+from django_bolt._urlconf import served_apis
 from django_bolt.api import (
     BoltAPI,
     _routes_and_native_routes,
@@ -900,7 +901,7 @@ class Command(BaseCommand):
             setup_django_logging()
         if initialize_file_response_settings is not None:
             initialize_file_response_settings()
-        apis = self.autodiscover_apis()
+        apis = served_apis(self.autodiscover_apis())
         if not apis:
             # Stop before the fork. A worker has nothing to serve.
             raise CommandError(_NO_API_MESSAGE)
@@ -992,7 +993,7 @@ class Command(BaseCommand):
             initialize_file_response_settings()
 
         # Autodiscover BoltAPI instances
-        apis = self.autodiscover_apis()
+        apis = served_apis(self.autodiscover_apis())
 
         if not apis:
             # A server with no API has nothing to serve. Stop with exit status 1.
