@@ -208,6 +208,37 @@ api.example.com {
 
 Caddy gets a TLS certificate, and it sets `X-Forwarded-For` and `X-Forwarded-Proto`. It also passes WebSocket upgrades.
 
+### Serve under a sub-path
+
+Set `FORCE_SCRIPT_NAME` when the proxy serves the project under a sub-path, for example `https://example.com/blog/`:
+
+```python title="mysite/settings.py"
+FORCE_SCRIPT_NAME = "/blog"
+STATIC_URL = "/blog/static/"
+```
+
+The proxy must remove the sub-path from the request path, as for Django under WSGI.
+In nginx, a URI after the upstream in `proxy_pass` replaces the matched location:
+
+```nginx
+location /blog/ {
+    proxy_pass http://blog/;
+    proxy_set_header Host $host;
+}
+```
+
+In Caddy, `handle_path /blog/*` removes the sub-path.
+Bolt then does these things:
+
+- It serves `/articles/42` and gives 404 for `/blog/articles/42`.
+- `request.path` is `/blog/articles/42`, `request.path_info` is `/articles/42` and `request.META["SCRIPT_NAME"]` is `/blog`.
+- `reverse()`, `request.get_full_path()`, `request.build_absolute_uri()` and the `Location` of a trailing-slash redirect start with `/blog`.
+- The OpenAPI `servers` is `/blog`, and the docs pages load the schema from `/blog/docs/openapi.json`.
+- It serves `STATIC_URL` and `MEDIA_URL` without `/blog`.
+- A Django app of `mount_django()`, such as the admin, gets the same paths.
+
+Bolt reads no request header for the sub-path. `reverse()` in a WebSocket handler does not add the sub-path.
+
 ### Trust the proxy headers
 
 Bolt reads `X-Forwarded-For` and `X-Forwarded-Proto` only from a peer in `BOLT_TRUSTED_PROXIES`.

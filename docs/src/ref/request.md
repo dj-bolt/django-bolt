@@ -48,7 +48,8 @@ All attributes are read-only, except `user` and `auser`.
 | Attribute | Type | Description |
 | --- | --- | --- |
 | `method` | `str` | The HTTP method, for example `"GET"`. |
-| `path` | `str` | The path, with no query string. |
+| `path` | `str` | The path, with no query string. With `FORCE_SCRIPT_NAME`, the script name comes first, as in Django. |
+| `path_info` | `str` | The path without the script name. The router matches it. Without `FORCE_SCRIPT_NAME`, it is `path`. |
 | `body` | `bytes` | The raw body. |
 | `headers` | `dict[str, Any]` | The headers, with lower-case names. A typed `Header()` argument replaces its value with the converted value. |
 | `cookies` | `dict[str, Any]` | The cookies. A typed `Cookie()` argument replaces its value with the converted value. |

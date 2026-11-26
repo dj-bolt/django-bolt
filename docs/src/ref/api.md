@@ -246,6 +246,22 @@ A router with a parent registers one time for each `prefix`, with the prefixes o
 
 - `TypeError`: `router` is not a `Router`. Use `mount()` for a `BoltAPI`.
 
+### api.urls
+
+<!-- fragment -->
+```python
+api.urls -> tuple[object, str | None, str | None]
+```
+
+The URLconf module, the app namespace and the instance namespace of the API, as `admin.site.urls` gives them.
+Use it in `path()`, for example `path("blog/", api.urls)`. Bolt then serves each route of the API under `blog/`, and `reverse()` gives the same path.
+The two namespaces are the `namespace` of the API. See [Mount an API in the URLconf](../topics/routing.md#mount-an-api-in-the-urlconf).
+
+**Errors**
+
+- `ImproperlyConfigured`: at startup, `runbolt` and `TestClient` refuse a prefix that Bolt cannot serve at one path.
+  Examples are `re_path()`, `i18n_patterns()`, a converter other than `str`, no trailing slash, and include keyword arguments.
+
 ### api.mount()
 
 <!-- fragment -->
