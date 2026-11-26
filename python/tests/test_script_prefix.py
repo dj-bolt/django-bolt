@@ -35,6 +35,7 @@ from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.urls import get_script_prefix, path, reverse, reverse_lazy, set_script_prefix
 from django.utils import translation
 from django.utils.deprecation import MiddlewareMixin
+from django.utils.functional import SimpleLazyObject
 
 from django_bolt import BoltAPI, Depends, Request, StreamingResponse, WebSocket
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated, JWTAuthentication
@@ -267,6 +268,22 @@ def test_files_at_the_script_name_are_refused_at_startup(settings, tmp_path, set
 
     with pytest.raises(ImproperlyConfigured, match=f'{setting} "/files/" is FORCE_SCRIPT_NAME'):
         TestClient(BoltAPI())
+
+
+@pytest.mark.parametrize("client_class", [TestClient, AsyncTestClient])
+def test_a_static_files_config_replaces_the_static_url_at_the_script_name(settings, tmp_path, client_class):
+    # The static_files_config of a test client replaces STATIC_URL, so Bolt serves no files at the script name.
+    settings.FORCE_SCRIPT_NAME = "/files"
+    settings.STATIC_ROOT = str(tmp_path)
+    settings.STATIC_URL = "/files/"
+    static_files = {"url_prefix": "/assets", "directories": [str(tmp_path)], "csp_header": None}
+
+    client_class(BoltAPI(), static_files_config=static_files)
+
+    settings.MEDIA_ROOT = str(tmp_path)
+    settings.MEDIA_URL = "/files/"
+    with pytest.raises(ImproperlyConfigured, match='MEDIA_URL "/files/" is FORCE_SCRIPT_NAME'):
+        client_class(BoltAPI(), static_files_config=static_files)
 
 
 def test_the_default_media_url_at_the_script_name_serves_no_media(settings):
@@ -1000,6 +1017,8 @@ def _chunks() -> list:
         memoryview(b"b"),
         _WithBytes(),
         3,
+        # bytes() of this object raises TypeError, so its text is the chunk.
+        SimpleLazyObject(lambda: "|" + reverse("page", kwargs={"n": 3})),
     ]
 
 
@@ -1026,7 +1045,7 @@ def test_a_lazy_chunk_of_a_body_has_the_script_prefix(mount_urlconf, settings, i
         with TestClient(api) as client:
             bodies.append(client.get("/stream").content)
 
-    assert bodies == [b"/myapp/page/1|/myapp/page/2|abc3", b"/page/1|/page/2|abc3"]
+    assert bodies == [b"/myapp/page/1|/myapp/page/2|abc3|/myapp/page/3", b"/page/1|/page/2|abc3|/page/3"]
 
 
 # The names of the parameters of the functions that give a hop the script prefix.

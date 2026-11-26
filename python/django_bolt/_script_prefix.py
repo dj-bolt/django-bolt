@@ -74,14 +74,20 @@ def configure() -> str | None:
     return script_prefix
 
 
-def refuse_files_at_script_name(script_prefix: str | None) -> None:
+def refuse_files_at_script_name(script_prefix: str | None, *, static_files_replaced: bool = False) -> None:
     """Refuse a ``STATIC_URL`` or ``MEDIA_URL`` that is the script name, where Bolt serves those files.
 
     The proxy removes the script name, so Bolt would serve the files at "/",
     and that hides each route. Django also gives a relative value the script
-    prefix, for example the default ``MEDIA_URL`` "". Bolt serves no files for
-    such a value, as without the setting. Thus only the value in the settings
-    module counts. Call this before a lifespan or the startup banner.
+    prefix. The default ``MEDIA_URL`` "" becomes the script name in this way,
+    and Bolt serves no files for it, as without the setting. Thus only the
+    value in the settings module counts. Call this before a lifespan or the
+    startup banner.
+
+    Args:
+        script_prefix: The script prefix of ``configure()``.
+        static_files_replaced: True when a test client got a ``static_files_config``.
+            That config replaces ``STATIC_URL``, so only ``MEDIA_URL`` counts.
 
     Raises:
         ImproperlyConfigured: ``STATIC_URL`` or ``MEDIA_URL`` is the script
@@ -96,6 +102,8 @@ def refuse_files_at_script_name(script_prefix: str | None) -> None:
         "STATIC_URL": lambda: bool(settings.DEBUG) or _is_path(settings.STATIC_ROOT) or bool(settings.STATICFILES_DIRS),
         "MEDIA_URL": lambda: _is_path(settings.MEDIA_ROOT),
     }
+    if static_files_replaced:
+        del serves["STATIC_URL"]
     for name, serves_files in serves.items():
         # settings.STATIC_URL has the script prefix in front of a relative
         # value. The wrapped settings give the value as the user wrote it.
@@ -306,10 +314,10 @@ def _sync_body(content: Any, script_prefix: str) -> Any:
                 item = context.run(iterator.__next__)
             except StopIteration:
                 return
-            if type(item) is not bytes and type(item) is not str and not _is_rust_chunk(item):
-                # Rust would call str() after the step, with no prefix. A lazy
+            if type(item) is not bytes and type(item) is not str:
+                # Rust would read the chunk after the step, with no prefix. A lazy
                 # object, such as reverse_lazy(), gives its text only then.
-                item = context.run(str, item)
+                item = context.run(_read_chunk, item)
             yield item
     finally:
         close = getattr(iterator, "close", None)
@@ -317,6 +325,20 @@ def _sync_body(content: Any, script_prefix: str) -> Any:
             context.run(close)
 
 
-def _is_rust_chunk(item: Any) -> bool:
-    """Whether Rust takes ``item`` as a chunk with no call to ``str()``. See ``convert_python_chunk``."""
-    return isinstance(item, (bytes, bytearray, str, memoryview)) or hasattr(item, "__bytes__")
+def _read_chunk(item: Any) -> Any:
+    """Read ``item`` as Rust reads a chunk, in the order of ``convert_python_chunk``.
+
+    Rust takes bytes, bytearray, str and memoryview with no call into Python.
+    It takes the bytes of ``__bytes__()``. When that call gives no bytes, as for
+    a ``SimpleLazyObject`` of a str, the text of the object is the chunk.
+    """
+    if isinstance(item, (bytes, bytearray, str, memoryview)):
+        return item
+    if hasattr(item, "__bytes__"):
+        try:
+            buffer = item.__bytes__()
+        except Exception:  # Rust reads the text of the chunk after each error of __bytes__().
+            return str(item)
+        if isinstance(buffer, (bytes, bytearray)):
+            return buffer
+    return str(item)
