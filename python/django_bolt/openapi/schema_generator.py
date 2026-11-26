@@ -96,6 +96,17 @@ def _response_class_media(response_class: type | None) -> tuple[str, Schema] | N
     return None
 
 
+def _body_schema_type(field: Any) -> Any:
+    """The type of a body field for its schema.
+
+    Binding keeps only the struct or the dataclass type of a body. The schema
+    also shows the ``msgspec.Meta`` items of its ``Annotated``. (#958)
+    """
+    if not field.schema_meta:
+        return field.annotation
+    return Annotated[(field.annotation, *field.schema_meta)]
+
+
 def _unwrap_annotated(annotation: Any) -> Any:
     """The type behind a ``type`` alias and ``Annotated``, without the metadata."""
     annotation = resolve_type_alias(annotation)
@@ -1213,6 +1224,7 @@ class SchemaGenerator:
         if body_field is not None and body_field.embed:
             return self._embedded_request_body(body_field)
 
+        dependency_body = None
         if not body_param or not body_type:
             # A dependency can read the JSON body.
             dependency_body = next(
@@ -1293,6 +1305,9 @@ class SchemaGenerator:
             return None
 
         # JSON request body
+        schema_field = body_field if body_field is not None and body_field.name == body_param else dependency_body
+        if schema_field is not None and schema_field.annotation is body_type:
+            body_type = _body_schema_type(schema_field)
         self._input_schema = True
         try:
             schema = self._type_to_schema(body_type, register_component=True)
@@ -1314,7 +1329,7 @@ class SchemaGenerator:
         """The request body of a ``Body(embed=True)`` parameter: a JSON object with the value at one key."""
         marker = field.param
         key = field.alias or field.name
-        schema = self._type_to_schema(field.annotation, register_component=True)
+        schema = self._type_to_schema(_body_schema_type(field), register_component=True)
         has_default = field.default is not inspect.Parameter.empty
         if has_default and field.default is not None:
             schema = self._with_default(schema, field.default)
