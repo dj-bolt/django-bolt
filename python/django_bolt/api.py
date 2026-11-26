@@ -37,6 +37,7 @@ from ._kwargs import (
     extract_response_metadata,
     field_has_upload_file,
 )
+from ._urlconf import ApiURLConf
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler, annotation_globals
@@ -4012,6 +4013,21 @@ class BoltAPI:
         # starts its worker processes.
         _core.check_native_capsule(capsule)
         self._native_routes.append((method, full_path, capsule))
+
+    @property
+    def urls(self) -> tuple[ApiURLConf, str | None, str | None]:
+        """Mount this API in Django's URLconf, as ``admin.site.urls`` does.
+
+        Usage::
+
+            urlpatterns = [path("missions/", api.urls)]
+
+        Bolt then serves each route of this API under ``missions/``, and
+        ``reverse()`` gives the same path. The ``namespace`` of this API is the
+        app and the instance namespace. An enclosing ``include()`` adds its own
+        namespace in front of it.
+        """
+        return ApiURLConf(self), self.namespace, self.namespace
 
     def mount(self, path: str, app: BoltAPI) -> None:
         """
