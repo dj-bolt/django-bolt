@@ -285,7 +285,7 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
         annotation = type_hints.get(name, param.annotation)
 
         # Take the Param or Depends marker out of Annotated[T, ...] or the default. msgspec.Meta stays.
-        annotation, explicit_marker = split_param_annotation(annotation, param.default)
+        annotation, explicit_marker, schema_meta = split_param_annotation(annotation, param.default)
 
         # Create FieldDefinition with inference
         field = FieldDefinition.from_parameter(
@@ -294,6 +294,7 @@ def compile_binder(fn: Callable, http_method: str, path: str) -> HandlerMetadata
             path_params=path_params,
             http_method=http_method,
             explicit_marker=explicit_marker,
+            schema_meta=schema_meta,
         )
         _check_field_type(fn, field)
 
@@ -428,7 +429,8 @@ def compile_websocket_binder(fn: Callable, path: str) -> HandlerMetadata:
             continue
 
         # Take the Param or Depends marker out of Annotated[T, ...] or the default. msgspec.Meta stays.
-        annotation, explicit_marker = split_param_annotation(annotation, param.default)
+        # A WebSocket has no body, so the schema Meta of a struct has no use here.
+        annotation, explicit_marker, _schema_meta = split_param_annotation(annotation, param.default)
 
         # Create FieldDefinition with inference
         # WebSocket doesn't have body, so primitives should default to query

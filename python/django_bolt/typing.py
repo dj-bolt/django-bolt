@@ -340,11 +340,27 @@ def resolve_type_alias(annotation: Any) -> Any:
 # The constraint arguments of Query() and Path(), with the msgspec.Meta names.
 _MARKER_CONSTRAINTS = ("gt", "ge", "lt", "le", "multiple_of", "min_length", "max_length", "pattern")
 
+# The msgspec.Meta names that the OpenAPI schema shows next to the $ref of a struct.
+_SCHEMA_KEYWORDS = ("title", "description", "examples", "extra_json_schema")
 
-def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, Any]:
-    """Split a parameter annotation into its value type and its ``Param`` or ``Depends`` marker.
 
-    ``Annotated[int, msgspec.Meta(ge=1), Query()]`` gives ``(Annotated[int, msgspec.Meta(ge=1)], Query())``.
+def _schema_keywords(metas: list[msgspec.Meta]) -> tuple[msgspec.Meta, ...]:
+    """The schema keywords of ``metas``, without the constraints.
+
+    msgspec cannot apply a constraint such as ``ge`` to a struct, and binding ignores it.
+    """
+    keyword_metas = []
+    for meta in metas:
+        keywords = {name: value for name in _SCHEMA_KEYWORDS if (value := getattr(meta, name)) is not None}
+        if keywords:
+            keyword_metas.append(msgspec.Meta(**keywords))
+    return tuple(keyword_metas)
+
+
+def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, Any, tuple[msgspec.Meta, ...]]:
+    """Split a parameter annotation into its value type, its ``Param`` or ``Depends`` marker and its schema Meta.
+
+    ``Annotated[int, msgspec.Meta(ge=1), Query()]`` gives ``(Annotated[int, msgspec.Meta(ge=1)], Query(), ())``.
     The marker comes from ``Annotated``, or else from ``default``. It is None when there is none.
     The constraint arguments of the marker (``Query(ge=1)``) become one more ``msgspec.Meta``.
     The ``msgspec.Meta`` items stay on a scalar or a sequence type, so the value
@@ -353,6 +369,11 @@ def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, A
     and rejects ``Annotated[int | None, Meta(ge=1)]``. A struct, a dataclass, an
     upload or a ``File()`` parameter keeps only its base type, as before. A
     ``NewType`` or a ``type`` alias resolves to the type it names.
+
+    The third item holds the schema keywords of the ``msgspec.Meta`` items of a
+    struct or a dataclass type: ``title``, ``description``, ``examples`` and
+    ``extra_json_schema``. Binding does not use them. Only the OpenAPI schema
+    reads them, for example the description of a body. (#958)
 
     Raises:
         TypeError: msgspec cannot apply a constraint to the type, for example ``ge`` to a ``Decimal``.
@@ -366,27 +387,23 @@ def split_param_annotation(annotation: Any, default: Any = None) -> tuple[Any, A
         constraints = [extra for extra in extras if isinstance(extra, msgspec.Meta)]
     else:
         base, marker, constraints = annotation, default_marker, []
+    inner = unwrap_optional(base)
+    if is_msgspec_struct(inner) or is_dataclass_type(inner):
+        return base, marker, _schema_keywords(constraints)
     if isinstance(marker, Param):
         marker_constraints = {
             name: value for name in _MARKER_CONSTRAINTS if (value := getattr(marker, name)) is not None
         }
         if marker_constraints:
             constraints.append(msgspec.Meta(**marker_constraints))
-    inner = unwrap_optional(base)
-    if (
-        not constraints
-        or is_msgspec_struct(inner)
-        or is_dataclass_type(inner)
-        or is_upload_file_type(inner)
-        or (isinstance(marker, Param) and marker.source == "file")
-    ):
-        return base, marker
+    if not constraints or is_upload_file_type(inner) or (isinstance(marker, Param) and marker.source == "file"):
+        return base, marker, ()
     constrained = Annotated[(inner, *constraints)]
     if is_optional(base):
         constrained = constrained | None
     # Check the constraints at registration. Else each request fails with a TypeError.
     msgspec.inspect.type_info(constrained)
-    return constrained, marker
+    return constrained, marker, ()
 
 
 def is_dataclass_type(annotation: Any) -> bool:
@@ -588,6 +605,12 @@ class FieldDefinition:
     param: Any = None
     """Original Param marker (for accessing file constraints, etc.)"""
 
+    schema_meta: tuple[msgspec.Meta, ...] = ()
+    """The schema keywords of the ``msgspec.Meta`` items of a struct or a dataclass type.
+
+    Binding does not use them. Only the OpenAPI schema reads them. (#958)
+    """
+
     # Pre-compiled extractor function (set at registration time)
     extractor: Callable[..., Any] | None = None
     """Pre-compiled extractor function for this parameter.
@@ -661,6 +684,7 @@ class FieldDefinition:
         path_params: set[str],
         http_method: str,
         explicit_marker: Any = None,
+        schema_meta: tuple[msgspec.Meta, ...] = (),
     ) -> FieldDefinition:
         """
         Create FieldDefinition from inspect.Parameter.
@@ -671,6 +695,7 @@ class FieldDefinition:
             path_params: Set of path parameter names
             http_method: HTTP method for inference
             explicit_marker: Explicit Param or Depends marker if present
+            schema_meta: The Meta items that only the OpenAPI schema reads
 
         Returns:
             FieldDefinition instance
@@ -716,4 +741,5 @@ class FieldDefinition:
             dependency=dependency,
             kind=parameter.kind,
             param=param,
+            schema_meta=schema_meta,
         )
