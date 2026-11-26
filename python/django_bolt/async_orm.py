@@ -31,7 +31,7 @@ from typing import Any, NamedTuple
 
 from asgiref.sync import SyncToAsync
 from django.conf import settings
-from django.core.exceptions import EmptyResultSet, SynchronousOnlyOperation
+from django.core.exceptions import EmptyResultSet, ImproperlyConfigured, SynchronousOnlyOperation
 from django.db import connections
 from django.db.models.query import MAX_GET_RESULTS, QuerySet
 from django.db.utils import (
@@ -134,7 +134,7 @@ class _Pool:
     which is cheaper than a new cursor for each query.
     """
 
-    __slots__ = ("alias", "closed", "database", "idle", "opened", "template", "waiters")
+    __slots__ = ("alias", "closed", "database", "idle", "opened", "preparing", "template", "waiters")
 
     def __init__(self, alias: str, database: Any) -> None:
         self.alias = alias
@@ -145,13 +145,16 @@ class _Pool:
         self.closed = False
         # None until ``prepare`` runs.
         self.template: _Template | None = None
+        # Reads that start together wait for one ``prepare``.
+        self.preparing = asyncio.Lock()
 
     async def prepare(self) -> None:
         """Read the template of the database. The first read of the pool calls this before it compiles."""
         alias = self.alias
-        template = _templates.get(alias)
-        if template is None:
-            template = _templates[alias] = await run_in_orm_executor(_read_template, alias)
+        async with self.preparing:
+            template = _templates.get(alias)
+            if template is None:
+                template = _templates[alias] = await run_in_orm_executor(_read_template, alias)
         # The compile step reads the server version for some expressions.
         # Without this value, the connection wrapper of the loop thread would
         # open a sync connection to read it.
@@ -416,7 +419,8 @@ def configure() -> None:
     With the setting off, it gets Django's methods back.
 
     Raises:
-        ImproperlyConfigured: DJANGO_BOLT_LOOP_CONNECTIONS is not an int of 1 or more.
+        ImproperlyConfigured: BOLT_ASYNC_ORM_ON_LOOP is not a bool, or
+            DJANGO_BOLT_LOOP_CONNECTIONS is not an int of 1 or more.
     """
     global _connection_limit
     limit = _thread_count(CONNECTIONS_VARIABLE)
@@ -425,7 +429,9 @@ def configure() -> None:
     _connection_limit = limit or DEFAULT_CONNECTIONS
     # The settings of a database can change between two servers of one process, as in tests.
     _templates.clear()
-    enabled = bool(getattr(settings, SETTING, False))
+    enabled = getattr(settings, SETTING, False)
+    if type(enabled) is not bool:
+        raise ImproperlyConfigured(f"{SETTING} must be a bool, got {type(enabled).__name__} {enabled!r}.")
     if enabled and sys.platform == "win32":
         # The event loop of a worker watches sockets only on Unix.
         logger.warning("%s has no effect on Windows. The async ORM uses the ORM thread pool.", SETTING)

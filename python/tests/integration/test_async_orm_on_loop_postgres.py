@@ -316,6 +316,9 @@ def _api() -> BoltAPI:
 
     @api.get("/cancelled-waiter")
     async def cancelled_waiter():
+        # Open the one connection of the loop, so the first query below takes it at once.
+        await _backend_pid()
+
         async def first_query() -> int:
             pid = await _backend_pid()
             # The connection is free again and the second query has its turn, but did not run yet.
@@ -535,6 +538,26 @@ def test_two_queries_of_one_request_run_on_two_connections(on_loop):
         first, second = client.get("/two-at-once").json()
 
     assert first != second
+
+
+def test_reads_that_start_together_open_one_django_connection(on_loop):
+    """The first read of a loop copies the state of a Django connection. One copy serves each loop connection."""
+    opened = []
+
+    def count(sender: Any, connection: Any, **kwargs: Any) -> None:
+        if connection.alias == ALIAS:
+            opened.append(threading.current_thread().name)
+
+    connections[ALIAS].close()
+    connection_created.connect(count)
+    try:
+        with TestClient(_api()) as client:
+            first, second = client.get("/two-at-once").json()
+    finally:
+        connection_created.disconnect(count)
+
+    assert first != second
+    assert len(opened) == 1, opened
 
 
 def test_a_query_waits_when_each_connection_is_in_use(on_loop, monkeypatch):

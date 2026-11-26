@@ -89,3 +89,14 @@ def test_an_invalid_connection_count_stops_the_server_at_startup(monkeypatch, va
 
     with pytest.raises(ImproperlyConfigured, match="DJANGO_BOLT_LOOP_CONNECTIONS must be an int of 1 or more"):
         TestClient(_api())
+
+
+@pytest.mark.parametrize("value", ["yes", 1, None])
+def test_a_setting_that_is_not_a_bool_stops_the_server_at_startup(value):
+    with (
+        override_settings(BOLT_ASYNC_ORM_ON_LOOP=value),
+        pytest.raises(ImproperlyConfigured, match="BOLT_ASYNC_ORM_ON_LOOP must be a bool, got "),
+    ):
+        TestClient(_api())
+    # The next server starts with the setting off.
+    concurrency.check_pool_environment()
