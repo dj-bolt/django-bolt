@@ -101,6 +101,8 @@ class WebSocketTestClient:
         """
         # runbolt serves an API that the URLconf mounts under its prefixes.
         self.api = served_api(api)
+        # The served API is new for each client. The connections share the buckets of the API.
+        self._rate_limit_api = api
         self.path = path
         self.headers = headers or {}
         self.query_string = query_string
@@ -142,7 +144,7 @@ class WebSocketTestClient:
             self._cors_allowed_origins,
             None,
             self.api._rust_compression_config(),
-            _rate_limiters(self.api),
+            _rate_limiters(self._rate_limit_api),
             error_renderer=self.api._rust_error_renderer(),
         )
 

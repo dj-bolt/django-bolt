@@ -159,8 +159,12 @@ def urlconf_mounts(urlconf: str | None = None) -> list[UrlconfMount]:
             that is not a ``str`` parameter. Also when ``django_bolt.urls``
             is under a prefix: Bolt serves those routes at their own paths.
     """
+    resolver = get_resolver(urlconf)
+    # django_bolt.urls as the root mounts no API. Its patterns need this walk, so do not read them.
+    if getattr(resolver.urlconf_module, "__name__", None) == REVERSE_ONLY_URLCONF:
+        return []
     mounts: list[UrlconfMount] = []
-    _collect(get_resolver(urlconf).url_patterns, (), mounts)
+    _collect(resolver.url_patterns, (), mounts)
     return mounts
 
 
@@ -268,7 +272,10 @@ def _prefixes_by_api() -> dict[int, tuple[BoltAPI, list[str]]]:
     if not settings.configured or not getattr(settings, "ROOT_URLCONF", None):
         return grouped
     for mount in urlconf_mounts():
-        grouped.setdefault(id(mount.api), (mount.api, []))[1].append(mount.prefix)
+        prefixes = grouped.setdefault(id(mount.api), (mount.api, []))[1]
+        # One prefix in two namespaces reverses two ways, but serves one time.
+        if mount.prefix not in prefixes:
+            prefixes.append(mount.prefix)
     return grouped
 
 

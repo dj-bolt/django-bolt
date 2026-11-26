@@ -39,6 +39,7 @@ from django.utils.translation import gettext_lazy
 from django_bolt import BoltAPI, WebSocket, _core
 from django_bolt._urlconf import REVERSE_ONLY_URLCONF, UrlconfMount, join_mount_path, served_apis, urlconf_mounts
 from django_bolt.management.commands.runbolt import Command
+from django_bolt.middleware import rate_limit
 from django_bolt.openapi import OpenAPIConfig
 from django_bolt.testing import TestClient, WebSocketTestClient
 from django_bolt.urls import _LazyUrlpatterns
@@ -914,3 +915,59 @@ def test_a_django_view_behind_mount_django_sees_the_paths_of_django_wsgi(mount_u
 
     assert status == 200
     assert through_bolt == json.loads(body)
+
+
+# --- Review follow-ups ------------------------------------------------------
+
+
+def test_one_prefix_in_two_namespaces_serves_the_routes_once(mount_urlconf):
+    api = _api()
+    mount_urlconf(
+        [
+            path("missions/", include(([path("", api.urls)], "first"))),
+            path("missions/", include(([path("", api.urls)], "second"))),
+        ]
+    )
+
+    assert reverse("first:detail", kwargs={"mission_id": 3}) == "/missions/3"
+    assert reverse("second:detail", kwargs={"mission_id": 3}) == "/missions/3"
+    with TestClient(api) as client:
+        assert client.get("/missions/3").json() == {"id": 3}
+
+
+@pytest.fixture
+def reverse_only_root(settings):
+    """Make a module that works as ``django_bolt.urls`` the ROOT_URLCONF."""
+    name = f"tests._reverse_only_root_{next(_names)}"
+    sys.modules[name] = _reverse_only_module()
+    settings.ROOT_URLCONF = name
+    yield
+    sys.modules.pop(name, None)
+
+
+def test_django_bolt_urls_as_the_root_urlconf_reverses_and_serves(reverse_only_root, settings):
+    settings.BOLT_API = [f"{__name__}:UNMOUNTED"]
+
+    assert reverse("own_detail", kwargs={"mission_id": 1}) == "/own/1"
+    with TestClient(UNMOUNTED) as client:
+        assert client.get("/own/1").json() == {"id": 1}
+
+
+@pytest.mark.asyncio
+async def test_websocket_connections_to_a_mounted_api_share_its_rate_limit(mount_urlconf):
+    api = BoltAPI()
+
+    @api.websocket("/limited")
+    @rate_limit(rps=1, burst=1)
+    async def limited(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.send_text("connected")
+
+    mount_urlconf([path("missions/", api.urls)])
+    options = {"cors_allowed_origins": ["*"], "read_django_settings": False}
+
+    async with WebSocketTestClient(api, "/missions/limited", **options) as ws:
+        assert await ws.receive_text() == "connected"
+    with pytest.raises(PermissionError, match="Rate limit exceeded"):
+        async with WebSocketTestClient(api, "/missions/limited", **options):
+            pass
