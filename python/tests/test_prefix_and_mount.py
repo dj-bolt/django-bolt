@@ -11,7 +11,7 @@ from typing import Annotated
 
 import pytest
 
-from django_bolt import BoltAPI, Router, WebSocket
+from django_bolt import BoltAPI, Depends, Router, WebSocket
 from django_bolt.auth import APIKeyAuthentication, IsAuthenticated
 from django_bolt.middleware import Middleware
 from django_bolt.openapi import OpenAPIConfig, SwaggerRenderPlugin
@@ -264,6 +264,65 @@ def test_a_mounted_handler_cannot_take_a_mount_path_parameter_as_an_argument():
     with pytest.raises(ValueError, match=r"GET /c takes the parameter 'x' of the mount path '/t/\{x\}'"):
         api.mount("/t/{x}", child)
     assert api._routes == []
+
+
+def _x_sync(x: int) -> int:
+    return x
+
+
+async def _x_async(x: int) -> int:
+    return x
+
+
+def _x_nested(value: Annotated[int, Depends(_x_sync)]) -> int:
+    return value
+
+
+@pytest.mark.parametrize("dependency", [_x_sync, _x_async, _x_nested], ids=["sync", "async", "nested"])
+@pytest.mark.parametrize("handler_is_async", [True, False], ids=["async-handler", "sync-handler"])
+def test_a_mounted_dependency_cannot_take_a_mount_path_parameter_as_an_argument(dependency, handler_is_async):
+    """The dependency was compiled for the route without the mount path, so the argument reads the query."""
+    api = BoltAPI()
+    child = BoltAPI()
+
+    if handler_is_async:
+
+        @child.get("/c")
+        async def handler(value: Annotated[int, Depends(dependency)]):
+            return {"x": value}
+
+    else:
+
+        @child.get("/c")
+        def handler(value: Annotated[int, Depends(dependency)]):
+            return {"x": value}
+
+    with pytest.raises(
+        ValueError, match=r"A dependency of the handler of GET /c takes the parameter 'x' of the mount path '/t/\{x\}'"
+    ):
+        api.mount("/t/{x}", child)
+    assert api._routes == []
+
+
+def test_a_mounted_dependency_reads_a_mount_path_parameter_from_the_request():
+    api = BoltAPI()
+    child = BoltAPI()
+
+    def from_request(request) -> str:
+        return request.params["x"]
+
+    def from_the_query(x: Annotated[int, Query()] = 0) -> int:
+        return x
+
+    @child.get("/c")
+    async def handler(
+        path_value: Annotated[str, Depends(from_request)], query_value: Annotated[int, Depends(from_the_query)]
+    ):
+        return {"path": path_value, "query": query_value}
+
+    api.mount("/t/{x:int}", child)
+    with TestClient(api) as client:
+        assert client.get("/t/5/c?x=9").json() == {"path": "5", "query": 9}
 
 
 def test_a_mounted_handler_reads_a_mount_path_parameter_from_the_request():

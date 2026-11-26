@@ -177,6 +177,9 @@ class HandlerMetadata(TypedDict, total=False):
     namespace: str
     """Opt-in reverse namespace from BoltAPI(namespace=...); "" when unset"""
 
+    mount_namespaces: tuple[str, ...]
+    """The namespace of each API that mount() copied the route through, from the outer API; not set on an own route"""
+
     # OpenAPI documentation metadata
     openapi_tags: list[str]
     """OpenAPI tags for grouping endpoints"""

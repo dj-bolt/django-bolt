@@ -462,10 +462,12 @@ _PATH_PARAM_NAME = re.compile(r"\{([^}:]+)")
 
 
 def _refuse_mount_path_arguments(path: str, app: BoltAPI) -> None:
-    """Refuse a mounted handler that takes a parameter of the mount path as an argument.
+    """Refuse a mounted handler or dependency that takes a parameter of the mount path as an argument.
 
-    The mounted API compiled each route without the mount path. An argument
-    with the name of a mount path parameter thus reads the query, not the path.
+    The mounted API compiled each route and its dependencies without the mount
+    path. An argument with the name of a mount path parameter thus reads the
+    query, not the path. An argument with a marker, such as ``Query()``, reads
+    the source of its marker on each route, so it is not refused.
     """
     names = set(_PATH_PARAM_NAME.findall(path))
     if not names:
@@ -473,15 +475,24 @@ def _refuse_mount_path_arguments(path: str, app: BoltAPI) -> None:
     routes = [(f"{method} {route_path}", handler_id) for method, route_path, handler_id, _handler in app._routes]
     routes.extend((f"WEBSOCKET {ws_path}", handler_id) for ws_path, handler_id, _handler in app._websocket_routes)
     for route, handler_id in routes:
-        for field in app._handler_meta.get(handler_id, {}).get("fields", ()):
-            # A marker such as Query() says that the argument is not from the path.
-            if field.name in names and field.param is None and field.source not in ("path", "request", "dependency"):
-                raise ValueError(
-                    f"The handler of {route} takes the parameter {field.name!r} of the mount path {path!r} as an "
-                    f"argument, and the argument reads the {field.source}. A mounted route was compiled without "
-                    f"the mount path. Read the value from request.params[{field.name!r}], or use a Router "
-                    "with this prefix."
-                )
+        meta = app._handler_meta.get(handler_id, {})
+        # dependency_fields has the request data fields of each dependency of the route, also of a nested one.
+        for owner, fields in (
+            ("The handler", meta.get("fields", ())),
+            ("A dependency of the handler", meta.get("dependency_fields", ())),
+        ):
+            for field in fields:
+                if (
+                    field.name in names
+                    and field.param is None
+                    and field.source not in ("path", "request", "dependency")
+                ):
+                    raise ValueError(
+                        f"{owner} of {route} takes the parameter {field.name!r} of the mount path {path!r} as an "
+                        f"argument, and the argument reads the {field.source}. A mounted route was compiled without "
+                        f"the mount path. Read the value from request.params[{field.name!r}], mark the argument "
+                        "with Path(), or use a Router with this prefix."
+                    )
 
 
 def _refuse_repeated_path_params(path: str) -> None:
@@ -4171,6 +4182,7 @@ class BoltAPI:
                 self._handler_meta[new_handler_id] = {
                     **meta,
                     "include_in_schema": _layer(meta["include_in_schema"], app.include_in_schema),
+                    "mount_namespaces": (app.namespace or "", *meta.get("mount_namespaces", ())),
                 }
 
             # Copy middleware metadata (with path updated)
@@ -4203,6 +4215,7 @@ class BoltAPI:
                 self._handler_meta[new_handler_id] = {
                     **meta,
                     "include_in_schema": _layer(meta["include_in_schema"], app.include_in_schema),
+                    "mount_namespaces": (app.namespace or "", *meta.get("mount_namespaces", ())),
                 }
 
             if handler_id in app._handler_middleware:

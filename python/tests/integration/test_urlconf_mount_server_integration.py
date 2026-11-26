@@ -6,9 +6,12 @@ in-process TestClient cannot show.
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from .apps import app_module
+from .helpers import _terminate_process
 
 _URLS = """
 from django.urls import path
@@ -55,3 +58,28 @@ def test_runbolt_serves_the_apis_of_django_bolt_urls_under_its_prefix(make_serve
         assert server.wait_for_text("/api/render", 'href="/api/missions/42"') == '<a href="/api/missions/42">go</a>'
         assert server.get("/api/missions/42").json() == {"id": 42}
         assert server.get("/missions/42").status_code == 404
+
+
+_REGEX_REVERSE_ONLY_URLS = """
+from django.urls import include, re_path
+
+urlpatterns = [re_path(r"^api/", include("django_bolt.urls"))]
+"""
+
+
+@pytest.mark.server_integration
+def test_only_runbolt_refuses_a_prefix_of_django_bolt_urls_that_it_cannot_serve(make_server_project):
+    project = make_server_project(api_module=app_module("url_reverse"), urls_content=_REGEX_REVERSE_ONLY_URLS)
+
+    # Django alone does not serve Bolt routes, so its commands accept the URLconf.
+    project.manage("check")
+    project.manage("migrate", "--noinput")
+    process, _port = project.spawn()
+    try:
+        stdout, stderr = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        _terminate_process(process)
+        pytest.fail("runbolt started with a regex prefix on django_bolt.urls")
+
+    assert process.returncode != 0, f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    assert "The URLconf includes django_bolt.urls at re_path('^api/', include('django_bolt.urls'))." in stderr

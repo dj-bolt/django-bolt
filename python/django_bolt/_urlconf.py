@@ -10,8 +10,8 @@ then the prefix, then the route path without its leading slash.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from django.conf import settings
@@ -53,8 +53,13 @@ def _reverse_only_view(*args, **kwargs):  # pragma: no cover - never invoked
     raise RuntimeError("django_bolt reverse-only view should never be called")
 
 
-def _iter_named_routes(api):
-    """Yield ``(namespace, name, route, explicit)`` for every named route on ``api``."""
+def _iter_named_routes(api, *, by_mount: bool):
+    """Yield ``(namespaces, name, route, explicit)`` for every named route on ``api``.
+
+    ``namespaces`` is the namespace of the API that registered the route. With
+    ``by_mount``, it is the namespace of each API that ``mount()`` copied the
+    route through instead, from the outer API to the inner one.
+    """
     routes = list(getattr(api, "_routes", []))
     routes += [(None, path, hid, fn) for path, hid, fn in getattr(api, "_websocket_routes", [])]
     for _method, full_path, handler_id, _fn in routes:
@@ -62,23 +67,27 @@ def _iter_named_routes(api):
         name = meta.get("name")
         if not name:
             continue
-        yield meta.get("namespace") or "", name, _to_django_route(full_path), bool(meta.get("name_explicit"))
+        chain = meta.get("mount_namespaces", ()) if by_mount else (meta.get("namespace") or "",)
+        namespaces = tuple(namespace for namespace in chain if namespace)
+        yield namespaces, name, _to_django_route(full_path), bool(meta.get("name_explicit"))
 
 
-def build_urlpatterns(api, own_namespace: str = "") -> list:
+def build_urlpatterns(api, *, by_mount: bool = False) -> list:
     """Build reverse-only ``urlpatterns`` from a (merged) BoltAPI.
 
     Flat routes reverse by their bare name; routes whose API set a ``namespace``
     are grouped under it and reverse as ``namespace:name``, like a Django
-    ``include`` with an ``app_name``. Routes in ``own_namespace`` are flat:
-    the include of ``api.urls`` gives that namespace. Identical targets (e.g. several methods on
+    ``include`` with an ``app_name``. With ``by_mount``, as for ``api.urls``,
+    the routes of ``api`` itself are flat, because the include gives the
+    namespace of ``api``. A route that ``api`` copied with ``mount()`` goes
+    under the namespace of each API that it came through. Identical targets (e.g. several methods on
     one path) are deduped, an explicit name wins over a derived one, and two
     explicit names mapping to different paths are a configuration error.
     """
-    # (namespace, name) -> (route, explicit). Resolve priority/collisions here.
-    chosen: dict[tuple[str, str], tuple[str, bool]] = {}
-    for namespace, name, route, explicit in _iter_named_routes(api):
-        key = (namespace, name)
+    # (namespaces, name) -> (route, explicit). Resolve priority/collisions here.
+    chosen: dict[tuple[tuple[str, ...], str], tuple[str, bool]] = {}
+    for namespaces, name, route, explicit in _iter_named_routes(api, by_mount=by_mount):
+        key = (namespaces, name)
         existing = chosen.get(key)
         if existing is None:
             chosen[key] = (route, explicit)
@@ -87,20 +96,25 @@ def build_urlpatterns(api, own_namespace: str = "") -> list:
         if prev_route == route:
             continue
         if explicit and prev_explicit:
-            label = f"{namespace}:{name}" if namespace else name
+            label = ":".join((*namespaces, name))
             raise ImproperlyConfigured(f"Duplicate route name {label!r} maps to both {prev_route!r} and {route!r}.")
         if explicit and not prev_explicit:
             chosen[key] = (route, True)
 
-    flat: list = []
-    namespaced: dict[str, list] = {}
-    for (namespace, name), (route, _explicit) in chosen.items():
-        pattern = path(route, _reverse_only_view, name=name)
-        (namespaced.setdefault(namespace, []) if namespace and namespace != own_namespace else flat).append(pattern)
+    groups: dict[tuple[str, ...], list] = {}
+    for (namespaces, name), (route, _explicit) in chosen.items():
+        groups.setdefault(namespaces, []).append(path(route, _reverse_only_view, name=name))
+    return _nest(groups)
 
-    urlpatterns = list(flat)
-    for namespace, patterns in namespaced.items():
-        urlpatterns.append(path("", include((patterns, namespace))))
+
+def _nest(groups: dict[tuple[str, ...], list]) -> list:
+    """Put each group of patterns in one include for each namespace of its key. The empty key is flat."""
+    urlpatterns = list(groups.get((), []))
+    inner: dict[str, dict[tuple[str, ...], list]] = {}
+    for namespaces, patterns in groups.items():
+        if namespaces:
+            inner.setdefault(namespaces[0], {})[namespaces[1:]] = patterns
+    urlpatterns.extend(path("", include((_nest(sub), namespace))) for namespace, sub in inner.items())
     return urlpatterns
 
 
@@ -119,7 +133,7 @@ class ApiURLConf:
 
     @property
     def urlpatterns(self) -> list[Any]:
-        return build_urlpatterns(self.api, own_namespace=self.api.namespace or "")
+        return build_urlpatterns(self.api, by_mount=True)
 
     def __repr__(self) -> str:
         return f"<ApiURLConf of {self.api!r}>"
@@ -149,9 +163,14 @@ class ReverseOnlyURLConf(Sequence):
     def apis(self) -> list[tuple[str, BoltAPI]]:
         """Return the APIs that ``runbolt`` finds and that no ``api.urls`` of ``ROOT_URLCONF`` mounts."""
         if self._apis is None:
-            mounted = {id(mount.api) for mount in _walk_root().mounts}
+            mounted = {id(api) for api, _chain in _walk_root().mounts}
             self._apis = [(label, api) for label, api in self._command().autodiscover_apis() if id(api) not in mounted]
         return self._apis
+
+    def forget(self) -> None:
+        """Forget the APIs and the patterns. They depend on ``ROOT_URLCONF``."""
+        self._apis = None
+        self._patterns = None
 
     def _load(self) -> list[Any]:
         if self._patterns is None:
@@ -161,6 +180,10 @@ class ReverseOnlyURLConf(Sequence):
 
     def __getitem__(self, index: Any) -> Any:
         return self._load()[index]
+
+    def __iter__(self) -> Iterator[Any]:
+        # The iteration of Sequence stops at an IndexError, so it would hide one from autodiscovery.
+        yield from self._load()
 
     def __len__(self) -> int:
         return len(self._load())
@@ -176,24 +199,32 @@ class UrlconfMount:
     ``prefix`` is the Django route of the include in Bolt syntax, for example
     ``"org/{org}/missions/"``. It is empty at the root. ``namespace`` is the
     chain of instance namespaces above the API and of the API, for example
-    ``"outer:inner"``.
+    ``"outer:inner"``. ``where`` names the URLconf entries of the mount, for the
+    messages of the errors.
     """
 
     api: BoltAPI
     prefix: str
     namespace: str
+    where: str = field(default="", compare=False)
 
 
 class _Walk:
-    """What one walk of a URLconf finds."""
+    """What one walk of a URLconf finds.
 
-    __slots__ = ("mounts", "reverse_only", "reverse_only_prefixes")
+    The walk only finds the entries. It does not check the prefixes, because
+    Django alone does not serve Bolt routes: only ``runbolt`` and the test
+    clients refuse a prefix that Bolt cannot serve.
+    """
+
+    __slots__ = ("mounts", "reverse_only", "reverse_only_chains")
 
     def __init__(self) -> None:
-        self.mounts: list[UrlconfMount] = []
-        # The include of django_bolt.urls, and its prefixes in URLconf order, each one time.
+        # Each api.urls entry: its API, and the resolvers from the root to the entry.
+        self.mounts: list[tuple[BoltAPI, tuple[URLResolver, ...]]] = []
+        # The include of django_bolt.urls, and the resolvers from the root to each include of it.
         self.reverse_only: ReverseOnlyURLConf | None = None
-        self.reverse_only_prefixes: list[str] = []
+        self.reverse_only_chains: list[tuple[URLResolver, ...]] = []
 
 
 def join_mount_path(prefix: str, route_path: str) -> str:
@@ -213,11 +244,11 @@ def urlconf_mounts(urlconf: str | None = None) -> list[UrlconfMount]:
     ``urlconf`` defaults to ``ROOT_URLCONF``.
 
     Raises:
-        ImproperlyConfigured: A prefix above a mounted API or above
-            ``django_bolt.urls`` is not a static ``path()`` route that ends
-            with a slash, or it has a parameter that Bolt cannot serve.
+        ImproperlyConfigured: A prefix above a mounted API is not a static
+            ``path()`` route that ends with a slash, or it has a parameter
+            that Bolt cannot serve.
     """
-    return _walk(urlconf).mounts
+    return _mounts(_walk(urlconf))
 
 
 def _walk(urlconf: str | None) -> _Walk:
@@ -240,20 +271,23 @@ def _collect(patterns: Any, parents: tuple[URLResolver, ...], walk: _Walk) -> No
         chain = (*parents, entry)
         module = entry.urlconf_module
         if isinstance(module, ApiURLConf):
-            namespace = ":".join(resolver.namespace for resolver in chain if resolver.namespace)
-            where = f"The URLconf mounts a BoltAPI at {_describe(chain, 'api.urls')}."
-            walk.mounts.append(UrlconfMount(module.api, _bolt_prefix(chain, where, refuse_kwargs=True), namespace))
+            walk.mounts.append((module.api, chain))
         elif isinstance(module, ReverseOnlyURLConf):
-            # The last entry of the chain is in django_bolt.urls itself, so the message names its parents.
-            where = f"The URLconf includes {REVERSE_ONLY_URLCONF} at {_describe(parents, _INCLUDE_REVERSE_ONLY)}."
-            # Bolt ignored the keyword arguments of this include before, so it does not refuse them.
-            prefix = _bolt_prefix(chain, where, refuse_kwargs=False)
             if walk.reverse_only is None:
                 walk.reverse_only = module
-            if prefix not in walk.reverse_only_prefixes:
-                walk.reverse_only_prefixes.append(prefix)
+            walk.reverse_only_chains.append(chain)
         else:
             _collect(entry.url_patterns, chain, walk)
+
+
+def _mounts(walk: _Walk) -> list[UrlconfMount]:
+    """Return the ``api.urls`` mounts of ``walk`` with their prefixes. Refuse a prefix that Bolt cannot serve."""
+    mounts = []
+    for api, chain in walk.mounts:
+        namespace = ":".join(resolver.namespace for resolver in chain if resolver.namespace)
+        where = f"The URLconf mounts a BoltAPI at {_describe(chain, 'api.urls')}."
+        mounts.append(UrlconfMount(api, _bolt_prefix(chain, where, refuse_kwargs=True), namespace, where))
+    return mounts
 
 
 def _entry(pattern: Any, target: str) -> str:
@@ -326,7 +360,22 @@ def _bolt_prefix(chain: tuple[URLResolver, ...], where: str, *, refuse_kwargs: b
             f"{where} The prefix gives an empty path segment. "
             "Start each route of the include without a slash, and end it with one slash."
         )
+    repeated = _repeated_parameter(prefix)
+    if repeated is not None:
+        raise ImproperlyConfigured(
+            f"{where} The prefix has the parameter {repeated!r} two times. Give each parameter of a path its own name."
+        )
     return prefix
+
+
+def _repeated_parameter(bolt_path: str) -> str | None:
+    """The first parameter name that ``bolt_path`` has two times, or None."""
+    seen: set[str] = set()
+    for match in _PARAM_RE.finditer(bolt_path):
+        if match.group(1) in seen:
+            return match.group(1)
+        seen.add(match.group(1))
+    return None
 
 
 def _bolt_route(route: str, pattern: RoutePattern, where: str) -> str:
@@ -356,26 +405,59 @@ def _bolt_route(route: str, pattern: RoutePattern, where: str) -> str:
     return bolt_route
 
 
-def _prefixes_by_api(walk: _Walk) -> dict[int, tuple[BoltAPI, list[str]]]:
+# A prefix with the sentence that names its URLconf entry, for the messages of the errors.
+_Prefixes = dict[str, str]
+
+
+def _prefixes_by_api(walk: _Walk) -> dict[int, tuple[BoltAPI, _Prefixes]]:
     """Group the prefixes of the ``api.urls`` mounts by API, in URLconf order."""
-    grouped: dict[int, tuple[BoltAPI, list[str]]] = {}
-    for mount in walk.mounts:
-        prefixes = grouped.setdefault(id(mount.api), (mount.api, []))[1]
+    grouped: dict[int, tuple[BoltAPI, _Prefixes]] = {}
+    for mount in _mounts(walk):
         # One prefix in two namespaces reverses two ways, but serves one time.
-        if mount.prefix not in prefixes:
-            prefixes.append(mount.prefix)
+        grouped.setdefault(id(mount.api), (mount.api, {}))[1].setdefault(mount.prefix, mount.where)
     return grouped
 
 
-def _reverse_only_prefixes(walk: _Walk) -> list[str] | None:
+def _reverse_only_prefixes(walk: _Walk) -> _Prefixes | None:
     """The prefixes of ``django_bolt.urls``, or None when its APIs serve at their own paths."""
-    prefixes = walk.reverse_only_prefixes
-    return None if prefixes in ([], [""]) else prefixes
+    prefixes: _Prefixes = {}
+    for chain in walk.reverse_only_chains:
+        # The last entry of the chain is in django_bolt.urls itself, so the message names its parents.
+        where = f"The URLconf includes {REVERSE_ONLY_URLCONF} at {_describe(chain[:-1], _INCLUDE_REVERSE_ONLY)}."
+        # Bolt ignored the keyword arguments of this include before, so it does not refuse them.
+        prefixes.setdefault(_bolt_prefix(chain, where, refuse_kwargs=False), where)
+    return None if set(prefixes) <= {""} else prefixes
 
 
-def _serve(api: BoltAPI, prefixes: list[str]) -> BoltAPI:
+def _serve(api: BoltAPI, prefixes: _Prefixes) -> BoltAPI:
     # A mount at the root serves the paths of the API itself.
-    return api if set(prefixes) == {""} else api._served_at(prefixes)
+    if set(prefixes) == {""}:
+        return api
+    for prefix, where in prefixes.items():
+        _refuse_unservable(api, prefix, where)
+    return api._served_at(list(prefixes))
+
+
+def _refuse_unservable(api: BoltAPI, prefix: str, where: str) -> None:
+    """Refuse an endpoint of ``api`` that Bolt cannot serve under ``prefix``. ``where`` names the URLconf entry."""
+    if "{" not in prefix:
+        return
+    if api._asgi_mounts or api._mcp_mounts:
+        raise ImproperlyConfigured(
+            f"{where} The prefix {prefix!r} has a path parameter. Bolt serves an ASGI mount, a Django mount "
+            "and an MCP server at a static path, and the API has one. Mount the API under a prefix "
+            "without a parameter, or move the mount to an API at a static prefix."
+        )
+    paths = [route[1] for route in (*api._routes, *api._native_routes)]
+    paths.extend(ws_path for ws_path, _handler_id, _handler in api._websocket_routes)
+    for route_path in paths:
+        served = join_mount_path(prefix, route_path)
+        repeated = _repeated_parameter(served)
+        if repeated is not None:
+            raise ImproperlyConfigured(
+                f"{where} The path {served!r} has the parameter {repeated!r} two times. "
+                "Give the parameter of the prefix another name."
+            )
 
 
 def served_api(api: BoltAPI) -> BoltAPI:
@@ -385,12 +467,16 @@ def served_api(api: BoltAPI) -> BoltAPI:
     ``api.urls`` mounts. When no ``api.urls`` mounts ``api`` and
     ``django_bolt.urls`` names it, it serves under the prefixes of that include.
     Otherwise it is ``api``.
+
+    Raises:
+        ImproperlyConfigured: ``ROOT_URLCONF`` has a prefix that Bolt cannot
+            serve above an ``api.urls`` or above ``django_bolt.urls``.
     """
     walk = _walk_root()
     entry = _prefixes_by_api(walk).get(id(api))
+    moved = _reverse_only_prefixes(walk)
     if entry is not None:
         return _serve(api, entry[1])
-    moved = _reverse_only_prefixes(walk)
     # Autodiscovery runs only when django_bolt.urls has a prefix, to know if it names the API.
     if (
         moved is not None
@@ -409,6 +495,10 @@ def served_apis(apis: list[tuple[str, BoltAPI]]) -> list[tuple[str, BoltAPI]]:
     when autodiscovery found it. The other APIs are the APIs that
     ``django_bolt.urls`` names, so they serve under the prefixes of its include.
     The mounted APIs that autodiscovery did not find come last, in URLconf order.
+
+    Raises:
+        ImproperlyConfigured: ``ROOT_URLCONF`` has a prefix that Bolt cannot
+            serve above an ``api.urls`` or above ``django_bolt.urls``.
     """
     walk = _walk_root()
     grouped = _prefixes_by_api(walk)
@@ -423,5 +513,5 @@ def served_apis(apis: list[tuple[str, BoltAPI]]) -> list[tuple[str, BoltAPI]]:
         else:
             served.append((label, api))
     for api, prefixes in grouped.values():
-        served.append((f"path({prefixes[0]!r}, api.urls)", _serve(api, prefixes)))
+        served.append((f"path({next(iter(prefixes))!r}, api.urls)", _serve(api, prefixes)))
     return served

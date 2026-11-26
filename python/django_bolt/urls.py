@@ -34,6 +34,10 @@ after it imports the whole URLconf, because the patterns depend on the
 
 from __future__ import annotations
 
+from typing import Any
+
+from django.core.signals import setting_changed
+from django.dispatch import receiver
 from django.urls import path
 
 from django_bolt._urlconf import ReverseOnlyURLConf, build_urlpatterns
@@ -41,4 +45,12 @@ from django_bolt.management.commands.runbolt import Command as _Runbolt
 
 __all__ = ["build_urlpatterns", "urlpatterns"]
 
-urlpatterns = [path("", (ReverseOnlyURLConf(_Runbolt), None, None))]
+_patterns = ReverseOnlyURLConf(_Runbolt)
+urlpatterns = [path("", (_patterns, None, None))]
+
+
+@receiver(setting_changed)
+def _forget_patterns(*, setting: str, **kwargs: Any) -> None:
+    """Forget the patterns when ``ROOT_URLCONF`` changes, as Django forgets its URL caches then."""
+    if setting == "ROOT_URLCONF":
+        _patterns.forget()
