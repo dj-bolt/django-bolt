@@ -344,6 +344,16 @@ All notable changes to this project will be documented in this file.
 - **The dispatch of a route with no auth costs less** - Bolt read the auth context of each request, also on a route with no auth backend. Now it reads the context only for a route with a backend. The async dispatch also found the API with the middleware of the route on each request. Now registration stores that API. For a route with no auth, the Python dispatch runs 4% to 14% fewer instructions. A route with auth runs about 3% fewer on the async dispatch, and about 1.5% more on the sync dispatch.
 - **A guarded route with no auth backend uses `JWTAuthentication()`** - A route with `guards=[IsAuthenticated()]`, no `auth` and no `BOLT_AUTHENTICATION_CLASSES` had no backend. Thus each request got a 401, also a request with a valid token. Now such a route gets `JWTAuthentication()`, which verifies an HS256 token in the `Authorization` header with `SECRET_KEY`. The rule applies to each guard that needs a user: `IsAuthenticated` and `Requires`, from the route, a router, a class-based view, an `@action`, `BOLT_DEFAULT_PERMISSION_CLASSES`, a WebSocket route or an MCP mount. A route with no guard, or with `AllowAny()` first, still has no backend. `auth=[]` and `BOLT_AUTHENTICATION_CLASSES = []` still mean no backend.
 
+### Deprecated
+
+- **Public names that no Bolt code calls** - Each of these names now gives a `DeprecationWarning` when you use it. Bolt removes them in the next minor release. They still work until then. (#873)
+  - `django_bolt.auth`: `register_auth_backend()`, `get_registered_backend()` and `load_user()`. Bolt registers the backends of each route itself. To get the user, use `request.user` or `await request.auser()`.
+  - `django_bolt.auth.user_loader`: `load_user_sync()`, `default_django_user_loader()`, `default_django_user_aloader()` and `DEFAULT_USER_LOADERS`.
+  - `django_bolt.websocket`: `run_websocket_handler()` and `is_websocket_handler()`. Register a handler with `@api.websocket()`.
+  - `django_bolt.admin`: `get_admin_route_patterns()` and `get_admin_info()`, and `django_bolt.admin.admin_detection.get_static_url_prefix()`. Use `is_admin_installed()`, `should_enable_admin()`, `detect_admin_url_prefix()` and `settings.STATIC_URL`.
+  - The `host` and `port` arguments of `AdminRouteRegistrar.register_routes()`. They have no effect.
+  - `django_bolt.request.is_request()`, `Response.to_bytes()` and `django_bolt.openapi.spec.schema.SchemaDataContainer`.
+
 ### Removed
 
 - **Three definitions that nothing used** - `django_bolt.responses.UploadFile` was an old copy of the upload class. The public `UploadFile` is `django_bolt.datastructures.UploadFile`, and `from django_bolt import UploadFile` still gives it. `django_bolt.testing.helpers.create_test_client` was a wrapper of `TestClient(...)` that `django_bolt.testing` did not export. `django_bolt._json.decode_typed` had no caller. Use `TestClient(api)` and `msgspec.json.decode(value, type=...)`.
