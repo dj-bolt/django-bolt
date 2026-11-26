@@ -1099,7 +1099,10 @@ class Command(BaseCommand):
         # Register WebSocket routes with Rust (including pre-compiled injectors)
         ws_routes = merged_api._rust_websocket_routes(script_prefix)
         if ws_routes:
-            _core.register_websocket_routes(ws_routes)
+            try:
+                _core.register_websocket_routes(ws_routes)
+            except ValueError as e:
+                raise CommandError(str(e)) from e
 
         # Register middleware metadata if present
         middleware_count = 0

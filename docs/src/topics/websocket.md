@@ -123,6 +123,8 @@ A value that does not convert refuses the handshake with `400`.
 For example, `/ws/articles/abc/presence` gets `400`, and the handler does not run.
 
 A route matches the request path with and without a trailing slash.
+Thus `/live` and `/live/` are one route, and a second route at that path stops the startup.
+[Routes that stop the startup](routing.md#routes-that-stop-the-startup) gives each such error.
 A WebSocket has no request body, so a body, form or file parameter is not available.
 
 The `WebSocket` object also has these attributes: `path`, `path_info`, `query_params`, `headers`, `cookies`, `path_params`, `subprotocols`, `client` and `state`.

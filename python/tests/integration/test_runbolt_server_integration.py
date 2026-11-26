@@ -121,6 +121,17 @@ def test_runbolt_with_a_bolt_compression_of_a_wrong_type_stops_startup(make_serv
     assert "settings.BOLT_COMPRESSION must be a CompressionConfig, None or False, not bool" in str(excinfo.value)
 
 
+def test_runbolt_with_two_websocket_routes_at_one_position_stops_with_a_command_error(make_server_project):
+    project = make_server_project(api_module=app_module("websocket_route_conflict"))
+
+    with pytest.raises(AssertionError) as excinfo, project.start(timeout=15):
+        pass
+
+    assert (
+        "CommandError: Failed to register route: WEBSOCKET /live/{rest:path} conflicts with WEBSOCKET /live/{room}."
+    ) in str(excinfo.value)
+
+
 def test_runbolt_failing_system_check_stops_startup(make_server_project):
     project = make_server_project(
         installed_apps=["badapp.apps.BadAppConfig"],
