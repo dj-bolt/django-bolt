@@ -40,6 +40,13 @@ PYTHON = "Python refuses it"
 VERSIONS = "Python versions read it differently"
 NOT_ISO = "Python reads it, but it is not ISO 8601; master refused it too"
 NOT_ASCII = "int() or float() reads it; master refused it too"
+OFFSET_SECONDS = "Python reads it, but RFC 3339 has no seconds in an offset; master refused it too"
+
+# The digit limit that Bolt reads at startup: that of int(), at most 4300.
+# Python has no limit for 0, and Bolt then keeps 4300.
+PYTHON_DIGITS = sys.get_int_max_str_digits()
+DIGITS = min(4300, PYTHON_DIGITS or 4300)
+TOO_MANY_DIGITS = PYTHON if 0 < PYTHON_DIGITS <= 4300 else "int() reads it, but Bolt keeps 4300 digits"
 
 # (type, text, value or the reason of the refusal). Each form of audit findings
 # F1 to F5, and each form that 9d369a5a refused although master and Python read it.
@@ -77,15 +84,14 @@ FORMS = [
     # F3: an int beyond i64 is a Python int, up to the digit limit of int().
     ("int", "9223372036854775808", 9223372036854775808),
     ("int", "-9223372036854775809", -9223372036854775809),
-    ("int", "1" * 4300, int("1" * 4300)),
-    ("int", "1" * 4301, PYTHON),
-    ("int", "0" * 4301, PYTHON),
+    ("int", "1" * DIGITS, (10**DIGITS - 1) // 9),
+    ("int", "1" * (DIGITS + 1), TOO_MANY_DIGITS),
+    ("int", "0" * (DIGITS + 1), TOO_MANY_DIGITS),
     # F4: ISO 8601 forms that Python reads.
     ("datetime", "2024-01-15T10:30", dt(2024, 1, 15, 10, 30)),
     ("datetime", "2024-01-15T10", dt(2024, 1, 15, 10)),
     ("datetime", "2024-01-15T10:30:00+0530", dt(2024, 1, 15, 10, 30, tzinfo=tz(5, 30))),
     ("datetime", "2024-01-15T10:30:00+05", dt(2024, 1, 15, 10, 30, tzinfo=tz(5))),
-    ("datetime", "2024-01-15T10:30:00+05:30:15.5", dt(2024, 1, 15, 10, 30, tzinfo=tz(5, 30, 15, 500000))),
     ("datetime", "20240115T103000", dt(2024, 1, 15, 10, 30)),
     ("datetime", "20240115", dt(2024, 1, 15)),
     ("datetime", "2024-W03-1T10:30:00", dt(2024, 1, 15, 10, 30)),
@@ -140,7 +146,17 @@ FORMS = [
     ("datetime", "2024-01-15T10:30:00.Z", NOT_ISO),
     ("time", "10:30:00+05:60", NOT_ISO),
     ("time", "10:30:00\0", NOT_ISO),
+    ("datetime", "2024-01-15T10:30:00\0", NOT_ISO),
+    ("datetime", "2024-01-15T10:30:00+05:30:15.5", OFFSET_SECONDS),
+    ("datetime", "2024-01-15T10:30:00+05:30:15", OFFSET_SECONDS),
+    ("datetime", "2024-01-15T10:30:00+05:30:00", OFFSET_SECONDS),
+    ("datetime", "2024-01-15T10:30:00-00:00:00", OFFSET_SECONDS),
+    ("time", "10:30:00+053015", OFFSET_SECONDS),
+    ("time", "10:30:00-23:59:59.999999", OFFSET_SECONDS),
     ("date", "20240115xx", NOT_ISO),
+    ("date", "0002121227", NOT_ISO),
+    ("datetime", "2024-01-15\x1c10:30", NOT_ISO),
+    ("datetime", "2024-01-15\x1f10:30", NOT_ISO),
     ("int", "1_000", NOT_ASCII),
     ("int", " 5", NOT_ASCII),
     ("int", "٣", NOT_ASCII),
@@ -158,13 +174,18 @@ TYPES = {"int": int, "float": float, "date": datetime.date, "time": datetime.tim
 
 
 def describe(value):
-    """Give the JSON form of a converted value: its type, its fields and its UTC offset."""
+    """Give the JSON form of a converted value: its type, its fields and its UTC offset.
+
+    An int is in hex: str() and repr() refuse more digits than the digit limit of int().
+    """
     if isinstance(value, datetime.datetime | datetime.time):
         offset = value.utcoffset()
         seconds = None if offset is None else offset.total_seconds()
         return [type(value).__name__, value.replace(tzinfo=None).isoformat(), seconds, value.tzinfo is UTC]
     if isinstance(value, datetime.date):
         return ["date", value.isoformat()]
+    if type(value) is int:
+        return ["int", hex(value)]
     return [type(value).__name__, repr(value)]
 
 

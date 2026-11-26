@@ -110,7 +110,10 @@ async def time_value(v: datetime.time):
 
 
 def _describe(value):
-    """Give the JSON form of a converted value: its type, its fields and its UTC offset."""
+    """Give the JSON form of a converted value: its type, its fields and its UTC offset.
+
+    An int is in hex: str() and repr() refuse more digits than the digit limit of int().
+    """
     if isinstance(value, datetime.datetime | datetime.time):
         offset = value.utcoffset()
         seconds = None if offset is None else offset.total_seconds()
@@ -118,6 +121,8 @@ def _describe(value):
         return [type(value).__name__, value.replace(tzinfo=None).isoformat(), seconds, utc]
     if isinstance(value, datetime.date):
         return ["date", value.isoformat()]
+    if type(value) is int:
+        return ["int", hex(value)]
     return [type(value).__name__, repr(value)]
 
 
@@ -438,7 +443,8 @@ PARAM_TEXTS = st.one_of(
 # The ISO 8601 forms that Bolt reads (see docs/src/topics/requests.md).
 _ISO_DATE = r"\d{4}(?:-\d{2}-\d{2}|\d{4}|-?W\d{2}|-W\d{2}-\d|W\d{3})"
 _HMS = r"\d{2}(?::\d{2}(?::\d{2}(?:[.,]\d+)?)?|\d{2}(?:\d{2}(?:[.,]\d+)?)?)?"
-_CLOCK = rf"(?P<clock>{_HMS})(?:Z|[+-](?P<zone>{_HMS}))?"
+# RFC 3339 has no seconds in an offset, so Bolt refuses them, although Python reads them.
+_CLOCK = rf"(?P<clock>{_HMS})(?:Z|[+-](?P<zone>\d{{2}}(?::?\d{{2}})?))?"
 ISO_FORMS = {
     "date": re.compile(_ISO_DATE, re.ASCII),
     "time": re.compile(rf"T?{_CLOCK}", re.ASCII),
@@ -458,16 +464,12 @@ def _python_reads_it_on_each_version(match: re.Match) -> bool:
         # Only Python 3.14 reads hour 24, as midnight of the next day.
         return False
     zone = groups.get("zone")
-    if zone is None:
-        return True
-    fields, _, fraction = zone.replace(",", ".").partition(".")
-    fields = fields.replace(":", "")
-    hours, minutes, seconds = (int(fields[at : at + 2] or 0) for at in (0, 2, 4))
-    if minutes > 59 or seconds > 59:
-        # Each version reads +05:60 as six hours. It is not ISO 8601.
-        return False
-    # For +00:00:00.5, Python 3.13 keeps the fraction; 3.12 and 3.14 give UTC.
-    return bool(hours or minutes or seconds) or not int(fraction[:6] or 0)
+    # Each version reads +05:60 as six hours. It is not ISO 8601.
+    return zone is None or int(zone.replace(":", "")[2:] or 0) <= 59
+
+
+# The digit limit of an int that Bolt reads at startup: that of int(), at most 4300.
+_INT_DIGITS = min(4300, sys.get_int_max_str_digits() or 4300)
 
 
 def _python_value(kind: str, text: str):
@@ -479,7 +481,8 @@ def _python_value(kind: str, text: str):
     """
     try:
         if kind == "int":
-            return int(text) if re.fullmatch(r"[+-]?[0-9]+", text, re.ASCII) else None
+            readable = re.fullmatch(r"[+-]?[0-9]+", text, re.ASCII) and len(text.lstrip("+-")) <= _INT_DIGITS
+            return int(text) if readable else None
         if kind == "float":
             readable = text.isascii() and "_" not in text and not any(char.isspace() for char in text)
             return float(text) if readable else None
@@ -507,6 +510,8 @@ def _python_value(kind: str, text: str):
 @example(case=("time", "10:30.5"))
 @example(case=("time", "10:30:00+00:00:00.5"))
 @example(case=("time", "10:30:00+05:60"))
+@example(case=("time", "10:30:00+05:30:15"))
+@example(case=("datetime", "2024-01-15T10:30:00+05:30:00"))
 @example(case=("date", "20240115xx"))
 @example(case=("int", "9223372036854775808"))
 @example(case=("int", "007"))

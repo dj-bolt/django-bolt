@@ -321,8 +321,9 @@ fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {
 // of an hour or a minute (3.14 refuses it). Bolt also refuses some texts that
 // Python reads but that are not ISO 8601: whitespace, `_` or other digits than
 // ASCII in a number, a date and time separator other than `T`, `t` or a space,
-// text between the time and the offset, an offset field out of range, and a
-// NUL character. Each parser reads the text once, with no Python call.
+// text between the time and the offset, an offset field out of range, seconds
+// in an offset, and a NUL character. Each parser reads the text once, with no
+// Python call.
 
 /// The most digits that an `int` text can have: the default of
 /// `sys.get_int_max_str_digits()`. A higher limit, or no limit, keeps this
@@ -340,6 +341,8 @@ static INT_MAX_DIGITS: AtomicUsize = AtomicUsize::new(MAX_INT_DIGITS);
 ///
 /// The server and the test client call this once, when they start. A later
 /// call of `sys.set_int_max_str_digits()` does not change the limit of Bolt.
+/// A process has one limit, as Python has one for each interpreter. Thus the
+/// last server or test client that starts sets the limit for all of them.
 pub fn resolve_int_max_str_digits(py: Python<'_>) -> PyResult<()> {
     let limit: usize = py
         .import("sys")?
@@ -396,20 +399,16 @@ fn parse_float(value: &str) -> Result<CoercedValue, String> {
     })
 }
 
-/// A UTC offset as a Python `timedelta` holds it: whole seconds, then
-/// microseconds with the same sign. It is less than 24 hours.
+/// A UTC offset in whole minutes, less than 24 hours. ISO 8601 and RFC 3339
+/// give an offset no seconds field, so Bolt refuses one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UtcOffset {
-    pub seconds: i32,
-    pub micros: i32,
+    pub minutes: i32,
 }
 
 impl UtcOffset {
     /// The offset of `Z`, `+00:00` and `-00:00`. Python gives `timezone.utc` for it.
-    pub const UTC: Self = Self {
-        seconds: 0,
-        micros: 0,
-    };
+    pub const UTC: Self = Self { minutes: 0 };
 }
 
 fn digit(c: u8) -> Option<u32> {
@@ -487,7 +486,7 @@ fn parse_hms(text: &[u8]) -> Option<(u32, u32, u32, u32)> {
 }
 
 /// Parse a time of day with an optional UTC offset: `Z`, or a sign and the
-/// form of [`parse_hms`].
+/// form of [`parse_offset`].
 fn parse_clock(text: &[u8]) -> Option<(NaiveTime, Option<UtcOffset>)> {
     let zone_at = text
         .iter()
@@ -505,26 +504,22 @@ fn parse_clock(text: &[u8]) -> Option<(NaiveTime, Option<UtcOffset>)> {
     Some((time, offset))
 }
 
-/// Parse the fields of an offset after its sign. Python reads `+05:60` as six
-/// hours; Bolt refuses a field out of range.
+/// Parse an offset after its sign: `HH`, `HHMM` or `HH:MM`. Python also reads
+/// seconds and a fraction, and `+05:60` as six hours. Bolt refuses them: the
+/// JSON encoder writes an offset in whole minutes, so a second would change
+/// the instant in a response.
 fn parse_offset(sign: u8, zone: &[u8]) -> Option<UtcOffset> {
-    let (hours, minutes, seconds, micros) = parse_hms(zone)?;
-    if hours > 23 || minutes > 59 || seconds > 59 {
+    let (hours, minutes) = match *zone {
+        [h0, h1] => (pair(h0, h1)?, 0),
+        [h0, h1, m0, m1] | [h0, h1, b':', m0, m1] => (pair(h0, h1)?, pair(m0, m1)?),
+        _ => return None,
+    };
+    if hours > 23 || minutes > 59 {
         return None;
     }
-    let seconds = (hours * 3600 + minutes * 60 + seconds) as i32;
-    // For +00:00:00.5, Python 3.13 keeps the fraction; 3.12 and 3.14 give UTC.
-    if seconds == 0 && micros != 0 {
-        return None;
-    }
-    let micros = micros as i32;
-    Some(if sign == b'-' {
-        UtcOffset {
-            seconds: -seconds,
-            micros: -micros,
-        }
-    } else {
-        UtcOffset { seconds, micros }
+    let minutes = (hours * 60 + minutes) as i32;
+    Some(UtcOffset {
+        minutes: if sign == b'-' { -minutes } else { minutes },
     })
 }
 
@@ -594,29 +589,22 @@ fn big_int_to_py<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>
 /// The largest offset of whole minutes, in minutes: 23:59.
 const MAX_OFFSET_MINUTES: i32 = 24 * 60 - 1;
 
-/// One `timezone` for each offset of whole minutes, made at its first use.
+/// One `timezone` for each offset, made at its first use.
 /// A `timezone` costs a `timedelta` and a constructor call under the GIL.
 static TZINFO_BY_MINUTE: [PyOnceLock<Py<PyTzInfo>>; 2 * MAX_OFFSET_MINUTES as usize + 1] =
     [const { PyOnceLock::new() }; 2 * MAX_OFFSET_MINUTES as usize + 1];
 
 /// Give the Python `tzinfo` of an offset. UTC is the cached
-/// `datetime.timezone.utc`, as `fromisoformat()` gives. An offset of whole
-/// minutes is cached; an offset with seconds is rare and is not.
+/// `datetime.timezone.utc`, as `fromisoformat()` gives.
 fn tzinfo_to_py(py: Python<'_>, offset: UtcOffset) -> PyResult<Bound<'_, PyTzInfo>> {
-    let new_tzinfo = || {
-        PyTzInfo::fixed_offset(
-            py,
-            PyDelta::new(py, 0, offset.seconds, offset.micros, true)?,
-        )
-    };
     if offset == UtcOffset::UTC {
         return Ok(PyTzInfo::utc(py)?.to_owned());
     }
-    if offset.micros != 0 || offset.seconds % 60 != 0 {
-        return new_tzinfo();
-    }
-    let slot = &TZINFO_BY_MINUTE[(offset.seconds / 60 + MAX_OFFSET_MINUTES) as usize];
-    let tzinfo = slot.get_or_try_init(py, || new_tzinfo().map(Bound::unbind))?;
+    let slot = &TZINFO_BY_MINUTE[(offset.minutes + MAX_OFFSET_MINUTES) as usize];
+    let tzinfo = slot.get_or_try_init(py, || {
+        PyTzInfo::fixed_offset(py, PyDelta::new(py, 0, offset.minutes * 60, 0, true)?)
+            .map(Bound::unbind)
+    })?;
     Ok(tzinfo.bind(py).clone())
 }
 
@@ -625,23 +613,31 @@ fn micros(time: NaiveTime) -> u32 {
     time.nanosecond() / 1000
 }
 
-/// Convert the text items of a `list[T]` parameter with the parser of one `T`
-/// value, so that a list and a single value of one type accept the same text.
+/// Convert the text items of a sequence parameter with the parser of one `T`
+/// value, so that a sequence and a single value of one type accept the same text.
 ///
-/// The extractors call this once for each parameter, at most, with the type
-/// hint that the route registration found. An item that is not text stays as
-/// it is. The first refused item raises `ValueError(index, message)`.
+/// The extractors call this at most once for each parameter, with the type
+/// hint and the length bounds that the route registration found. A length out
+/// of `min_length..=max_length`, or an item that is not text, gives `items`
+/// itself: msgspec then refuses it with its own error, and it checks the
+/// length before it reads an item. The first refused text raises
+/// `ValueError(index, message)`.
 #[pyfunction]
+#[pyo3(signature = (items, type_hint, min_length = 0, max_length = usize::MAX))]
 pub fn parse_text_items<'py>(
     items: &Bound<'py, PyList>,
     type_hint: u8,
+    min_length: usize,
+    max_length: usize,
 ) -> PyResult<Bound<'py, PyList>> {
     let py = items.py();
+    if !(min_length..=max_length).contains(&items.len()) {
+        return Ok(items.clone());
+    }
     let converted = PyList::empty(py);
     for (index, item) in items.iter().enumerate() {
         let Ok(text) = item.cast::<PyString>() else {
-            converted.append(item)?;
-            continue;
+            return Ok(items.clone());
         };
         match coerce_typed(&text.to_string_lossy(), type_hint) {
             Ok(value) => converted.append(coerced_value_to_py(py, &value)?)?,
@@ -949,7 +945,8 @@ mod tests {
 
         /// A time converts in each form that `time.fromisoformat()` reads, alone,
         /// after `T`, and after a date and a separator. A fraction keeps its
-        /// first six digits. An offset keeps its fields.
+        /// first six digits. An offset keeps its fields. An offset with
+        /// seconds is refused.
         #[test]
         fn a_time_converts_in_each_form(
             (hour, minute, second) in (0u32..24, 0u32..60, 0u32..60),
@@ -980,7 +977,7 @@ mod tests {
             let timed = [coerce(&text, TYPE_TIME), coerce(&format!("T{text}"), TYPE_TIME)];
             let dated = coerce(&datetime_text, TYPE_DATETIME);
             match offset {
-                // Python versions disagree on an offset of zero seconds with a fraction.
+                // An offset with seconds is refused.
                 None if !zone.is_empty() => {
                     prop_assert!(timed.iter().all(Result::is_err), "{}", text);
                     prop_assert!(dated.is_err(), "{}", datetime_text);
@@ -1044,7 +1041,7 @@ mod tests {
         "[0-9]{4}(-[0-9]{2}-[0-9]{2}|[0-9]{4}|-?W[0-9]{2}|-W[0-9]{2}-[0-9]|W[0-9]{3})";
     const CLOCK_GRAMMAR: &str = concat!(
         "[0-9]{2}(:[0-9]{2}(:[0-9]{2}([.,][0-9]+)?)?|[0-9]{2}([0-9]{2}([.,][0-9]+)?)?)?",
-        "(Z|[+-][0-9]{2}(:[0-9]{2}(:[0-9]{2}([.,][0-9]+)?)?|[0-9]{2}([0-9]{2}([.,][0-9]+)?)?)?)?",
+        "(Z|[+-][0-9]{2}(:?[0-9]{2})?)?",
     );
     const INT_GRAMMAR: &str = "[+-]?[0-9]+";
     const FLOAT_GRAMMAR: &str =
@@ -1057,32 +1054,25 @@ mod tests {
         format!("{kept:0<6}").parse().unwrap()
     }
 
-    /// The offset of a zone text such as "Z", "+05:30", "-0530" or "+05:30:15.5".
-    /// None for no zone, and for a zone of zero seconds with a fraction.
+    /// The offset of a zone text such as "Z", "+05:30", "-0530" or "+05".
+    /// None for no zone, and for a zone with seconds, such as "+05:30:15".
     fn offset_of(zone: &str) -> Option<UtcOffset> {
         let sign = match zone.as_bytes().first()? {
             b'Z' => return Some(UtcOffset::UTC),
             b'-' => -1,
             _ => 1,
         };
-        let (fields, fraction) = match zone[1..].find(['.', ',']) {
-            Some(at) => (&zone[1..at + 1], &zone[at + 2..]),
-            None => (&zone[1..], ""),
-        };
-        let digits: String = fields.chars().filter(char::is_ascii_digit).collect();
+        let digits: String = zone[1..].chars().filter(char::is_ascii_digit).collect();
+        if digits.len() > 4 {
+            return None;
+        }
         let field = |at: usize| {
             digits
                 .get(at..at + 2)
                 .map_or(0, |d| d.parse::<i32>().unwrap())
         };
-        let seconds = field(0) * 3600 + field(2) * 60 + field(4);
-        let micros = micros_of(&format!(".{fraction}")) as i32;
-        if seconds == 0 && micros != 0 {
-            return None;
-        }
         Some(UtcOffset {
-            seconds: sign * seconds,
-            micros: sign * micros,
+            minutes: sign * (field(0) * 60 + field(2)),
         })
     }
 
@@ -1370,16 +1360,6 @@ mod tests {
                 "datetime.timedelta(days=-1, seconds=60)",
             ),
             (
-                "2024-01-15T10:30:00+05:30:15.5",
-                "2024, 1, 15, 10, 30",
-                "datetime.timedelta(seconds=19815, microseconds=500000)",
-            ),
-            (
-                "2024-01-15T10:30:00-05:30:15.5",
-                "2024, 1, 15, 10, 30",
-                "datetime.timedelta(days=-1, seconds=66584, microseconds=500000)",
-            ),
-            (
                 "9999-12-31T23:59:59-01:00",
                 "9999, 12, 31, 23, 59, 59",
                 "datetime.timedelta(days=-1, seconds=82800)",
@@ -1531,26 +1511,35 @@ mod tests {
         assert_refused(TYPE_TIME, &["10.+05:00", "10:30:00.+05:00"]);
     }
 
+    /// The expected values are Python expressions, not digit texts: `repr()`
+    /// of an `int` of more digits than `sys.get_int_max_str_digits()` fails,
+    /// and the limit of the test process can be lower than 4300.
     #[test]
     fn f3_an_int_beyond_i64_converts_as_python_does() {
         let longest = "9".repeat(MAX_INT_DIGITS);
         let negative_longest = format!("-{longest}");
         let zeros = format!("{}1", "0".repeat(MAX_INT_DIGITS - 1));
         for (value, expected) in [
-            ("9223372036854775808", "9223372036854775808"),
-            ("-9223372036854775809", "-9223372036854775809"),
-            ("+18446744073709551616", "18446744073709551616"),
+            ("9223372036854775808", "2**63"),
+            ("-9223372036854775809", "-(2**63) - 1"),
+            ("+18446744073709551616", "2**64"),
             (
                 "-340282366920938463463374607431768211457",
-                "-340282366920938463463374607431768211457",
+                "-(2**128) - 1",
             ),
-            (longest.as_str(), longest.as_str()),
-            (negative_longest.as_str(), negative_longest.as_str()),
+            (longest.as_str(), "10**4300 - 1"),
+            (negative_longest.as_str(), "1 - 10**4300"),
             (zeros.as_str(), "1"),
         ] {
-            let (repr, _) =
-                python_repr(value, TYPE_INT).unwrap_or_else(|| panic!("{value} was refused"));
-            assert_eq!(repr, expected, "{value}");
+            let coerced = coerce(value, TYPE_INT).unwrap_or_else(|e| panic!("{value}: {e}"));
+            Python::initialize();
+            Python::attach(|py| {
+                let object = coerced_value_to_py(py, &coerced).unwrap();
+                let expected = py
+                    .eval(&std::ffi::CString::new(expected).unwrap(), None, None)
+                    .unwrap();
+                assert!(object.bind(py).eq(expected).unwrap(), "{value}");
+            });
         }
         // int() refuses more digits than sys.get_int_max_str_digits(), 4300 by default.
         let too_long = "9".repeat(MAX_INT_DIGITS + 1);
@@ -1739,10 +1728,6 @@ mod tests {
                     "10+05:30",
                     "datetime.time(10, 0, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800)))",
                 ),
-                (
-                    "10:30:00-23:59:59.999999",
-                    "datetime.time(10, 30, tzinfo=datetime.timezone(datetime.timedelta(days=-1, microseconds=1)))",
-                ),
                 ("10:30:00", "datetime.time(10, 30)"),
                 ("10:30", "datetime.time(10, 30)"),
                 ("10", "datetime.time(10, 0)"),
@@ -1767,6 +1752,41 @@ mod tests {
                 "10:30:00+05:3",
                 "10:30:00+0530:15",
                 "１０:30:00",
+            ],
+        );
+    }
+
+    /// Python reads seconds in an offset, but RFC 3339 has none, and the JSON
+    /// encoder writes the offset in whole minutes. Master refused these texts too.
+    #[test]
+    fn an_offset_with_seconds_is_refused() {
+        let zones = [
+            "+05:30:15",
+            "-05:30:15.5",
+            "+05:30:00",
+            "+00:00:00",
+            "-00:00:00",
+            "+053015",
+            "+053000",
+            "+05:30:15,5",
+            "-23:59:59.999999",
+        ];
+        for zone in zones {
+            assert_refused(TYPE_DATETIME, &[&format!("2024-01-15T10:30:00{zone}")]);
+            assert_refused(TYPE_DATETIME, &[&format!("20240115T1030{zone}")]);
+            assert_refused(TYPE_TIME, &[&format!("10:30:00{zone}"), &format!("10{zone}")]);
+        }
+        assert_python_values(
+            TYPE_TIME,
+            &[
+                (
+                    "10:30:00-23:59",
+                    "datetime.time(10, 30, tzinfo=datetime.timezone(datetime.timedelta(days=-1, seconds=60)))",
+                ),
+                (
+                    "10:30:00+0000",
+                    "datetime.time(10, 30, tzinfo=datetime.timezone.utc)",
+                ),
             ],
         );
     }
@@ -1831,28 +1851,21 @@ mod tests {
         );
     }
 
-    /// A `list[T]` parameter converts each text item with the parser of one `T`.
+    /// A sequence parameter converts each text item with the parser of one `T`.
     #[test]
     fn parse_text_items_converts_each_text_and_names_the_first_refused_item() {
         Python::initialize();
         Python::attach(|py| {
             let items = PyList::new(py, ["7", "+5", "9223372036854775808"]).unwrap();
-            let converted = parse_text_items(&items, TYPE_INT).unwrap();
+            let converted = parse_text_items(&items, TYPE_INT, 0, usize::MAX).unwrap();
             assert_eq!(
                 converted.repr().unwrap().to_string(),
                 "[7, 5, 9223372036854775808]"
             );
-
-            let mixed = PyList::new(py, [1i64.into_pyobject(py).unwrap().into_any()]).unwrap();
-            mixed.append("2024-01-15T10:30").unwrap();
-            let converted = parse_text_items(&mixed, TYPE_DATETIME).unwrap();
-            assert_eq!(
-                converted.repr().unwrap().to_string(),
-                "[1, datetime.datetime(2024, 1, 15, 10, 30)]"
-            );
+            assert!(!converted.is(&items));
 
             let refused = PyList::new(py, ["1", "2", "5.0"]).unwrap();
-            let error = parse_text_items(&refused, TYPE_INT).unwrap_err();
+            let error = parse_text_items(&refused, TYPE_INT, 0, usize::MAX).unwrap_err();
             assert_eq!(
                 error
                     .value(py)
@@ -1863,6 +1876,28 @@ mod tests {
                     .to_string(),
                 "(2, \"Invalid integer '5.0': expected a whole number such as 42 or -7\")"
             );
+        });
+    }
+
+    /// A length out of bounds or an item that is not text gives the list
+    /// itself, and no item is read: msgspec gives the error.
+    #[test]
+    fn parse_text_items_gives_the_list_itself_out_of_bounds_or_for_an_item_that_is_not_text() {
+        Python::initialize();
+        Python::attach(|py| {
+            let items = PyList::new(py, ["x", "2", "3"]).unwrap();
+            for (min_length, max_length) in [(0, 2), (4, 9)] {
+                let given = parse_text_items(&items, TYPE_INT, min_length, max_length).unwrap();
+                assert!(given.is(&items), "{min_length}..={max_length}");
+            }
+            let bounded = PyList::new(py, ["1", "2", "3"]).unwrap();
+            let converted = parse_text_items(&bounded, TYPE_INT, 3, 3).unwrap();
+            assert_eq!(converted.repr().unwrap().to_string(), "[1, 2, 3]");
+
+            let mixed = PyList::new(py, ["2024-01-15T10:30"]).unwrap();
+            mixed.append(1i64).unwrap();
+            let given = parse_text_items(&mixed, TYPE_DATETIME, 0, usize::MAX).unwrap();
+            assert!(given.is(&mixed));
         });
     }
 

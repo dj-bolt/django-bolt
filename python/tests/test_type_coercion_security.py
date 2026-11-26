@@ -18,6 +18,7 @@ These tests validate the security measures implemented in src/type_coercion.rs.
 
 from __future__ import annotations
 
+import sys
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Annotated
@@ -28,6 +29,9 @@ import pytest
 from django_bolt import BoltAPI
 from django_bolt.param_functions import Form, Query
 from django_bolt.testing import TestClient
+
+# The digit limit of an int that Bolt reads at startup: that of int(), at most 4300.
+DIGITS = min(4300, sys.get_int_max_str_digits() or 4300)
 
 # =============================================================================
 # Test Fixtures
@@ -216,15 +220,20 @@ class TestIntegerBoundaries:
         assert data["value"] == min_i64
 
     @pytest.mark.parametrize(
-        "value",
-        ["9223372036854775808", "-9223372036854775809", "1" * 4300, "-" + "9" * 4300],
-        ids=["i64-max-plus-one", "i64-min-minus-one", "4300-digits", "4300-digits-negative"],
+        ("value", "expected"),
+        [
+            ("9223372036854775808", 2**63),
+            ("-9223372036854775809", -(2**63) - 1),
+            ("1" * DIGITS, (10**DIGITS - 1) // 9),
+            ("-" + "9" * DIGITS, 1 - 10**DIGITS),
+        ],
+        ids=["i64-max-plus-one", "i64-min-minus-one", "limit-digits", "limit-digits-negative"],
     )
-    def test_f3_an_int_beyond_i64_converts_as_python_does(self, client, value):
+    def test_f3_an_int_beyond_i64_converts_as_python_does(self, client, value, expected):
         """An int beyond i64 is a Python int, as int() gives."""
         response = client.get("/query/int", params={"value": value})
         assert response.status_code == 200, response.text
-        assert response.json() == {"value": int(value), "type": "int"}
+        assert response.json() == {"value": expected, "type": "int"}
 
     @pytest.mark.parametrize(
         ("path", "detail"),
@@ -244,11 +253,11 @@ class TestIntegerBoundaries:
             ),
             # int() refuses more digits than sys.get_int_max_str_digits().
             (
-                "/query/int?value=" + "1" * 4301,
-                f"Query parameter 'value': Invalid integer '{'1' * 4301}': more than 4300 digits",
+                "/query/int?value=" + "1" * (DIGITS + 1),
+                f"Query parameter 'value': Invalid integer '{'1' * (DIGITS + 1)}': more than {DIGITS} digits",
             ),
         ],
-        ids=["float", "scientific", "empty", "4301-digits"],
+        ids=["float", "scientific", "empty", "too-many-digits"],
     )
     def test_invalid_int_rejected(self, client, path, detail):
         """Each value that int() refuses gets 422 with the reason."""
