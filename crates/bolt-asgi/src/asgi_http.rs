@@ -9,12 +9,12 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
 use bolt_core::error::handle_python_error;
 use bolt_core::middleware::client_ip::{self, TrustedProxies};
-use bolt_core::state::{AsgiMount, TASK_LOCALS};
+use bolt_core::request::client_path;
+use bolt_core::state::{AppState, AsgiMount, TASK_LOCALS};
 
 struct AsgiResponseStart {
     status: StatusCode,
@@ -386,11 +386,17 @@ fn request_host(req: &HttpRequest) -> &str {
         .unwrap_or_else(|| req.app_config().host())
 }
 
+/// Build the ASGI scope of a request to a mounted app.
+///
+/// `path` is the path under the mount. `root_path` is the mount point that
+/// the client sees: the script name (`FORCE_SCRIPT_NAME`), then the mount
+/// prefix. An app builds its URLs from it, as a WSGI app does from `SCRIPT_NAME`.
 fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
     mount: &AsgiMount,
     trusted_proxies: &TrustedProxies,
+    script_name: Option<&str>,
 ) -> PyResult<Py<PyDict>> {
     let scope = PyDict::new(py);
     let asgi_info = PyDict::new(py);
@@ -434,11 +440,15 @@ fn build_scope(
         "query_string",
         PyBytes::new(py, req.query_string().as_bytes()),
     )?;
-    if mount.prefix == "/" {
-        scope.set_item("root_path", "")?;
+    let mount_prefix = if mount.prefix == "/" {
+        ""
     } else {
-        scope.set_item("root_path", &mount.prefix)?;
-    }
+        &mount.prefix
+    };
+    scope.set_item(
+        "root_path",
+        client_path(script_name, mount_prefix.to_owned()),
+    )?;
 
     let headers = PyList::empty(py);
     for (name, value) in req.headers() {
@@ -502,11 +512,14 @@ pub async fn handle_asgi_mount_request(
     req: HttpRequest,
     mut payload: web::Payload,
     mount: &AsgiMount,
-    debug: bool,
-    max_payload_size: usize,
-    asgi_mount_timeout: Duration,
-    trusted_proxies: &TrustedProxies,
+    state: &AppState,
 ) -> HttpResponse {
+    let AppState {
+        debug,
+        max_payload_size,
+        asgi_mount_timeout,
+        ..
+    } = *state;
     // 1. Buffer request body.
     // NOTE: This read loop currently has no timeout. Slow-client request body timeouts
     // should be enforced at the edge proxy/load balancer for now.
@@ -553,7 +566,13 @@ pub async fn handle_asgi_mount_request(
     };
 
     let py_future: Py<PyAny> = match Python::attach(|py| -> PyResult<Py<PyAny>> {
-        let scope = build_scope(py, &req, mount, trusted_proxies)?;
+        let scope = build_scope(
+            py,
+            &req,
+            mount,
+            &state.trusted_proxies,
+            state.script_name.as_deref(),
+        )?;
         let receive_obj = Py::new(
             py,
             AsgiReceive {

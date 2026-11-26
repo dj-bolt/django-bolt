@@ -127,7 +127,8 @@ Examples are an item of a `list[int]`, a `Query(ge=1)` limit and a field of a pa
 A route matches the request path with and without a trailing slash.
 A WebSocket has no request body, so a body, form or file parameter is not available.
 
-The `WebSocket` object also has these attributes: `path`, `query_params`, `headers`, `cookies`, `path_params`, `subprotocols`, `client` and `state`.
+The `WebSocket` object also has these attributes: `path`, `path_info`, `query_params`, `headers`, `cookies`, `path_params`, `subprotocols`, `client` and `state`.
+With `FORCE_SCRIPT_NAME`, `path` starts with the script name and `path_info` does not, as for a request. See [Serve under a sub-path](deployment.md#serve-under-a-sub-path).
 
 ### Use dependencies
 

@@ -11,7 +11,9 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import ImproperlyConfigured
+from django.urls import get_script_prefix
 
+from django_bolt.openapi.config import DefaultServers
 from django_bolt.openapi.plugins import JsonRenderPlugin, YamlRenderPlugin
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.responses import HTML, JSON, PlainText
@@ -81,7 +83,7 @@ class OpenAPIRouteRegistrar:
         async def openapi_json_handler(request):
             """Serve OpenAPI schema as JSON."""
             try:
-                schema = self._get_schema()
+                schema = self._served_schema()
                 rendered = json_plugin.render(schema, "")
                 return JSON(rendered, status_code=200, headers={"content-type": json_plugin.media_type})
             except Exception as e:
@@ -94,7 +96,7 @@ class OpenAPIRouteRegistrar:
 
         async def openapi_yaml_handler(request):
             """Serve OpenAPI schema as YAML."""
-            schema = self._get_schema()
+            schema = self._served_schema()
             rendered = yaml_plugin.render(schema, "")
             return PlainText(rendered, status_code=200, headers={"content-type": yaml_plugin.media_type})
 
@@ -102,7 +104,7 @@ class OpenAPIRouteRegistrar:
 
         async def openapi_yml_handler(request):
             """Serve OpenAPI schema as YAML (alternative extension)."""
-            schema = self._get_schema()
+            schema = self._served_schema()
             rendered = yaml_plugin.render(schema, "")
             return PlainText(rendered, status_code=200, headers={"content-type": yaml_plugin.media_type})
 
@@ -139,6 +141,24 @@ class OpenAPIRouteRegistrar:
 
         return self.api._openapi_schema
 
+    def _served_schema(self) -> dict[str, Any]:
+        """The schema for a docs request.
+
+        Under ``FORCE_SCRIPT_NAME``, the API is behind the script name. The
+        default server ``/`` is the root of the host, so the script name
+        replaces it. A server list that the user sets stays.
+        """
+        schema = self._get_schema()
+        if isinstance(self.api._openapi_config.servers, DefaultServers):
+            script_name = get_script_prefix().rstrip("/")
+            if script_name and schema.get("servers") == [{"url": "/"}]:
+                return {**schema, "servers": [{"url": script_name}]}
+        return schema
+
+    def _schema_url(self, schema_url: str) -> str:
+        """The URL from which a docs page loads the schema: the script name, then ``schema_url``."""
+        return get_script_prefix().rstrip("/") + schema_url
+
     def _register_ui_plugins(self, route_prefix: str) -> None:
         """Register UI plugin routes (Swagger UI, ReDoc, etc.)."""
         # Schema URL is always the full path (for the UI to fetch)
@@ -161,8 +181,8 @@ class OpenAPIRouteRegistrar:
                     async def ui_handler(request):
                         """Serve OpenAPI UI."""
                         try:
-                            schema = self._get_schema()
-                            rendered = p.render(schema, schema_url)
+                            schema = self._served_schema()
+                            rendered = p.render(schema, self._schema_url(schema_url))
                             return response_class(rendered, status_code=200, headers={"content-type": p.media_type})
                         except Exception as e:
                             raise Exception(
@@ -196,8 +216,8 @@ class OpenAPIRouteRegistrar:
                 async def openapi_root_handler(request):
                     """Serve default OpenAPI UI at root path."""
                     try:
-                        schema = self._get_schema()
-                        rendered = p.render(schema, url)
+                        schema = self._served_schema()
+                        rendered = p.render(schema, self._schema_url(url))
                         return response_class(rendered, status_code=200, headers={"content-type": p.media_type})
                     except Exception as e:
                         raise Exception(f"Failed to render OpenAPI UI: {type(e).__name__}: {str(e)}") from e

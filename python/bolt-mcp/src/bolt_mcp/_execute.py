@@ -10,10 +10,12 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import msgspec
 
+from django_bolt import _script_prefix
 from django_bolt._json import decode as json_decode
 from django_bolt._json import default_serializer
 from django_bolt._json import encode as json_encode
@@ -199,7 +201,10 @@ async def run_tool(tool: ToolDef, kwargs: dict[str, Any]) -> Any:
     """Invoke a tool and return its result value (awaiting async, off-loading sync)."""
     if tool.is_async:
         return await tool.fn(**kwargs)
-    return await asyncio.to_thread(tool.fn, **kwargs)
+    # As asyncio.to_thread(), with the context of a hop: under FORCE_SCRIPT_NAME,
+    # the thread gets the script prefix of the call.
+    context = _script_prefix.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(None, partial(context.run, tool.fn, **kwargs))
 
 
 async def execute_tool(tool: ToolDef, kwargs: dict[str, Any], *, mask_error_details: bool) -> dict[str, Any]:

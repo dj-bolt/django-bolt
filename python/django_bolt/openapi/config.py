@@ -33,6 +33,18 @@ if TYPE_CHECKING:
 __all__ = ("OpenAPIConfig",)
 
 
+class DefaultServers(list):
+    """The servers of an ``OpenAPIConfig`` that does not set ``servers``.
+
+    Under ``FORCE_SCRIPT_NAME``, the docs replace this default with the script
+    name. A list that the user gives stays, also ``[Server(url="/")]``.
+    """
+
+
+def _default_servers() -> list[Server]:
+    return DefaultServers([Server(url="/")])
+
+
 @dataclass
 class OpenAPIConfig:
     """Configuration for OpenAPI documentation generation.
@@ -79,7 +91,7 @@ class OpenAPIConfig:
     components: Components = field(default_factory=Components)
     """API components (schemas, security schemes, etc.)."""
 
-    servers: list[Server] = field(default_factory=lambda: [Server(url="/")])
+    servers: list[Server] = field(default_factory=_default_servers)
     """A list of Server instances."""
 
     summary: str | None = field(default=None)

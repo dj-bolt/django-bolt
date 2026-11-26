@@ -476,7 +476,7 @@ class DjangoMiddleware:
             token = None
         else:
             # First Django middleware in chain - create new Django request
-            django_request = _to_django_request(request)
+            django_request = _convert_request(request)
 
             # Set up per-request context for the get_response bridge
             ctx = {
@@ -1096,7 +1096,7 @@ class DjangoMiddlewareStack:
         3. Convert the Django response to a Bolt response one time.
         """
         # 1. Single Bolt→Django conversion
-        django_request = _to_django_request(request)
+        django_request = _convert_request(request)
 
         # An inner Django middleware and the render of a TemplateResponse call
         # process_exception and process_template_response of this stack, as Django does.
@@ -1225,6 +1225,38 @@ def _to_django_request(request: Request) -> HttpRequest:
     django_request._set_content_type_params(django_request.META)
 
     return django_request
+
+
+def _to_django_request_with_script_name(request: Request) -> HttpRequest:
+    """Convert a request of a server with ``FORCE_SCRIPT_NAME``, as Django's ``WSGIRequest`` does.
+
+    ``request.path`` has the script name, so the Django ``path`` has it too.
+    The Django ``path_info`` has no script name.
+    """
+    django_request = _to_django_request(request)
+    path_info = request.path_info
+    if "%" in path_info:
+        # The script name has no "%" (see _script_prefix.configure), so the
+        # decoded path is the script name, then the decoded path info.
+        path_info = repercent_broken_unicode(unquote_to_bytes(path_info)).decode()
+        request.META["PATH_INFO"] = path_info
+    django_request.path_info = path_info
+    return django_request
+
+
+def use_script_name() -> None:
+    """Convert each request from now on with the paths of ``FORCE_SCRIPT_NAME``.
+
+    ``_script_prefix.configure()`` calls this when the first server or client
+    with the setting starts. Without the setting, a request has the same path
+    and path info, so the conversion stays as it was.
+    """
+    global _convert_request
+    _convert_request = _to_django_request_with_script_name
+
+
+# The conversion of each Django middleware request. See use_script_name().
+_convert_request = _to_django_request
 
 
 def _should_adopt_django_user(django_user: Any, bolt_request: Request) -> bool:
