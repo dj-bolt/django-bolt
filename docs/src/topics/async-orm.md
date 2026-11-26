@@ -189,10 +189,14 @@ Your handlers do not change. Bolt reads the setting when the server starts. Each
 
 The result is the result of the sync ORM. The setting is off by default.
 
-The setting removes the wait of the threads of one process for the GIL. Measure it on your deployment before you keep it.
-Measured with one process and a local PostgreSQL, a returned QuerySet gave 79% more requests per second with the process on two cores.
-With the process on one core, it gave 7 to 24% fewer, because the async driver of psycopg uses more CPU for a query than the sync driver.
-The async ORM calls gave 12 to 20% more on one core and 45 to 64% more on two cores.
+The setting removes the thread hop of each read, and the wait of the threads of one process for the GIL. Measure it on your deployment before you keep it.
+Measured on six routes with one process, a local PostgreSQL and 64 connections, against the same routes with the setting off:
+
+| The server process runs on | A returned QuerySet | The async ORM calls |
+| --- | --- | --- |
+| One core | 8 to 11% more requests in one second | 6 to 57% more |
+| Two cores | 119% more | 107 to 155% more |
+
 It needs PostgreSQL, psycopg 3 and the `django.db.backends.postgresql` engine. It has no effect on Windows.
 
 ### Reads that stay on the ORM thread pool
