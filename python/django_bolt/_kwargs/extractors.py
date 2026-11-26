@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import enum
 import inspect
+import sys
 from collections.abc import Callable
 from functools import partial
 from typing import Annotated, Any, Literal, NamedTuple, get_args, get_origin
@@ -101,36 +102,103 @@ def _text_item_hint(field_type: Any) -> int | None:
     return _TEXT_ITEM_HINTS.get(item)
 
 
+class _TextItems(NamedTuple):
+    """How Rust converts the text items of a sequence type, found at registration."""
+
+    hint: int
+    # The type of the sequence when msgspec has nothing to check, else None.
+    plain: type | None
+    min_length: int
+    max_length: int
+
+
+# The msgspec type info of each sequence whose items Rust can convert, and its Python type.
+_TEXT_ITEM_SEQUENCES = {
+    msgspec.inspect.ListType: list,
+    msgspec.inspect.SetType: set,
+    msgspec.inspect.FrozenSetType: frozenset,
+    msgspec.inspect.VarTupleType: tuple,
+}
+
+
+def _bare_type_info(node: msgspec.inspect.Type) -> msgspec.inspect.Type:
+    """Give the msgspec type info under ``Metadata`` and ``Optional``."""
+    while True:
+        if isinstance(node, msgspec.inspect.Metadata):
+            node = node.type
+        elif isinstance(node, msgspec.inspect.UnionType):
+            arms = [arm for arm in node.types if not isinstance(arm, msgspec.inspect.NoneType)]
+            if len(arms) != 1:
+                return node
+            node = arms[0]
+        else:
+            return node
+
+
+def _text_items_plan(field_type: Any) -> _TextItems | None:
+    """Give how Rust converts the text items of a sequence type, or None.
+
+    A ``list``, ``set``, ``frozenset`` or ``tuple[T, ...]`` with no length
+    bound and no item constraint is plain: Rust builds the items, and
+    msgspec has nothing to check. A ``tuple[T]`` holds one item.
+    """
+    hint = _text_item_hint(field_type)
+    if hint is None:
+        return None
+    node = _bare_type_info(msgspec.inspect.type_info(field_type))
+    if isinstance(node, msgspec.inspect.TupleType):
+        return _TextItems(hint, None, 1, 1)
+    item = _bare_type_info(node.item_type)
+    unbounded = node.min_length is None and node.max_length is None
+    plain = unbounded and all(getattr(item, name) is None for name in item.__struct_fields__)
+    return _TextItems(
+        hint,
+        _TEXT_ITEM_SEQUENCES[type(node)] if plain else None,
+        node.min_length or 0,
+        sys.maxsize if node.max_length is None else node.max_length,
+    )
+
+
 def _item_error(loc: str, key: str, error: ValueError, value: list[Any]) -> dict[str, Any]:
     """Give the error of the item that ``parse_text_items`` refused, as msgspec names an item."""
     index, message = error.args
     return {"type": "validation_error", "loc": (loc, key), "msg": f"{message} - at `$[{index}]`", "input": value}
 
 
-def _parse_text_item_fields(
-    data: dict[str, Any], fields: tuple[tuple[str, str, int], ...], loc: str
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    """Convert the text items of the sequence fields of a parameter model.
+def _item_fields_plan(fields: Any) -> tuple[tuple[str, str, int, int, int], ...]:
+    """Give the key, the ``loc`` name, the type hint and the length bounds of each typed sequence field.
 
-    ``fields`` holds the key in ``data``, the name in ``loc`` and the type hint
-    of each field. Give the values with the converted items, and the error of
-    each field with a refused item, by its key.
+    ``fields`` gives the key, the ``loc`` name and the type of each field of a parameter model.
     """
-    converted: dict[str, Any] | None = None
-    errors: dict[str, dict[str, Any]] = {}
-    for key, name, hint in fields:
-        value = data.get(key)
-        if type(value) is not list:
-            continue
-        try:
-            items = parse_text_items(value, hint)
-        except ValueError as error:
-            errors[key] = _item_error(loc, name, error, value)
-            continue
-        if converted is None:
-            converted = dict(data)
-        converted[key] = items
-    return (data if converted is None else converted), errors
+    plan = []
+    for key, name, field_type in fields:
+        items = _text_items_plan(field_type)
+        if items is not None:
+            plan.append((key, name, items.hint, items.min_length, items.max_length))
+    return tuple(plan)
+
+
+def _convert_item_fields(
+    values: dict[str, Any], fields: tuple[tuple[str, str, int, int, int], ...], loc: str
+) -> dict[str, dict[str, Any]] | None:
+    """Convert the text items of the typed sequence fields of a parameter model in ``values``.
+
+    ``values`` is a dict of the extractor, not of the request. A field with a
+    length out of its bounds keeps its texts, so msgspec gives the length
+    error. Give the error of each field with a refused item, by its key, or
+    None when no item is refused.
+    """
+    refused = None
+    for key, name, hint, min_length, max_length in fields:
+        value = values.get(key)
+        if type(value) is list:
+            try:
+                values[key] = parse_text_items(value, hint, min_length, max_length)
+            except ValueError as error:
+                if refused is None:
+                    refused = {}
+                refused[key] = _item_error(loc, name, error, value)
+    return refused
 
 
 def _holds_one_item(annotation: Any) -> bool:
@@ -209,7 +277,6 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
     wrap = is_sequence and one_item
     # Rust gives each value of a repeated form key as a list.
     take_last = loc == "body" and not is_sequence
-    item_hint = _text_item_hint(target)
     if wrap and loc in _SINGLE_VALUE_SOURCES and not _holds_one_item(target):
         raise TypeError(
             f"The {loc} parameter {key!r} gets one value, but its type {target!r} cannot hold one item. "
@@ -224,14 +291,8 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
             value = [value]
         elif take_last and type(value) is list:
             value = value[-1]
-        items = value
-        if item_hint is not None and type(value) is list:
-            try:
-                items = parse_text_items(value, item_hint)
-            except ValueError as error:
-                raise RequestValidationError(errors=[_item_error(loc, key, error, value)]) from None
         try:
-            return msgspec.convert((items,), holder, strict=False).value
+            return msgspec.convert((value,), holder, strict=False).value
         except msgspec.ValidationError as error:
             # Remove the position of the value in the holder from the error path.
             msg = str(error).replace(" - at `$[0]`", "").replace("`$[0]", "`$")
@@ -239,7 +300,47 @@ def _param_converter(annotation: Any, loc: str, key: str, *, one_item: bool = Fa
                 errors=[{"type": "validation_error", "loc": (loc, key), "msg": msg, "input": value}]
             ) from None
 
-    return convert
+    text_items = _text_items_plan(target) if is_sequence else None
+    if text_items is None:
+        return convert
+    hint, plain, min_length, max_length = text_items
+
+    if plain is not None:
+        # Rust builds each item, and msgspec has nothing to check.
+        def convert_plain(value: Any) -> Any:
+            if wrap and not isinstance(value, list):
+                value = [value]
+            if type(value) is list:
+                try:
+                    items = parse_text_items(value, hint)
+                except ValueError as error:
+                    raise RequestValidationError(errors=[_item_error(loc, key, error, value)]) from None
+                # The list itself comes back when an item is not text. msgspec then refuses it.
+                if items is not value:
+                    return items if plain is list else plain(items)
+            return convert(value)
+
+        return convert_plain
+
+    def convert_items(value: Any) -> Any:
+        if wrap and not isinstance(value, list):
+            value = [value]
+        items = value
+        if type(value) is list:
+            # A length out of bounds gives the list itself, so msgspec refuses it before it reads an item.
+            try:
+                items = parse_text_items(value, hint, min_length, max_length)
+            except ValueError as error:
+                raise RequestValidationError(errors=[_item_error(loc, key, error, value)]) from None
+        try:
+            return msgspec.convert((items,), holder, strict=False).value
+        except msgspec.ValidationError as error:
+            msg = str(error).replace(" - at `$[0]`", "").replace("`$[0]", "`$")
+            raise RequestValidationError(
+                errors=[{"type": "validation_error", "loc": (loc, key), "msg": msg, "input": value}]
+            ) from None
+
+    return convert_items
 
 
 # A text parameter of one of these types gets the UTF-8 bytes of the text.
@@ -674,7 +775,7 @@ def _is_sequence_field(field_type: Any) -> bool:
     """
     Determine whether a type annotation represents a sequence container (list, set, frozenset, or tuple).
 
-    Unwraps Optional[...] and Annotated[...] before checking the underlying origin. A bare ``set`` has no origin, so the class itself counts.
+    Unwraps Optional[...], Annotated[...] and a type alias before checking the underlying origin. A bare ``set`` has no origin, so the class itself counts.
 
     Parameters:
         field_type (Any): The type annotation to inspect.
@@ -682,9 +783,9 @@ def _is_sequence_field(field_type: Any) -> bool:
     Returns:
         bool: `True` if the (unwrapped) annotation's origin is one of list, set, frozenset, or tuple; `False` otherwise.
     """
-    inner = unwrap_optional(field_type)
+    inner = unwrap_optional(resolve_type_alias(field_type))
     if get_origin(inner) is Annotated:
-        inner = unwrap_optional(get_args(inner)[0])
+        inner = unwrap_optional(resolve_type_alias(get_args(inner)[0]))
     return (get_origin(inner) or inner) in _SEQUENCE_ORIGINS
 
 
@@ -791,11 +892,8 @@ def _create_param_struct_extractor(
     # Empty for a model with no bytes field, so such a model has no cost for each request.
     _bytes_fields = _bytes_field_plan(struct_type)
     # The sequence fields whose text items Rust converts. Empty for most models.
-    _item_fields = tuple(
-        (f.encode_name, f.encode_name, hint)
-        for f in msgspec.structs.fields(struct_type)
-        if (hint := _text_item_hint(f.type)) is not None
-    )
+    _item_fields = _item_fields_plan((f.encode_name, f.encode_name, f.type) for f in msgspec.structs.fields(struct_type))
+    _item_keys = frozenset(key for key, *_ in _item_fields)
     # A struct that forbids unknown fields must not get the keys of other parameters.
     # For any other struct, the set is empty and the request path does not change.
     forbids_unknown = struct_type.__struct_config__.forbid_unknown_fields
@@ -837,8 +935,8 @@ def _create_param_struct_extractor(
 
             values = _encode_bytes_fields(merged, _bytes_fields) if _bytes_fields else merged
             if _item_fields:
-                values, refused = _parse_text_item_fields(values, _item_fields, source)
-                if refused:
+                refused = _convert_item_fields(values, _item_fields, source)
+                if refused is not None:
                     raise RequestValidationError(
                         errors=_collect_struct_errors(
                             struct_type, values, param_type, source, has_files=True, inputs=merged, refused=refused
@@ -886,14 +984,18 @@ def _create_param_struct_extractor(
                 msgspec.ValidationError: If msgspec conversion fails but no per-field errors were produced.
             """
             if _seq_field_names:
-                # Only allocate a copy when there's actual wrapping to do.
+                # Only allocate a copy when there's actual wrapping to do, or text items to convert.
                 wrapped: dict[str, Any] | None = None
                 for name in _seq_field_names:
                     value = param_map.get(name)
-                    if value is not None and not isinstance(value, list):
+                    if value is None:
+                        continue
+                    is_list = isinstance(value, list)
+                    if not is_list or name in _item_keys:
                         if wrapped is None:
                             wrapped = dict(param_map)
-                        wrapped[name] = [value]
+                        if not is_list:
+                            wrapped[name] = [value]
                 param_map = wrapped if wrapped is not None else param_map
 
             if _other_keys:
@@ -905,8 +1007,9 @@ def _create_param_struct_extractor(
 
             values = _encode_bytes_fields(param_map, _bytes_fields) if _bytes_fields else param_map
             if _item_fields:
-                values, refused = _parse_text_item_fields(values, _item_fields, source)
-                if refused:
+                # A field with text items made `param_map` a copy above.
+                refused = _convert_item_fields(values, _item_fields, source)
+                if refused is not None:
                     raise RequestValidationError(
                         errors=_collect_struct_errors(
                             struct_type, values, param_type, source, inputs=param_map, refused=refused
@@ -1013,10 +1116,8 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
     bytes_fields = _bytes_field_plan(struct_type)
     strict = not any(wrap for _, _, wrap in header_to_encoded)
     # The sequence fields whose text item Rust converts. Empty for most models.
-    item_fields = tuple(
-        (encoded_name, header_name, hint)
-        for header_name, encoded_name, field_type, _ in header_fields
-        if (hint := _text_item_hint(field_type)) is not None
+    item_fields = _item_fields_plan(
+        (encoded_name, header_name, field_type) for header_name, encoded_name, field_type, _ in header_fields
     )
 
     def extract(headers_map: dict[str, str]) -> Any:
@@ -1028,8 +1129,8 @@ def _create_header_struct_extractor(struct_type: type, default: Any) -> Callable
 
         values = _encode_bytes_fields(converted, bytes_fields) if bytes_fields else converted
         if item_fields:
-            values, refused = _parse_text_item_fields(values, item_fields, "header")
-            if refused:
+            refused = _convert_item_fields(values, item_fields, "header")
+            if refused is not None:
                 raise RequestValidationError(
                     errors=_collect_header_struct_errors(error_fields, values, converted, strict, refused)
                 )
