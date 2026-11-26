@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import dis
 import functools
 import inspect
@@ -24,6 +25,7 @@ except ImportError:
 import msgspec
 from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
+from django.core.exceptions import ImproperlyConfigured
 from django.core.handlers.asgi import ASGIHandler
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
@@ -4248,8 +4250,18 @@ class BoltAPI:
         """
         served = BoltAPI(**self._init_kwargs)
         served._compression = self._compression
-        served._openapi_config = self._openapi_config
+        # The docs move with the API, under its first prefix.
+        config = self._openapi_config
+        if config is not None and prefixes[0]:
+            config = dataclasses.replace(config, path="/" + prefixes[0].rstrip("/") + config.path)
+        served._openapi_config = config
         for prefix in prefixes:
+            if prefix and any(definition.get("verify_token") is not None for definition in self._mcp_mounts):
+                raise ImproperlyConfigured(
+                    f"The URLconf mounts a BoltAPI with an OAuth-protected MCP server under {prefix!r}. "
+                    "The OAuth audience and resource metadata of the server name its own path. "
+                    'Mount this API with path("", api.urls), or move the MCP server to an API at the root.'
+                )
             mount_path = "/" + prefix.rstrip("/") if prefix else ""
             _refuse_mount_path_arguments(mount_path, self)
             served._mount(self, mount_path, functools.partial(join_mount_path, prefix))

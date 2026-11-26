@@ -7,12 +7,14 @@ mounted API at the path that Django's ``reverse()`` gives for it.
 from __future__ import annotations
 
 import itertools
+import json
 import re
 import sys
 import types
 from contextlib import asynccontextmanager
 
 import pytest
+from bolt_mcp import MCP, ProtectedResource
 from django.conf.urls.i18n import i18n_patterns
 from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpResponse
@@ -20,10 +22,11 @@ from django.test import Client as DjangoClient
 from django.urls import NoReverseMatch, include, path, re_path, register_converter, resolve, reverse
 from django.utils.translation import gettext_lazy
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, WebSocket, _core
 from django_bolt._urlconf import REVERSE_ONLY_URLCONF, UrlconfMount, join_mount_path, served_apis, urlconf_mounts
 from django_bolt.management.commands.runbolt import Command
-from django_bolt.testing import TestClient
+from django_bolt.openapi import OpenAPIConfig
+from django_bolt.testing import TestClient, WebSocketTestClient
 from django_bolt.urls import _LazyUrlpatterns
 
 _names = itertools.count()
@@ -52,6 +55,10 @@ def make_urlconf():
     yield make
     for name in created:
         sys.modules.pop(name, None)
+
+
+# A prefix with a path parameter cannot hold the docs.
+_NO_DOCS = OpenAPIConfig(title="Missions", version="1.0.0", enabled=False)
 
 
 def _api(namespace: str | None = None) -> BoltAPI:
@@ -341,7 +348,7 @@ def test_the_api_prefix_comes_after_the_urlconf_prefix(mount_urlconf):
 
 
 def test_a_prefix_parameter_is_in_request_params(mount_urlconf):
-    api = BoltAPI()
+    api = BoltAPI(openapi_config=_NO_DOCS)
 
     @api.get("/{mission_id}")
     async def detail(request, mission_id: int) -> dict:
@@ -490,7 +497,7 @@ def test_the_same_route_name_in_two_namespaces(mount_urlconf):
 
 
 def test_a_prefix_parameter_reverses_from_its_kwarg(mount_urlconf):
-    api = BoltAPI(namespace="missions")
+    api = BoltAPI(namespace="missions", openapi_config=_NO_DOCS)
 
     @api.get("/{mission_id}", name="detail")
     async def detail(request, mission_id: int) -> dict:
@@ -571,3 +578,131 @@ def test_django_bolt_urls_under_a_prefix_is_refused(mount_urlconf):
 
     with pytest.raises(ImproperlyConfigured, match="includes django_bolt.urls under 'api/'"):
         TestClient(_api())
+
+
+# --- Other route kinds ------------------------------------------------------
+
+
+def test_the_docs_and_the_schema_paths_of_a_mounted_api_carry_the_prefix(mount_urlconf):
+    api = _api()
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api) as client:
+        schema = client.get("/missions/docs/openapi.json").json()
+        page = client.get("/missions/docs/rapidoc").text
+        unprefixed = client.get("/docs/openapi.json").status_code
+
+    assert list(schema["paths"]) == ["/missions/{mission_id}"]
+    assert 'spec-url="/missions/docs/openapi.json"' in page
+    assert unprefixed == 404
+
+
+def test_docs_under_a_prefix_with_a_parameter_are_refused(mount_urlconf):
+    api = _api()
+    mount_urlconf([path("org/<org>/", api.urls)])
+
+    with pytest.raises(ImproperlyConfigured, match=r"OpenAPIConfig\(enabled=False\)"):
+        TestClient(api)
+
+
+@pytest.mark.asyncio
+async def test_websocket_routes_of_a_mounted_api_carry_the_prefix(mount_urlconf):
+    api = BoltAPI()
+
+    @api.websocket("/echo")
+    async def echo(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.send_text(await websocket.receive_text())
+        await websocket.close()
+
+    mount_urlconf([path("missions/", api.urls)])
+
+    async with WebSocketTestClient(api, "/missions/echo") as ws:
+        await ws.send_text("hi")
+        assert await ws.receive_text() == "hi"
+    with pytest.raises(ValueError, match="No WebSocket handler found for path: /echo"):
+        async with WebSocketTestClient(api, "/echo"):
+            pass
+
+
+def test_an_asgi_mount_of_a_mounted_api_carries_the_prefix(mount_urlconf):
+    async def files(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": b"files"})
+
+    api = BoltAPI()
+    api.mount_asgi("/files", files)
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api) as client:
+        assert client.get("/missions/files/a.txt").text == "files"
+        assert client.get("/files/a.txt").status_code == 404
+
+
+def test_an_mcp_server_of_a_mounted_api_carries_the_prefix(mount_urlconf):
+    api = BoltAPI()
+    api.mount_mcp(MCP("missions"))
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api) as client:
+        prefixed = client.post("/missions/mcp", content=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+        unprefixed = client.post("/mcp", content=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+
+    assert prefixed.status_code == 200
+    assert "mcp-session-id" in prefixed.headers
+    assert unprefixed.status_code == 404
+
+
+def test_an_oauth_protected_mcp_server_under_a_prefix_is_refused(mount_urlconf):
+    api = BoltAPI()
+    oauth = ProtectedResource(resource_url="https://example.com/mcp", token_verifier=lambda _token: None)
+    api.mount_mcp(MCP("missions"), oauth=oauth)
+    mount_urlconf([path("missions/", api.urls)])
+
+    with pytest.raises(ImproperlyConfigured, match="OAuth-protected MCP server"):
+        TestClient(api)
+
+
+def test_reverse_of_a_websocket_route_gives_its_served_path(mount_urlconf):
+    api = BoltAPI(namespace="live")
+
+    @api.websocket("/feed/{channel}", name="feed")
+    async def feed(websocket: WebSocket, channel: str) -> None:
+        await websocket.close()
+
+    mount_urlconf([path("missions/", api.urls)])
+
+    assert reverse("live:feed", kwargs={"channel": "news"}) == "/missions/feed/news"
+
+
+_MCP_HEADERS = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+    "MCP-Protocol-Version": "2025-06-18",
+}
+_MCP_INITIALIZE = json.dumps(
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "pytest", "version": "1.0"},
+        },
+    }
+)
+
+
+def test_a_native_route_of_a_mounted_api_carries_the_prefix(mount_urlconf):
+    api = BoltAPI()
+    api.native_route("GET", "/items/{id}", _core.native_test_capsule())
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api) as client:
+        prefixed = client.get("/missions/items/7")
+        unprefixed = client.get("/items/7")
+
+    assert prefixed.status_code == 201
+    assert (prefixed.json()["path"], prefixed.json()["params"]) == ("/missions/items/7", {"id": "7"})
+    assert unprefixed.status_code == 404
