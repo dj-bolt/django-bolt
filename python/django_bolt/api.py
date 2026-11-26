@@ -30,7 +30,7 @@ from django.core.handlers.asgi import ASGIHandler
 from django.core.signals import request_finished, request_started
 from django.db.models import QuerySet
 
-from . import _core, _json
+from . import _core, _json, concurrency
 from ._bridge import make_bound_dispatch
 from ._kwargs import (
     compile_argument_injector,
@@ -4307,6 +4307,19 @@ class BoltAPI:
                     django_scope = dict(scope)
                 django_scope["root_path"] = ""
             root_path = django_scope.get("root_path") or ""
+            script_prefix = concurrency._script_prefix
+            if script_prefix is not None and django_scope.get("type") == "http":
+                # The proxy removed FORCE_SCRIPT_NAME. Django's ASGIRequest then
+                # gives the path with it and the path info without it, as WSGI does.
+                script_name = script_prefix.rstrip("/")
+                raw_path = django_scope.get("raw_path")
+                if not isinstance(raw_path, bytes | bytearray | memoryview):
+                    raw_path = django_scope["path"].encode()
+                django_scope = {
+                    **django_scope,
+                    "path": script_name + django_scope["path"],
+                    "raw_path": script_name.encode() + bytes(raw_path),
+                }
 
             async def django_send(message):
                 rewritten = _rewrite_django_mount_redirect_message(message, root_path)

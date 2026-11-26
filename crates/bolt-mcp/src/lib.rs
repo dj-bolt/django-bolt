@@ -56,6 +56,8 @@ pub struct McpRouteRequest {
     pub conn_scheme: &'static str,
     /// The client address, as for a route request.
     pub conn_remote_addr: Option<std::net::IpAddr>,
+    /// `FORCE_SCRIPT_NAME` of the app, as for a route request.
+    pub script_name: Option<Arc<str>>,
 }
 
 /// Carries an `McpRouteRequest` through the http request extensions into

@@ -1062,10 +1062,15 @@ async fn route_request(
                 // The line of the redirect has the filter of the route at the other form.
                 *access_log_route = Some(alternate.handler_id());
                 let query = req.query_string();
+                // The client sees the path behind the script name (FORCE_SCRIPT_NAME).
+                let script_name = state
+                    .script_name
+                    .as_deref()
+                    .map_or("", |name| name.trim_end_matches('/'));
                 let location = if query.is_empty() {
-                    alternate_path.clone()
+                    format!("{}{}", script_name, alternate_path)
                 } else {
-                    format!("{}?{}", alternate_path, query)
+                    format!("{}{}?{}", script_name, alternate_path, query)
                 };
                 return HttpResponse::PermanentRedirect() // 308
                     .insert_header(("Location", location))
@@ -1741,6 +1746,7 @@ async fn route_request(
             conn_scheme,
             conn_remote_addr,
             rust_answer,
+            script_name: state.script_name.clone(),
         };
         let request_obj = Py::new(py, request)?;
 

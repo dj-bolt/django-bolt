@@ -27,6 +27,7 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connections
 from django.db.backends.signals import connection_created
+from django.urls import get_script_prefix, set_script_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -342,8 +343,25 @@ def _drop_broken_connections_after_error() -> None:
         logger.exception("Could not close the unusable database connections of a thread after a call failed")
 
 
+# FORCE_SCRIPT_NAME of the server or the test client with a trailing slash, as
+# get_script_prefix() gives it. Read at startup. Django keeps the script prefix
+# of each thread in an asgiref Local, and a context that a hop copies to
+# another thread does not carry it. Thus each hop sets it again.
+_script_prefix: str | None = None
+
+
+def configure_script_prefix() -> None:
+    """Read ``FORCE_SCRIPT_NAME`` for the threads that run requests. None when it is not set."""
+    global _script_prefix
+    name = settings.FORCE_SCRIPT_NAME
+    _script_prefix = (name if name.endswith("/") else name + "/") if name else None
+
+
 def _call_guarded[T](fn: Callable[..., T], *args: object, **kwargs: object) -> T:
     """Call ``fn`` on the pool thread and drop dead connections when it raises."""
+    # A hop runs in a copied context, so the prefix stays with this call.
+    if _script_prefix is not None and get_script_prefix() != _script_prefix:
+        set_script_prefix(_script_prefix)
     if (_generation_epoch and _thread_state.epoch != _generation_epoch) or _check_before_call:
         _check_before_pool_call()
     if _pooled_aliases:

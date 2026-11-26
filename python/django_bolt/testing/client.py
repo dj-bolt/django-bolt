@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 import httpx
 from httpx import Response
 
-from django_bolt import BoltAPI, _core
+from django_bolt import BoltAPI, _core, concurrency
 from django_bolt._urlconf import served_api
 from django_bolt.api import (
     _routes_and_native_routes,
@@ -31,6 +31,7 @@ from django_bolt.api import (
     _validate_mcp_mount_conflicts,
     run_lifespans,
 )
+from django_bolt.concurrency import configure_script_prefix
 from django_bolt.middleware.middleware import refuse_unread_route_config
 from django_bolt.testing.dbshare import SharedConnections
 from django_bolt.testing.server_exceptions import ServerExceptions, bound_dispatches
@@ -97,7 +98,8 @@ def _docs_routes(api: BoltAPI) -> list[tuple[Any, ...]]:
         # runbolt, or the test, added the docs routes to api._routes.
         return []
     # The values of the config are the key, so a changed value registers again.
-    key = _config_key(api._openapi_config)
+    # The docs pages have the script name in the URL of the schema.
+    key = (_config_key(api._openapi_config), concurrency._script_prefix)
     cached = api._client_docs_routes
     if cached is not None and cached[0] == key:
         return cached[1]
@@ -433,6 +435,8 @@ class TestClient(httpx.Client):
 
         # runbolt serves an API that the URLconf mounts under its prefixes.
         api = served_api(api)
+        # The dispatch of each route sets the script prefix, as in runbolt.
+        configure_script_prefix()
         # runbolt registers the docs routes before it validates the routes. Do the same.
         docs_routes = _prepare_api(api)
 
@@ -769,6 +773,7 @@ class AsyncTestClient(httpx.AsyncClient):
             **kwargs: Additional arguments passed to httpx.AsyncClient
         """
         api = served_api(api)
+        configure_script_prefix()
         # Register the docs routes as TestClient does.
         docs_routes = _prepare_api(api)
 

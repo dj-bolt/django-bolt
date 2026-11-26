@@ -6,20 +6,34 @@ mounted API at the path that Django's ``reverse()`` gives for it.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import re
 import sys
 import types
 from contextlib import asynccontextmanager
+from wsgiref.util import setup_testing_defaults
 
 import pytest
 from bolt_mcp import MCP, ProtectedResource
 from django.conf.urls.i18n import i18n_patterns
+from django.contrib.auth.models import User
 from django.core.exceptions import ImproperlyConfigured
-from django.http import HttpResponse
+from django.core.handlers.wsgi import WSGIHandler
+from django.http import HttpResponse, JsonResponse
 from django.test import Client as DjangoClient
-from django.urls import NoReverseMatch, include, path, re_path, register_converter, resolve, reverse
+from django.urls import (
+    NoReverseMatch,
+    get_script_prefix,
+    include,
+    path,
+    re_path,
+    register_converter,
+    resolve,
+    reverse,
+    set_script_prefix,
+)
 from django.utils.translation import gettext_lazy
 
 from django_bolt import BoltAPI, WebSocket, _core
@@ -706,3 +720,197 @@ def test_a_native_route_of_a_mounted_api_carries_the_prefix(mount_urlconf):
     assert prefixed.status_code == 201
     assert (prefixed.json()["path"], prefixed.json()["params"]) == ("/missions/items/7", {"id": "7"})
     assert unprefixed.status_code == 404
+
+
+# --- Script prefix (FORCE_SCRIPT_NAME) ----------------------------------------
+# The proxy removes the script prefix from the path, as for Django's WSGIHandler.
+
+
+def _request_facts(request, name: str, **kwargs) -> dict:
+    return {
+        "reverse": reverse(name, kwargs=kwargs),
+        "path": request.path,
+        "path_info": request.path_info,
+        "SCRIPT_NAME": request.META["SCRIPT_NAME"],
+        "PATH_INFO": request.META["PATH_INFO"],
+        "full_path": request.get_full_path(),
+        "absolute": request.build_absolute_uri(),
+    }
+
+
+def _django_facts_view(request, mission_id):
+    return JsonResponse(_request_facts(request, "plain", mission_id=mission_id))
+
+
+def _django_wsgi_get(path_info: str, query: str = "") -> tuple[int, bytes]:
+    """GET through Django's own WSGIHandler, as a WSGI server behind a proxy that removed the script name."""
+    environ = {"PATH_INFO": path_info, "QUERY_STRING": query, "SCRIPT_NAME": "", "SERVER_NAME": "testserver"}
+    setup_testing_defaults(environ)
+    statuses: list[str] = []
+    # The handler sets the script prefix of this thread. Give the next test its own.
+    previous = get_script_prefix()
+    try:
+        body = b"".join(WSGIHandler()(environ, lambda status, _headers, _exc_info=None: statuses.append(status)))
+    finally:
+        set_script_prefix(previous)
+    return int(statuses[0].split()[0]), body
+
+
+@pytest.mark.django_db
+def test_a_bolt_request_under_force_script_name_matches_a_django_wsgi_request(mount_urlconf, settings):
+    api = BoltAPI(namespace="missions")
+
+    @api.get("/{mission_id}", name="detail")
+    async def detail(request, mission_id: int) -> dict:
+        return _request_facts(request, "missions:detail", mission_id=mission_id)
+
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    mount_urlconf([path("missions/", api.urls), path("plain/<int:mission_id>", _django_facts_view, name="plain")])
+
+    with TestClient(api) as client:
+        bolt = client.get("/missions/7?x=1").json()
+    status, body = _django_wsgi_get("/plain/7", "x=1")
+    django = json.loads(body)
+
+    assert status == 200
+    assert django == {
+        "reverse": "/myapp/plain/7",
+        "path": "/myapp/plain/7",
+        "path_info": "/plain/7",
+        "SCRIPT_NAME": "/myapp",
+        "PATH_INFO": "/plain/7",
+        "full_path": "/myapp/plain/7?x=1",
+        "absolute": "http://testserver/myapp/plain/7?x=1",
+    }
+    assert bolt == {key: value.replace("plain", "missions") for key, value in django.items()}
+
+
+@pytest.mark.django_db
+def test_an_unstripped_path_is_not_found_as_with_django_wsgi(mount_urlconf, settings):
+    api = _api()
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    mount_urlconf([path("missions/", api.urls), path("plain/<int:mission_id>", _django_facts_view, name="plain")])
+
+    with TestClient(api) as client:
+        assert client.get("/myapp/missions/7").status_code == 404
+    assert _django_wsgi_get("/myapp/plain/7")[0] == 404
+
+
+@pytest.mark.django_db
+def test_reverse_has_the_script_prefix_in_each_kind_of_handler(mount_urlconf, settings):
+    api = BoltAPI(namespace="m")
+
+    @api.get("/sync", name="sync")
+    def sync_handler() -> dict:
+        return {"url": reverse("m:sync")}
+
+    @api.get("/orm", name="orm")
+    def orm_handler() -> dict:
+        User.objects.count()
+        return {"url": reverse("m:orm")}
+
+    @api.get("/async", name="async")
+    async def async_handler() -> dict:
+        await asyncio.sleep(0)
+        await User.objects.acount()
+        return {"url": reverse("m:async")}
+
+    settings.FORCE_SCRIPT_NAME = "/myapp/"
+    mount_urlconf([path("m/", api.urls)])
+
+    with TestClient(api) as client:
+        urls = [client.get(f"/m/{kind}").json()["url"] for kind in ("sync", "orm", "async")]
+
+    assert urls == ["/myapp/m/sync", "/myapp/m/orm", "/myapp/m/async"]
+
+
+def test_an_unmounted_api_has_no_script_prefix_without_the_setting():
+    api = BoltAPI()
+
+    @api.get("/facts")
+    async def facts(request) -> dict:
+        return {"path": request.path, "path_info": request.path_info, "SCRIPT_NAME": request.META["SCRIPT_NAME"]}
+
+    with TestClient(api) as client:
+        assert client.get("/facts").json() == {"path": "/facts", "path_info": "/facts", "SCRIPT_NAME": ""}
+
+
+def test_the_trailing_slash_redirect_has_the_script_prefix(mount_urlconf, settings):
+    api = BoltAPI()
+
+    @api.get("/list")
+    async def listing() -> dict:
+        return {}
+
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api, follow_redirects=False) as client:
+        response = client.get("/missions/list/?page=2")
+
+    assert response.status_code == 308
+    assert response.headers["location"] == "/myapp/missions/list?page=2"
+
+
+def test_the_docs_fetch_the_schema_through_the_script_prefix(mount_urlconf, settings):
+    api = _api()
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    mount_urlconf([path("missions/", api.urls)])
+
+    with TestClient(api) as client:
+        schema = client.get("/missions/docs/openapi.json").json()
+        page = client.get("/missions/docs/rapidoc").text
+
+    assert schema["servers"] == [{"url": "/myapp"}]
+    assert list(schema["paths"]) == ["/missions/{mission_id}"]
+    assert 'spec-url="/myapp/missions/docs/openapi.json"' in page
+
+
+def test_static_files_serve_at_the_static_url_without_the_script_prefix(settings, tmp_path):
+    (tmp_path / "site.css").write_text("body {}")
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    settings.STATIC_URL = "/myapp/static/"
+    settings.STATIC_ROOT = str(tmp_path)
+
+    with TestClient(BoltAPI()) as client:
+        assert client.get("/static/site.css").text == "body {}"
+
+
+def test_the_script_prefix_of_one_client_does_not_stay_on_the_worker_threads(settings):
+    def make_api() -> BoltAPI:
+        api = BoltAPI()
+
+        @api.get("/sync")
+        def sync_prefix() -> dict:
+            return {"prefix": get_script_prefix()}
+
+        @api.get("/async")
+        async def async_prefix() -> dict:
+            return {"prefix": get_script_prefix()}
+
+        return api
+
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    with TestClient(make_api()) as client:
+        prefixed = {client.get(route).json()["prefix"] for route in ("/sync", "/async") for _ in range(3)}
+    settings.FORCE_SCRIPT_NAME = None
+    with TestClient(make_api()) as client:
+        plain = {client.get(route).json()["prefix"] for route in ("/sync", "/async") for _ in range(6)}
+
+    assert (prefixed, plain) == ({"/myapp/"}, {"/"})
+
+
+@pytest.mark.django_db
+def test_a_django_view_behind_mount_django_sees_the_paths_of_django_wsgi(mount_urlconf, settings):
+    settings.FORCE_SCRIPT_NAME = "/myapp"
+    mount_urlconf([path("plain/<int:mission_id>", _django_facts_view, name="plain")])
+    api = BoltAPI()
+    # As the admin mount: the URLconf patterns have the mount path.
+    api.mount_django("/plain", clear_root_path=True)
+
+    with TestClient(api) as client:
+        through_bolt = client.get("/plain/7?x=1").json()
+    status, body = _django_wsgi_get("/plain/7", "x=1")
+
+    assert status == 200
+    assert through_bolt == json.loads(body)

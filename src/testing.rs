@@ -658,6 +658,7 @@ pub fn test_request(
                         media_files_config: config.media_files_config,
                         access_loggers: Vec::new(),
                         error_renderer,
+                        script_name: config.script_name,
                     });
 
                     // Create Actix test service with production middleware stack
@@ -1130,6 +1131,7 @@ mod tests {
                 rate_limit_ipv6_prefix: 64,
                 static_files_config: None,
                 media_files_config: None,
+                script_name: None,
             },
             global_compression_config: None,
             rate_limiters: Arc::default(),

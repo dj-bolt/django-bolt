@@ -34,3 +34,18 @@ def test_runbolt_serves_a_mounted_api_under_its_prefix_one_time(make_server_proj
         assert server.get("/health").json() == {"status": "ok"}
         # reverse() in a handler gives the served path.
         assert server.get("/link").json() == {"url": "/missions/42"}
+
+
+@pytest.mark.server_integration
+def test_runbolt_under_force_script_name_serves_the_stripped_path_and_reverses_with_the_prefix(make_server_project):
+    module = app_module("urlconf_mount")
+    project = make_server_project(
+        api_module=module,
+        urls_content=_URLS,
+        # The proxy removes /myapp from the path, as for Django's WSGIHandler.
+        settings_extra='FORCE_SCRIPT_NAME = "/myapp"',
+    )
+    with project.start() as server:
+        assert server.wait_for_json("/missions/42", lambda body: body == {"id": 42}) == {"id": 42}
+        assert server.get("/link").json() == {"url": "/myapp/missions/42"}
+        assert server.get("/myapp/missions/42").status_code == 404

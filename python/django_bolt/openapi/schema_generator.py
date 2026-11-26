@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_
 import msgspec
 from django.conf import settings as django_settings
 
+from .. import concurrency
 from .._serializer_input import any_serializer
 from ..datastructures import UploadFile
 from ..pagination import CursorPagination, LimitOffsetPagination, PageNumberPagination, PaginationBase
@@ -701,6 +702,11 @@ class SchemaGenerator:
             OpenAPI schema object.
         """
         openapi = self.config.to_openapi_schema()
+        # The default server "/" is the root of the host. Under FORCE_SCRIPT_NAME
+        # the API is behind the script name.
+        script_prefix = concurrency._script_prefix
+        if script_prefix and [server.url for server in openapi.servers or ()] == ["/"]:
+            openapi.servers = [replace(openapi.servers[0], url=script_prefix.rstrip("/") or "/")]
 
         # The security schemes of the auth backends, filled by _extract_security calls.
         # The schemes of the config come first: a name of the user keeps its scheme.

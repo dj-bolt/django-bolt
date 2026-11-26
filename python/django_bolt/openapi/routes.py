@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import ImproperlyConfigured
 
+from django_bolt import concurrency
 from django_bolt.openapi.plugins import JsonRenderPlugin, YamlRenderPlugin
 from django_bolt.openapi.schema_generator import SchemaGenerator
 from django_bolt.responses import HTML, JSON, PlainText
@@ -139,10 +140,13 @@ class OpenAPIRouteRegistrar:
 
         return self.api._openapi_schema
 
+    def _schema_url(self) -> str:
+        """The URL of the JSON schema that a docs page fetches: the script name, then the docs path."""
+        return f"{(concurrency._script_prefix or '').rstrip('/')}{self.api._openapi_config.path}/openapi.json"
+
     def _register_ui_plugins(self, route_prefix: str) -> None:
         """Register UI plugin routes (Swagger UI, ReDoc, etc.)."""
-        # Schema URL is always the full path (for the UI to fetch)
-        schema_url = f"{self.api._openapi_config.path}/openapi.json"
+        schema_url = self._schema_url()
 
         for plugin in self.api._openapi_config.render_plugins:
             for plugin_path in plugin.paths:
@@ -183,8 +187,7 @@ class OpenAPIRouteRegistrar:
         which strips trailing slashes (e.g., /docs/ -> /docs).
         """
         if self.api._openapi_config.default_plugin:
-            # Schema URL is always the full path (for the UI to fetch)
-            schema_url = f"{self.api._openapi_config.path}/openapi.json"
+            schema_url = self._schema_url()
             plugin = self.api._openapi_config.default_plugin
 
             # Capture plugin in closure
