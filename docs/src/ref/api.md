@@ -259,8 +259,9 @@ The two namespaces are the `namespace` of the API. See [Mount an API in the URLc
 
 **Errors**
 
-- `ImproperlyConfigured`: at startup, `runbolt` and `TestClient` refuse a prefix that Bolt cannot serve at one path.
-  Examples are `re_path()`, `i18n_patterns()`, a converter other than `str`, no trailing slash, and include keyword arguments.
+- `ImproperlyConfigured`: at startup, `runbolt` and `TestClient` refuse a prefix that Bolt cannot serve at static paths.
+  Examples are `re_path()`, `i18n_patterns()`, a converter other than `str`, two parameters in one segment, no trailing slash, and include keyword arguments.
+  The message names the URLconf entry.
 
 ### api.mount()
 

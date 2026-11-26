@@ -361,7 +361,8 @@ curl localhost:8000/blog/articles/42
 The API does not serve `/articles/42` any more.
 Bolt joins the prefix and the route path as Django does. Thus the root route `"/"` of the API serves at `/blog/`, also when `trailing_slash="strip"`.
 An API that the URLconf mounts and that `runbolt` also finds serves one time, under its prefixes. An API that the URLconf mounts is served also when `runbolt` does not find it.
-`TestClient(api)` serves an API that the URLconf mounts under its prefixes too.
+`TestClient(api)` serves an API that the URLconf mounts under its prefixes too. Thus it imports `ROOT_URLCONF`.
+A URLconf that does not import makes `TestClient` raise. It also makes the system checks of `runbolt` fail.
 
 ### Reverse through namespaces
 
@@ -395,10 +396,11 @@ A `str` parameter in the prefix becomes a path parameter, for example `path("<te
 A handler reads its value from `request.params["tenant"]`, as for a [mount path](#mount-an-api-in-another-api). `reverse()` needs it as a keyword argument.
 The docs of an API cannot be under such a prefix. Set `OpenAPIConfig(enabled=False)` on the API.
 
-Bolt serves an API at one static path. These prefixes stop the startup with `ImproperlyConfigured`:
+Bolt serves an API at static paths. These prefixes stop the startup with `ImproperlyConfigured`, and the message names the URLconf entry:
 
 - a `re_path()` prefix, an `i18n_patterns()` prefix, or a translated prefix
 - a converter other than `str`, for example `<int:org>`, because the Bolt router does not check it
+- two parameters in one path segment, for example `<a>-<b>/`, because the Bolt router allows one
 - a prefix that does not end with a slash, or a prefix that gives an empty path segment
 - keyword arguments in the include, because a Bolt handler does not get them
 
@@ -422,7 +424,7 @@ The Django admin and the static files are not part of an API, so they do not mov
 
 ### Reverse an API that the URLconf does not mount
 
-Include `django_bolt.urls` one time to name the routes of each API that `runbolt` finds and the URLconf does not mount:
+Include `django_bolt.urls` to name the routes of each API that `runbolt` finds and that no `api.urls` mounts:
 
 ```python title="mysite/urls.py"
 from django.urls import include, path
@@ -437,8 +439,13 @@ urlpatterns = [
 '/articles/42'
 ```
 
-These APIs serve at their own paths, so `django_bolt.urls` must have the empty prefix. Another prefix stops the startup with `ImproperlyConfigured`.
 `BoltAPI(namespace="blog")` puts each route of the API in a namespace. Then use `reverse("blog:article-detail", ...)`.
+
+A prefix on this include moves these APIs, as `api.urls` does. With `path("api/", include("django_bolt.urls"))`, Bolt serves `/api/articles/42`, and `reverse()` gives the same path.
+The prefix rules of `api.urls` apply, but Bolt ignores the keyword arguments of the include.
+`TestClient(api)` serves such an API under the prefix too.
+
+`django_bolt.urls.urlpatterns` is a list with one include. Thus a URLconf can copy it with `[*urlpatterns]` or join it to a list with `+`.
 
 ## Describe a route in the OpenAPI document
 
