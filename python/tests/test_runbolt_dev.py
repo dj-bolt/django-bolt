@@ -689,6 +689,59 @@ def test_merge_apis_runs_the_middleware_of_the_first_api_for_a_path_with_no_rout
     assert second_response.headers["x-api"] == "second"
 
 
+def test_docs_routes_of_a_merged_api_run_the_middleware_given_at_registration():
+    """The docs routes of a merged API run the middleware that ``_register_openapi_routes`` gets.
+
+    This test makes the call itself. It does not cover the two call sites in runbolt.
+    """
+    first = BoltAPI(middleware=[_FirstApiMiddleware])
+    second = BoltAPI(middleware=[_SecondApiMiddleware])
+
+    @first.get("/first")
+    async def first_route():
+        return {"api": "first"}
+
+    @second.get("/second")
+    async def second_route():
+        return {"api": "second"}
+
+    merged = runbolt_module.Command().merge_apis([("first.api", first), ("second.api", second)])
+    merged._register_openapi_routes(middleware=[_FirstApiMiddleware])
+
+    with TestClient(merged) as client:
+        docs = client.get("/docs/openapi.json")
+
+    assert docs.status_code == 200
+    assert docs.headers["x-api"] == "first"
+    assert set(docs.json()["paths"]) == {"/first", "/second"}
+
+
+def test_docs_routes_of_a_merged_api_use_the_trailing_slash_of_the_first_api():
+    """The docs routes that runbolt adds to a merged API end with "/" when the first API appends one."""
+    first = BoltAPI(trailing_slash="append")
+    second = BoltAPI()
+
+    @first.get("/first")
+    async def first_route():
+        return {"api": "first"}
+
+    @second.get("/second")
+    async def second_route():
+        return {"api": "second"}
+
+    merged = runbolt_module.Command().merge_apis([("first.api", first), ("second.api", second)])
+    merged._register_openapi_routes()
+
+    with TestClient(merged) as client:
+        with_slash = client.get("/docs/openapi.json/")
+        without_slash = client.get("/docs/openapi.json", follow_redirects=False)
+
+    assert with_slash.status_code == 200
+    assert set(with_slash.json()["paths"]) == {"/first/", "/second"}
+    assert without_slash.status_code == 308
+    assert without_slash.headers["location"] == "/docs/openapi.json/"
+
+
 def _two_apis_and_their_merge() -> tuple[BoltAPI, BoltAPI, BoltAPI]:
     first = BoltAPI()
     second = BoltAPI()

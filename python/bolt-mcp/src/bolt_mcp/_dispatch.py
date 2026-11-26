@@ -163,6 +163,7 @@ def tool_entry(mcp: MCP, tool: ToolDef, mount_user_loaders: tuple[Any, ...]) -> 
         "needs_request": tool.request_param is not None or tool.ctx_param is not None,
         "guards": [g.to_metadata() for g in tool.guards],
         "route_auth": tool.route_auth,
+        "task": tool.task,
     }
 
 

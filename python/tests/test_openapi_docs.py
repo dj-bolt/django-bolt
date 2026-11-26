@@ -5,8 +5,12 @@ These tests verify that the OpenAPI/Swagger documentation endpoints
 are working correctly and not throwing internal errors.
 """
 
+import json
 import re
+import subprocess
+import sys
 import time
+from html.parser import HTMLParser
 from typing import Annotated
 from urllib.parse import urljoin
 
@@ -205,7 +209,7 @@ def test_docs_pages_escape_the_text_of_the_api():
             render_plugins=[
                 SwaggerRenderPlugin(path="/swagger"),
                 RedocRenderPlugin(path="/redoc"),
-                ScalarRenderPlugin(path="/scalar", options={"title": "Tom's API"}),
+                ScalarRenderPlugin(path="/scalar", options={"title": "Tom's API", "note": "Q&A </script>"}),
                 RapidocRenderPlugin(path="/rapidoc"),
                 StoplightRenderPlugin(path="/stoplight"),
             ],
@@ -231,8 +235,11 @@ def test_docs_pages_escape_the_text_of_the_api():
     # The page holds the docstring as JSON text that the browser reads back to the same string.
     for name in ("swagger", "redoc"):
         assert r"\u003c/script\u003e\u003cscript\u003ealert(1)\u003c/script\u003e" in pages[name], name
-    # The apostrophe does not end a JavaScript string.
-    assert """dataset.configuration = JSON.stringify({"title":"Tom's API"})""" in pages["scalar"]
+    # The apostrophe does not end a JavaScript string. "&" and "</script>" do not end the script.
+    expected = (
+        r"""dataset.configuration = JSON.stringify({"title":"Tom's API","note":"Q\u0026A \u003c/script\u003e"})"""
+    )
+    assert expected in pages["scalar"]
 
 
 @pytest.mark.parametrize(
@@ -397,6 +404,63 @@ def test_docs_page_options_change_the_page(plugin_class, options, url, present, 
         assert part in page
     for part in absent:
         assert part not in page
+
+
+class _ShownText(HTMLParser):
+    """Collect the text that a browser shows: the text outside the head, a script and a noscript element."""
+
+    _hidden = frozenset({"head", "script", "noscript"})
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._depth = 0
+        self.text: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        self._depth += tag in self._hidden
+
+    def handle_endtag(self, tag):
+        self._depth -= tag in self._hidden
+
+    def handle_data(self, data):
+        if self._depth == 0 and data.strip():
+            self.text.append(data.strip())
+
+
+def test_scalar_page_with_no_options_loads_the_latest_bundle_and_shows_no_text():
+    """The default Scalar page loads the latest bundle. Until the script runs, the page shows no text."""
+    api = BoltAPI(
+        openapi_config=OpenAPIConfig(title="Scalar API", version="1.0.0", render_plugins=[ScalarRenderPlugin()])
+    )
+    api._register_openapi_routes()
+
+    with TestClient(api) as client:
+        page = client.get("/docs/scalar").text
+
+    assert '<script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@latest" crossorigin>' in page
+    parser = _ShownText()
+    parser.feed(page)
+    assert parser.text == []
+
+
+def test_yaml_plugin_without_pyyaml_gives_the_json_document_after_a_comment():
+    """With no PyYAML, the YAML text is the JSON document after a comment. A YAML parser reads the same document."""
+    document = {"openapi": "3.1.0", "info": {"title": "No YAML", "version": "1.0.0"}, "paths": {}}
+    code = (
+        "import json, sys\n"
+        "sys.modules['yaml'] = None\n"
+        "from django_bolt.openapi.plugins import YamlRenderPlugin\n"
+        "sys.stdout.write(YamlRenderPlugin().render(json.loads(sys.argv[1]), ''))\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code, json.dumps(document)], capture_output=True, text=True, check=True, timeout=60
+    )
+
+    comment, _, body = result.stdout.partition("\n")
+    assert comment == "# PyYAML not installed. Install with: pip install pyyaml"
+    assert json.loads(body) == document
+    assert yaml.safe_load(result.stdout) == document
 
 
 def test_openapi_root_serves_the_plugin_with_the_root_path():
@@ -1182,6 +1246,38 @@ def test_openapi_auth_errors_follow_include_error_responses_and_a_declared_respo
         "application/json": {"schema": {"anyOf": [{"$ref": "#/components/schemas/Locked"}, ERROR_DETAIL_SCHEMA]}}
     }
     assert "401" in responses
+
+
+def test_openapi_auth_errors_follow_the_order_of_the_guards_and_keep_the_challenge_of_a_declared_401():
+    """The first guard that needs a user gives the 401, also before AllowAny. A declared 401 keeps the challenge."""
+
+    class Locked(msgspec.Struct):
+        reason: str
+
+    api = BoltAPI(openapi_config=OpenAPIConfig(title="Auth Test API", version="1.0.0"))
+    api_key = APIKeyAuthentication(api_keys={"test-key"})
+
+    @api.get("/first-guard", auth=[api_key], guards=[IsAuthenticated(), AllowAny()])
+    async def first_guard() -> dict:
+        return {}
+
+    @api.get("/declared", auth=[api_key], guards=[IsAuthenticated()], response_model={200: dict, 401: Locked})
+    async def declared():
+        return {}
+
+    api._register_openapi_routes()
+    with TestClient(api) as client:
+        responses = {path: item["get"]["responses"] for path, item in _document(client)["paths"].items()}
+        first_guard_response = client.get("/first-guard")
+        declared_response = client.get("/declared")
+
+    assert first_guard_response.status_code == 401
+    assert responses["/first-guard"]["401"]["headers"] == {"WWW-Authenticate": WWW_AUTHENTICATE_HEADER}
+    assert declared_response.headers["www-authenticate"] == "ApiKey"
+    assert responses["/declared"]["401"]["headers"] == {"WWW-Authenticate": WWW_AUTHENTICATE_HEADER}
+    assert responses["/declared"]["401"]["content"] == {
+        "application/json": {"schema": {"anyOf": [{"$ref": "#/components/schemas/Locked"}, ERROR_DETAIL_SCHEMA]}}
+    }
 
 
 @pytest.mark.django_db

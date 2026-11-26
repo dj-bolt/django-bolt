@@ -997,7 +997,9 @@ pub fn start_server(
 
                     // Custom shutdown sequencing (Actix signals disabled above):
                     // 1. close WebSocket connections with 1012 Service Restart so
-                    //    clients reconnect to a healthy worker,
+                    //    clients reconnect to a healthy worker, and cancel the
+                    //    running MCP tasks (a graceful stop waits, bounded, for
+                    //    their coroutines to end),
                     // 2. graceful Actix stop (drain in-flight HTTP up to
                     //    shutdown_timeout). SIGTERM drains gracefully;
                     //    SIGINT/SIGQUIT stop immediately (Actix's default
@@ -1006,7 +1008,18 @@ pub fn start_server(
                     aw::rt::spawn(async move {
                         let graceful = wait_for_shutdown_signal().await;
                         bolt_websocket::begin_drain();
+                        // MCP tasks are no HTTP requests, so the Actix drain
+                        // does not wait for them. Cancel them while the worker
+                        // loops still run, so their cleanup code runs.
+                        bolt_mcp::cancel_running_tasks();
                         if graceful {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            while bolt_mcp::running_task_bodies() > 0
+                                && std::time::Instant::now() < deadline
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
                             // The 1012 close is delivered by each actor's
                             // drain-watch poll tick; stopping Actix immediately
                             // races it and can tear connections down with a

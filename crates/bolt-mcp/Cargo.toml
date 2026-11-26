@@ -23,5 +23,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
 bolt-core = { workspace = true }
 bolt-loop = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# Paused time for the TTL tests of the task store.
+tokio = { workspace = true, features = ["test-util"] }

@@ -597,6 +597,38 @@ def _validate_option_ranges(options) -> None:
             raise CommandError(f"{flag} must be at most {highest}, got {value}")
 
 
+def _option_that_splits_mcp_tasks(options) -> str | None:
+    """Return the option that lets another process get a ``tasks/get``, if one is set.
+
+    MCP tasks live in the memory of the process that runs them. With
+    ``SO_REUSEPORT``, the kernel can give the next request to another process.
+    Worker recycling starts the new worker before the old one stops, with the same result.
+    """
+    if options["processes"] > 1:
+        return f"--processes {options['processes']}"
+    if options["max_rss"]:
+        return "--max-rss"
+    if options["workers_lifetime"]:
+        return "--workers-lifetime"
+    return None
+
+
+def _reject_mcp_task_tools(mcp_mounts: list[dict], option: str) -> None:
+    """Stop startup when an MCP mount has a tool with ``task=True`` and ``option`` is set."""
+    mounts = []
+    for mount in mcp_mounts:
+        task_tools = sorted(name for name, tool in mount["tools"].items() if tool["task"] is not None)
+        if task_tools:
+            mounts.append(f"{mount['path']!r} has task tools ({', '.join(task_tools)})")
+    if mounts:
+        raise CommandError(
+            f"The MCP mount at {'; the MCP mount at '.join(mounts)}. "
+            "MCP tasks live in the memory of one process, so tasks/get must reach that process. "
+            f"With {option}, another process can get the request. "
+            "Run one process with no --max-rss and no --workers-lifetime, or remove task=True."
+        )
+
+
 def _merge_handler(merged, api, old_handler_id: int, new_handler_id: int) -> None:
     """Copy the metadata of one handler of ``api`` into ``merged`` with a new handler id.
 
@@ -792,7 +824,11 @@ class Command(BaseCommand):
 
         # Run autodiscovery + banner once in the parent before forking so the
         # user sees a single clean banner instead of N copies.
-        self._print_multiprocess_banner(options)
+        apis, merged_api = self._discover_multiprocess_apis()
+        split_option = _option_that_splits_mcp_tasks(options)
+        if split_option is not None:
+            _reject_mcp_task_tools(merged_api._mcp_mounts, split_option)
+        self._print_multiprocess_banner(options, apis, merged_api)
 
         def spawn_worker(slot: int) -> int:
             # A forked worker inherits the sockets of the parent's open database
@@ -858,22 +894,22 @@ class Command(BaseCommand):
         if exit_code:
             sys.exit(exit_code)
 
-    def _print_multiprocess_banner(self, options):
-        """Perform a dry-run of autodiscovery to collect route/feature info,
-        then print the startup banner once from the parent process."""
+    def _discover_multiprocess_apis(self):
+        """Run autodiscovery once in the parent process. Return ``(apis, merged_api)``."""
         # Setup logging/file-response just like start_single_process
         if setup_django_logging is not None:
             setup_django_logging()
         if initialize_file_response_settings is not None:
             initialize_file_response_settings()
-        banner_base_url = _build_display_url(options["host"], options["port"], dev_mode=False)
-
         apis = served_apis(self.autodiscover_apis())
         if not apis:
             # Stop before the fork. A worker has nothing to serve.
             raise CommandError(_NO_API_MESSAGE)
+        return apis, self.merge_apis(apis)
 
-        merged_api = self.merge_apis(apis)
+    def _print_multiprocess_banner(self, options, apis, merged_api):
+        """Print the startup banner once from the parent process, with the route and feature info."""
+        banner_base_url = _build_display_url(options["host"], options["port"], dev_mode=False)
         _user_route_count = len(merged_api._routes) + len(merged_api._native_routes)
 
         features: list[tuple[str, str]] = []
