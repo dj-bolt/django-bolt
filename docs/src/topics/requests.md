@@ -136,14 +136,17 @@ curl "localhost:8000/articles?page=2&search=django&tag=python&tag=web"
 
 Bolt converts the text of a path, query, header, cookie or form value to the type of the argument.
 For `int`, `float`, `date`, `time` and `datetime`, Bolt reads the text as Python reads it, with `int()`, `float()` and `fromisoformat()`.
-A single argument and a `list[...]` argument of these types accept the same text.
+A single argument and a `list`, `set`, `frozenset`, `tuple[T]` or `tuple[T, ...]` of these types accept the same text.
+This also applies to a field of a parameter model.
+Other containers still give their items to msgspec, for example `tuple[int, int]` or `list[int | None]`.
+msgspec converts `5.0` to an `int` and refuses `+5`.
 
 | Type | Text | Examples |
 | --- | --- | --- |
 | `int` | An optional `+` or `-`, then ASCII digits. | `42`, `-7`, `+5`, `007`, `9223372036854775808` |
 | `float` | An optional `+` or `-`, then digits with an optional point and exponent. Or `nan`, `inf` or `infinity` in any case. | `1.5`, `.5`, `-2e3`, `1e999`, `inf` |
 | `date` | `YYYY-MM-DD` or `YYYYMMDD`. Or a week date: `YYYY-Www-D`, `YYYYWwwD`, `YYYY-Www` or `YYYYWww`. | `2024-01-15`, `20240115`, `2024-W03-1` |
-| `time` | An optional `T`, then `HH`, `HH:MM`, `HH:MM:SS`, `HHMM` or `HHMMSS`. A fraction of the second can follow, after `.` or `,`. Then an optional offset: `Z`, or a sign and the hours, minutes and seconds in one of these forms. | `10:30`, `10:30:00.5`, `103000`, `10:30:00+05:30`, `10:30:00Z` |
+| `time` | An optional `T`, then `HH`, `HH:MM`, `HH:MM:SS`, `HHMM` or `HHMMSS`. A fraction of the second can follow, after `.` or `,`. Then an optional offset: `Z`, or a sign and `HH`, `HHMM` or `HH:MM`. | `10:30`, `10:30:00.5`, `103000`, `10:30:00+05:30`, `10:30:00Z` |
 | `datetime` | A `date`, then optionally `T`, `t` or one whitespace character and a `time` with no `T`. | `2024-01-15T10:30`, `2024-01-15 10:30:00Z`, `20240115T103000+0530` |
 
 - A `datetime` or a `time` keeps the offset of its text. `Z`, `+00:00` and `-00:00` give `datetime.timezone.utc`. A text with no offset gives a naive value.
@@ -151,14 +154,18 @@ A single argument and a `list[...]` argument of these types accept the same text
 - Bolt keeps the first six digits of a fraction, as Python does.
 - An HTML `<input type="datetime-local">` sends `2024-01-15T10:30`. A `datetime` argument accepts it.
 - An `int` has at most the digits of `sys.get_int_max_str_digits()`: 4300 by default, and never more than 4300. Bolt reads the limit when the server starts. A later `sys.set_int_max_str_digits()` call has no effect.
+- A process has one digit limit, as Python has one for each interpreter. The last server or test client that starts sets it.
 
 Bolt refuses some text that Python reads:
 
 - In a number: `_`, whitespace and digits that are not ASCII, as in `1_000`, ` 5` or `٣`.
-- Between the date and the time: a character other than `T`, `t` or whitespace, as in `2024-01-15x10:30`.
+- Between the date and the time: a character other than `T`, `t` or Unicode whitespace, as in `2024-01-15x10:30`. The characters `\x1c` to `\x1f` are refused too. Python's `str.isspace()` calls them whitespace, but Unicode does not.
+- After a date in the basic format, two more characters, as in `0002121227`. `date.fromisoformat()` reads the first eight characters as `0002-12-12`.
 - Hour 24 and a fraction of an hour or a minute, as in `24:00` or `10:30.5`. Python 3.12 and 3.14 read them differently.
-- An offset with a minute or a second of 60 or more (`+05:60`), and an offset of zero seconds with a fraction (`+00:00:00.5`).
-- Text between the time and the offset, as in `10:30:00 +05:00`, and a NUL character.
+- An offset with seconds, as in `+05:30:15` or `+05:30:00`. RFC 3339 has no seconds in an offset. The JSON encoder writes an offset in whole minutes, so a second would change the instant in a response.
+- An offset with a minute of 60 or more, as in `+05:60`.
+- Text between the time and the offset, as in `10:30:00 +05:00`.
+- A NUL character, as in `2024-01-15T10:30:00\0`. Python stops at the NUL and reads the text before it.
 
 A `bool`, a `UUID` and a `Decimal` still differ between a single argument and a `list[...]` argument:
 

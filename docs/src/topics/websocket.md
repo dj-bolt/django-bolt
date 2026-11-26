@@ -121,6 +121,8 @@ A request to `/ws/articles/7/presence?nickname=ada` with the cookie `theme=dark`
 
 A value that does not convert refuses the handshake with `400`.
 For example, `/ws/articles/abc/presence` gets `400`, and the handler does not run.
+A value that fails a check of its parameter gets `400` too, before `accept()`.
+Examples are an item of a `list[int]`, a `Query(ge=1)` limit and a field of a parameter model.
 
 A route matches the request path with and without a trailing slash.
 A WebSocket has no request body, so a body, form or file parameter is not available.
@@ -439,6 +441,7 @@ Each receive method waits 5 seconds by default. Give `timeout=` to change it.
 | The handler closes the connection | `ConnectionClosed` on the next receive, with `code` and `reason` |
 | The handler refuses the handshake | `HandshakeRejected` at `async with`, with `status_code` |
 | The authentication, a guard or the Origin check refuses the handshake | `PermissionError` at `async with` |
+| A request value does not convert or fails its check (the server answers `400`) | `ValueError` at `async with`, with the detail of the server |
 | The handler raises before `accept()` | That exception at `async with` |
 | The handler raises after `accept()` | That exception when the `async with` block ends |
 
