@@ -7,6 +7,8 @@ import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from ..exceptions import RequestValidationError
+
 if TYPE_CHECKING:
     from .types import WebSocket
 
@@ -47,6 +49,40 @@ def build_websocket_request(scope: dict[str, Any]) -> dict[str, Any]:
         "path": scope.get("path", "/"),
         "method": "WEBSOCKET",
     }
+
+
+# The name of each request source in the detail of a refused WebSocket upgrade, as Rust names it.
+_SOURCE_LABELS = {"query": "Query parameter", "path": "Path parameter", "header": "Header", "cookie": "Cookie"}
+
+
+def invalid_request_detail(error: BaseException) -> str | None:
+    """Give the detail of a request value that a parameter extractor refused, or None.
+
+    Rust refuses a bad scalar value before the handler runs, and the upgrade
+    gets 400. An extractor refuses other values, such as an item of a
+    ``list[int]``, with ``RequestValidationError``. Before accept, Bolt then
+    refuses the upgrade with 400 too, with a detail of the same form:
+    ``Query parameter 'ids': ...``. For another error, give None.
+
+    An error item can come from a handler, so each key is optional. An item
+    with no "msg" uses its "type", then "Invalid value".
+    """
+    if not isinstance(error, RequestValidationError):
+        return None
+    details = []
+    for item in error.errors():
+        if not isinstance(item, dict):
+            details.append(str(item))
+            continue
+        message = item.get("msg") or item.get("type") or "Invalid value"
+        loc = item.get("loc")
+        if not isinstance(loc, (list, tuple)) or len(loc) < 2:
+            details.append(str(message))
+            continue
+        source, *names = loc
+        label = _SOURCE_LABELS.get(source, source) if isinstance(source, str) else source
+        details.append(f"{label} '{'.'.join(str(name) for name in names)}': {message}")
+    return "; ".join(details) or str(error)
 
 
 def is_websocket_handler(func: Callable[..., Any]) -> bool:

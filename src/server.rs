@@ -285,8 +285,10 @@ impl ServerConfig {
             (None, None, None)
         };
 
-        // Resolve DJANGO_BOLT_MAX_PARAM_LENGTH once at startup, not per request.
+        // Resolve DJANGO_BOLT_MAX_PARAM_LENGTH and the digit limit of int() once
+        // at startup, not per request.
         let max_param_length = bolt_core::type_coercion::resolve_max_param_length(py)?;
+        bolt_core::type_coercion::resolve_int_max_str_digits(py)?;
         // Lanes and the Python thread pools start later. Check their variables
         // now, so an invalid value stops startup.
         bolt_core::lane::configure_idle_time(py)?;

@@ -32,9 +32,10 @@ from django_bolt import BoltAPI, _core
 from django_bolt._script_prefix import asgi_mounts
 from django_bolt._script_prefix import configure as configure_script_prefix
 from django_bolt._urlconf import served_api
+from django_bolt.exceptions import RequestValidationError
 from django_bolt.websocket import CloseCode, WebSocket, WebSocketDisconnect, WebSocketException
 from django_bolt.websocket.close_codes import check_close_frame
-from django_bolt.websocket.handlers import build_websocket_request
+from django_bolt.websocket.handlers import build_websocket_request, invalid_request_detail
 
 # Each WebSocketTestClient is one connection with its own test app. The
 # connections to one API share its rate-limit buckets, as the connections to
@@ -358,7 +359,10 @@ class WebSocketTestClient:
 
         # Call the pre-compiled injector of the route to get (args, kwargs), as
         # Rust does. The server calls it with no await, so this client does the same.
-        args, kwargs = self._injectors[handler_id](request)
+        try:
+            args, kwargs = self._injectors[handler_id](request)
+        except RequestValidationError as error:
+            raise _invalid_request(error) from error
 
         # Prepend websocket to args (same as Rust does)
         args = [ws] + list(args)
@@ -417,6 +421,15 @@ class WebSocketTestClient:
         """Record an error of the handler: a failed handshake, or a close with 1011."""
         if not self._accepted:
             # An error before accept fails the handshake, as the server answers 500.
+            # A refused request value fails it as a refused scalar does.
+            if isinstance(error, RequestValidationError):
+                try:
+                    error = _invalid_request(error)
+                except Exception:
+                    # The detail cannot be made, for example for RequestValidationError(None).
+                    # The handshake fails with the error itself, as for another error.
+                    self._decide(error)
+                    return
             self._decide(error)
             return
         # The server does not report a client that left as a handler error.
@@ -617,6 +630,16 @@ class WebSocketTestClient:
                 yield await self.receive_json(timeout=timeout)
             except (ConnectionClosed, TimeoutError):
                 break
+
+
+def _invalid_request(error: RequestValidationError) -> ValueError:
+    """Give the ValueError that Rust raises for a refused scalar, for a value that an extractor refused.
+
+    The server answers 400 for both.
+    """
+    invalid = ValueError(invalid_request_detail(error))
+    invalid.__cause__ = error
+    return invalid
 
 
 class HandshakeRejected(Exception):
