@@ -552,7 +552,7 @@ dev = [
     { name = "psycopg", specifier = ">=3.3" },
     { name = "psycopg-pool", specifier = ">=3.3" },
     { name = "pydantic", specifier = ">=2" },
-    { name = "pyjwt", specifier = ">=2.11" },
+    { name = "pyjwt", specifier = ">=2.15.1" },
     { name = "pytest", specifier = ">=9.0" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "pytest-codspeed", specifier = ">=5.0" },
