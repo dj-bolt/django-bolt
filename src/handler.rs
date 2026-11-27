@@ -36,7 +36,7 @@ use bolt_core::request_pipeline::{
 use bolt_core::response_builder;
 use bolt_core::response_meta::ResponseMeta;
 use bolt_core::responses;
-use bolt_core::router::{QueryParams, normalize_request_path, parse_query_string};
+use bolt_core::router::{QueryParams, QuerySentLens, normalize_request_path, parse_query_string};
 use bolt_core::state::{AppState, find_asgi_mount};
 use bolt_core::streaming::{StreamConfig, create_python_stream, create_sse_stream};
 use bolt_core::type_coercion::{
@@ -1218,20 +1218,21 @@ async fn route_request(
     // Max parameter length resolved once at startup; read the plain field here.
     let max_param_length = state.max_param_length;
 
+    // Each length check of a query value shares one pass over the raw query.
+    let mut query_lens = QuerySentLens::new(query_string.unwrap_or_default(), max_param_length);
+
     // A no-route answer has no handler, so no query value is checked for it.
     // Thus a 422 cannot take the place of the 404 or the 405.
     let check_query = rust_answer.is_none();
 
     // A sequence query parameter takes each value of its repeated key.
     let query_sequences = match route_metadata {
-        Some(route_meta) if needs_query && check_query => match query_sequences(
-            req.uri().query(),
-            &route_meta.query_seq_fields,
-            max_param_length,
-        ) {
-            Ok(sequences) => sequences,
-            Err(error) => return error.into_response(),
-        },
+        Some(route_meta) if needs_query && check_query => {
+            match query_sequences(&mut query_lens, &route_meta.query_seq_fields) {
+                Ok(sequences) => sequences,
+                Err(error) => return error.into_response(),
+            }
+        }
         _ => Vec::new(),
     };
 
@@ -1241,6 +1242,7 @@ async fn route_request(
             match validate_and_cache_typed_params(
                 path_params.as_ref(),
                 query_params.as_ref(),
+                &mut query_lens,
                 &route_meta.path_types,
                 &route_meta.query_types,
                 max_param_length,

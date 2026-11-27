@@ -25,9 +25,9 @@ use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::request::client_path;
 use bolt_core::request_pipeline::{
     EMPTY_TYPES, header_str, insert_header_line, query_sequences, set_declared_item,
-    set_param_item, set_query_sequences,
+    set_param_item, set_query_item, set_query_sequences,
 };
-use bolt_core::router::parse_query_string;
+use bolt_core::router::{QuerySentLens, parse_query_string};
 use bolt_core::state::AppState;
 use bolt_core::type_coercion::TypeHints;
 use bolt_core::validation::{AuthGuardResult, validate_auth_and_guards};
@@ -211,26 +211,16 @@ fn build_scope(
 
     // Parse the query string with the HTTP parser: the last value of a repeated key wins.
     // A value that is too long or a bad typed value rejects the upgrade, as in HTTP.
+    // Each length check of a query value shares one pass over the raw query.
     let query_dict = PyDict::new(py);
+    let mut query_lens = QuerySentLens::new(req.query_string(), max_param_length);
     for (key, value) in &parse_query_string(req.query_string()) {
-        set_param_item(
-            py,
-            &query_dict,
-            key,
-            value,
-            query_types,
-            max_param_length,
-            "Query parameter",
-        )?;
+        set_query_item(py, &query_dict, key, value, query_types, &mut query_lens)?;
     }
     // A sequence parameter takes each value of its repeated key, as in HTTP.
     // Each value gets the length check, as the loop above checks only the last one.
     if let Some(route_meta) = route_meta {
-        let sequences = query_sequences(
-            Some(req.query_string()),
-            &route_meta.query_seq_fields,
-            max_param_length,
-        )?;
+        let sequences = query_sequences(&mut query_lens, &route_meta.query_seq_fields)?;
         set_query_sequences(py, &query_dict, &sequences)?;
     }
     scope_dict.set_item("query_params", query_dict)?;

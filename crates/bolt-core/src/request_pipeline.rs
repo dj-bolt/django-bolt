@@ -19,9 +19,10 @@ use std::hash::Hash;
 
 use crate::form_parsing::ValidationError;
 use crate::responses;
-use crate::router::{PathParams, QueryParams, QuerySequences};
+use crate::router::{PathParams, QueryParams, QuerySentLens, QuerySequences};
 use crate::type_coercion::{
-    CoercedValue, CoercedValues, TYPE_STRING, TypeHints, coerce_param, coerced_value_to_py,
+    CoercedValue, CoercedValues, TYPE_STRING, TypeHints, coerce_checked_value, coerce_param,
+    coerced_value_to_py,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -34,23 +35,28 @@ pub static EMPTY_TYPES: std::sync::LazyLock<TypeHints> = std::sync::LazyLock::ne
 /// Each source uses its own type hints, so a query key with the name of a
 /// typed path parameter keeps its string. Returns the pre-coerced non-string
 /// values of each source. String parameters are validated for length but left as-is.
+/// `query` holds the raw query string of `query_params`: the length check counts
+/// the bytes of a query value after its percent-decoding.
 pub fn validate_and_cache_typed_params<'t>(
     path_params: Option<&PathParams<'_>>,
     query_params: Option<&QueryParams<'_>>,
+    query: &mut QuerySentLens<'_>,
     path_types: &'t TypeHints,
     query_types: &'t TypeHints,
     max_length: usize,
 ) -> Result<(CoercedValues<'t>, CoercedValues<'t>), HttpResponse> {
     let path_coerced = match path_params {
-        Some(params) => {
-            validate_and_cache_source(params, path_types, max_length, "Path parameter")?
-        }
+        Some(params) => validate_source(params, path_types, max_length, "Path parameter", None)?,
         None => Vec::new(),
     };
     let query_coerced = match query_params {
-        Some(params) => {
-            validate_and_cache_source(params, query_types, max_length, "Query parameter")?
-        }
+        Some(params) => validate_source(
+            params,
+            query_types,
+            max_length,
+            "Query parameter",
+            Some(query),
+        )?,
         None => Vec::new(),
     };
     Ok((path_coerced, query_coerced))
@@ -80,25 +86,39 @@ where
     K: Borrow<str> + Eq + Hash,
     V: AsRef<str>,
 {
+    validate_source(values, types, max_length, label, None)
+}
+
+/// `validate_and_cache_source`, with the raw query string when `values` holds its params.
+fn validate_source<'t, K, V>(
+    values: &AHashMap<K, V>,
+    types: &'t TypeHints,
+    max_length: usize,
+    label: &str,
+    mut query: Option<&mut QuerySentLens<'_>>,
+) -> Result<CoercedValues<'t>, HttpResponse>
+where
+    K: Borrow<str> + Eq + Hash,
+    V: AsRef<str>,
+{
     let mut coerced_values = CoercedValues::new();
     if types.len() < values.len() {
         for (name, value) in values {
             let value = value.as_ref();
             // Security: Always validate length for ALL parameters (including strings)
             if value.len() > max_length {
-                return Err(too_long(label, name.borrow(), value.len(), max_length));
+                check_sent_len(
+                    label,
+                    name.borrow(),
+                    value,
+                    max_length,
+                    query.as_deref_mut(),
+                )?;
             }
         }
         for (name, &type_hint) in types {
             if let Some(value) = values.get(name.as_str()) {
-                coerce_into(
-                    &mut coerced_values,
-                    name,
-                    value.as_ref(),
-                    type_hint,
-                    max_length,
-                    label,
-                )?;
+                coerce_into(&mut coerced_values, name, value.as_ref(), type_hint, label)?;
             }
         }
     } else {
@@ -106,17 +126,10 @@ where
             let (name, value): (&str, &str) = (name.borrow(), value.as_ref());
             // Security: Always validate length for ALL parameters (including strings)
             if value.len() > max_length {
-                return Err(too_long(label, name, value.len(), max_length));
+                check_sent_len(label, name, value, max_length, query.as_deref_mut())?;
             }
             if let Some((typed_name, &type_hint)) = types.get_key_value(name) {
-                coerce_into(
-                    &mut coerced_values,
-                    typed_name,
-                    value,
-                    type_hint,
-                    max_length,
-                    label,
-                )?;
+                coerce_into(&mut coerced_values, typed_name, value, type_hint, label)?;
             }
         }
     }
@@ -130,21 +143,23 @@ where
 /// scalar parser keeps the last value of a key, so it does not check the others.
 /// The error is the rejected parameter, for HTTP and WebSocket.
 pub fn query_sequences<'a>(
-    query: Option<&'a str>,
+    query: &mut QuerySentLens<'a>,
     keys: &AHashSet<String>,
-    max_length: usize,
 ) -> Result<QuerySequences<'a>, ParamError> {
-    let query = match query {
-        Some(query) if !keys.is_empty() && !query.is_empty() => query,
-        _ => return Ok(Vec::new()),
-    };
-    let sequences = crate::router::collect_query_sequences(query, keys);
+    let (text, max_length) = (query.query(), query.max_length());
+    if keys.is_empty() || text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sequences = crate::router::collect_query_sequences(text, keys);
     for (name, values) in &sequences {
-        if let Some(value) = values.iter().find(|value| value.len() > max_length) {
+        // Only a long text needs the count of its decoded bytes.
+        if values.iter().any(|value| value.len() > max_length)
+            && let Some(len) = query.first_over(name)
+        {
             return Err(ParamError {
                 label: "Query parameter",
                 name: name.to_string(),
-                msg: too_long_msg(value.len(), max_length),
+                msg: too_long_msg(len, max_length),
             });
         }
     }
@@ -197,6 +212,36 @@ fn too_long(label: &str, name: &str, len: usize, max_length: usize) -> HttpRespo
     responses::error_422_param(label, name, &too_long_msg(len, max_length))
 }
 
+/// Reject a value whose text is over the limit, unless its bytes as sent fit in it.
+#[cold]
+fn check_sent_len(
+    label: &str,
+    name: &str,
+    value: &str,
+    max_length: usize,
+    query: Option<&mut QuerySentLens<'_>>,
+) -> Result<(), HttpResponse> {
+    let len = sent_len(query, name, value);
+    if len > max_length {
+        Err(too_long(label, name, len, max_length))
+    } else {
+        Ok(())
+    }
+}
+
+/// The byte count of `value` as the client sent it.
+///
+/// A query value counts its bytes after the percent-decoding. Its text can be
+/// longer, because a byte that is not UTF-8 becomes U+FFFD, which has three
+/// bytes. The query map holds the last value of a repeated key. Another
+/// source gives its text with no such change.
+#[cold]
+fn sent_len(query: Option<&mut QuerySentLens<'_>>, name: &str, value: &str) -> usize {
+    query
+        .and_then(|query| query.last(name))
+        .unwrap_or(value.len())
+}
+
 #[cold]
 fn too_long_detail(label: &str, name: &str, len: usize, max_length: usize) -> String {
     format!("{} '{}': {}", label, name, too_long_msg(len, max_length))
@@ -216,13 +261,13 @@ fn coerce_into<'t>(
     name: &'t str,
     value: &str,
     type_hint: u8,
-    max_length: usize,
     label: &str,
 ) -> Result<(), HttpResponse> {
     if type_hint == TYPE_STRING {
         return Ok(());
     }
-    match coerce_param(value, type_hint, max_length) {
+    // The caller checked the length of each value.
+    match coerce_checked_value(Cow::Borrowed(value), type_hint) {
         Ok(coerced) => {
             coerced_values.push((name, coerced));
             Ok(())
@@ -254,8 +299,8 @@ pub fn coerce_declared_value(
 /// Coerce one path or query value as `types` declares, and check its length.
 ///
 /// Unlike [`coerce_declared_value`], the length limit applies to all values,
-/// including strings. `coerce_param` checks a typed value, so this function
-/// checks only a value that it does not coerce. The error is the detail text.
+/// including strings. `query` holds the raw query string of a query value, as
+/// in [`validate_and_cache_typed_params`]. The error is the detail text.
 #[inline]
 pub fn coerce_param_value(
     name: &str,
@@ -263,12 +308,22 @@ pub fn coerce_param_value(
     types: &TypeHints,
     max_length: usize,
     label: &str,
+    query: Option<&mut QuerySentLens<'_>>,
 ) -> Result<Option<CoercedValue>, String> {
-    let coerced = coerce_declared_value(name, value, types, max_length, label)?;
-    if coerced.is_none() && value.len() > max_length {
-        return Err(too_long_detail(label, name, value.len(), max_length));
+    if value.len() > max_length {
+        let len = sent_len(query, name, value);
+        if len > max_length {
+            return Err(too_long_detail(label, name, len, max_length));
+        }
     }
-    Ok(coerced)
+    match types.get(name) {
+        Some(&type_hint) if type_hint != TYPE_STRING => {
+            coerce_checked_value(Cow::Borrowed(value), type_hint)
+                .map(Some)
+                .map_err(|error| format!("{} '{}': {}", label, name, error))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Set `name` in a WebSocket scope dict, coerced when `types` declares it.
@@ -288,7 +343,7 @@ pub fn set_declared_item(
     set_coerced_item(py, dict, name, value, coerced)
 }
 
-/// Set a path or query `name` in a WebSocket scope dict, coerced when `types` declares it.
+/// Set a path `name` in a WebSocket scope dict, coerced when `types` declares it.
 ///
 /// A value that is too long or a bad typed value is a `ValueError`.
 /// The error rejects the upgrade, as a header or cookie error does.
@@ -301,7 +356,29 @@ pub fn set_param_item(
     max_length: usize,
     label: &str,
 ) -> PyResult<()> {
-    let coerced = coerce_param_value(name, value, types, max_length, label);
+    let coerced = coerce_param_value(name, value, types, max_length, label, None);
+    set_coerced_item(py, dict, name, value, coerced)
+}
+
+/// Set a query `name` in a WebSocket scope dict, as `set_param_item` does.
+/// `query` holds the raw query string of `value` and the length limit.
+pub fn set_query_item(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    name: &str,
+    value: &str,
+    types: &TypeHints,
+    query: &mut QuerySentLens<'_>,
+) -> PyResult<()> {
+    let max_length = query.max_length();
+    let coerced = coerce_param_value(
+        name,
+        value,
+        types,
+        max_length,
+        "Query parameter",
+        Some(query),
+    );
     set_coerced_item(py, dict, name, value, coerced)
 }
 
@@ -471,24 +548,97 @@ mod tests {
     #[test]
     fn query_sequences_checks_the_length_of_each_value() {
         let keys: AHashSet<String> = ["tag".to_string()].into_iter().collect();
-        let sequences = query_sequences(Some("tag=abc&tag=de"), &keys, 3).unwrap();
+        let sequences =
+            query_sequences(&mut QuerySentLens::new("tag=abc&tag=de", 3), &keys).unwrap();
         assert_eq!(
             sequences,
             vec![(Cow::from("tag"), vec![Cow::from("abc"), Cow::from("de")])]
         );
-        let detail = query_sequences(Some("tag=abcd&tag=a"), &keys, 3)
+        let detail = query_sequences(&mut QuerySentLens::new("tag=abcd&tag=a", 3), &keys)
             .unwrap_err()
             .to_string();
         assert_eq!(
             detail,
             "Query parameter 'tag': Parameter too long: 4 bytes (max 3 bytes)"
         );
-        assert!(query_sequences(None, &keys, 3).unwrap().is_empty());
         assert!(
-            query_sequences(Some("tag=abcd"), &Default::default(), 3)
+            query_sequences(&mut QuerySentLens::new("", 3), &keys)
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            query_sequences(&mut QuerySentLens::new("tag=abcd", 3), &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `%FF` decodes to one byte, and its text U+FFFD has three bytes.
+    #[test]
+    fn a_query_value_counts_its_bytes_after_the_percent_decoding() {
+        let at_limit = format!("v={}", "%FF".repeat(17));
+        let over_limit = format!("v=a&v={}", "%FF".repeat(18));
+        let message = "Query parameter 'v': Parameter too long: 18 bytes (max 17 bytes)";
+
+        let typed = types(&[("v", TYPE_INT)]);
+        let untyped = types(&[]);
+        let query = crate::router::parse_query_string(&at_limit);
+        let checked = validate_and_cache_typed_params(
+            None,
+            Some(&query),
+            &mut QuerySentLens::new(&at_limit, 17),
+            &untyped,
+            &untyped,
+            17,
+        );
+        assert!(checked.is_ok());
+        let query = crate::router::parse_query_string(&over_limit);
+        let response = validate_and_cache_typed_params(
+            None,
+            Some(&query),
+            &mut QuerySentLens::new(&over_limit, 17),
+            &untyped,
+            &untyped,
+            17,
+        )
+        .unwrap_err();
+        assert!(detail(response).contains(message));
+
+        let keys: AHashSet<String> = ["v".to_string()].into_iter().collect();
+        assert!(query_sequences(&mut QuerySentLens::new(&at_limit, 17), &keys).is_ok());
+        let error = query_sequences(&mut QuerySentLens::new(&over_limit, 17), &keys).unwrap_err();
+        assert_eq!(error.to_string(), message);
+
+        let value = "\u{FFFD}".repeat(17);
+        let checked = coerce_param_value(
+            "v",
+            &value,
+            &untyped,
+            17,
+            "Query parameter",
+            Some(&mut QuerySentLens::new(&at_limit, 17)),
+        );
+        assert!(checked.is_ok());
+        let value = "\u{FFFD}".repeat(18);
+        let error = coerce_param_value(
+            "v",
+            &value,
+            &untyped,
+            17,
+            "Query parameter",
+            Some(&mut QuerySentLens::new(&over_limit, 17)),
+        );
+        assert_eq!(error.unwrap_err(), message);
+        // A typed value is checked first on its bytes, then on its type.
+        let error = coerce_param_value(
+            "v",
+            "\u{FFFD}",
+            &typed,
+            17,
+            "Query parameter",
+            Some(&mut QuerySentLens::new("v=%FF", 17)),
+        );
+        assert!(error.unwrap_err().contains("Invalid integer"));
     }
 
     fn values(pairs: &[(&str, &str)]) -> AHashMap<String, String> {
@@ -510,6 +660,62 @@ mod tests {
         assert_eq!(response.status(), 422);
         let bytes = response.into_body().try_into_bytes().unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn scans() -> usize {
+        crate::router::QUERY_SCANS.with(std::cell::Cell::get)
+    }
+
+    /// Many values with a text over the limit and bytes under it: one pass for
+    /// the request, as HTTP and the WebSocket scope check them.
+    #[test]
+    fn a_query_with_many_long_texts_is_read_once() {
+        let query: String = (0..64)
+            .map(|i| format!("k{i}={}", "%FF".repeat(6)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let untyped = types(&[]);
+        let keys: AHashSet<String> = (0..64).map(|i| format!("k{i}")).collect();
+        let params = crate::router::parse_query_string(&query);
+
+        let before = scans();
+        let mut lens = QuerySentLens::new(&query, 17);
+        assert_eq!(query_sequences(&mut lens, &keys).unwrap().len(), 64);
+        let checked =
+            validate_and_cache_typed_params(None, Some(&params), &mut lens, &untyped, &untyped, 17);
+        assert!(checked.is_ok());
+        assert_eq!(scans() - before, 1);
+
+        let before = scans();
+        let mut lens = QuerySentLens::new(&query, 17);
+        for (name, value) in &params {
+            let checked = coerce_param_value(
+                name,
+                value,
+                &untyped,
+                17,
+                "Query parameter",
+                Some(&mut lens),
+            );
+            assert!(checked.is_ok());
+        }
+        assert!(query_sequences(&mut lens, &keys).is_ok());
+        assert_eq!(scans() - before, 1);
+    }
+
+    #[test]
+    fn a_query_with_no_long_text_is_not_read_again() {
+        let query = "a=1&b=%FF&tag=x&tag=y";
+        let keys: AHashSet<String> = ["tag".to_string()].into_iter().collect();
+        let params = crate::router::parse_query_string(query);
+        let untyped = types(&[]);
+        let before = scans();
+        let mut lens = QuerySentLens::new(query, 17);
+        assert!(query_sequences(&mut lens, &keys).is_ok());
+        let checked =
+            validate_and_cache_typed_params(None, Some(&params), &mut lens, &untyped, &untyped, 17);
+        assert!(checked.is_ok());
+        assert_eq!(scans(), before);
     }
 
     #[test]
@@ -607,17 +813,25 @@ mod tests {
     #[test]
     fn param_value_rejects_bad_typed_value_with_label_and_name() {
         let hints = types(&[("limit", TYPE_INT)]);
-        let detail = coerce_param_value("limit", "abc", &hints, 64, "Query parameter").unwrap_err();
+        let detail =
+            coerce_param_value("limit", "abc", &hints, 64, "Query parameter", None).unwrap_err();
         assert!(
             detail.starts_with("Query parameter 'limit': Invalid integer 'abc'"),
             "{detail}"
         );
         assert!(matches!(
-            coerce_param_value("limit", "7", &hints, 64, "Query parameter"),
+            coerce_param_value("limit", "7", &hints, 64, "Query parameter", None),
             Ok(Some(CoercedValue::Int(7)))
         ));
-        let detail = coerce_param_value("limit", &"1".repeat(65), &hints, 64, "Query parameter")
-            .unwrap_err();
+        let detail = coerce_param_value(
+            "limit",
+            &"1".repeat(65),
+            &hints,
+            64,
+            "Query parameter",
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             detail,
             "Query parameter 'limit': Parameter too long: 65 bytes (max 64 bytes)"
@@ -628,12 +842,12 @@ mod tests {
     fn param_value_checks_length_of_untyped_value() {
         let hints = types(&[]);
         assert!(
-            coerce_param_value("q", "short", &hints, 64, "Path parameter")
+            coerce_param_value("q", "short", &hints, 64, "Path parameter", None)
                 .unwrap()
                 .is_none()
         );
-        let detail =
-            coerce_param_value("q", &"a".repeat(65), &hints, 64, "Path parameter").unwrap_err();
+        let detail = coerce_param_value("q", &"a".repeat(65), &hints, 64, "Path parameter", None)
+            .unwrap_err();
         assert_eq!(
             detail,
             "Path parameter 'q': Parameter too long: 65 bytes (max 64 bytes)"
@@ -645,12 +859,26 @@ mod tests {
         let hints = types(&[("id", TYPE_INT)]);
         let none = types(&[]);
         let bad = path_values(&[("id", "x")]);
-        let response =
-            validate_and_cache_typed_params(Some(&bad), None, &hints, &none, 64).unwrap_err();
+        let response = validate_and_cache_typed_params(
+            Some(&bad),
+            None,
+            &mut QuerySentLens::new("", 64),
+            &hints,
+            &none,
+            64,
+        )
+        .unwrap_err();
         assert!(detail(response).contains("Path parameter 'id'"));
         let bad_query = crate::router::parse_query_string("id=x");
-        let response =
-            validate_and_cache_typed_params(None, Some(&bad_query), &none, &hints, 64).unwrap_err();
+        let response = validate_and_cache_typed_params(
+            None,
+            Some(&bad_query),
+            &mut QuerySentLens::new("id=x", 64),
+            &none,
+            &hints,
+            64,
+        )
+        .unwrap_err();
         assert!(detail(response).contains("Query parameter 'id'"));
     }
 
@@ -663,6 +891,7 @@ mod tests {
         let (path_coerced, query_coerced) = validate_and_cache_typed_params(
             Some(&path),
             Some(&query),
+            &mut QuerySentLens::new("id=x", 64),
             &path_hints,
             &query_hints,
             64,
@@ -691,7 +920,7 @@ mod tests {
     fn param_value_accepts_an_untyped_value_of_max_length() {
         let value = "a".repeat(64);
         assert!(
-            coerce_param_value("q", &value, &types(&[]), 64, "Path parameter")
+            coerce_param_value("q", &value, &types(&[]), 64, "Path parameter", None)
                 .unwrap()
                 .is_none()
         );

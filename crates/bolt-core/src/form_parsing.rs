@@ -7,6 +7,7 @@ use actix_multipart::Multipart;
 use actix_web::error::PayloadError;
 use actix_web::web::Bytes;
 use futures_util::{Stream, StreamExt};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::io::Write;
@@ -15,7 +16,10 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use tempfile::NamedTempFile;
 
-use crate::type_coercion::{CoerceError, CoercedValue, TYPE_STRING, coerce_param};
+use crate::router::{
+    decode_latin1_query_component, decode_query_component, percent_decoded_len, raw_query_pairs,
+};
+use crate::type_coercion::{CoerceError, CoercedValue, TYPE_STRING, coerce_checked_value};
 
 /// Memory limit for in-memory file storage (1MB default)
 pub const DEFAULT_MEMORY_LIMIT: usize = 1024 * 1024;
@@ -275,11 +279,16 @@ pub struct FormParseResult {
 /// accumulated and promoted to `FormValue::Multi(vec_of_coerced_values)` without allocating a
 /// `Vec` for the single-occurrence case.
 ///
+/// The body decodes as Django `request.POST` decodes it. A UTF-8 body decodes as a query
+/// string does. Django reads a body that is not UTF-8 as Latin-1, as a whole (`QueryDict`).
+/// The UTF-8 check runs once for the body, so a key or value with no escape is not copied.
+///
 /// Errors:
 /// - Returns a `ValidationError` with `error_type = "too_many_fields"` when the body has more
 ///   than `max_fields` fields. The parser stops at that field, so the rest is not decoded.
 /// - Returns a `ValidationError` produced by `ValidationError::type_coercion_error` if coercion
-///   of any field value fails.
+///   of any field value fails, or if a value has more than `max_param_length` bytes after
+///   its percent-decoding.
 ///
 /// # Examples
 ///
@@ -295,9 +304,53 @@ pub fn parse_urlencoded(
     max_param_length: usize,
     max_fields: usize,
 ) -> Result<HashMap<String, FormValue>, ValidationError> {
+    let limits = (max_param_length, max_fields);
+    match std::str::from_utf8(body) {
+        Ok(text) => collect_urlencoded(
+            raw_query_pairs(text).map(|(key, value)| {
+                (
+                    decode_query_component(key),
+                    decode_query_component(value),
+                    value.as_bytes(),
+                )
+            }),
+            type_hints,
+            limits,
+        ),
+        Err(_) => collect_urlencoded(
+            raw_byte_pairs(body).map(|(key, value)| {
+                (
+                    Cow::Owned(decode_latin1_query_component(key)),
+                    Cow::Owned(decode_latin1_query_component(value)),
+                    value,
+                )
+            }),
+            type_hints,
+            limits,
+        ),
+    }
+}
+
+/// Split a body that is not UTF-8 into raw (key, value) pairs, as `raw_query_pairs` does.
+fn raw_byte_pairs(body: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    body.split(|&byte| byte == b'&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match memchr::memchr(b'=', pair) {
+            Some(at) => (&pair[..at], &pair[at + 1..]),
+            None => (pair, &[][..]),
+        })
+}
+
+/// Coerce and collect decoded (key, value, raw value) fields of a urlencoded body.
+/// `limits` holds `max_param_length` and `max_fields`.
+fn collect_urlencoded<'a>(
+    fields: impl Iterator<Item = (Cow<'a, str>, Cow<'a, str>, &'a [u8])>,
+    type_hints: &HashMap<String, u8>,
+    (max_param_length, max_fields): (usize, usize),
+) -> Result<HashMap<String, FormValue>, ValidationError> {
     let mut result: HashMap<String, FormValue> = HashMap::new();
 
-    for (index, (key, value)) in form_urlencoded::parse(body).enumerate() {
+    for (index, (key, value, raw_value)) in fields.enumerate() {
         if index >= max_fields {
             return Err(ValidationError {
                 error_type: "too_many_fields".to_string(),
@@ -307,7 +360,15 @@ pub fn parse_urlencoded(
             });
         }
         let type_hint = type_hints.get(key.as_ref()).copied().unwrap_or(TYPE_STRING);
-        let coerced = coerce_param(&value, type_hint, max_param_length).map_err(|e| {
+        // The text is never shorter than the decoded bytes, so only a long
+        // text needs the count of its bytes.
+        if value.len() > max_param_length {
+            let len = percent_decoded_len(raw_value);
+            if len > max_param_length {
+                return Err(too_long_field(&key, type_hint, len, max_param_length));
+            }
+        }
+        let coerced = coerce_checked_value(value, type_hint).map_err(|e| {
             ValidationError::type_coercion_error(&key, type_hint_name(type_hint), &e.to_string())
         })?;
 
@@ -482,15 +543,14 @@ pub async fn parse_multipart(
                 })?;
                 // Security: enforce the length limit incrementally so an oversized
                 // field is rejected before the entire body is buffered into memory.
+                // This is the only length check of the field: it counts the bytes
+                // that the client sent, and the decoded text can be longer.
                 if value_bytes.len() + data.len() > max_param_length {
-                    return Err(ValidationError::type_coercion_error(
+                    return Err(too_long_field(
                         &field_name,
-                        type_hint_name(type_hint),
-                        &CoerceError::TooLong {
-                            len: value_bytes.len() + data.len(),
-                            max: max_param_length,
-                        }
-                        .to_string(),
+                        type_hint,
+                        value_bytes.len() + data.len(),
+                        max_param_length,
                     ));
                 }
                 // Enforce aggregate payload limit incrementally so an unbounded
@@ -502,10 +562,14 @@ pub async fn parse_multipart(
                 value_bytes.extend_from_slice(&data);
             }
 
-            let value = String::from_utf8_lossy(&value_bytes).to_string();
+            // Django decodes a text field with `force_str(errors="replace")`.
+            // A UTF-8 value moves into the text without a copy.
+            let value = match String::from_utf8(value_bytes) {
+                Ok(text) => text,
+                Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+            };
 
-            // Type coercion
-            let coerced = coerce_param(&value, type_hint, max_param_length).map_err(|e| {
+            let coerced = coerce_checked_value(Cow::Owned(value), type_hint).map_err(|e| {
                 ValidationError::type_coercion_error(
                     &field_name,
                     type_hint_name(type_hint),
@@ -669,6 +733,16 @@ fn is_content_type_allowed(content_type: &str, allowed_types: &[String]) -> bool
     false
 }
 
+/// The error of a form value that has more than `max` bytes.
+#[cold]
+fn too_long_field(field: &str, type_hint: u8, len: usize, max: usize) -> ValidationError {
+    ValidationError::type_coercion_error(
+        field,
+        type_hint_name(type_hint),
+        &CoerceError::TooLong { len, max }.to_string(),
+    )
+}
+
 /// Get human-readable type name from type hint
 fn type_hint_name(type_hint: u8) -> &'static str {
     use crate::type_coercion::*;
@@ -826,6 +900,117 @@ mod tests {
             result.get("name"),
             Some(FormValue::Single(CoercedValue::String(s))) if s == "John"
         ));
+    }
+
+    /// Each key of a urlencoded body with all its values, as text, in key order.
+    fn urlencoded_text(body: &[u8]) -> Vec<(String, Vec<String>)> {
+        let parsed = parse_urlencoded(body, &HashMap::new(), 8192, DEFAULT_MAX_FIELDS).unwrap();
+        let text = |value: &CoercedValue| match value {
+            CoercedValue::String(text) => text.clone(),
+            other => panic!("an untyped field must stay text, got {other:?}"),
+        };
+        let mut fields: Vec<(String, Vec<String>)> = parsed
+            .into_iter()
+            .map(|(key, value)| {
+                let values = match &value {
+                    FormValue::Single(single) => vec![text(single)],
+                    FormValue::Multi(many) => many.iter().map(text).collect(),
+                };
+                (key, values)
+            })
+            .collect();
+        fields.sort();
+        fields
+    }
+
+    /// A body and the (key, value) fields that it gives.
+    type FormRow<'a> = (&'a [u8], &'a [(&'a str, &'a str)]);
+
+    /// Each row is what Django 5.2 and 6.1 give in `request.POST` for the body.
+    #[test]
+    fn f7_a_body_that_is_not_utf8_reads_as_django_reads_it() {
+        let rows: &[FormRow<'_>] = &[
+            (b"name=caf\xe9", &[("name", "café")]),
+            (b"caf\xe9=1", &[("café", "1")]),
+            // Django reads the whole body as Latin-1, so a UTF-8 field changes too.
+            (b"a=\xc3\xa9&b=\xe9", &[("a", "Ã©"), ("b", "é")]),
+            // The bytes of an escape still decode as UTF-8.
+            (b"a=%C3%A9&b=\xe9", &[("a", "é"), ("b", "é")]),
+            // Each run of ASCII decodes on its own.
+            (b"a=%C3\xa9", &[("a", "\u{FFFD}©")]),
+            (b"a=caf\xe9+x%zz", &[("a", "café x%zz")]),
+            (b"v=\xc0\xaf", &[("v", "À¯")]),
+            (b"v=\xff\xff", &[("v", "ÿÿ")]),
+            // A UTF-8 body keeps its rules.
+            (b"name=caf%E9", &[("name", "caf\u{FFFD}")]),
+            (b"name=caf%C3%A9", &[("name", "café")]),
+            (b"name=caf\xc3\xa9", &[("name", "café")]),
+            (b"v=%ED%A0%80", &[("v", "\u{FFFD}\u{FFFD}\u{FFFD}")]),
+            (b"\xef\xbb\xbfname=x", &[("\u{FEFF}name", "x")]),
+        ];
+        for (body, expected) in rows {
+            let expected: Vec<(String, Vec<String>)> = expected
+                .iter()
+                .map(|(key, value)| (key.to_string(), vec![value.to_string()]))
+                .collect();
+            assert_eq!(urlencoded_text(body), expected, "body {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_typed_field_of_a_body_that_is_not_utf8_converts_from_its_text() {
+        let type_hints = HashMap::from([("age".to_string(), crate::type_coercion::TYPE_INT)]);
+        let parsed = parse_urlencoded(
+            b"age=30&name=caf\xe9",
+            &type_hints,
+            8192,
+            DEFAULT_MAX_FIELDS,
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.get("age"),
+            Some(FormValue::Single(CoercedValue::Int(30)))
+        ));
+        assert!(matches!(
+            parsed.get("name"),
+            Some(FormValue::Single(CoercedValue::String(text))) if text == "café"
+        ));
+    }
+
+    /// The text of the field `v` with the value, or the error message, under the limit `max`.
+    fn urlencoded_value(value: &[u8], max: usize) -> Result<String, String> {
+        let mut body = b"v=".to_vec();
+        body.extend_from_slice(value);
+        match parse_urlencoded(&body, &HashMap::new(), max, DEFAULT_MAX_FIELDS) {
+            Ok(mut parsed) => match parsed.remove("v") {
+                Some(FormValue::Single(CoercedValue::String(text))) => Ok(text),
+                other => panic!("unexpected value {other:?}"),
+            },
+            Err(error) => Err(error.ctx["error"].as_str().unwrap().to_string()),
+        }
+    }
+
+    #[test]
+    fn f8_a_urlencoded_value_counts_its_bytes_after_the_percent_decoding() {
+        let too_long = |len| CoerceError::TooLong { len, max: 17 }.to_string();
+        // Escaped bytes that are not UTF-8. The text has three bytes for each.
+        assert_eq!(
+            urlencoded_value(&b"%FF".repeat(17), 17),
+            Ok("\u{FFFD}".repeat(17))
+        );
+        assert_eq!(urlencoded_value(&b"%FF".repeat(18), 17), Err(too_long(18)));
+        // Raw bytes of a body that is not UTF-8. The text has two bytes for each.
+        assert_eq!(urlencoded_value(&[0xFF; 17], 17), Ok("ÿ".repeat(17)));
+        assert_eq!(urlencoded_value(&[0xFF; 18], 17), Err(too_long(18)));
+        // A UTF-8 character counts its bytes.
+        assert_eq!(
+            urlencoded_value(&b"%C3%A9".repeat(8), 16),
+            Ok("é".repeat(8))
+        );
+        assert_eq!(
+            urlencoded_value(&b"%C3%A9".repeat(9), 17),
+            Err(too_long(18))
+        );
     }
 
     #[test]
@@ -1096,6 +1281,37 @@ mod tests {
             error.ctx["error"],
             serde_json::json!(CoerceError::TooLong { len: 5, max: 4 }.to_string())
         );
+    }
+
+    /// The limit counts the bytes that the client sent. The text has three
+    /// bytes for each byte that is not UTF-8.
+    #[test]
+    fn f8_a_multipart_field_at_the_byte_limit_passes() {
+        let limits = Limits {
+            max_param_length: 17,
+            ..Limits::default()
+        };
+        let parse = |value: &[u8]| parse_parts(&[text_part("v", value)], &HashMap::new(), &limits);
+
+        let accepted = parse(&[0xFF; 17]).unwrap();
+        assert!(matches!(
+            accepted.form_map.get("v"),
+            Some(FormValue::Single(CoercedValue::String(text))) if *text == "\u{FFFD}".repeat(17)
+        ));
+        let error = match parse(&[0xFF; 18]) {
+            Ok(_) => panic!("a value over max_param_length must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.ctx["error"],
+            serde_json::json!(CoerceError::TooLong { len: 18, max: 17 }.to_string())
+        );
+
+        // A UTF-8 character counts its bytes: 8 x 2 bytes and one more.
+        let at_limit = format!("{}a", "é".repeat(8));
+        assert!(parse(at_limit.as_bytes()).is_ok());
+        let over_limit = format!("{}ab", "é".repeat(8));
+        assert!(parse(over_limit.as_bytes()).is_err());
     }
 
     #[test]
@@ -1398,6 +1614,80 @@ mod tests {
         // The header and five chunks of 1000 bytes pass 4096 bytes.
         let consumed = consumed.load(Ordering::SeqCst);
         assert!(consumed <= 6, "read {consumed} of {total_chunks} chunks");
+    }
+
+    const FORM_PIECES: &[&str] = &["%FF", "%C3", "%C3%A9", "%zz", "%", "+", "=", "é", "a"];
+
+    /// A value of a form body: escapes, valid and not, and any byte but `&`.
+    fn form_value_bytes() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        let piece = prop_oneof![
+            prop::sample::select(FORM_PIECES).prop_map(|piece| piece.as_bytes().to_vec()),
+            any::<u8>()
+                .prop_filter("& ends a field", |byte| *byte != b'&')
+                .prop_map(|byte| vec![byte]),
+        ];
+        prop::collection::vec(piece, 0..24).prop_map(|pieces| pieces.concat())
+    }
+
+    /// A UTF-8 value of a form body: escapes, valid and not, and any character but `&`.
+    fn form_value_text() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let piece = prop_oneof![
+            prop::sample::select(FORM_PIECES).prop_map(str::to_string),
+            any::<char>()
+                .prop_filter("& ends a field", |character| *character != '&')
+                .prop_map(String::from),
+        ];
+        prop::collection::vec(piece, 0..24).prop_map(|pieces| pieces.concat())
+    }
+
+    proptest::proptest! {
+        /// A value of `max_param_length` decoded bytes passes, and one byte less
+        /// is too long. The error gives the decoded byte count.
+        #[test]
+        fn a_urlencoded_value_is_checked_on_its_decoded_bytes(value in form_value_bytes()) {
+            let len = urlencoding::decode_binary(&value).len();
+            proptest::prop_assert!(urlencoded_value(&value, len).is_ok());
+            if len > 0 {
+                let too_long = CoerceError::TooLong { len, max: len - 1 }.to_string();
+                proptest::prop_assert_eq!(urlencoded_value(&value, len - 1), Err(too_long));
+            }
+        }
+
+        /// A UTF-8 body gives the pairs of the WHATWG parser, as before.
+        #[test]
+        fn a_utf8_body_parses_as_the_whatwg_parser(value in form_value_text()) {
+            let body = format!("k={value}&{value}");
+            let body = body.as_bytes();
+            let mut expected: HashMap<String, Vec<String>> = HashMap::new();
+            for (key, value) in serde_urlencoded::from_bytes::<Vec<(String, String)>>(body).unwrap() {
+                expected.entry(key).or_default().push(value);
+            }
+            let mut expected: Vec<(String, Vec<String>)> = expected.into_iter().collect();
+            expected.sort();
+            proptest::prop_assert_eq!(urlencoded_text(body), expected);
+        }
+
+        /// A multipart text field decodes as UTF-8 with U+FFFD, and the limit
+        /// counts the bytes that the client sent.
+        #[test]
+        fn a_multipart_value_is_checked_on_its_bytes(value in proptest::collection::vec(proptest::prelude::any::<u8>(), 1..40)) {
+            proptest::prop_assume!(!value.windows(BOUNDARY.len()).any(|w| w == BOUNDARY.as_bytes()));
+            let parse = |max| {
+                let limits = Limits { max_param_length: max, ..Limits::default() };
+                parse_parts(&[text_part("v", &value)], &HashMap::new(), &limits)
+            };
+            let parsed = parse(value.len()).unwrap();
+            let expected = String::from_utf8_lossy(&value).into_owned();
+            proptest::prop_assert!(matches!(
+                parsed.form_map.get("v"),
+                Some(FormValue::Single(CoercedValue::String(text))) if *text == expected
+            ));
+            let error = parse(value.len() - 1).err().unwrap();
+            let too_long = CoerceError::TooLong { len: value.len(), max: value.len() - 1 }.to_string();
+            proptest::prop_assert_eq!(&error.ctx["error"], &serde_json::json!(too_long));
+        }
     }
 
     #[test]

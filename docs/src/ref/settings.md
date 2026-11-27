@@ -372,7 +372,7 @@ See [Async ORM](../topics/async-orm.md) and [Middleware](../topics/middleware.md
 
 | Variable | Type | Default | Effect |
 | --- | --- | --- | --- |
-| `DJANGO_BOLT_MAX_PARAM_LENGTH` | int, 1 to 1048576 | `8192` | Longest value in bytes of a path, query or form parameter. A longer value gets `422`. |
+| `DJANGO_BOLT_MAX_PARAM_LENGTH` | int, 1 to 1048576 | `8192` | Longest value in bytes of a path, query or form parameter. A longer value gets `422`. For a query or form value, the limit counts the bytes that the client sent: a query or URL-encoded value after the percent-decoding, a multipart value as it is. For a path value, the limit counts the bytes of the text. The text that the handler gets can have more bytes when the value is not UTF-8. Each bad byte becomes U+FFFD, which has three bytes, so the text can have up to three times the limit. In a URL-encoded body that is not UTF-8, a raw byte that is not ASCII becomes a Latin-1 character of two bytes. For example, a limit of `17` accepts 17 bytes `%FF` and gives a text of 51 bytes. |
 | `DJANGO_BOLT_MAX_SYNC_STREAMING_THREADS` | int, 1 or more | `1000` | Wins over `BOLT_MAX_SYNC_STREAMING_THREADS`. |
 | `DJANGO_BOLT_STREAM_SYNC_BATCH_SIZE` | int, 1 or more | `5` | Items that a sync generator sends in one batch. A server-sent event stream always sends 1. |
 | `DJANGO_BOLT_STREAM_CHANNEL_CAPACITY` | int, 1 or more | `32` | Chunks that wait between a generator and the response. |
