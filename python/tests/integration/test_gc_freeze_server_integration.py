@@ -22,6 +22,8 @@ pytestmark = pytest.mark.server_integration
 
 # Django and Bolt make more objects than this number before the server starts.
 MANY_OBJECTS = 10_000
+# Python 3.12 starts with 375 frozen objects of its own. The other versions start with none.
+FEW_OBJECTS = 1_000
 
 
 def test_a_server_freezes_the_objects_of_its_startup(make_server_project):
@@ -39,7 +41,7 @@ def test_the_setting_off_leaves_each_object_to_the_collector(make_server_project
     with project.start() as server:
         state = server.get("/collector").json()
 
-    assert state["frozen"] == 0
+    assert state["frozen"] < FEW_OBJECTS
 
 
 def test_a_server_freezes_the_objects_that_its_lifespan_makes(make_server_project):
