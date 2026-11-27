@@ -1391,8 +1391,8 @@ class BoltAPI:
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
-                # Store the auth backend instances for user resolution and for the
-                # OpenAPI schema: the explicit ones, or the defaults that Rust gets.
+                # Store the auth backend instances for the OpenAPI schema: the
+                # explicit ones, or the defaults that Rust gets.
                 if ws_auth_backends:
                     middleware_meta["_auth_backend_instances"] = ws_auth_backends
 
@@ -2419,8 +2419,7 @@ class BoltAPI:
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
-                # Backend instances (not metadata) are kept so user resolution
-                # can call their get_user() methods.
+                # The OpenAPI schema reads the backend instances.
                 if effective_auth_backends:
                     middleware_meta["_auth_backend_instances"] = effective_auth_backends
 
