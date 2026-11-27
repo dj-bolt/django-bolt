@@ -344,14 +344,6 @@ async fn drive(
                     }
                     while let Some((sql, token)) = waiting.pop_front() {
                         let null = std::ptr::null();
-                        if (api.send_query_params)(conn, sql.as_ptr(), 0, null, null, null, null, 0)
-                            == 0
-                        {
-                            let failure = connection_failure(api, conn, "sending query");
-                            // libpq did not take this statement.
-                            waiting.push_front((sql, token));
-                            return Err(failure);
-                        }
                         let sent = if in_flight.is_empty() {
                             let now = clock();
                             shared.head_since.store(now, Ordering::Relaxed);
@@ -359,10 +351,15 @@ async fn drive(
                         } else {
                             0
                         };
-                        // libpq has the statement, and can have sent a part of it.
+                        // From here, a failure is a failure of this statement. libpq
+                        // sends a large statement in parts, so the server can have
+                        // a statement that libpq then reports as not sent.
                         in_flight.push_back((token, sent));
                         unsent = true;
-                        if (api.pipeline_sync)(conn) == 0 {
+                        if (api.send_query_params)(conn, sql.as_ptr(), 0, null, null, null, null, 0)
+                            == 0
+                            || (api.pipeline_sync)(conn) == 0
+                        {
                             return Err(connection_failure(api, conn, "sending query"));
                         }
                     }

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import ctypes
 import logging
 import math
@@ -82,6 +83,9 @@ _FASTEST_DRIFT = 1.05
 # statements, plus this margin in seconds.
 _SLOW_FACTOR = 2.0
 _SLOW_MARGIN = 0.001
+# A cancel request that does not end in this time closes its connection: see
+# ``_Connection.abandon``. ``cancel_safe`` of psycopg waits for the same time.
+_CANCEL_SECONDS = 30.0
 
 # The module of the backend that Bolt supports. A subclass can change how a
 # connection opens or how a cursor runs a query, and a loop connection would
@@ -210,21 +214,30 @@ def _deliver(statement: _Statement, result: tuple[int, Any, Any], service: float
     kind = result[0]
     if kind == _Libpq.CANCEL_SENT:
         link.cancelling = False
+        # The timer is gone when the request ended after ``_CANCEL_SECONDS``.
+        if link.cancel_timer is not None:
+            link.cancel_timer.cancel()
+            link.cancel_timer = None
         if result[2] is not None:
             logger.warning("The server did not get the cancel request of a loop query: %s", result[2])
         if not link.in_flight:
             link.pool.settle(link)
         return
     statement.pending = False
-    waiter = statement.waiter
-    # A read that stopped does not wait for the result: see ``_Connection.abandon``.
-    if not waiter.done():
-        waiter.set_result(result)
+    if statement.abandoned:
+        # The read stopped, and does not wait for the result.
+        link.abandoned -= 1
+    else:
+        statement.waiter.set_result(result)
     link.pool.finished(link, kind, service)
 
 
 class _StaleConnection(Exception):  # noqa: N818 - not an error of the caller: the pool takes another connection
     """The connection ended before the send. The server did not get the statement."""
+
+
+class _OnThread(Exception):  # noqa: N818 - not an error of the caller: the read uses Django's own method
+    """The pool found that only a thread can run its reads: see ``_Pool._open``."""
 
 
 class _Connection:
@@ -241,7 +254,10 @@ class _Connection:
     """
 
     __slots__ = (
+        "abandoned",
         "born",
+        "call_later",
+        "cancel_timer",
         "cancelling",
         "closed",
         "connection",
@@ -272,14 +288,19 @@ class _Connection:
         # The column types that the loaders of ``transformer`` are for.
         self.oids: tuple[int, ...] | None = None
         self.create_future = loop.create_future
+        self.call_later = loop.call_later
         # The loop time at which the connection opened.
         self.born = loop.time()
         # The loop time at which the connection became idle.
         self.idle_since = 0.0
         # The reads that have a place on this connection: see ``_Pool.acquire``.
         self.in_flight = 0
+        # The statements in flight whose read stopped. No task waits for their results.
+        self.abandoned = 0
         # True while Rust sends the cancel request of a statement. The connection takes no statement then.
         self.cancelling = False
+        # The timer that closes the connection when the cancel request does not end, or None.
+        self.cancel_timer: asyncio.TimerHandle | None = None
         # True after a result that can leave a transaction open: see ``_Pool.settle``.
         self.suspect = False
         self.closed = False
@@ -296,10 +317,15 @@ class _Connection:
         request ended: a late request would stop the next statement.
 
         The request opens a connection of its own and blocks, so Rust sends
-        it from another thread, with no GIL.
+        it from another thread, with no GIL. libpq sets no time limit for the
+        request. A request that does not end keeps the connection out of
+        use, so the connection closes after ``_CANCEL_SECONDS``.
         """
-        if self.in_flight == 1 and not self.cancelling:
-            self.cancelling = self.native.cancel(statement)
+        statement.abandoned = True
+        self.abandoned += 1
+        if self.in_flight == 1 and not self.cancelling and self.native.cancel(statement):
+            self.cancelling = True
+            self.cancel_timer = self.call_later(_CANCEL_SECONDS, self.pool.cancel_expired, self)
 
     def in_transaction(self) -> bool:
         """True when the server holds a transaction open. Call it with no statement in flight."""
@@ -308,6 +334,9 @@ class _Connection:
     def close(self) -> None:
         """Close the connection. Rust makes no call on it after ``native.close()`` returns."""
         self.closed = True
+        if self.cancel_timer is not None:
+            self.cancel_timer.cancel()
+            self.cancel_timer = None
         self.native.close()
         self.connection.pgconn.finish()
 
@@ -318,7 +347,7 @@ class _Statement:
     ``CursorWrapper`` of Django uses this object as a cursor: ``execute``.
     """
 
-    __slots__ = ("link", "pending", "query", "result", "waiter")
+    __slots__ = ("abandoned", "link", "pending", "query", "result", "waiter")
 
     def __init__(self, link: _Connection) -> None:
         self.link = link
@@ -326,6 +355,8 @@ class _Statement:
         self.waiter: Any = None
         # True from the send until Rust gives the result.
         self.pending = False
+        # True when the read stopped while the statement was in flight.
+        self.abandoned = False
         # The statement with its parameters. Django logs it when the statement has an error.
         self.query: bytes | None = None
         self.result: Any = None
@@ -511,9 +542,9 @@ class _Pool:
         """
         async with self.preparing:
             if self.pg_version is None:
-                self.finished(await self.acquire())
-        if self.wrapped:
-            self.close()
+                # A connection with an execute wrapper does not come back: see ``_open``.
+                with contextlib.suppress(_OnThread):
+                    self.finished(await self.acquire())
 
     async def acquire(self) -> _Connection:
         """Return a connection with a place for one statement. ``finished`` gives the place back.
@@ -631,13 +662,22 @@ class _Pool:
             self._closed_one()
             raise
         self.pg_version = own.pg_version
-        if own.execute_wrappers and not self.wrapped:
-            self.wrapped = True
-            logger.info(
-                "The async ORM reads of the database %r use the ORM thread pool: "
-                "a connection_created receiver installs an execute wrapper.",
-                self.alias,
-            )
+        if own.execute_wrappers:
+            # The loop cannot call the wrapper around a query: see ``_pool_of``. The read
+            # that opened this connection uses a thread, and so does each later read.
+            if not self.wrapped:
+                self.wrapped = True
+                logger.info(
+                    "The async ORM reads of the database %r use the ORM thread pool: "
+                    "a connection_created receiver installs an execute wrapper.",
+                    self.alias,
+                )
+            link.close()
+            self._closed_one()
+            # A receiver can add its wrapper after the first connection. The reads in
+            # flight on the connections before end there, and then these connections close.
+            self.close()
+            raise _OnThread
         link.in_flight = 1
         self.links.append(link)
         return link
@@ -726,6 +766,15 @@ class _Pool:
             self.discard(idle.popleft())
         self.reaper = loop.call_later(idle[0].idle_since - expired, self._close_idle) if idle else None
 
+    def cancel_expired(self, link: _Connection) -> None:
+        """The cancel request of ``link`` did not end in ``_CANCEL_SECONDS``: see ``_Connection.abandon``."""
+        link.cancel_timer = None
+        if not link.closed:
+            logger.warning(
+                "The cancel request of a loop query did not end in %g seconds. Its connection closes.", _CANCEL_SECONDS
+            )
+            self.discard(link)
+
     def fail(self, link: _Connection) -> None:
         """Close a connection that ended. The statements in flight on it get their results from Rust."""
         if not link.closed:
@@ -743,11 +792,15 @@ class _Pool:
             self.discard(idle.pop())
 
     def close(self) -> None:
-        """Close each connection. Call it when no read is in flight: such a read gets no result."""
+        """Close each connection with no read in flight. The other connections close when their reads end: see ``settle``.
+
+        A statement whose read stopped does not keep its connection open.
+        """
         self.closed = True
         self.idle.clear()
         for link in list(self.links):
-            self.discard(link)
+            if link.in_flight == link.abandoned:
+                self.discard(link)
         for name in ("reaper", "expirer"):
             timer = getattr(self, name)
             if timer is not None:
@@ -848,18 +901,16 @@ def _new_pool(loop: WorkerLoop, alias: str) -> _Pool | None:
     return pool
 
 
-def _pool_for(queryset: QuerySet) -> _Pool | None:
-    """Return the pool for this read, or None when the read must use Django's own method.
+def _loop_for_reads() -> WorkerLoop | None:
+    """Return the event loop of this thread when a read can run on it, or None.
 
-    Django's method runs the sync ORM on a thread, with the connection of
-    Django. A read needs it in these conditions:
+    A read uses a thread in these conditions:
 
     - The loop is not the loop of a Bolt worker. A pool lives as long as its loop.
-    - The QuerySet has ``prefetch_related``. The prefetch queries are sync code.
-    - The class of the QuerySet has its own ``_fetch_all``, or the QuerySet
-      has an iterable class that is not of Django. Such code can query.
-    - The code that builds a row of this model queried before: see ``_fetch_all``.
-    - Each condition of ``_pool_of``.
+    - The request has Django middleware. Its lane keeps state for the
+      request, such as the schema of a tenant.
+    - Sync code called the coroutine with ``async_to_sync``. Django's method
+      then runs on the thread of that code, with its transaction.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -867,24 +918,18 @@ def _pool_for(queryset: QuerySet) -> _Pool | None:
         return None
     if type(loop) is not WorkerLoop:
         return None
-    if queryset._prefetch_related_lookups:
+    if in_lane_mode() or _thread_sensitive_context.get(None) is not None:
         return None
-    if type(queryset)._fetch_all is not _django_fetch_all or queryset._iterable_class.__module__ != _ITERABLES_MODULE:
+    if getattr(AsyncToSync.executors, "current", None) is not None:
         return None
-    if queryset.model in _models_on_threads:
-        return None
-    return _pool_of(loop, queryset.db)
+    return loop
 
 
 def _pool_of(loop: WorkerLoop, alias: str) -> _Pool | None:
-    """The part of ``_pool_for`` that does not need the QuerySet.
+    """Return the pool of ``loop`` for the database ``alias``, or None when its reads use a thread.
 
     A read uses a thread in these conditions:
 
-    - The request has Django middleware. Its lane keeps state for the
-      request, such as the schema of a tenant.
-    - Sync code called the coroutine with ``async_to_sync``. Django's method
-      then runs on the thread of that code, with its transaction.
     - The database is not PostgreSQL with psycopg 3, Django's backend,
       client-side parameters and ``AUTOCOMMIT``.
     - The connection of the thread is in a transaction. The test client gives
@@ -893,10 +938,6 @@ def _pool_of(loop: WorkerLoop, alias: str) -> _Pool | None:
       query: it measures the time of the query and gets its error. On the
       event loop, the wrapper would return before the query runs.
     """
-    if in_lane_mode() or _thread_sensitive_context.get(None) is not None:
-        return None
-    if getattr(AsyncToSync.executors, "current", None) is not None:
-        return None
     pools = loop._query_pools
     pool = pools.get(alias, _MISSING)
     if pool is _MISSING:
@@ -909,15 +950,42 @@ def _pool_of(loop: WorkerLoop, alias: str) -> _Pool | None:
     return pool
 
 
-def _pool_on_loop(alias: str) -> _Pool | None:
-    """Return the pool for a read that builds no row of a model, or None: see ``_pool_of``."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
+def _pool_of_queryset(queryset: QuerySet) -> _Pool | None:
+    """Return the pool for a read of ``queryset`` that builds no row of a model, or None.
+
+    None is for each condition of ``_loop_for_reads`` and of ``_pool_of``, and
+    for a database router that queries. Django's method runs the router on a thread.
+    """
+    loop = _loop_for_reads()
+    if loop is None:
         return None
-    if type(loop) is not WorkerLoop:
+    try:
+        # Without ``using()``, the database router gives the database.
+        alias = queryset.db
+    except SynchronousOnlyOperation:
         return None
     return _pool_of(loop, alias)
+
+
+def _pool_for(queryset: QuerySet) -> _Pool | None:
+    """Return the pool for a read that builds rows, or None when the read must use Django's own method.
+
+    Django's method runs the sync ORM on a thread, with the connection of
+    Django. A read needs it in these conditions:
+
+    - The QuerySet has ``prefetch_related``. The prefetch queries are sync code.
+    - The class of the QuerySet has its own ``_fetch_all``, or the QuerySet
+      has an iterable class that is not of Django. Such code can query.
+    - The code that builds a row of this model queried before: see ``_fetch_all``.
+    - Each condition of ``_pool_of_queryset``.
+    """
+    if queryset._prefetch_related_lookups:
+        return None
+    if type(queryset)._fetch_all is not _django_fetch_all or queryset._iterable_class.__module__ != _ITERABLES_MODULE:
+        return None
+    if queryset.model in _models_on_threads:
+        return None
+    return _pool_of_queryset(queryset)
 
 
 async def _prepare(pool: _Pool, wrapper: Any) -> bool:
@@ -945,13 +1013,17 @@ async def fetch(alias: str, sql: str, params: Any) -> list[tuple[Any, ...]] | No
     Returns None for a read that must use the ORM thread pool (see
     ``_pool_of``). Call this function only when ``enabled`` is true.
     """
-    pool = _pool_on_loop(alias)
+    loop = _loop_for_reads()
+    pool = _pool_of(loop, alias) if loop is not None else None
     if pool is None:
         return None
     wrapper = connections[alias]
     if not await _prepare(pool, wrapper):
         return None
-    return await pool.fetch(wrapper, sql, params)
+    try:
+        return await pool.fetch(wrapper, sql, params)
+    except _OnThread:
+        return None
 
 
 async def _all_columns(pool: _Pool, compiler: Any) -> Any:
@@ -973,7 +1045,10 @@ async def _all_columns(pool: _Pool, compiler: Any) -> Any:
         return None
     if not sql:
         return ()
-    return await pool.fetch(wrapper, sql, params)
+    try:
+        return await pool.fetch(wrapper, sql, params)
+    except _OnThread:
+        return None
 
 
 async def _rows(pool: _Pool, compiler: Any) -> Any:
@@ -1294,7 +1369,10 @@ async def count(queryset: QuerySet) -> int | None:
     """
     if type(queryset).count is not _django_count:
         return None
-    pool = _pool_on_loop(queryset.db)
+    if queryset._result_cache is not None:
+        # Django counts the rows that the QuerySet has, and uses no connection.
+        return len(queryset._result_cache)
+    pool = _pool_of_queryset(queryset)
     if pool is None:
         return None
     # ``Query.get_count`` gives this entry of its aggregation.
@@ -1312,7 +1390,7 @@ async def _acount(self: QuerySet) -> int:
 
 async def _aaggregate(self: QuerySet, *args: Any, **kwargs: Any) -> dict[str, Any]:
     """``QuerySet.aaggregate``."""
-    pool = _pool_on_loop(self.db) if type(self).aggregate is _django_aggregate else None
+    pool = _pool_of_queryset(self) if type(self).aggregate is _django_aggregate else None
     if pool is None:
         return await _django_aaggregate(self, *args, **kwargs)
     result = await _aggregation(self, pool, _django_aggregate, args, kwargs, None)

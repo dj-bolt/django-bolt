@@ -357,6 +357,7 @@ These threads can hold a connection:
 - one request lane for each request in flight on a route with Django middleware.
 
 With `BOLT_ASYNC_ORM_ON_LOOP`, each worker thread also holds up to `DJANGO_BOLT_LOOP_CONNECTIONS` connections (10 by default) to each PostgreSQL database.
+A pool of `OPTIONS["pool"]` does not limit these connections. Add them to the connections of the pool.
 
 Multiply by `--processes`. Make sure that the database accepts that number of connections, or use a pool.
 

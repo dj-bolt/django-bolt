@@ -226,6 +226,7 @@ Some reads need the database connection of a thread, or sync code. For these rea
 | A returned QuerySet with the return type `list[SomeSerializer]`, when the Serializer reads model instances | On the ORM pool, a relation that the QuerySet did not load can still load. A plain Serializer reads `.values()` rows, and its QuerySet loads on the event loop. |
 | `await request.auser()` with a `get_user` or a `get_user_sync` of your own, or with a user model whose default manager has its own `get_queryset()` | Bolt runs your code, or the manager, for each load. |
 | The rows of a page of `@paginate` | Bolt moved only the count of the rows to the event loop. |
+| A read whose database router queries in `db_for_read()` | Sync code cannot query on the event loop. |
 | The other async calls, for example `acontains()`, `ain_bulk()`, `acreate()` and `asave()` | Bolt replaces only the reads above. |
 
 ### Connections of the event loop
@@ -248,7 +249,7 @@ Django opens each loop connection, with the parameters of `DATABASES`. No thread
 
 - A read does not use a connection that the database closed while the connection was idle, for example after a database restart. The loop opens a new one.
 - A connection that ends during a query fails each read that has a statement in flight on it. Bolt does not send these statements again, because the database can have run them.
-- When a request stops during a query, Bolt asks the server to cancel the query. The request does not block the event loop. With more statements in flight on the connection, Bolt sends no request, and the query runs to its end. The server cancels the statement that it runs when the request comes, and that can be the statement of another read.
+- When a request stops during a query, Bolt asks the server to cancel the query. The request does not block the event loop. With more statements in flight on the connection, Bolt sends no request, and the query runs to its end. The server cancels the statement that it runs when the request comes, and that can be the statement of another read. A cancel request that does not end in 30 seconds closes its connection.
 - With a database router, one read uses one database: the database that the router gives for the first call.
 - With `DEBUG = True`, `connection.queries` and the `django.db.backends` logger have each read, with its time.
 - A database error is a `django.db` error around the psycopg error, with the fields that the sync ORM gives.
@@ -261,7 +262,8 @@ Add the loop connections to the connection count of your database. See [Tune the
 A loop connection is in the pipeline mode of libpq. Bolt sends a statement on it while the statements before are in flight.
 The server runs the statements of one connection in their order. Each statement is its own transaction, and an error of one statement does not fail the others.
 
-Thus a read at the connection limit does not wait for the round trip of another read. Its statement goes out at once, behind the statements in flight on the connection with the fewest statements.
+Thus a read at the connection limit does not wait for the round trip of another read. When a connection has a free place, the statement goes out at once, behind the statements in flight there.
+Bolt takes the connection with the fewest statements.
 `DJANGO_BOLT_LOOP_PIPELINE_DEPTH` sets how many statements one connection can have in flight.
 A read waits when no connection can take its statement. That is when each connection is at that number, cancels a statement, or runs a slow statement.
 The read that waited longest gets the next place.
