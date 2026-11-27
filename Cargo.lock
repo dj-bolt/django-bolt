@@ -490,7 +490,6 @@ dependencies = [
  "cookie",
  "dashmap",
  "flate2",
- "form_urlencoded",
  "futures-util",
  "governor",
  "http 1.5.0",

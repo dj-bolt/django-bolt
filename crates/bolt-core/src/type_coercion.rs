@@ -238,6 +238,21 @@ pub fn coerce_param(
     coerce_typed(value, type_hint).map_err(CoerceError::Invalid)
 }
 
+/// Coerce a value that the caller checked for length.
+///
+/// The caller counts the bytes that the client sent. A decoded text can be
+/// longer (U+FFFD has three bytes), so this function does not count again.
+/// A string value moves into the result without a copy.
+pub fn coerce_checked_value(
+    value: std::borrow::Cow<'_, str>,
+    type_hint: u8,
+) -> Result<CoercedValue, CoerceError> {
+    match type_hint {
+        TYPE_STRING => Ok(CoercedValue::String(value.into_owned())),
+        _ => coerce_typed(&value, type_hint).map_err(CoerceError::Invalid),
+    }
+}
+
 /// Parse `value` into `type_hint` without the length check. Plain-message errors
 /// are wrapped in [`CoerceError::Invalid`] by the public entry points above.
 fn coerce_typed(value: &str, type_hint: u8) -> Result<CoercedValue, String> {

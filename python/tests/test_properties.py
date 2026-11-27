@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import io
 import itertools
 import re
 import sys
@@ -25,12 +26,13 @@ from urllib.parse import quote
 import httpx
 import jwt
 import pytest
+from django.core.handlers.wsgi import WSGIRequest
 from django.http import HttpResponse, QueryDict
 from django.http.cookie import parse_cookie
 from django.test import override_settings
 from django.urls import include, reverse
 from django.urls import path as django_path
-from hypothesis import example, given
+from hypothesis import assume, example, given
 from hypothesis import strategies as st
 
 from django_bolt import BoltAPI
@@ -62,6 +64,11 @@ async def sequence(k: Annotated[list[str], Query()] = []):  # noqa: B006
 @api.post("/form")
 async def form(k: Annotated[list[str], Form()] = []):  # noqa: B006
     return k
+
+
+@api.post("/form-fields")
+async def form_fields(request, k: Annotated[list[str], Form()] = []):  # noqa: B006
+    return {key: value if isinstance(value, list) else [value] for key, value in request.form.items()}
 
 
 @api.get("/path/{value}")
@@ -256,6 +263,80 @@ def test_a_urlencoded_form_matches_django_getlist(client, raw):
     )
     assert response.status_code == 200
     assert response.json() == QueryDict(raw).getlist("k")
+
+
+# Pieces of a form body: separators, escapes, Latin-1 and UTF-8 bytes, and any bytes.
+FORM_BODY_PIECES = [b"&", b"=", b"+", b"%", b"k", b"%FF", b"%C3", b"%C3%A9", b"\xe9", b"\xc3\xa9", b"\xa9"]
+form_bodies = st.lists(
+    st.one_of(st.sampled_from(FORM_BODY_PIECES), st.binary(min_size=1, max_size=4)), max_size=30
+).map(b"".join)
+
+
+@example(body=b"name=caf\xe9")
+@example(body=b"a=\xc3\xa9&b=\xe9")
+@example(body=b"a=%C3\xa9")
+@given(body=form_bodies)
+def test_a_urlencoded_body_of_any_bytes_matches_django(client, body):
+    response = client.post("/form-fields", content=body, headers={"content-type": "application/x-www-form-urlencoded"})
+    assert response.status_code == 200, response.text
+    # Django request.POST of a urlencoded body (HttpRequest._load_post_and_files).
+    assert response.json() == dict(QueryDict(body, encoding="utf-8").lists())
+
+
+MULTIPART_BOUNDARY = b"bolt-property-boundary-7d3f"
+
+
+def _django_post(body: bytes, content_type: str) -> dict[str, list[str]]:
+    environ = {
+        "REQUEST_METHOD": "POST",
+        "CONTENT_TYPE": content_type,
+        "CONTENT_LENGTH": str(len(body)),
+        "wsgi.input": io.BytesIO(body),
+        "PATH_INFO": "/",
+        "SERVER_NAME": "testserver",
+        "SERVER_PORT": "80",
+        "wsgi.url_scheme": "http",
+    }
+    return dict(WSGIRequest(environ).POST.lists())
+
+
+def _is_header_name_safe(name: bytes) -> bool:
+    """Leave out what is not about text decoding.
+
+    A quote, a backslash or a control byte changes the header syntax, and
+    Django strips white space around a name.
+    """
+    if any(byte < 0x20 or byte in b'"\\\x7f' for byte in name):
+        return False
+    text = name.decode("utf-8", "replace")
+    return text == text.strip()
+
+
+@example(name=b"v", value=b"caf\xe9")
+@example(name=b"caf\xc3\xa9", value=b"\xff" * 17)
+@example(name=b"caf\xe9", value=b"1")
+@given(name=st.binary(min_size=1, max_size=12).filter(_is_header_name_safe), value=st.binary(max_size=40))
+def test_a_multipart_field_of_any_bytes_matches_django(client, name, value):
+    assume(MULTIPART_BOUNDARY not in value)
+    body = (
+        b"--" + MULTIPART_BOUNDARY + b"\r\n"
+        b'Content-Disposition: form-data; name="' + name + b'"\r\n\r\n' + value + b"\r\n"
+        b"--" + MULTIPART_BOUNDARY + b"--\r\n"
+    )
+    content_type = f"multipart/form-data; boundary={MULTIPART_BOUNDARY.decode()}"
+    response = client.post("/form-fields", content=body, headers={"content-type": content_type})
+    django_post = _django_post(body, content_type)
+    try:
+        name.decode("utf-8")
+    except UnicodeDecodeError:
+        # Django drops a part whose header is not UTF-8. The multipart parser
+        # of Bolt cannot skip a part, so the request gets 422.
+        assert django_post == {}
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"][0]["type"] == "multipart_error"
+    else:
+        assert response.status_code == 200, response.text
+        assert response.json() == django_post
 
 
 # httpx removes the dot segments "." and "..", as a browser does.
