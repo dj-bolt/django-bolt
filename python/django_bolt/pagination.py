@@ -363,6 +363,9 @@ class PaginationBase(ABC):
             elif relation_loader is not None:
                 # Join the relations of a nested Struct item type, in the same hop.
                 return await run_in_orm_executor(relation_loader.evaluate, queryset)
+            # With BOLT_ASYNC_ORM_ON_LOOP, the event loop sends the statement.
+            if async_orm.enabled and await async_orm.load(queryset):
+                return list(queryset)
             return await run_in_orm_executor(list, queryset)
         # Non-QuerySet async iterables (has __aiter__)
         if hasattr(queryset, "__aiter__"):

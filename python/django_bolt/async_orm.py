@@ -2,8 +2,9 @@
 
 Django's async ORM API is ``sync_to_async`` around the sync API, so each call
 runs on a thread. With ``BOLT_ASYNC_ORM_ON_LOOP = True``, Bolt replaces these
-read calls of ``QuerySet``: ``async for`` (``__aiter__``), ``aget()``,
-``afirst()``, ``alast()``, ``aexists()``, ``acount()`` and ``aaggregate()``.
+read calls of ``QuerySet``: ``async for`` (``__aiter__``), ``aiterator()``,
+``aget()``, ``afirst()``, ``alast()``, ``aexists()``, ``acount()`` and
+``aaggregate()``.
 
 The flow of one read:
 
@@ -106,6 +107,7 @@ _DJANGO_ERRORS = (
 )
 
 _django_aiter = QuerySet.__aiter__
+_django_aiterator = QuerySet.aiterator
 _django_aget = QuerySet.aget
 _django_afirst = QuerySet.afirst
 _django_alast = QuerySet.alast
@@ -262,6 +264,7 @@ class _Connection:
         "closed",
         "connection",
         "create_future",
+        "cursors",
         "database",
         "encoding",
         "idle_since",
@@ -303,6 +306,8 @@ class _Connection:
         self.cancel_timer: asyncio.TimerHandle | None = None
         # True after a result that can leave a transaction open: see ``_Pool.settle``.
         self.suspect = False
+        # The cursors that the connection opened: see ``_Pool.declare``. Each cursor gets a name with its number.
+        self.cursors = 0
         self.closed = False
         self.native = _Libpq(pool.addresses, pgconn.pgconn_ptr, pgconn.socket, connection, loop.call_soon, _deliver)
 
@@ -454,6 +459,21 @@ class _Statement:
             message = message[len(severity) + 1 :]
         text = message.decode(encoding, "replace").strip() or "no error details available"
         return error_class(text, info=fields, encoding=encoding)
+
+
+class _Declare(_Statement):
+    """The statement that opens a cursor of the server for a query: see ``_Pool.declare``."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, link: _Connection, name: str) -> None:
+        super().__init__(link)
+        self.name = name
+
+    def execute(self, sql: Any, params: Any = None) -> None:
+        # The statement of the server-side cursor that Django makes on a connection with ``AUTOCOMMIT``.
+        # ``WITH HOLD`` keeps the cursor after the transaction of this statement.
+        super().execute(f'DECLARE "{self.name}" NO SCROLL CURSOR WITH HOLD FOR {sql}', params)
 
 
 class _Pool:
@@ -855,6 +875,89 @@ class _Pool:
                     # The statement did not go out, so no result gives its place back.
                     self.finished(link)
 
+    async def declare(self, wrapper: Any, sql: str, params: Any) -> tuple[_Connection, str]:
+        """Open a cursor of the server for one read, and return its connection and its name.
+
+        Only the connection of a cursor can read it. Thus the cursor keeps
+        one place on its connection until ``close_cursor``. The connection
+        then does not close between two chunks. Other reads use the other
+        places of the connection.
+
+        The statement goes through ``CursorWrapper.execute`` of Django, as in ``fetch``.
+        """
+        database_error = self.database.Error
+        while True:
+            link = await self.acquire()
+            link.cursors += 1
+            name = f"_bolt_curs_{link.cursors}"
+            statement = _Declare(link, name)
+            # The place from ``acquire`` is the place of the cursor. Each statement takes one more place.
+            link.in_flight += 1
+            try:
+                if wrapper.queries_logged:
+                    with CursorDebugWrapper(statement, wrapper).debug_sql(sql, params, use_last_executed_query=True):
+                        CursorWrapper(statement, wrapper).execute(sql, params)
+                        await statement.wait()
+                else:
+                    CursorWrapper(statement, wrapper).execute(sql, params)
+                    await statement.wait()
+                return link, name
+            except _StaleConnection:
+                self.finished(link)
+                continue
+            except database_error as error:
+                # The server made no cursor.
+                self.finished(link)
+                raise _django_error(self.database, error) from error
+            except BaseException:
+                if statement.waiter is None:
+                    self.finished(link)
+                else:
+                    # The read stopped, and the server can still make the cursor.
+                    self.close_cursor(link, name)
+                raise
+            finally:
+                if statement.waiter is None:
+                    # The statement did not go out, so no result gives its place back.
+                    self.finished(link)
+
+    async def fetch_cursor(self, link: _Connection, name: str, size: int) -> list[tuple[Any, ...]]:
+        """Return the next ``size`` rows of a cursor of ``declare``, or fewer rows at its end."""
+        if link.closed:
+            raise OperationalError("the connection of the cursor ended")
+        statement = _Statement(link)
+        link.in_flight += 1
+        try:
+            statement.execute(f'FETCH FORWARD {size} FROM "{name}"')
+            await statement.wait()
+            return statement.fetchall()
+        except _StaleConnection as error:
+            # Another connection does not have the cursor.
+            raise OperationalError(str(error)) from error
+        except self.database.Error as error:
+            raise _django_error(self.database, error) from error
+        finally:
+            if statement.waiter is None:
+                self.finished(link)
+
+    def close_cursor(self, link: _Connection, name: str) -> None:
+        """Close a cursor of ``declare``, and give its place back when the server closed it.
+
+        This call does not wait, so a read that stops can make it. The
+        statement goes out behind the statements in flight of the cursor.
+        """
+        if not link.closed:
+            statement = _Statement(link)
+            link.in_flight += 1
+            try:
+                statement.execute(f'CLOSE "{name}"')
+            except _StaleConnection:
+                self.finished(link)
+            else:
+                statement.waiter.add_done_callback(lambda _waiter: self.finished(link))
+                return
+        self.finished(link)
+
 
 def _django_error(database: Any, error: Exception) -> Exception:
     """Return the ``django.db`` error for a psycopg error, as ``DatabaseErrorWrapper`` does."""
@@ -1026,27 +1129,35 @@ async def fetch(alias: str, sql: str, params: Any) -> list[tuple[Any, ...]] | No
         return None
 
 
-async def _all_columns(pool: _Pool, compiler: Any) -> Any:
-    """Compile the query of ``compiler`` and return its rows from the database, with each column of the statement.
+async def _compiled(pool: _Pool, compiler: Any) -> Any:
+    """Compile the query of ``compiler`` and return its statement and its parameters.
 
-    Returns None when the read must use a thread: the pool found that after
-    its first connection, or an expression needed the database to compile.
-    The thread path gives such an expression a connection.
+    Returns ``()`` for a query that can match nothing: ``execute_sql`` gives
+    no rows for it. Returns None when the read must use a thread: the pool
+    found that after its first connection, or an expression needed the
+    database to compile. The thread path gives such an expression a connection.
     """
-    wrapper = compiler.connection
-    if not await _prepare(pool, wrapper):
+    if not await _prepare(pool, compiler.connection):
         return None
     try:
         sql, params = compiler.as_sql()
     except EmptyResultSet:
-        # ``execute_sql`` gives no rows for a query that can match nothing.
         return ()
     except SynchronousOnlyOperation:
         return None
-    if not sql:
-        return ()
+    return (sql, params) if sql else ()
+
+
+async def _all_columns(pool: _Pool, compiler: Any) -> Any:
+    """Return the rows of the query of ``compiler`` from the database, with each column of the statement.
+
+    Returns None when the read must use a thread: see ``_compiled``.
+    """
+    statement = await _compiled(pool, compiler)
+    if not statement:
+        return statement
     try:
-        return await pool.fetch(wrapper, sql, params)
+        return await pool.fetch(compiler.connection, *statement)
     except _OnThread:
         return None
 
@@ -1061,17 +1172,13 @@ async def _rows(pool: _Pool, compiler: Any) -> Any:
     return rows
 
 
-async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
-    """Fill the result cache of ``queryset``: ``QuerySet._fetch_all`` with the query on the event loop."""
-    query = queryset.query
-    # A router can give another database for each call of ``queryset.db``. The read uses the database of its pool.
-    alias = pool.alias
-    compiler = query.get_compiler(using=alias)
-    rows = await _rows(pool, compiler)
-    if rows is None:
-        await SyncToAsync(queryset._fetch_all)()
-        return
+def _build(queryset: QuerySet, compiler: Any, rows: Any, alias: str, **options: Any) -> list[Any]:
+    """Build the result of ``queryset`` from ``rows`` of the database, with the iterable class of Django.
 
+    ``compiler`` is the compiler that gave the statement of the rows.
+    ``options`` are the arguments of the iterable class.
+    """
+    query = queryset.query
     # The iterable class asks the query for a compiler and the compiler for
     # the rows. Give it this compiler, which has the rows.
     compiler.execute_sql = lambda *_args, **_kwargs: (rows,)
@@ -1080,7 +1187,23 @@ async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
     database_of_the_queryset = queryset._db
     queryset._db = alias
     try:
-        queryset._result_cache = list(queryset._iterable_class(queryset))
+        return list(queryset._iterable_class(queryset, **options))
+    finally:
+        queryset._db = database_of_the_queryset
+        del query.get_compiler
+
+
+async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
+    """Fill the result cache of ``queryset``: ``QuerySet._fetch_all`` with the query on the event loop."""
+    # A router can give another database for each call of ``queryset.db``. The read uses the database of its pool.
+    alias = pool.alias
+    compiler = queryset.query.get_compiler(using=alias)
+    rows = await _rows(pool, compiler)
+    if rows is None:
+        await SyncToAsync(queryset._fetch_all)()
+        return
+    try:
+        queryset._result_cache = _build(queryset, compiler, rows, alias)
         return
     except SynchronousOnlyOperation:
         # The code that builds a row queried: a ``from_db`` method, a field
@@ -1088,9 +1211,6 @@ async def _fetch_all(queryset: QuerySet, pool: _Pool) -> None:
         # thread reads the rows again, and each later read of this model
         # starts on a thread.
         _models_on_threads.add(queryset.model)
-    finally:
-        queryset._db = database_of_the_queryset
-        del query.get_compiler
     await SyncToAsync(queryset._fetch_all)()
 
 
@@ -1128,6 +1248,75 @@ def _aiter(self: QuerySet) -> Any:
             yield item
 
     return generator()
+
+
+async def _aiterator(self: QuerySet, chunk_size: int = 2000) -> Any:
+    """``QuerySet.aiterator``: the rows in chunks of ``chunk_size``, and no result cache.
+
+    As Django, the read opens a cursor of the server, and each chunk is one
+    ``FETCH`` statement. The cursor closes at the last row, and also when the
+    code that reads the iterator stops before that row. With
+    ``DISABLE_SERVER_SIDE_CURSORS``, Django reads all rows with one statement,
+    and builds them in chunks.
+    """
+    if chunk_size <= 0:
+        raise ValueError("Chunk size must be strictly positive.")
+    pool = _pool_for(self)
+    compiler = cursor = rows = None
+    if pool is not None:
+        alias = pool.alias
+        compiler = self.query.get_compiler(using=alias)
+        wrapper = compiler.connection
+        if wrapper.settings_dict.get("DISABLE_SERVER_SIDE_CURSORS"):
+            rows = await _all_columns(pool, compiler)
+        else:
+            statement = await _compiled(pool, compiler)
+            if statement:
+                with contextlib.suppress(_OnThread):
+                    cursor = await pool.declare(wrapper, *statement)
+            elif statement is not None:
+                rows = ()
+    if cursor is None and rows is None:
+        async for item in _django_aiterator(self, chunk_size):
+            yield item
+        return
+
+    loop = asyncio.get_running_loop()
+    options = {"chunked_fetch": cursor is not None, "chunk_size": chunk_size}
+    # ``execute_sql`` removes the columns that the query selects only to order the rows.
+    columns = compiler.col_count if compiler.has_extra_select else None
+    on_thread = False
+    start = 0
+    try:
+        while True:
+            if cursor is None:
+                chunk = rows[start : start + chunk_size]
+                start += chunk_size
+            else:
+                chunk = await pool.fetch_cursor(*cursor, chunk_size)
+            if columns is not None:
+                chunk = [row[:columns] for row in chunk]
+            if not on_thread:
+                try:
+                    items = _build(self, compiler, chunk, alias, **options)
+                except SynchronousOnlyOperation:
+                    # The code that builds a row queried: see ``_fetch_all``. A thread builds
+                    # this chunk again, and each later chunk.
+                    _models_on_threads.add(self.model)
+                    on_thread = True
+            if on_thread:
+                items = await SyncToAsync(_build)(self, compiler, chunk, alias, **options)
+            for item in items:
+                yield item
+            if len(chunk) < chunk_size:
+                return
+    finally:
+        if cursor is not None:
+            # The garbage collector can end this generator on another thread. Only the thread of the loop uses a pool.
+            if asyncio._get_running_loop() is loop:
+                pool.close_cursor(*cursor)
+            else:
+                loop.call_soon_threadsafe(pool.close_cursor, *cursor)
 
 
 async def _aget(self: QuerySet, *args: Any, **kwargs: Any) -> Any:
@@ -1437,6 +1626,7 @@ def configure() -> None:
     enabled = setting
     for name, method, django_method in (
         ("__aiter__", _aiter, _django_aiter),
+        ("aiterator", _aiterator, _django_aiterator),
         ("aget", _aget, _django_aget),
         ("afirst", _afirst, _django_afirst),
         ("alast", _alast, _django_alast),

@@ -145,7 +145,7 @@ curl localhost:8000/articles/99
 A sync ORM call in an `async def` handler raises Django's `SynchronousOnlyOperation`, and the client gets a `500` response. This also applies to a relation that is not loaded, for example `article.author` after `aget()`.
 
 Bolt sends each async ORM call to the ORM thread pool. Thus `DJANGO_BOLT_ORM_THREADS` limits the queries in flight. See [Tune the thread pools](#tune-the-thread-pools).
-On PostgreSQL, a returned QuerySet, `async for`, `aget()`, `afirst()`, `alast()`, `aexists()`, `acount()`, `aaggregate()` and `await request.auser()` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
+On PostgreSQL, a returned QuerySet, `async for`, `aiterator()`, `aget()`, `afirst()`, `alast()`, `aexists()`, `acount()`, `aaggregate()` and `await request.auser()` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
 
 ## Iterate over a QuerySet
 
@@ -169,6 +169,28 @@ async def list_titles() -> list[str]:
 ```
 
 `async for` loads all rows in one call to the ORM thread pool. It then iterates over them in memory.
+
+For a result with many rows, use `aiterator()`. It reads `chunk_size` rows at a time, and it does not keep the rows:
+
+```python
+from django_bolt import BoltAPI
+from django_bolt.responses import EventSourceResponse
+
+from blog.models import Article
+
+api = BoltAPI()
+
+
+@api.get("/articles/export")
+async def export_articles() -> EventSourceResponse:
+    async def events():
+        async for article in Article.objects.order_by("id").aiterator(chunk_size=500):
+            yield {"id": article.id, "title": article.title}
+
+    return EventSourceResponse(events())
+```
+
+On PostgreSQL, Django reads the chunks from a cursor of the server. Thus the memory of the process holds one chunk.
 A returned QuerySet with a `list[Struct]` return type reads only the Struct fields, with `.values()`, and makes no model instances. Return the QuerySet when the rows need no change.
 
 ## Run async reads on the event loop
@@ -177,9 +199,10 @@ Django's async ORM runs each call on a thread, and Bolt loads a QuerySet that a 
 
 - a QuerySet that a handler returns,
 - `async for` over a QuerySet,
+- `aiterator()`,
 - `aget()`, `afirst()`, `alast()` and `aexists()`,
 - `acount()` and `aaggregate()`,
-- the count of the rows for `@paginate`,
+- the count of the rows and the rows of a page for `@paginate`,
 - `await request.auser()`, when the auth backend loads the user by primary key.
 
 Add the setting:
@@ -226,7 +249,7 @@ Some reads need the database connection of a thread, or sync code. For these rea
 | A returned QuerySet with the return type `list[SomeSerializer]`, when the Serializer reads model instances | On the ORM pool, a relation that the QuerySet did not load can still load. A plain Serializer reads `.values()` rows, and its QuerySet loads on the event loop. |
 | A QuerySet that a sync handler returns with the return type `list[SomeSerializer]`, when the Serializer has validators | A validator is your code, and it can query. With an async handler, validators run on the event loop, also with the setting off. |
 | `await request.auser()` with a `get_user` or a `get_user_sync` of your own, or with a user model whose default manager has its own `get_queryset()` | Bolt runs your code, or the manager, for each load. |
-| The rows of a page of `@paginate` | Bolt moved only the count of the rows to the event loop. |
+| The rows of a page of `@paginate` whose item type is a Struct with a nested Struct | Bolt loads the relations of the rows with sync code. The count of the rows runs on the event loop. |
 | A read whose database router queries in `db_for_read()` | Sync code cannot query on the event loop. |
 | The other async calls, for example `acontains()`, `ain_bulk()`, `acreate()` and `asave()` | Bolt replaces only the reads above. |
 
@@ -239,6 +262,9 @@ Django opens each loop connection, with the parameters of `DATABASES`. No thread
 - A loop connection is not in Django's connection pool (`OPTIONS["pool"]`), and `CONN_MAX_AGE` does not apply to it.
 - A read takes an idle connection. With no idle connection, the loop opens one, up to the limit. The pool of [sqlx](https://github.com/launchbadge/sqlx) has the same limits and the same defaults.
 - At the limit, a read uses a connection that is in use. See [Statements in flight on one connection](#statements-in-flight-on-one-connection).
+- `aiterator()` opens a cursor of the server, as Django does, and each chunk is one `FETCH` statement on the connection of the cursor. The cursor keeps one place on that connection. Other reads use the other places.
+- The cursor closes after the last row. It also closes when the code that reads it stops, for example when the client of a stream goes away.
+- With `DISABLE_SERVER_SIDE_CURSORS` in the database settings, `aiterator()` reads all rows with one statement, as Django does.
 
 | Variable | Default | Effect |
 | --- | --- | --- |

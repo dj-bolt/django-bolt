@@ -1313,6 +1313,74 @@ def _api() -> BoltAPI:
             "built_on": probe.built_on,
         }
 
+    @api.get("/chunks/{name}")
+    async def chunks(name: str):
+        queryset, plain = QUERIES[name]
+        # Two rows for each chunk, so a query with three rows needs two chunks.
+        return [plain(row) async for row in queryset().aiterator(chunk_size=2)]
+
+    @api.get("/chunk-threads")
+    async def chunk_threads():
+        probes = LoopProbe.objects.using(ALIAS).order_by("id")
+        return {
+            "handler": threading.current_thread().name,
+            "aiterator": [probe.built_on async for probe in probes.aiterator(chunk_size=1)],
+        }
+
+    @api.get("/chunk-backends/{rows}")
+    async def chunk_backends(rows: int):
+        """Read ``rows`` rows of a cursor, with another read after each row. Give the connection of each row."""
+        pids = []
+        other = []
+        async for probe in _probe_with_backend_pid().aiterator(chunk_size=1):
+            pids.append(probe.pid)
+            other.append(await _backend_pid())
+            if len(pids) == rows:
+                break
+        return {"pids": pids, "other": other}
+
+    @api.get("/cancelled-cursor")
+    async def cancelled_cursor():
+        # Open the one connection of the loop.
+        before = await _backend_pid()
+        slow = _probe_with_backend_pid().annotate(nap=RawSQL("(SELECT 1 FROM pg_sleep(0.3))", []))
+        try:
+            await asyncio.wait_for(anext(slow.aiterator(chunk_size=1)), timeout=0.05)
+        except TimeoutError:
+            # This read needs the place that the cursor of the cancelled read has on the connection.
+            following = await asyncio.wait_for(_backend_pid(), timeout=10)
+            return {"same_connection": following == before}
+        return {"same_connection": None}
+
+    @api.get("/chunks-together")
+    async def chunks_together():
+        async def labels() -> list[Any]:
+            return [[probe.label, probe.pid] async for probe in _probe_with_backend_pid().aiterator(chunk_size=1)]
+
+        return await asyncio.gather(labels(), labels(), labels())
+
+    @api.get("/chunks-with-prefetch")
+    async def chunks_with_prefetch():
+        posts = _posts().prefetch_related("tags").order_by("id")
+        return [
+            [post.title, sorted(tag.name for tag in post.tags.all())] async for post in posts.aiterator(chunk_size=2)
+        ]
+
+    @api.get("/chunks-of-size/{size}")
+    async def chunks_of_size(size: int):
+        try:
+            return [name async for name in Author.objects.using(ALIAS).values_list("name", flat=True).aiterator(size)]
+        except ValueError as error:
+            return {"error": str(error)}
+
+    @api.get("/chunks-division-by-zero")
+    async def chunks_division_by_zero():
+        authors = Author.objects.using(ALIAS).extra(where=["1 / (id - id) = 1"])
+        try:
+            return [author.id async for author in authors.aiterator(chunk_size=2)]
+        except Exception as error:
+            return {"module": type(error).__module__, "error": type(error).__qualname__}
+
     @api.get("/authors")
     async def authors():
         return [name async for name in Author.objects.using(ALIAS).values_list("name", flat=True).order_by("id")]
@@ -1534,6 +1602,163 @@ def test_async_for_gives_the_rows_of_the_sync_orm(on_loop, name):
         assert expected, "the query of this case must select rows"
 
 
+@pytest.mark.parametrize("name", sorted(QUERIES))
+def test_aiterator_gives_the_rows_of_the_sync_orm(on_loop, name):
+    queryset, plain = QUERIES[name]
+    expected = _as_json([plain(row) for row in queryset().iterator(chunk_size=2)])
+
+    with TestClient(_api()) as client:
+        response = client.get(f"/chunks/{name}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+def test_aiterator_builds_its_rows_on_the_thread_of_the_handler(on_loop):
+    with TestClient(_api()) as client:
+        threads = client.get("/chunk-threads").json()
+
+    handler = threads["handler"]
+    assert not handler.startswith(ORM_THREAD)
+    assert threads == {"handler": handler, "aiterator": [handler, handler]}
+
+
+def test_aiterator_uses_the_orm_pool_when_the_setting_is_off(loop_db):
+    with TestClient(_api()) as client:
+        threads = client.get("/chunk-threads").json()
+
+    assert all(name.startswith(ORM_THREAD) for name in threads["aiterator"]), threads
+
+
+def _wait_for_last_statement(db: LoopDb, pid: int, start: str) -> str:
+    """Wait until the last statement of the connection ``pid`` starts with ``start``."""
+    deadline = time.monotonic() + 5
+    while not (statement := _last_statement(db, pid)).startswith(start):
+        assert time.monotonic() < deadline, statement
+        time.sleep(0.01)
+    return statement
+
+
+@pytest.mark.parametrize("rows", [2, 1], ids=["to_the_last_row", "stopped_after_one_row"])
+def test_aiterator_reads_a_cursor_of_the_server_on_one_connection_and_closes_it(on_loop, rows):
+    """Django reads the chunks from a cursor of the server, and closes the cursor also when the read stops early."""
+    with TestClient(_api()) as client:
+        backends = client.get(f"/chunk-backends/{rows}").json()
+        pids = backends["pids"]
+        assert len(pids) == rows
+        # Each chunk comes from the connection that has the cursor. The other reads use the other connection.
+        assert len(set(pids)) == 1
+        assert set(backends["other"]).isdisjoint(pids)
+        _wait_for_last_statement(on_loop, pids[0], "CLOSE ")
+        # The cursor gave its place on the connection back.
+        assert client.get("/authors").json() == ["Ada", "Bob", "Cy"]
+
+
+def test_the_cursor_of_aiterator_gives_its_connection_back(on_loop, monkeypatch, one_statement_for_each_connection):
+    """With one connection that takes one statement, the read after a cursor needs the place of the cursor."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_ACQUIRE_SECONDS", "5")
+    with TestClient(_api()) as client:
+        threads = client.get("/chunk-threads").json()
+        after = client.get("/authors")
+
+    assert threads["aiterator"] == [threads["handler"]] * 2
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
+def test_a_read_that_stops_while_its_cursor_opens_gives_its_connection_back(
+    on_loop, monkeypatch, one_statement_for_each_connection
+):
+    """The server can make the cursor after the read stopped. The cursor then closes, and its place comes back."""
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    with TestClient(_api()) as client:
+        response = client.get("/cancelled-cursor")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"same_connection": True}
+
+
+def test_aiterator_of_a_model_whose_rows_need_a_query_builds_its_chunks_on_a_thread(on_loop):
+    built = []
+
+    def count_authors(sender: Any, instance: Any, **kwargs: Any) -> None:
+        built.append(threading.current_thread().name)
+        instance.authors = Author.objects.using(ALIAS).count()
+
+    post_init.connect(count_authors, sender=LoopProbe)
+    try:
+        with TestClient(_api()) as client:
+            response = client.get("/chunk-threads")
+    finally:
+        post_init.disconnect(count_authors, sender=LoopProbe)
+
+    assert response.status_code == 200, response.text
+    threads = response.json()
+    assert all(name.startswith(ORM_THREAD) for name in threads["aiterator"]), threads
+    # The event loop stopped at the first row. A thread then built that row again, and the row of the next chunk.
+    assert len(threads["aiterator"]) == 2
+    assert [name.startswith(ORM_THREAD) for name in built] == [False, True, True]
+
+
+def test_aiterator_reads_many_cursors_at_one_time(on_loop):
+    with TestClient(_api()) as client:
+        streams = client.get("/chunks-together").json()
+
+    assert len(streams) == 3
+    for stream in streams:
+        assert [label for label, _pid in stream] == ["b", "a"]
+        assert len({pid for _label, pid in stream}) == 1
+
+
+def test_aiterator_with_one_connection_reads_other_statements_between_its_chunks(on_loop, monkeypatch):
+    monkeypatch.setenv("DJANGO_BOLT_LOOP_CONNECTIONS", "1")
+    with TestClient(_api()) as client:
+        backends = client.get("/chunk-backends/2").json()
+
+    assert len(set(backends["pids"] + backends["other"])) == 1
+    assert len(backends["pids"]) == 2
+
+
+def test_aiterator_without_server_side_cursors_reads_the_rows_in_one_statement(on_loop, monkeypatch):
+    """``DISABLE_SERVER_SIDE_CURSORS`` is for a connection pooler that gives each statement another connection."""
+    monkeypatch.setitem(connections.settings[ALIAS], "DISABLE_SERVER_SIDE_CURSORS", True)
+    with TestClient(_api()) as client:
+        threads = client.get("/chunk-threads").json()
+        backends = client.get("/chunk-backends/2").json()
+
+    assert threads["aiterator"] == [threads["handler"]] * 2
+    # No cursor keeps a place on the connection, so the other reads take the same idle connection.
+    assert len(set(backends["pids"])) == 1
+    assert backends["other"] == backends["pids"]
+
+
+def test_aiterator_with_prefetch_related_loads_its_relations(on_loop):
+    """The prefetch queries are sync code, so such a QuerySet stays on the thread path."""
+    with TestClient(_api()) as client:
+        response = client.get("/chunks-with-prefetch")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [["Loops", ["django", "rust"]], ["Lanes", ["rust"]], ["Pools", ["django", "rust"]]]
+
+
+@pytest.mark.parametrize("size", [1, 3, 2000, 0])
+def test_aiterator_takes_each_chunk_size_of_django(on_loop, size):
+    with TestClient(_api()) as client:
+        response = client.get(f"/chunks-of-size/{size}")
+
+    expected = ["Ada", "Bob", "Cy"] if size else {"error": "Chunk size must be strictly positive."}
+    assert sorted(response.json()) == sorted(expected)
+
+
+def test_a_query_error_of_aiterator_is_the_django_error_and_the_next_query_works(on_loop):
+    with TestClient(_api()) as client:
+        error = client.get("/chunks-division-by-zero").json()
+        after = client.get("/authors")
+
+    assert error == {"module": "django.db.utils", "error": "DataError"}
+    assert after.json() == ["Ada", "Bob", "Cy"]
+
+
 @pytest.mark.parametrize("name", sorted(GETS))
 def test_aget_gives_the_object_or_the_error_of_get(on_loop, name):
     queryset, arguments = GETS[name]
@@ -1668,6 +1893,8 @@ def test_afirst_and_alast_build_their_row_on_the_thread_of_the_handler(on_loop):
         "/aggregate/over_an_annotation",
         # The offset is after the last row, so the pagination sends only the statement of the count.
         "/authors-after/0?offset=50",
+        # The pagination sends the statement of the count and the statement of the rows of the page.
+        "/authors-after/0?limit=2&offset=1",
     ],
 )
 def test_a_count_and_an_aggregate_open_no_django_connection(on_loop, path):
