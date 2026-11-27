@@ -5,13 +5,9 @@ from __future__ import annotations
 import contextlib
 import inspect
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from .._deprecation import warn_deprecated
 from ..exceptions import RequestValidationError
-
-if TYPE_CHECKING:
-    from .types import WebSocket
 
 
 def build_websocket_request(scope: dict[str, Any]) -> dict[str, Any]:
@@ -86,17 +82,11 @@ def invalid_request_detail(error: BaseException) -> str | None:
     return "; ".join(details) or str(error)
 
 
-def is_websocket_handler(func: Callable[..., Any]) -> bool:
-    """Deprecated. Check if a function is a WebSocket handler."""
-    warn_deprecated("is_websocket_handler()")
-    return getattr(func, "_is_websocket_handler", False)
-
-
 def mark_websocket_handler(func: Callable[..., Any]) -> Callable[..., Any]:
     """Mark a function as a WebSocket handler.
 
     A bound method cannot hold an attribute. The mark goes on its function, and
-    `is_websocket_handler` reads it through the method.
+    a read of the attribute through the method finds it.
     """
     getattr(func, "__func__", func)._is_websocket_handler = True
     return func
@@ -135,42 +125,3 @@ def get_websocket_param_name(func: Callable[..., Any]) -> str | None:
     # Return first parameter as fallback
     params = list(sig.parameters.keys())
     return params[0] if params else None
-
-
-async def run_websocket_handler(
-    handler: Callable[..., Any],
-    websocket: WebSocket,
-    path_params: dict[str, str] | None = None,
-    **extra_kwargs: Any,
-) -> None:
-    """
-    Deprecated. Run a WebSocket handler with proper parameter injection.
-
-    Args:
-        handler: The WebSocket handler function
-        websocket: The WebSocket connection object
-        path_params: Path parameters from URL matching
-        extra_kwargs: Additional keyword arguments
-    """
-    warn_deprecated("run_websocket_handler()", "Register the handler with `@api.websocket()`.")
-    kwargs: dict[str, Any] = {}
-
-    # Find the WebSocket parameter name
-    ws_param = get_websocket_param_name(handler)
-    if ws_param:
-        kwargs[ws_param] = websocket
-
-    # Add path parameters
-    if path_params:
-        sig = inspect.signature(handler)
-        for name, value in path_params.items():
-            if name in sig.parameters and name != ws_param:
-                kwargs[name] = value
-
-    # Add extra kwargs
-    kwargs.update(extra_kwargs)
-
-    # Call the handler
-    result = handler(**kwargs)
-    if inspect.iscoroutine(result):
-        await result
