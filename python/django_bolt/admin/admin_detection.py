@@ -5,7 +5,6 @@ Utilities for detecting and configuring Django admin integration.
 from __future__ import annotations
 
 import contextlib
-import logging
 import sys
 
 from django.conf import settings
@@ -14,8 +13,6 @@ from django.contrib.sessions.middleware import SessionMiddleware
 from django.urls import NoReverseMatch, get_resolver, get_script_prefix, reverse
 from django.utils import translation
 from django.utils.module_loading import import_string
-
-logger = logging.getLogger(__name__)
 
 
 def _has_session_middleware() -> bool:
@@ -162,64 +159,6 @@ def admin_url_needs_path_parameter() -> bool:
     return False
 
 
-def get_admin_route_patterns() -> list[tuple[str, list[str]]]:
-    """
-    Get route patterns to register for Django admin.
-
-    Returns:
-        List of (path_pattern, methods) tuples for admin routes
-        Example: [('/admin/{path:path}', ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])]
-    """
-    if not is_admin_installed():
-        return []
-
-    # Detect admin URL prefix
-    admin_prefix = detect_admin_url_prefix()
-    if not admin_prefix:
-        return []
-
-    # Build catch-all pattern for admin routes
-    # Use {path:path} syntax for catch-all parameter
-    admin_pattern = f"/{admin_prefix}/{{path:path}}"
-
-    # Admin needs to handle common HTTP methods
-    # Only use methods supported by django-bolt's router (GET, POST, PUT, PATCH, DELETE)
-    methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
-
-    # Also add exact /admin route (without trailing slash)
-    # NOTE: NormalizePath::trim() in Rust strips trailing slashes from incoming requests,
-    # so we register routes WITHOUT trailing slashes to match the normalized paths.
-    # However, for TestClient with use_http_layer=True, we also need the trailing slash version.
-    admin_root = f"/{admin_prefix}"
-    admin_root_slash = f"/{admin_prefix}/"
-
-    return [
-        (admin_root, methods),
-        (admin_root_slash, methods),
-        (admin_pattern, methods),
-    ]
-
-
-def get_static_url_prefix() -> str | None:
-    """
-    Get the STATIC_URL prefix from Django settings.
-
-    Returns:
-        Static URL prefix (e.g., 'static') or None if not configured
-    """
-    try:
-        if hasattr(settings, "STATIC_URL") and settings.STATIC_URL:
-            static_url = settings.STATIC_URL
-            # Remove leading/trailing slashes
-            return static_url.strip("/")
-    except Exception as e:
-        logger.warning(
-            "Failed to get STATIC_URL from Django settings. Static file serving may not work correctly. Error: %s", e
-        )
-
-    return None
-
-
 def should_enable_admin() -> bool:
     """
     Determine if admin should be auto-enabled.
@@ -268,18 +207,3 @@ def should_enable_admin() -> bool:
     except Exception as e:
         print(f"[django-bolt] Warning: Could not check admin dependencies: {e}", file=sys.stderr)
         return False
-
-
-def get_admin_info() -> dict:
-    """
-    Get information about Django admin configuration.
-
-    Returns:
-        Dict with admin configuration details
-    """
-    return {
-        "installed": is_admin_installed(),
-        "enabled": should_enable_admin(),
-        "url_prefix": detect_admin_url_prefix(),
-        "static_url": get_static_url_prefix(),
-    }

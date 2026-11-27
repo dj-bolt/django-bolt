@@ -1142,10 +1142,6 @@ class Command(BaseCommand):
         if middleware_count:
             features.append(("Middleware", f"{middleware_count} handlers"))
 
-        # Register authentication backends for user resolution (request.user loading)
-        # CRITICAL: Must be called BEFORE starting server so backends are available for user loading
-        merged_api._register_auth_backends()
-
         # Print structured startup banner (only for main process or single-process mode)
         if process_id is None:
             if is_dev_reload_restart:

@@ -13,8 +13,6 @@ from typing import (
     runtime_checkable,
 )
 
-from ._core import PyRequest
-
 if TYPE_CHECKING:
     from django.contrib.sessions.backends.base import SessionBase
 
@@ -121,11 +119,6 @@ class Request(Protocol):
         ...
 
 
-def is_request(request: Any):
-    return isinstance(request, PyRequest)
-
-
 __all__ = [
     "Request",
-    "is_request",
 ]
