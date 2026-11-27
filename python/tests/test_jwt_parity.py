@@ -264,6 +264,24 @@ def test_json_that_is_not_utf8_is_refused(client, part, encoding):
     assert (bolt_accepts(client, "plain", token), pyjwt_accepts("plain", token)) == (False, True)
 
 
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [
+        (HS256, '"is_staff":{"a":"\xff"}'),
+        (HS256, '"permissions":[{"a":"\xff"}]'),
+        (HS256, '"aud":{"a":"\xff"}'),
+        (HS256, '"x":"\xff"'),
+        ('{"alg":"HS256","x":"\xff"}', '"x":1'),
+        ('{"alg":"HS256","x":{"a":"\xff"}}', '"x":1'),
+    ],
+)
+def test_a_byte_that_is_not_utf8_is_refused_in_each_value(client, header, value):
+    """RFC 7515, section 5.2 and RFC 7519, section 7.2: each part is UTF-8, also in a value that Bolt does not read."""
+    claims = f'{{"sub":"1","exp":{int(time.time()) + 3600},{value}}}'
+    token = _signed(header.encode("latin-1"), claims.encode("latin-1"))
+    assert (bolt_accepts(client, "plain", token), pyjwt_accepts("plain", token)) == (False, False)
+
+
 def test_an_empty_jti_fails_require_jti():
     """An empty jti names no token. The `require` option of PyJWT checks only that the claim is present."""
     api = BoltAPI()

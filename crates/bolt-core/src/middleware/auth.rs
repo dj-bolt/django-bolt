@@ -463,10 +463,16 @@ impl<'de> Deserialize<'de> for Claims {
     }
 }
 
+/// A part of a token as text. Each part is UTF-8 (RFC 7515, section 5.2).
+/// serde_json does not check the UTF-8 of a value that it skips in a slice.
+fn token_text(bytes: &[u8]) -> serde_json::Result<&str> {
+    std::str::from_utf8(bytes).map_err(de::Error::custom)
+}
+
 /// Parse the claims of a token. A claim that Bolt checks on each token must
 /// have its JSON type, see [`ClaimsVisitor`].
 fn parse_token_claims(bytes: &[u8]) -> serde_json::Result<Claims> {
-    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let mut deserializer = serde_json::Deserializer::from_str(token_text(bytes)?);
     let claims = deserializer.deserialize_map(ClaimsVisitor { strict: true })?;
     deserializer.end()?;
     Ok(claims)
@@ -1245,7 +1251,7 @@ fn decode_and_validate(
     let (header_b64, claims_b64) = message.split_once('.')?;
 
     let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).ok()?;
-    let header: TokenHeader = match serde_json::from_slice(&header_bytes) {
+    let header: TokenHeader = match token_text(&header_bytes).and_then(serde_json::from_str) {
         Ok(header) => header,
         Err(e) => {
             log::debug!("JWT rejected: header failed to parse: {}", e);
@@ -1604,6 +1610,11 @@ mod tests {
     /// Build a token from raw JSON parts so tests can emit headers that
     /// `jsonwebtoken::Header` cannot represent (non-string extras).
     fn sign_token(header_json: &str, claims_json: &str, alg: Algorithm) -> String {
+        sign_bytes(header_json.as_bytes(), claims_json.as_bytes(), alg)
+    }
+
+    /// [`sign_token`] for parts that need not be UTF-8.
+    fn sign_bytes(header_json: &[u8], claims_json: &[u8], alg: Algorithm) -> String {
         let message = format!(
             "{}.{}",
             URL_SAFE_NO_PAD.encode(header_json),
@@ -2964,6 +2975,39 @@ mod tests {
         assert!(!passes(r#"["HS256"]"#, &with_exp("")));
         assert!(!passes(r#"{"alg":"HS256"}"#, &format!(r#"["42",{exp}]"#)));
         assert!(!passes(r#"{"alg":"HS256"}"#, "42"));
+    }
+
+    /// RFC 7515, section 5.2 and RFC 7519, section 7.2: each part is UTF-8,
+    /// also in a value that Bolt does not read.
+    #[test]
+    fn a_byte_that_is_not_utf8_is_refused_in_each_value() {
+        let exp = future_exp();
+        let header = br#"{"alg":"HS256"}"#.as_slice();
+        let claims = format!(r#"{{"sub":"42","exp":{exp}}}"#).into_bytes();
+        let valid = |header: &[u8], claims: &[u8]| {
+            validate(&sign_bytes(header, claims, Algorithm::HS256), None, 0).is_some()
+        };
+        assert!(valid(header, &claims));
+        for bad_header in [
+            b"{\"alg\":\"HS256\",\"x\":\"\xff\"}".as_slice(),
+            b"{\"alg\":\"HS256\",\"x\":{\"a\":\"\xff\"}}",
+            b"{\"alg\":\"HS256\",\"x\":[\"\xff\"]}",
+        ] {
+            assert!(!valid(bad_header, &claims), "{}", bad_header.escape_ascii());
+        }
+        for value in [
+            b"\"is_staff\":{\"a\":\"\xff\"}".as_slice(),
+            b"\"permissions\":[{\"a\":\"\xff\"}]",
+            b"\"aud\":{\"\xff\":1}",
+            b"\"amr\":[[\"\xff\"]]",
+            b"\"x\":\"\xff\"",
+        ] {
+            let mut bad_claims = format!(r#"{{"sub":"42","exp":{exp},"#).into_bytes();
+            bad_claims.extend_from_slice(value);
+            bad_claims.push(b'}');
+            assert!(!valid(header, &bad_claims), "{}", value.escape_ascii());
+            assert!(parse_token_claims(&bad_claims).is_err());
+        }
     }
 
     #[test]
