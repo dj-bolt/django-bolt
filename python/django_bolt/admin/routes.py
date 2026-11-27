@@ -1,7 +1,6 @@
 """Django admin route registration via ASGI mount."""
 
 import sys
-import warnings
 from typing import TYPE_CHECKING
 
 from django.core.asgi import get_asgi_application
@@ -22,15 +21,8 @@ class AdminRouteRegistrar:
     def __init__(self, api: "BoltAPI"):
         self.api = api
 
-    def register_routes(self, host: str | None = None, port: int | None = None) -> None:
-        """Mount Django admin. The deprecated ``host`` and ``port`` have no effect."""
-        if host is not None or port is not None:
-            warnings.warn(
-                "The host and port arguments of register_routes() are deprecated. They have no effect. "
-                "Bolt removes them in the next minor release. Call register_routes() with no arguments.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+    def register_routes(self) -> None:
+        """Mount Django admin."""
         if self.api._admin_routes_registered:
             return
 
