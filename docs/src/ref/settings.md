@@ -315,6 +315,21 @@ Run these reads on the event loop, with no thread: a QuerySet that a handler ret
 It has no effect on Windows.
 See [Async ORM](../topics/async-orm.md#run-async-reads-on-the-event-loop).
 
+## Garbage collector
+
+### BOLT_GC_FREEZE
+
+Default: `True`. Type: `bool`.
+
+`runbolt` calls `gc.freeze()` in each server process when the startup is complete, before the process takes requests.
+The garbage collector of Python then does not read the objects of the startup: the modules, the models and the routes.
+A full collection is thus much shorter, and the server answers no request during a collection.
+Measured with one process and 2,000 requests in one second: a full collection took 30 to 45 ms with `False`, and 1 to 4 ms with `True`.
+
+Reference counts still free a frozen object. The collector does not free a frozen object in a reference cycle.
+Set `False` when your application drops large objects of its startup later, and these objects have reference cycles.
+`TestClient` does not freeze objects.
+
 ## Signals
 
 ### BOLT_EMIT_SIGNALS

@@ -23,6 +23,7 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
+from django_bolt._gc import freeze_setting, freeze_startup_objects
 from django_bolt._script_prefix import asgi_mounts, mcp_mounts, refuse_files_at_script_name
 from django_bolt._script_prefix import configure as configure_script_prefix
 from django_bolt._urlconf import served_apis
@@ -773,6 +774,8 @@ class Command(BaseCommand):
         A check error raises SystemCheckError, which stops startup with a
         non-zero exit code, like runserver.
         """
+        # Refuse the setting here, or each worker refuses it after the banner.
+        freeze_setting()
         if not options.get("skip_checks"):
             self.check(display_num_errors=True)
         self.check_migrations()
@@ -1169,21 +1172,10 @@ class Command(BaseCommand):
         # The lifespans of the API, of the APIs that it merges, and of the APIs that they mount.
         source_lifespans = merged_api._source_lifespans
 
-        # Start the server (all handlers go through async dispatch with thread pool for sync)
-        if source_lifespans:
-
-            def server_fn():
-                _core.start_server(
-                    merged_api._dispatch,
-                    options["host"],
-                    options["port"],
-                    compression_config,
-                    merged_api._rust_error_renderer(script_prefix),
-                )
-
-            with contextlib.suppress(KeyboardInterrupt):
-                asyncio.run(serve_with_lifespan(source_lifespans, server_fn))
-        else:
+        def serve() -> None:
+            # The startup is complete here: the routes are compiled, and each lifespan started.
+            freeze_startup_objects()
+            # All handlers go through async dispatch, with a thread pool for sync handlers.
             _core.start_server(
                 merged_api._dispatch,
                 options["host"],
@@ -1191,6 +1183,12 @@ class Command(BaseCommand):
                 compression_config,
                 merged_api._rust_error_renderer(script_prefix),
             )
+
+        if source_lifespans:
+            with contextlib.suppress(KeyboardInterrupt):
+                asyncio.run(serve_with_lifespan(source_lifespans, serve))
+        else:
+            serve()
 
     # ------------------------------------------------------------------
     # Startup banner
