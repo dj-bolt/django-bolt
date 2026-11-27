@@ -34,7 +34,11 @@ def freeze_setting() -> bool:
 
 
 def freeze_startup_objects() -> None:
-    """Freeze the objects of this process. Call it when the startup is complete, before the server takes requests.
+    """Freeze the objects of this process. The Rust server calls it when it starts: see ``start_server``.
+
+    The startup is complete then: the routes are registered, and each
+    lifespan started. A process with no server does not come here, so a test
+    process that runs the ``runbolt`` command with no server freezes nothing.
 
     Reference counts still free a frozen object. The collector does not: a
     frozen object in a reference cycle stays for the life of the process. So
