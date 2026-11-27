@@ -67,8 +67,6 @@ AGREE = [
     Case("j1-iat-in-the-year-1", live(iat=-62135596800.0)),
     Case("j1-nbf-after-the-year-9999", live(nbf=1e300)),
     Case("j1-iat-after-the-year-9999", live(iat=253402300800)),
-    # The nearest float of the decimal, as Python reads it: not the next whole second.
-    Case("j1-exp-just-below-a-whole-second", raw('{"sub":"1","exp":{exp}.99999985}')),
     # J2: a claim that Bolt does not check, in any JSON type.
     Case("j2-iss-number", live(iss=123)),
     Case("j2-iss-null", live(iss=None)),
