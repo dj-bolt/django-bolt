@@ -316,6 +316,9 @@ def make_verify_token(oauth_resource: Any) -> Any:
         user_id = claims.get("sub")
         if user_id is not None and not isinstance(user_id, str):
             return None
+        if "sub" in claims and user_id is None:
+            # A null `sub` is a missing `sub`. Rust reads a typed claim of null as malformed.
+            claims = {name: value for name, value in claims.items() if name != "sub"}
         permissions = claims.get("permissions")
         if not (isinstance(permissions, (list, tuple)) and all(isinstance(name, str) for name in permissions)):
             permissions = []

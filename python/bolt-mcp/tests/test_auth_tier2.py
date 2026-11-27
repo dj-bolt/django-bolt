@@ -187,6 +187,31 @@ def test_a_verified_sub_that_is_not_a_string_is_refused(sub):
     assert make_verify_token(resource)("token") is None
 
 
+def test_a_verified_null_sub_is_a_missing_sub():
+    """A ``token_verifier`` that gives ``"sub": null`` gives no subject, as a missing ``sub`` does."""
+    api = BoltAPI()
+    mcp = MCP("oauth-null-sub")
+
+    @mcp.tool
+    async def claims(request: Request) -> dict:
+        context = principal(request)
+        return {"user_id": context.get("user_id"), "auth_claims": context.get("auth_claims")}
+
+    @mcp.tool(guards=[Requires("sub", none_of=["blocked"])])
+    async def not_blocked() -> dict:
+        return {"ok": True}
+
+    resource = ProtectedResource(resource_url=RESOURCE_URL, token_verifier=lambda _token: {"sub": None, "role": "r"})
+    mount_mcp(api, mcp, oauth=resource)
+    bearer = "Bearer opaque-token"
+    with TestClient(api) as client:
+        resp, session_id = initialize(client, authorization=bearer)
+        assert resp.status_code == 200
+        # A guard reads a missing claim, so `none_of` lets the call pass.
+        assert _call(client, bearer, session_id, "not_blocked") == {"ok": True}
+        assert _call(client, bearer, session_id, "claims") == {"user_id": None, "auth_claims": {"role": "r"}}
+
+
 def test_scope_claim_accepts_string_and_json_arrays():
     resource = ProtectedResource(
         resource_url=RESOURCE_URL,
