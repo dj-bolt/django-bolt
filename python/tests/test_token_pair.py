@@ -348,6 +348,29 @@ class TestRotation:
             await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, max_session_lifetime=3600)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("rotate", [True, False], ids=["mode-a", "mode-b"])
+    @pytest.mark.parametrize(
+        ("claim", "value", "message"),
+        [
+            ("fam", None, "family"),
+            ("fam", 7, "family"),
+            ("oat", None, "origin auth time"),
+            ("amr", None, "authentication methods"),
+            ("amr", "pwd", "authentication methods"),
+            ("amr", ["pwd", 1], "authentication methods"),
+            ("ver", None, "version"),
+        ],
+    )
+    async def test_a_malformed_claim_is_rotation_error(self, rotate, claim, value, message):
+        """``auth_claims`` gives a claim of another JSON form as ``None``. Rotation reads it, so it fails."""
+        store = InMemoryRevocation()
+        pair = create_token_pair("u", secret=SECRET, method="pwd")
+        pair.refresh_claims[claim] = value
+
+        with pytest.raises(TokenRotationError, match=message):
+            await rotate_refresh_token(pair.refresh_claims, store=store, secret=SECRET, rotate=rotate)
+
+    @pytest.mark.asyncio
     async def test_future_oat_is_rejected(self):
         store = InMemoryRevocation()
         pair = create_token_pair("u", secret=SECRET)

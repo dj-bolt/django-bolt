@@ -2,26 +2,30 @@ use ahash::AHashMap;
 use aws_lc_rs::{constant_time, hmac};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, crypto, get_current_timestamp};
+use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, crypto};
 use pyo3::IntoPyObjectExt;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString};
-use serde::{Deserialize, Serialize};
+use pyo3::types::{PyDict, PyFloat, PyString};
+use serde::Deserialize;
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde_json::Number;
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::hash::{BuildHasher, RandomState};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 use std::str::FromStr;
 
 /// JWT `aud` claim: RFC 7519 §4.1.3 allows a single string or an array of
 /// strings. Real-world providers (e.g. Auth0) emit both forms.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum Audience {
     Single(String),
     Multiple(Vec<String>),
@@ -36,26 +40,422 @@ impl Audience {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A claim that [`Claims`] types. Each has one bit in a [`ClaimSet`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedClaim {
+    Sub,
+    Jti,
+    Typ,
+    Exp,
+    Nbf,
+    Iat,
+    Iss,
+    Aud,
+    Fam,
+    Oat,
+    Ver,
+    Amr,
+    IsStaff,
+    IsSuperuser,
+    IsAdmin,
+    Permissions,
+}
+
+impl TypedClaim {
+    const ALL: [TypedClaim; 16] = [
+        Self::Sub,
+        Self::Jti,
+        Self::Typ,
+        Self::Exp,
+        Self::Nbf,
+        Self::Iat,
+        Self::Iss,
+        Self::Aud,
+        Self::Fam,
+        Self::Oat,
+        Self::Ver,
+        Self::Amr,
+        Self::IsStaff,
+        Self::IsSuperuser,
+        Self::IsAdmin,
+        Self::Permissions,
+    ];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "sub" => Self::Sub,
+            "jti" => Self::Jti,
+            "typ" => Self::Typ,
+            "exp" => Self::Exp,
+            "nbf" => Self::Nbf,
+            "iat" => Self::Iat,
+            "iss" => Self::Iss,
+            "aud" => Self::Aud,
+            "fam" => Self::Fam,
+            "oat" => Self::Oat,
+            "ver" => Self::Ver,
+            "amr" => Self::Amr,
+            "is_staff" => Self::IsStaff,
+            "is_superuser" => Self::IsSuperuser,
+            "is_admin" => Self::IsAdmin,
+            "permissions" => Self::Permissions,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sub => "sub",
+            Self::Jti => "jti",
+            Self::Typ => "typ",
+            Self::Exp => "exp",
+            Self::Nbf => "nbf",
+            Self::Iat => "iat",
+            Self::Iss => "iss",
+            Self::Aud => "aud",
+            Self::Fam => "fam",
+            Self::Oat => "oat",
+            Self::Ver => "ver",
+            Self::Amr => "amr",
+            Self::IsStaff => "is_staff",
+            Self::IsSuperuser => "is_superuser",
+            Self::IsAdmin => "is_admin",
+            Self::Permissions => "permissions",
+        }
+    }
+
+    /// Bolt checks this claim on each token, so a token with it in another
+    /// JSON form fails (see [`parse_token_claims`]).
+    fn checked_on_each_token(self) -> bool {
+        matches!(
+            self,
+            Self::Sub | Self::Jti | Self::Typ | Self::Exp | Self::Nbf | Self::Iat
+        )
+    }
+
+    fn bit(self) -> u16 {
+        1 << self as u16
+    }
+}
+
+/// A set of typed claims, one bit for each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClaimSet(u16);
+
+impl ClaimSet {
+    pub fn contains(self, claim: TypedClaim) -> bool {
+        self.0 & claim.bit() != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Add `claim`. False when the set has it already.
+    pub fn insert(&mut self, claim: TypedClaim) -> bool {
+        let added = !self.contains(claim);
+        self.0 |= claim.bit();
+        added
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = TypedClaim> {
+        TypedClaim::ALL
+            .into_iter()
+            .filter(move |claim| self.contains(*claim))
+    }
+}
+
+/// The claims of a token. A claim has three states: missing, valid and
+/// malformed. A typed field holds its claim only in the exact JSON form of
+/// its type. In another form, also `null`, the field is `None` and
+/// `malformed` has the claim. Each reader of a malformed claim fails: a
+/// guard refuses, and `auth_claims` gives `None`. A token with a malformed
+/// claim fails only for a claim that Bolt checks (see [`parse_token_claims`]).
+#[derive(Debug, Clone, Default)]
 pub struct Claims {
-    pub sub: Option<String>,              // Subject (user ID)
-    pub exp: Option<i64>,                 // Expiry time
-    pub iat: Option<i64>,                 // Issued at
-    pub nbf: Option<i64>,                 // Not before
-    pub aud: Option<Audience>,            // Audience (string or array)
-    pub iss: Option<String>,              // Issuer
-    pub jti: Option<String>,              // JWT ID
-    pub typ: Option<String>,              // Token type ("access"/"refresh")
-    pub fam: Option<String>,              // Refresh-token rotation family
-    pub oat: Option<i64>,                 // Origin authentication time
-    pub ver: Option<i64>,                 // User token version
-    pub amr: Option<Vec<String>>,         // Authentication methods
-    pub is_staff: Option<bool>,           // Staff status
-    pub is_superuser: Option<bool>,       // Admin/superuser status
-    pub is_admin: Option<bool>,           // Alternative admin field
-    pub permissions: Option<Vec<String>>, // List of permissions
-    #[serde(flatten)]
+    pub sub: Option<String>,                       // Subject (user ID)
+    pub exp: Option<Number>,                       // Expiry time (NumericDate)
+    pub iat: Option<Number>,                       // Issued at (NumericDate)
+    pub nbf: Option<Number>,                       // Not before (NumericDate)
+    pub aud: Option<Audience>,                     // Audience (string or array)
+    pub iss: Option<String>,                       // Issuer
+    pub jti: Option<String>,                       // JWT ID
+    pub typ: Option<String>,                       // Token type ("access"/"refresh")
+    pub fam: Option<String>,                       // Refresh-token rotation family
+    pub oat: Option<i64>,                          // Origin authentication time
+    pub ver: Option<i64>,                          // User token version
+    pub amr: Option<Vec<String>>,                  // Authentication methods
+    pub is_staff: Option<bool>,                    // Staff status
+    pub is_superuser: Option<bool>,                // Admin/superuser status
+    pub is_admin: Option<bool>,                    // Alternative admin field
+    pub permissions: Option<Vec<String>>,          // List of permissions
     pub extra: HashMap<String, serde_json::Value>, // Any extra claims
+    /// The typed claims that the token gives in another JSON form.
+    pub malformed: ClaimSet,
+}
+
+/// The exact JSON form of a typed claim. A value of another JSON type gives
+/// `None`: the claim is then malformed.
+trait ExactForm: Sized {
+    fn from_bool(_: bool) -> Option<Self> {
+        None
+    }
+    fn from_i64(_: i64) -> Option<Self> {
+        None
+    }
+    fn from_u64(value: u64) -> Option<Self> {
+        i64::try_from(value).ok().and_then(Self::from_i64)
+    }
+    fn from_f64(_: f64) -> Option<Self> {
+        None
+    }
+    fn from_str(_: &str) -> Option<Self> {
+        None
+    }
+    fn from_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<Option<Self>, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+}
+
+impl ExactForm for bool {
+    fn from_bool(value: bool) -> Option<Self> {
+        Some(value)
+    }
+}
+
+impl ExactForm for i64 {
+    fn from_i64(value: i64) -> Option<Self> {
+        Some(value)
+    }
+    fn from_f64(value: f64) -> Option<Self> {
+        whole_i64(value)
+    }
+}
+
+/// `value` as an `i64` when it is a whole number in the range of `i64`.
+/// JSON does not tell `1` from `1.0` or `1e0` (RFC 8259, section 6).
+fn whole_i64(value: f64) -> Option<i64> {
+    // `i64::MIN as f64` is exact, and `i64::MAX as f64` is 2^63.
+    (value.fract() == 0.0 && value >= i64::MIN as f64 && value < i64::MAX as f64)
+        .then_some(value as i64)
+}
+
+impl ExactForm for String {
+    fn from_str(value: &str) -> Option<Self> {
+        Some(value.to_owned())
+    }
+}
+
+/// A NumericDate (RFC 7519, section 2): any JSON number, also with a fraction.
+/// A whole number in the range of `i64`, also as `N.0` or `Ne0`, becomes an
+/// integer. Thus a guard and Python see the same value as for `N`.
+impl ExactForm for Number {
+    fn from_i64(value: i64) -> Option<Self> {
+        Some(value.into())
+    }
+    fn from_u64(value: u64) -> Option<Self> {
+        Some(value.into())
+    }
+    fn from_f64(value: f64) -> Option<Self> {
+        whole_i64(value).map_or_else(|| Number::from_f64(value), |whole| Some(whole.into()))
+    }
+}
+
+/// An array of strings. An array with an item of another type gives `None`.
+impl ExactForm for Vec<String> {
+    fn from_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<Option<Self>, A::Error> {
+        let mut items = Some(Vec::new());
+        while let Some(item) = seq.next_element_seed(Lenient::<String>::default())? {
+            match (item, items.as_mut()) {
+                (Some(item), Some(items)) => items.push(item),
+                (None, _) => items = None,
+                (Some(_), None) => {}
+            }
+        }
+        Ok(items)
+    }
+}
+
+impl ExactForm for Audience {
+    fn from_str(value: &str) -> Option<Self> {
+        Some(Audience::Single(value.to_owned()))
+    }
+    fn from_seq<'de, A: SeqAccess<'de>>(seq: A) -> Result<Option<Self>, A::Error> {
+        Ok(Vec::<String>::from_seq(seq)?.map(Audience::Multiple))
+    }
+}
+
+/// Reads a JSON value of any type, and gives it only in the exact form `T`.
+struct Lenient<T>(PhantomData<T>);
+
+impl<T> Default for Lenient<T> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<'de, T: ExactForm> DeserializeSeed<'de> for Lenient<T> {
+    type Value = Option<T>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Option<T>, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de, T: ExactForm> Visitor<'de> for Lenient<T> {
+    type Value = Option<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+    fn visit_bool<E>(self, value: bool) -> Result<Option<T>, E> {
+        Ok(T::from_bool(value))
+    }
+    fn visit_i64<E>(self, value: i64) -> Result<Option<T>, E> {
+        Ok(T::from_i64(value))
+    }
+    fn visit_u64<E>(self, value: u64) -> Result<Option<T>, E> {
+        Ok(T::from_u64(value))
+    }
+    fn visit_f64<E>(self, value: f64) -> Result<Option<T>, E> {
+        Ok(T::from_f64(value))
+    }
+    fn visit_str<E>(self, value: &str) -> Result<Option<T>, E> {
+        Ok(T::from_str(value))
+    }
+    fn visit_unit<E>(self) -> Result<Option<T>, E> {
+        Ok(None)
+    }
+    fn visit_none<E>(self) -> Result<Option<T>, E> {
+        Ok(None)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Option<T>, A::Error> {
+        T::from_seq(seq)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Option<T>, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+}
+
+/// An object key. It borrows from the input when it has no escape.
+struct Key<'de>(Cow<'de, str>);
+
+impl<'de> Deserialize<'de> for Key<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = Key<'de>;
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string key")
+            }
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Key<'de>, E> {
+                Ok(Key(Cow::Borrowed(value)))
+            }
+            fn visit_str<E>(self, value: &str) -> Result<Key<'de>, E> {
+                Ok(Key(Cow::Owned(value.to_owned())))
+            }
+            fn visit_string<E>(self, value: String) -> Result<Key<'de>, E> {
+                Ok(Key(Cow::Owned(value)))
+            }
+        }
+        deserializer.deserialize_str(KeyVisitor)
+    }
+}
+
+fn duplicate_name<E: de::Error>(name: &str) -> E {
+    E::custom(format_args!("duplicate name `{name}`"))
+}
+
+/// Reads a JSON object of claims in one pass.
+///
+/// A name that occurs two times is an error (RFC 7519, section 4 allows it).
+/// A typed claim in another JSON type, also `null`, is malformed. With
+/// `strict`, a malformed claim that Bolt checks on each token is an error:
+/// `sub` and `jti` (strings, as PyJWT requires), `typ` (a string), and `exp`,
+/// `nbf` and `iat` (numbers).
+struct ClaimsVisitor {
+    strict: bool,
+}
+
+/// Read the next value into `field`. False when the value is malformed.
+fn read_typed<'de, T: ExactForm, A: MapAccess<'de>>(
+    map: &mut A,
+    field: &mut Option<T>,
+) -> Result<bool, A::Error> {
+    *field = map.next_value_seed(Lenient::default())?;
+    Ok(field.is_some())
+}
+
+impl<'de> Visitor<'de> for ClaimsVisitor {
+    type Value = Claims;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON object of claims")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Claims, A::Error> {
+        let mut claims = Claims::default();
+        let mut seen = ClaimSet::default();
+        while let Some(Key(name)) = map.next_key()? {
+            let Some(claim) = TypedClaim::from_name(&name) else {
+                let value = map.next_value()?;
+                match claims.extra.entry(name.into_owned()) {
+                    Entry::Occupied(entry) => return Err(duplicate_name(entry.key())),
+                    Entry::Vacant(entry) => entry.insert(value),
+                };
+                continue;
+            };
+            if !seen.insert(claim) {
+                return Err(duplicate_name(&name));
+            }
+            let valid = match claim {
+                TypedClaim::Sub => read_typed(&mut map, &mut claims.sub)?,
+                TypedClaim::Jti => read_typed(&mut map, &mut claims.jti)?,
+                TypedClaim::Typ => read_typed(&mut map, &mut claims.typ)?,
+                TypedClaim::Exp => read_typed(&mut map, &mut claims.exp)?,
+                TypedClaim::Nbf => read_typed(&mut map, &mut claims.nbf)?,
+                TypedClaim::Iat => read_typed(&mut map, &mut claims.iat)?,
+                TypedClaim::Iss => read_typed(&mut map, &mut claims.iss)?,
+                TypedClaim::Aud => read_typed(&mut map, &mut claims.aud)?,
+                TypedClaim::Fam => read_typed(&mut map, &mut claims.fam)?,
+                TypedClaim::Oat => read_typed(&mut map, &mut claims.oat)?,
+                TypedClaim::Ver => read_typed(&mut map, &mut claims.ver)?,
+                TypedClaim::Amr => read_typed(&mut map, &mut claims.amr)?,
+                TypedClaim::IsStaff => read_typed(&mut map, &mut claims.is_staff)?,
+                TypedClaim::IsSuperuser => read_typed(&mut map, &mut claims.is_superuser)?,
+                TypedClaim::IsAdmin => read_typed(&mut map, &mut claims.is_admin)?,
+                TypedClaim::Permissions => read_typed(&mut map, &mut claims.permissions)?,
+            };
+            if !valid {
+                if self.strict && claim.checked_on_each_token() {
+                    return Err(de::Error::custom(format_args!(
+                        "claim `{name}` has the wrong JSON type"
+                    )));
+                }
+                claims.malformed.insert(claim);
+            }
+        }
+        Ok(claims)
+    }
+}
+
+/// Lenient: each typed claim of another JSON type is malformed, with no
+/// error. The MCP bridge reads the claims of a verified principal this way.
+impl<'de> Deserialize<'de> for Claims {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(ClaimsVisitor { strict: false })
+    }
+}
+
+/// Parse the claims of a token. A claim that Bolt checks on each token must
+/// have its JSON type, see [`ClaimsVisitor`].
+fn parse_token_claims(bytes: &[u8]) -> serde_json::Result<Claims> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let claims = deserializer.deserialize_map(ClaimsVisitor { strict: true })?;
+    deserializer.end()?;
+    Ok(claims)
 }
 
 /// Authentication context built from successful authentication
@@ -671,19 +1071,77 @@ pub fn find_cookie_value<'a>(raw_cookie: &'a str, name: &str) -> Option<Cow<'a, 
     }
 }
 
-/// Minimal JOSE header: only the field the validation loop acts on.
+/// Minimal JOSE header: only the fields the validation loop acts on.
 ///
 /// Deliberately NOT `jsonwebtoken::Header`: its `extras` map is typed
 /// `HashMap<String, String>`, so any non-string extension parameter —
 /// which RFC 7515 §4.1.11 explicitly permits, and providers emit (Clerk:
 /// `"oiat": <int>`, Auth0: `"gty": [...]`) — fails to parse before
-/// signature verification even runs. serde ignores unknown fields here
+/// signature verification even runs. Other parameters are ignored
 /// regardless of their JSON type.
-#[derive(Deserialize)]
+#[derive(Default)]
 struct TokenHeader {
     alg: String,
-    #[serde(default)]
+    /// A string. `null` or another type is an error, as in PyJWT.
     kid: Option<String>,
+    /// The header has `crit`. Bolt supports no critical extension, so each
+    /// such token is invalid (RFC 7515, section 4.1.11).
+    crit: bool,
+    /// `"b64": false`: the payload is not base64url (RFC 7797). Bolt does
+    /// not support this form, and PyJWT refuses it with no detached payload.
+    unencoded_payload: bool,
+}
+
+/// Reads a JOSE header: a JSON object, not an array. A parameter that Bolt
+/// reads must occur one time.
+impl<'de> Deserialize<'de> for TokenHeader {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct HeaderVisitor;
+        impl<'de> Visitor<'de> for HeaderVisitor {
+            type Value = TokenHeader;
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<TokenHeader, A::Error> {
+                let mut header = TokenHeader::default();
+                let mut alg = None;
+                let mut seen = 0u8;
+                while let Some(Key(name)) = map.next_key()? {
+                    let bit = match name.as_ref() {
+                        "alg" => {
+                            alg = Some(map.next_value::<String>()?);
+                            1
+                        }
+                        "kid" => {
+                            header.kid = Some(map.next_value::<String>()?);
+                            1 << 1
+                        }
+                        "crit" => {
+                            map.next_value::<IgnoredAny>()?;
+                            header.crit = true;
+                            1 << 2
+                        }
+                        "b64" => {
+                            header.unencoded_payload =
+                                map.next_value_seed(Lenient::<bool>::default())? == Some(false);
+                            1 << 3
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    if seen & bit != 0 {
+                        return Err(duplicate_name(&name));
+                    }
+                    seen |= bit;
+                }
+                header.alg = alg.ok_or_else(|| de::Error::missing_field("alg"))?;
+                Ok(header)
+            }
+        }
+        deserializer.deserialize_map(HeaderVisitor)
+    }
 }
 
 /// Claims other than `typ` that name the token type: `token_type`
@@ -701,14 +1159,56 @@ fn is_non_access_token_type(token_type: &str) -> bool {
         .any(|name| token_type.eq_ignore_ascii_case(name))
 }
 
-/// The token types that the claims declare: `typ`, then each string value of
-/// [`OTHER_TOKEN_TYPE_CLAIMS`].
-fn declared_token_types(claims: &Claims) -> impl Iterator<Item = &str> {
-    claims.typ.as_deref().into_iter().chain(
-        OTHER_TOKEN_TYPE_CLAIMS
-            .iter()
-            .filter_map(|name| claims.extra.get(*name).and_then(serde_json::Value::as_str)),
-    )
+/// The token types that the claims declare: `typ`, then each value of
+/// [`OTHER_TOKEN_TYPE_CLAIMS`]. None when one of them is not a string, also
+/// `null`: Bolt cannot read the type of such a token.
+fn declared_token_types(claims: &Claims) -> Option<[Option<&str>; 3]> {
+    let mut types = [claims.typ.as_deref(), None, None];
+    for (slot, name) in types[1..].iter_mut().zip(OTHER_TOKEN_TYPE_CLAIMS) {
+        *slot = match claims.extra.get(name) {
+            None => None,
+            Some(serde_json::Value::String(value)) => Some(value.as_str()),
+            Some(_) => return None,
+        };
+    }
+    Some(types)
+}
+
+fn now_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |since| since.as_secs_f64())
+}
+
+/// Check `exp`, `nbf` and `iat` at `now`, with `leeway` seconds of clock skew.
+///
+/// The fraction of `exp` is removed, as `int()` of PyJWT does: a token never
+/// lives longer than PyJWT allows. `nbf` and `iat` are not rounded: a token
+/// counts only from `leeway` seconds before the time that it states (RFC
+/// 7519, section 4.1.5). Each test is the condition to accept, so a NaN refuses.
+fn check_time_claims(claims: &Claims, now: f64, leeway: f64) -> Result<(), &'static str> {
+    let live = claims
+        .exp
+        .as_ref()
+        .and_then(Number::as_f64)
+        .map(|exp| exp.trunc() > now - leeway);
+    match live {
+        None => return Err("missing required exp claim"),
+        Some(false) => return Err("token expired"),
+        Some(true) => {}
+    }
+    let not_after = |claim: &Option<Number>| {
+        claim
+            .as_ref()
+            .is_none_or(|time| time.as_f64().is_some_and(|time| time <= now + leeway))
+    };
+    if !not_after(&claims.nbf) {
+        return Err("token not yet valid (nbf)");
+    }
+    if !not_after(&claims.iat) {
+        return Err("token issued in the future (iat)");
+    }
+    Ok(())
 }
 
 /// Decode and validate a JWT against a prebuilt key and algorithm allowlist.
@@ -731,7 +1231,21 @@ fn decode_and_validate(
     let (header_b64, claims_b64) = message.split_once('.')?;
 
     let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).ok()?;
-    let header: TokenHeader = serde_json::from_slice(&header_bytes).ok()?;
+    let header: TokenHeader = match serde_json::from_slice(&header_bytes) {
+        Ok(header) => header,
+        Err(e) => {
+            log::debug!("JWT rejected: header failed to parse: {}", e);
+            return None;
+        }
+    };
+    if header.crit {
+        log::debug!("JWT rejected: the header has crit, and Bolt supports no extension");
+        return None;
+    }
+    if header.unencoded_payload {
+        log::debug!("JWT rejected: the header has \"b64\": false");
+        return None;
+    }
 
     // The token never chooses the algorithm — it must name one the backend
     // explicitly allows (prevents HS/RS confusion against the prebuilt key).
@@ -779,7 +1293,7 @@ fn decode_and_validate(
     }
 
     let claims_bytes = URL_SAFE_NO_PAD.decode(claims_b64).ok()?;
-    let claims: Claims = match serde_json::from_slice(&claims_bytes) {
+    let claims = match parse_token_claims(&claims_bytes) {
         Ok(claims) => claims,
         Err(e) => {
             log::debug!("JWT rejected: claims failed to parse: {}", e);
@@ -791,43 +1305,34 @@ fn decode_and_validate(
     // match `typ` exactly; routes with no expectation never accept refresh
     // or ID tokens. Other issuers name the type in other claims, so each of
     // those counts too: such a token never passes as an access token.
+    let Some(declared) = declared_token_types(&claims) else {
+        log::debug!("JWT rejected: a token type claim is not a string");
+        return None;
+    };
     match token_type {
         Some(expected) => {
             if claims.typ.as_deref() != Some(expected)
-                || declared_token_types(&claims).any(|t| t != expected)
+                || declared.into_iter().flatten().any(|t| t != expected)
             {
                 log::debug!("JWT rejected: token type claims do not match expected token type");
                 return None;
             }
         }
         None => {
-            if declared_token_types(&claims).any(is_non_access_token_type) {
+            if declared.into_iter().flatten().any(is_non_access_token_type) {
                 log::debug!("JWT rejected: refresh or ID token used on an access route");
                 return None;
             }
         }
     }
 
-    let now = get_current_timestamp() as i64;
-    match claims.exp {
-        Some(exp) if exp >= now - leeway => {}
-        Some(_) => {
-            log::debug!("JWT rejected: token expired");
-            return None;
-        }
-        None => {
-            log::debug!("JWT rejected: missing required exp claim");
-            return None;
-        }
-    }
-    if let Some(nbf) = claims.nbf
-        && nbf > now + leeway
-    {
-        log::debug!("JWT rejected: token not yet valid (nbf)");
+    if let Err(reason) = check_time_claims(&claims, now_seconds(), leeway as f64) {
+        log::debug!("JWT rejected: {}", reason);
         return None;
     }
     // aud is only validated when an audience is configured; a token merely
     // carrying an aud claim is not rejected (unlike jsonwebtoken's default).
+    // An aud that is not a string or an array of strings is None here.
     if let Some(expected) = audience {
         match &claims.aud {
             Some(aud) if aud.contains(expected) => {}
@@ -837,7 +1342,7 @@ fn decode_and_validate(
             }
         }
     }
-    // When an issuer is configured, a token without iss is rejected.
+    // When an issuer is configured, a token without a string iss is rejected.
     if let Some(expected) = issuer {
         match claims.iss.as_deref() {
             Some(iss) if iss == expected => {}
@@ -887,12 +1392,14 @@ fn try_jwt_auth(
     Some(AuthContext::from_jwt_claims(claims, "jwt", cookie_csrf))
 }
 
-/// Remove an auth scheme and the space after it from a header value.
+/// Remove an auth scheme and the spaces after it from a header value.
 ///
 /// The name of an auth scheme is case-insensitive (RFC 9110 section 11.1).
-/// `scheme` is ASCII. The comparison reads bytes and does not allocate.
+/// One or more spaces end it (`1*SP` in RFC 9110 section 11.4). A tab is
+/// not a space there. `scheme` is ASCII. The comparison reads bytes and
+/// does not allocate.
 #[inline]
-fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
+pub fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
     let bytes = value.as_bytes();
     let len = scheme.len();
     if bytes.len() > len
@@ -900,7 +1407,7 @@ fn strip_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
         && bytes[..len].eq_ignore_ascii_case(scheme.as_bytes())
     {
         // The bytes before `len + 1` are ASCII, so this is a char boundary.
-        Some(&value[len + 1..])
+        Some(value[len + 1..].trim_start_matches(' '))
     } else {
         None
     }
@@ -978,16 +1485,32 @@ pub fn populate_auth_context(context: &Py<PyDict>, auth_ctx: &AuthContext, py: P
 }
 
 /// Build a Python dict of a token's claims: the standard registered claims
-/// plus every extra claim from the JWT payload.
+/// plus every extra claim from the JWT payload. A malformed typed claim has
+/// the value `None`, so Python can tell it from a missing claim.
 fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
     let claims_dict = PyDict::new(py);
 
     set_if_some!(claims_dict, py, "sub", &claims.sub);
-    set_if_some!(claims_dict, py, "exp", claims.exp);
-    set_if_some!(claims_dict, py, "iat", claims.iat);
+    set_if_some!(
+        claims_dict,
+        py,
+        "exp",
+        claims.exp.as_ref().map(|n| numeric_date_to_py(py, n))
+    );
+    set_if_some!(
+        claims_dict,
+        py,
+        "iat",
+        claims.iat.as_ref().map(|n| numeric_date_to_py(py, n))
+    );
     set_if_some!(claims_dict, py, "is_staff", claims.is_staff);
     set_if_some!(claims_dict, py, "is_superuser", claims.is_superuser);
-    set_if_some!(claims_dict, py, "nbf", claims.nbf);
+    set_if_some!(
+        claims_dict,
+        py,
+        "nbf",
+        claims.nbf.as_ref().map(|n| numeric_date_to_py(py, n))
+    );
     match &claims.aud {
         Some(Audience::Single(aud)) => {
             let _ = claims_dict.set_item(intern!(py, "aud"), aud);
@@ -1010,22 +1533,45 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
     for (key, value) in &claims.extra {
         let py_value = match value {
             serde_json::Value::String(s) => PyString::new(py, s).into_any().unbind(),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    i.into_py_any(py).unwrap_or_else(|_| py.None())
-                } else if let Some(f) = n.as_f64() {
-                    f.into_py_any(py).unwrap_or_else(|_| py.None())
-                } else {
-                    py.None()
-                }
-            }
+            serde_json::Value::Number(n) => number_to_py(py, n),
             serde_json::Value::Bool(b) => (*b).into_py_any(py).unwrap_or_else(|_| py.None()),
             _ => py.None(),
         };
         let _ = claims_dict.set_item(key, py_value);
     }
+    if !claims.malformed.is_empty() {
+        for claim in claims.malformed.iter() {
+            let _ = claims_dict.set_item(claim.name(), py.None());
+        }
+    }
 
     claims_dict
+}
+
+/// A NumericDate as a Python int when it is a whole number, else a float.
+/// The parse makes a whole number in the range of `i64` an integer already.
+fn numeric_date_to_py(py: Python<'_>, number: &Number) -> Py<PyAny> {
+    match number.as_f64() {
+        Some(value) if number.is_f64() && value.fract() == 0.0 => PyFloat::new(py, value)
+            .call_method0(intern!(py, "__int__"))
+            .map_or_else(|_| py.None(), Bound::unbind),
+        _ => number_to_py(py, number),
+    }
+}
+
+/// A JSON number as Python's `json.loads` gives it: an int for an integer,
+/// a float for a number with a fraction or an exponent.
+fn number_to_py(py: Python<'_>, number: &Number) -> Py<PyAny> {
+    let value = if let Some(i) = number.as_i64() {
+        i.into_py_any(py)
+    } else if let Some(u) = number.as_u64() {
+        u.into_py_any(py)
+    } else if let Some(f) = number.as_f64() {
+        f.into_py_any(py)
+    } else {
+        Ok(py.None())
+    };
+    value.unwrap_or_else(|_| py.None())
 }
 
 #[cfg(test)]
@@ -1043,7 +1589,8 @@ mod tests {
         );
         assert_eq!(find_cookie_value("other=b", "tok"), None);
     }
-    use jsonwebtoken::EncodingKey;
+    use jsonwebtoken::{EncodingKey, get_current_timestamp};
+    use proptest::prelude::*;
 
     const SECRET: &str = "test-secret";
 
@@ -1874,7 +2421,7 @@ mod tests {
             let ctx = authenticate(&headers, &jwt);
             assert_eq!(ctx.unwrap().user_id.as_deref(), Some("42"), "{scheme}");
         }
-        // The scheme ends with one space, and another scheme stays in the token.
+        // A space ends the scheme, and another scheme stays in the token.
         for value in [format!("bearer{token}"), format!("basic {token}")] {
             let headers = AHashMap::from_iter([("authorization".to_string(), value.clone())]);
             assert!(authenticate(&headers, &jwt).is_none(), "{value}");
@@ -1899,22 +2446,21 @@ mod tests {
                 "{value}"
             );
         }
-        for value in [
-            "bearerkey-one",
-            "apikeykey-one",
-            "bearér key-one",
-            "bearer  key-one",
-        ] {
+        for value in ["bearerkey-one", "apikeykey-one", "bearér key-one"] {
             let headers = AHashMap::from_iter([("x-api-key".to_string(), value.to_string())]);
             assert!(authenticate(&headers, &api_key).is_none(), "{value}");
         }
     }
 
     #[test]
-    fn strip_scheme_removes_the_scheme_and_one_space() {
+    fn strip_scheme_removes_the_scheme_and_its_spaces() {
         assert_eq!(strip_scheme("Bearer abc", "Bearer"), Some("abc"));
         assert_eq!(strip_scheme("bEARER abc", "Bearer"), Some("abc"));
+        assert_eq!(strip_scheme("Bearer   abc", "Bearer"), Some("abc"));
+        assert_eq!(strip_scheme("Bearer \tabc", "Bearer"), Some("\tabc"));
+        assert_eq!(strip_scheme("Bearer\tabc", "Bearer"), None);
         assert_eq!(strip_scheme("Bearer ", "Bearer"), Some(""));
+        assert_eq!(strip_scheme("Bearer   ", "Bearer"), Some(""));
         assert_eq!(strip_scheme("Bearer", "Bearer"), None);
         assert_eq!(strip_scheme("Bearerabc", "Bearer"), None);
         assert_eq!(strip_scheme("Bear", "Bearer"), None);
@@ -2237,5 +2783,591 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// Whether a token of these raw header and claims passes an HS256
+    /// backend with no audience, no issuer and no leeway.
+    fn passes(header_json: &str, claims_json: &str) -> bool {
+        validate(
+            &sign_token(header_json, claims_json, Algorithm::HS256),
+            None,
+            0,
+        )
+        .is_some()
+    }
+
+    fn with_exp(claims: &str) -> String {
+        let exp = future_exp();
+        if claims.is_empty() {
+            format!(r#"{{"sub":"42","exp":{exp}}}"#)
+        } else {
+            format!(r#"{{"sub":"42","exp":{exp},{claims}}}"#)
+        }
+    }
+
+    /// RFC 7519, section 2: a NumericDate can have a fraction. PyJWT accepts it.
+    #[test]
+    fn j1_a_fractional_numeric_date_is_accepted() {
+        let now = get_current_timestamp() as f64;
+        for claims in [
+            format!(r#"{{"sub":"42","exp":{}}}"#, now + 3600.5),
+            format!(r#"{{"sub":"42","exp":{}e0}}"#, now + 3600.0),
+            format!(
+                r#"{{"sub":"42","exp":{},"nbf":{}}}"#,
+                now + 3600.0,
+                now - 100.25
+            ),
+            format!(
+                r#"{{"sub":"42","exp":{},"iat":{}}}"#,
+                now + 3600.0,
+                now - 100.75
+            ),
+        ] {
+            assert!(passes(r#"{"alg":"HS256"}"#, &claims), "{claims}");
+        }
+    }
+
+    /// A claim that Bolt does not check does not refuse the token because of
+    /// its JSON type. PyJWT accepts each of these tokens.
+    #[test]
+    fn j2_an_unchecked_claim_of_another_type_does_not_refuse_the_token() {
+        for claim in [
+            r#""iss":123"#,
+            r#""iss":null"#,
+            r#""aud":123"#,
+            r#""aud":["api",1]"#,
+            r#""is_staff":1"#,
+            r#""is_superuser":"true""#,
+            r#""is_admin":null"#,
+            r#""permissions":"read""#,
+            r#""permissions":["read",1]"#,
+            r#""amr":"pwd""#,
+            r#""fam":7"#,
+            r#""oat":1.5"#,
+            r#""ver":"1""#,
+        ] {
+            assert!(passes(r#"{"alg":"HS256"}"#, &with_exp(claim)), "{claim}");
+        }
+    }
+
+    /// RFC 9110, section 11.4: `credentials = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`.
+    #[test]
+    fn j3_more_than_one_space_after_the_scheme() {
+        let token = bearer_headers(SECRET)["authorization"]
+            .strip_prefix("Bearer ")
+            .unwrap()
+            .to_string();
+        let jwt = [hs256_backend(SECRET)];
+        for value in [format!("Bearer  {token}"), format!("bearer     {token}")] {
+            let headers = AHashMap::from_iter([("authorization".to_string(), value.clone())]);
+            assert!(authenticate(&headers, &jwt).is_some(), "{value}");
+        }
+        // A tab or another white space is not a space of RFC 9110.
+        for value in [format!("Bearer\t{token}"), format!("Bearer \t{token}")] {
+            let headers = AHashMap::from_iter([("authorization".to_string(), value.clone())]);
+            assert!(authenticate(&headers, &jwt).is_none(), "{value:?}");
+        }
+
+        let api_key = [AuthBackend::APIKey {
+            api_keys: ["key-one".to_string()].into_iter().collect(),
+            header: "x-api-key".to_string(),
+            key_permissions: HashMap::new(),
+        }];
+        for value in ["Bearer  key-one", "apikey   key-one"] {
+            let headers = AHashMap::from_iter([("x-api-key".to_string(), value.to_string())]);
+            assert!(authenticate(&headers, &api_key).is_some(), "{value}");
+        }
+        let headers =
+            AHashMap::from_iter([("x-api-key".to_string(), "ApiKey\tkey-one".to_string())]);
+        assert!(authenticate(&headers, &api_key).is_none());
+    }
+
+    /// JSON null is not a missing claim or header parameter. PyJWT refuses each.
+    #[test]
+    fn j4_a_null_registered_claim_is_refused() {
+        for claim in [
+            r#""sub":null"#,
+            r#""jti":null"#,
+            r#""nbf":null"#,
+            r#""iat":null"#,
+            r#""typ":null"#,
+        ] {
+            assert!(!passes(r#"{"alg":"HS256"}"#, &with_exp(claim)), "{claim}");
+        }
+        assert!(!passes(r#"{"alg":"HS256"}"#, r#"{"sub":"42","exp":null}"#));
+        for header in [r#"{"alg":"HS256","kid":null}"#, r#"{"alg":null}"#] {
+            assert!(!passes(header, &with_exp("")), "{header}");
+        }
+    }
+
+    /// PyJWT 2.10 and later refuse a token whose iat is after now plus the leeway.
+    #[test]
+    fn j5_a_token_issued_in_the_future_is_refused() {
+        let now = get_current_timestamp() as i64;
+        let issued_at = |iat: i64| {
+            let claims = format!(r#"{{"sub":"42","exp":{},"iat":{iat}}}"#, future_exp());
+            sign_token(r#"{"alg":"HS256"}"#, &claims, Algorithm::HS256)
+        };
+        assert!(validate(&issued_at(now + 3600), None, 60).is_none());
+        assert!(validate(&issued_at(now + 30), None, 0).is_none());
+        // The leeway applies to iat too.
+        assert!(validate(&issued_at(now + 30), None, 60).is_some());
+        assert!(validate(&issued_at(now - 30), None, 0).is_some());
+    }
+
+    /// RFC 7515, section 4.1.11: a token that lists an extension that the
+    /// recipient does not support is invalid. Bolt supports none.
+    #[test]
+    fn j6_a_token_with_a_critical_extension_is_refused() {
+        for header in [
+            r#"{"alg":"HS256","crit":["exp"],"exp":1}"#,
+            r#"{"alg":"HS256","crit":["b64"],"b64":true}"#,
+            r#"{"alg":"HS256","crit":[]}"#,
+            r#"{"alg":"HS256","crit":"exp"}"#,
+            r#"{"alg":"HS256","crit":[1]}"#,
+            r#"{"alg":"HS256","crit":null}"#,
+        ] {
+            assert!(!passes(header, &with_exp("")), "{header}");
+        }
+    }
+
+    /// RFC 7515 and 7519, section 4 allow a parser to refuse a name that
+    /// occurs two times. Bolt refuses it, so no reader can take the other one.
+    #[test]
+    fn a_duplicate_name_is_refused() {
+        for claims in [
+            with_exp(r#""sub":"7""#),
+            with_exp(r#""role":"a","role":"b""#),
+            with_exp(r#""is_staff":false,"is_staff":true"#),
+            with_exp(r#""permissions":[],"permissions":["admin"]"#),
+            format!(r#"{{"sub":"42","exp":1,"exp":{}}}"#, future_exp()),
+        ] {
+            assert!(!passes(r#"{"alg":"HS256"}"#, &claims), "{claims}");
+        }
+        for header in [
+            r#"{"alg":"HS256","alg":"HS256"}"#,
+            r#"{"alg":"HS256","kid":"a","kid":"a"}"#,
+            r#"{"alg":"HS256","b64":true,"b64":true}"#,
+        ] {
+            assert!(!passes(header, &with_exp("")), "{header}");
+        }
+        // Bolt does not read another header parameter.
+        assert!(passes(r#"{"alg":"HS256","x":1,"x":2}"#, &with_exp("")));
+    }
+
+    #[test]
+    fn a_header_or_claims_that_is_not_a_json_object_is_refused() {
+        let exp = future_exp();
+        assert!(!passes(r#"["HS256"]"#, &with_exp("")));
+        assert!(!passes(r#"{"alg":"HS256"}"#, &format!(r#"["42",{exp}]"#)));
+        assert!(!passes(r#"{"alg":"HS256"}"#, "42"));
+    }
+
+    #[test]
+    fn an_alg_that_is_not_an_allowed_name_is_refused() {
+        for header in [
+            r#"{"alg":"none"}"#,
+            r#"{"alg":"hs256"}"#,
+            r#"{"alg":""}"#,
+            r#"{"alg":["HS256"]}"#,
+            r#"{"typ":"JWT"}"#,
+        ] {
+            assert!(!passes(header, &with_exp("")), "{header}");
+        }
+    }
+
+    /// RFC 7797: Bolt does not support a payload that is not base64url.
+    #[test]
+    fn an_unencoded_payload_is_refused() {
+        assert!(!passes(r#"{"alg":"HS256","b64":false}"#, &with_exp("")));
+        assert!(passes(r#"{"alg":"HS256","b64":true}"#, &with_exp("")));
+        assert!(passes(r#"{"alg":"HS256","b64":"false"}"#, &with_exp("")));
+    }
+
+    /// RFC 7515, section 7.1 has three base64url parts with no padding.
+    #[test]
+    fn a_token_with_another_form_of_parts_is_refused() {
+        let encode = |part: &str| URL_SAFE_NO_PAD.encode(part);
+        let sign = |message: &str| {
+            let signature = crypto::sign(
+                message.as_bytes(),
+                &EncodingKey::from_secret(SECRET.as_bytes()),
+                Algorithm::HS256,
+            )
+            .unwrap();
+            format!("{message}.{signature}")
+        };
+        let header = encode(r#"{"alg":"HS256"}"#);
+        let claims = encode(&with_exp(""));
+        assert!(validate(&sign(&format!("{header}.{claims}")), None, 0).is_some());
+        for message in [
+            format!("{header}.{claims}.{claims}"),
+            header.clone(),
+            format!("{header}==.{claims}"),
+            format!("{header}.{claims}="),
+        ] {
+            assert!(validate(&sign(&message), None, 0).is_none(), "{message}");
+        }
+        let padded = sign(&format!("{header}.{claims}")) + "=";
+        assert!(validate(&padded, None, 0).is_none());
+    }
+
+    #[test]
+    fn an_audience_array_with_another_type_is_refused_only_when_checked() {
+        let token = |aud: &str| sign_token(r#"{"alg":"HS256"}"#, &with_exp(aud), Algorithm::HS256);
+        for aud in [
+            r#""aud":["api",1]"#,
+            r#""aud":123"#,
+            r#""aud":null"#,
+            r#""aud":[]"#,
+            r#""aud":"""#,
+        ] {
+            assert!(validate(&token(aud), Some("api"), 0).is_none(), "{aud}");
+            assert!(validate(&token(aud), None, 0).is_some(), "{aud}");
+        }
+        assert!(validate(&token(r#""aud":["web","api"]"#), Some("api"), 0).is_some());
+    }
+
+    #[test]
+    fn an_issuer_of_another_type_is_refused_only_when_checked() {
+        for iss in [r#""iss":123"#, r#""iss":null"#, r#""iss":["https://a"]"#] {
+            let token = sign_token(r#"{"alg":"HS256"}"#, &with_exp(iss), Algorithm::HS256);
+            let checked = decode_and_validate(
+                &token,
+                &hs256_key(),
+                &[Algorithm::HS256],
+                None,
+                Some("https://a"),
+                0,
+                None,
+            );
+            assert!(checked.is_none(), "{iss}");
+            assert!(validate(&token, None, 0).is_some(), "{iss}");
+        }
+    }
+
+    /// Bolt reads the type of a token from these claims. A value that is not a
+    /// string could hide a refresh token, so the token is refused.
+    #[test]
+    fn a_token_type_claim_that_is_not_a_string_is_refused() {
+        for claim in [
+            r#""typ":5"#,
+            r#""typ":["refresh"]"#,
+            r#""token_type":["refresh"]"#,
+            r#""token_type":null"#,
+            r#""token_use":{"id":true}"#,
+        ] {
+            let token = sign_token(r#"{"alg":"HS256"}"#, &with_exp(claim), Algorithm::HS256);
+            for expected in [None, Some("refresh")] {
+                let checked = decode_and_validate(
+                    &token,
+                    &hs256_key(),
+                    &[Algorithm::HS256],
+                    None,
+                    None,
+                    0,
+                    expected,
+                );
+                assert!(checked.is_none(), "{claim} {expected:?}");
+            }
+        }
+    }
+
+    /// A claim that grants something grants it only in its exact JSON form.
+    #[test]
+    fn a_grant_claim_grants_only_in_its_exact_form() {
+        let context = |claims: &str| {
+            let token = sign_token(r#"{"alg":"HS256"}"#, &with_exp(claims), Algorithm::HS256);
+            AuthContext::from_jwt_claims(validate(&token, None, 0).unwrap(), "jwt", false)
+        };
+        for flags in [
+            r#""is_staff":1,"is_superuser":"true""#,
+            r#""is_staff":"yes","is_superuser":[true]"#,
+            r#""is_staff":null,"is_superuser":{}"#,
+        ] {
+            let ctx = context(flags);
+            assert!(!ctx.is_staff && !ctx.is_superuser, "{flags}");
+            let claims = ctx.claims.unwrap();
+            assert_eq!(
+                (claims.is_staff, claims.is_superuser),
+                (None, None),
+                "{flags}"
+            );
+            let malformed = claims.malformed;
+            assert!(malformed.contains(TypedClaim::IsStaff), "{flags}");
+            assert!(malformed.contains(TypedClaim::IsSuperuser), "{flags}");
+        }
+        let ctx = context(r#""is_staff":true,"is_superuser":true"#);
+        assert!(ctx.is_staff && ctx.is_superuser);
+
+        for permissions in [
+            r#""permissions":"admin""#,
+            r#""permissions":["admin",1]"#,
+            r#""permissions":{"admin":1}"#,
+        ] {
+            assert!(context(permissions).permissions.is_empty(), "{permissions}");
+        }
+        let ctx = context(r#""permissions":["read","write"],"amr":["pwd",2],"is_admin":1"#);
+        assert_eq!(ctx.permissions.len(), 2);
+        let claims = ctx.claims.unwrap();
+        assert_eq!((claims.amr, claims.is_admin), (None, None));
+    }
+
+    fn time_check(claims: &str, now: f64, leeway: f64) -> Result<(), &'static str> {
+        let claims = parse_token_claims(claims.as_bytes()).unwrap();
+        check_time_claims(&claims, now, leeway)
+    }
+
+    /// PyJWT compares `int(exp) <= now - leeway` and `int(nbf) > now + leeway`
+    /// with the current time as a float. Bolt removes the fraction of `exp` as
+    /// PyJWT does. It does not round `nbf` and `iat` (RFC 7519, section 4.1.5).
+    #[test]
+    fn each_time_claim_has_its_boundary_on_each_side() {
+        let second = 1_795_714_848.0;
+        let now = second + 0.25;
+        let exp = |exp: &str| time_check(&format!(r#"{{"exp":{exp}}}"#), now, 0.0);
+        // The second of exp has started: expired, also for an integer exp.
+        assert_eq!(exp("1795714848"), Err("token expired"));
+        assert_eq!(exp("1795714848.75"), Err("token expired"));
+        assert_eq!(exp("1795714849"), Ok(()));
+        assert_eq!(exp("1795714849.5"), Ok(()));
+        assert_eq!(exp("1795714847.999"), Err("token expired"));
+        // With a fraction of now at or after the fraction of exp, PyJWT too.
+        let late = time_check(r#"{"exp":1795714849.5}"#, second + 0.75, 0.0);
+        assert_eq!(late, Ok(()));
+        let leeway = |claims: &str| time_check(claims, now, 60.0);
+        assert_eq!(leeway(r#"{"exp":1795714789}"#), Ok(()));
+        assert_eq!(leeway(r#"{"exp":1795714788.9}"#), Err("token expired"));
+
+        for (name, error) in [
+            ("nbf", "token not yet valid (nbf)"),
+            ("iat", "token issued in the future (iat)"),
+        ] {
+            let at = |time: &str, leeway: f64| {
+                time_check(&format!(r#"{{"exp":2e9,"{name}":{time}}}"#), now, leeway)
+            };
+            assert_eq!(at("1795714848.25", 0.0), Ok(()), "{name}");
+            assert_eq!(at("1795714848", 0.0), Ok(()), "{name}");
+            assert_eq!(at("1795714848.5", 0.0), Err(error), "{name}");
+            assert_eq!(at("1795714849", 0.0), Err(error), "{name}");
+            assert_eq!(at("1795714908.25", 60.0), Ok(()), "{name}");
+            assert_eq!(at("1795714908.5", 60.0), Err(error), "{name}");
+        }
+    }
+
+    /// A huge or negative NumericDate, or a huge leeway, does not panic or wrap.
+    #[test]
+    fn a_huge_numeric_date_neither_panics_nor_wraps() {
+        let now = 1_795_714_848.5;
+        for (claims, expected) in [
+            (r#"{"exp":1e300}"#, Ok(())),
+            (r#"{"exp":18446744073709551615}"#, Ok(())),
+            (r#"{"exp":184467440737095516150}"#, Ok(())),
+            (r#"{"exp":-1e300}"#, Err("token expired")),
+            (r#"{"exp":-9223372036854775808}"#, Err("token expired")),
+            (r#"{"exp":1e300,"nbf":-1e300,"iat":-1e300}"#, Ok(())),
+            (
+                r#"{"exp":1e300,"nbf":1e300}"#,
+                Err("token not yet valid (nbf)"),
+            ),
+            (
+                r#"{"exp":1e300,"iat":18446744073709551615}"#,
+                Err("token issued in the future (iat)"),
+            ),
+        ] {
+            assert_eq!(time_check(claims, now, 0.0), expected, "{claims}");
+        }
+        let huge = i64::MAX as f64;
+        assert_eq!(time_check(r#"{"exp":1,"nbf":9e18}"#, now, huge), Ok(()));
+        assert_eq!(
+            time_check(r#"{"exp":1,"iat":1e300}"#, now, huge),
+            Err("token issued in the future (iat)")
+        );
+        // JSON has no Infinity or NaN, and a number beyond f64 is an error.
+        for claims in [r#"{"exp":1e400}"#, r#"{"exp":Infinity}"#, r#"{"exp":NaN}"#] {
+            assert!(parse_token_claims(claims.as_bytes()).is_err(), "{claims}");
+        }
+    }
+
+    /// A whole number reaches Python as an int, also as `N.0`, `Ne0` or
+    /// beyond `i64`. Only a number with a fraction is a float.
+    #[test]
+    fn a_numeric_date_reaches_python_as_an_int_unless_it_has_a_fraction() {
+        Python::initialize();
+        let claims =
+            parse_token_claims(br#"{"exp":1795714848.0,"iat":1795714848.5,"nbf":1e3}"#).unwrap();
+        let huge = parse_token_claims(br#"{"exp":1e300,"iat":-1e19}"#).unwrap();
+        Python::attach(|py| {
+            let dict = claims_to_dict(py, &claims);
+            let item = |key: &str| dict.get_item(key).unwrap().unwrap();
+            assert_eq!(item("exp").get_type().name().unwrap(), "int");
+            assert_eq!(item("exp").extract::<i64>().unwrap(), 1_795_714_848);
+            assert_eq!(item("iat").get_type().name().unwrap(), "float");
+            assert_eq!(item("iat").extract::<f64>().unwrap(), 1_795_714_848.5);
+            assert_eq!(item("nbf").get_type().name().unwrap(), "int");
+            assert_eq!(item("nbf").extract::<i64>().unwrap(), 1000);
+
+            let dict = claims_to_dict(py, &huge);
+            let item = |key: &str| dict.get_item(key).unwrap().unwrap();
+            assert_eq!(item("exp").get_type().name().unwrap(), "int");
+            assert_eq!(item("exp").str().unwrap().to_string().len(), 301);
+            assert_eq!(item("iat").get_type().name().unwrap(), "int");
+            assert_eq!(
+                item("iat").str().unwrap().to_string(),
+                "-10000000000000000000"
+            );
+        });
+    }
+
+    /// A whole number is an integer for a guard too: `N.0` matches `N`.
+    #[test]
+    fn a_whole_number_parses_as_an_integer() {
+        for text in [
+            "1795714848",
+            "1795714848.0",
+            "1795714848e0",
+            "17957148.48e2",
+        ] {
+            let claims = parse_token_claims(
+                format!(r#"{{"exp":{text},"iat":{text},"nbf":{text},"oat":{text},"ver":{text}}}"#)
+                    .as_bytes(),
+            )
+            .unwrap();
+            for time in [&claims.exp, &claims.iat, &claims.nbf] {
+                assert_eq!(
+                    time.as_ref().unwrap(),
+                    &Number::from(1_795_714_848),
+                    "{text}"
+                );
+            }
+            assert_eq!(
+                (claims.oat, claims.ver),
+                (Some(1_795_714_848), Some(1_795_714_848))
+            );
+            assert!(claims.malformed.is_empty(), "{text}");
+        }
+        let claims = parse_token_claims(br#"{"exp":1.5,"oat":1.5,"ver":2e19}"#).unwrap();
+        assert!(claims.exp.unwrap().is_f64());
+        assert!(claims.malformed.contains(TypedClaim::Oat));
+        assert!(claims.malformed.contains(TypedClaim::Ver));
+    }
+
+    /// A malformed claim reaches Python as `None`, a missing one not at all.
+    #[test]
+    fn a_malformed_claim_reaches_python_as_none() {
+        Python::initialize();
+        let token = sign_token(
+            r#"{"alg":"HS256"}"#,
+            &with_exp(
+                r#""iss":5,"aud":[1],"fam":null,"oat":"1","ver":{},"amr":"pwd","is_staff":1,"is_superuser":"x","is_admin":[],"permissions":"admin","role":null"#,
+            ),
+            Algorithm::HS256,
+        );
+        let ctx = AuthContext::from_jwt_claims(validate(&token, None, 0).unwrap(), "jwt", false);
+        Python::attach(|py| {
+            let dict = claims_to_dict(py, ctx.claims.as_ref().unwrap());
+            for name in [
+                "iss",
+                "aud",
+                "fam",
+                "oat",
+                "ver",
+                "amr",
+                "is_staff",
+                "is_superuser",
+                "is_admin",
+                "permissions",
+                "role",
+            ] {
+                assert!(dict.get_item(name).unwrap().unwrap().is_none(), "{name}");
+            }
+            assert_eq!(dict.len(), 13);
+            assert!(dict.get_item("jti").unwrap().is_none());
+        });
+    }
+
+    /// The claims of an MCP principal are verified already. There a claim of
+    /// another type is malformed, also one that Bolt checks on each token.
+    #[test]
+    fn lenient_claims_mark_a_claim_of_another_type_as_malformed() {
+        let claims: Claims = serde_json::from_str(
+            r#"{"sub":null,"jti":5,"typ":null,"exp":"soon","is_staff":1,"role":"x"}"#,
+        )
+        .unwrap();
+        assert!(claims.sub.is_none() && claims.jti.is_none() && claims.typ.is_none());
+        assert!(claims.exp.is_none() && claims.is_staff.is_none());
+        let malformed: Vec<_> = claims.malformed.iter().collect();
+        assert_eq!(
+            malformed,
+            [
+                TypedClaim::Sub,
+                TypedClaim::Jti,
+                TypedClaim::Typ,
+                TypedClaim::Exp,
+                TypedClaim::IsStaff
+            ]
+        );
+        assert_eq!(claims.extra["role"], "x");
+        assert!(serde_json::from_str::<Claims>(r#"{"sub":"1","sub":"2"}"#).is_err());
+    }
+
+    /// Each typed claim has its own name and bit.
+    #[test]
+    fn each_typed_claim_has_its_name_and_bit() {
+        let mut set = ClaimSet::default();
+        for claim in TypedClaim::ALL {
+            assert_eq!(TypedClaim::from_name(claim.name()), Some(claim));
+            assert!(set.insert(claim), "{claim:?}");
+            assert!(!set.insert(claim), "{claim:?}");
+        }
+        assert_eq!(set.iter().collect::<Vec<_>>(), TypedClaim::ALL);
+        assert_eq!(TypedClaim::from_name("role"), None);
+    }
+
+    proptest! {
+        /// The scheme has no case, and one or more spaces end it. Any other
+        /// character there, a tab too, leaves the value as it is.
+        #[test]
+        fn strip_scheme_takes_one_or_more_spaces(
+            upper in proptest::collection::vec(any::<bool>(), 6),
+            spaces in 0usize..5,
+            separator in prop::sample::select(vec![" ", "\t", "\u{a0}", "\r", "x", "é"]),
+            rest in "[ A-Za-z0-9._~+/=\\t-]{0,20}",
+        ) {
+            let scheme: String = "bearer"
+                .chars()
+                .zip(&upper)
+                .map(|(c, upper)| if *upper { c.to_ascii_uppercase() } else { c })
+                .collect();
+            let value = format!("{scheme}{separator}{}{rest}", " ".repeat(spaces));
+            let expected = (separator == " ").then(|| rest.trim_start_matches(' '));
+            prop_assert_eq!(strip_scheme(&value, "Bearer"), expected);
+        }
+
+        /// A JSON number of any form is a NumericDate with the same value.
+        /// With no `float_roundtrip` feature, serde_json can round the last
+        /// bits of a float in another way. Near now, they are below a microsecond.
+        #[test]
+        fn a_json_number_parses_as_a_numeric_date(value in any::<f64>().prop_filter("finite", |v| v.is_finite()), int in any::<i64>(), uint in any::<u64>()) {
+            for text in [serde_json::to_string(&value).unwrap(), format!("{value:e}"), int.to_string(), uint.to_string()] {
+                let claims = parse_token_claims(format!(r#"{{"exp":{text}}}"#).as_bytes()).unwrap();
+                let expected: f64 = text.parse().unwrap();
+                let parsed = claims.exp.unwrap().as_f64().unwrap();
+                prop_assert!((parsed - expected).abs() <= expected.abs() * 4.0 * f64::EPSILON + f64::MIN_POSITIVE, "{} {} {}", text, parsed, expected);
+            }
+            let exact = parse_token_claims(format!(r#"{{"exp":{int}}}"#).as_bytes()).unwrap();
+            prop_assert_eq!(exact.exp.unwrap().as_i64(), Some(int));
+        }
+
+        /// Any other JSON value of a checked time claim refuses the token.
+        #[test]
+        fn a_numeric_date_of_another_type_is_an_error(
+            name in prop::sample::select(vec!["exp", "nbf", "iat"]),
+            value in prop::sample::select(vec!["null", "true", "\"1795714848\"", "[1]", "{}", "\"\""]),
+        ) {
+            let claims = format!(r#"{{"exp":2e9,"{name}":{value}}}"#);
+            let claims = if name == "exp" { format!(r#"{{"exp":{value}}}"#) } else { claims };
+            prop_assert!(parse_token_claims(claims.as_bytes()).is_err());
+        }
     }
 }

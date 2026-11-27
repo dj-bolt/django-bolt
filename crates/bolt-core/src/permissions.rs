@@ -6,9 +6,9 @@
 /// permission primitive. A `Requires` guard's claim name and expected
 /// values are extracted from Python once at registration, so request-time
 /// evaluation happens entirely in Rust with zero GIL overhead.
-use crate::middleware::auth::{Audience, AuthContext};
+use crate::middleware::auth::{Audience, AuthContext, TypedClaim};
 use bytes::Bytes;
-use serde_json::Value as Json;
+use serde_json::{Number, Value as Json};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -50,58 +50,22 @@ impl GuardDenial {
 /// A claim name compiled into a direct selector at registration, so
 /// request-time evaluation never string-matches the claim name.
 ///
-/// `Permissions` is special: it reads the unified permission set on
-/// `AuthContext`, which is populated from the JWT `permissions` claim OR
+/// `TypedClaim::Permissions` is special: it reads the unified permission set
+/// on `AuthContext`, which is populated from the JWT `permissions` claim OR
 /// from `key_permissions` for API-key auth — so `Requires("permissions", ..)`
 /// works for every backend. All other claims come from the token: the
-/// registered ones live in typed `Claims` fields (serde flattens the rest
-/// into `extra`), and backends that carry no claims never match.
+/// typed ones live in `Claims` fields (the reader puts the rest into
+/// `extra`), and backends that carry no claims never match.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClaimKey {
-    Permissions,
-    Sub,
-    Iss,
-    Jti,
-    Typ,
-    Fam,
-    Exp,
-    Iat,
-    Nbf,
-    Oat,
-    Ver,
-    IsStaff,
-    IsSuperuser,
-    IsAdmin,
-    Amr,
-    Aud,
+    Typed(TypedClaim),
     /// Any claim without a typed `Claims` field — looked up in `extra`.
     Extra(String),
 }
 
 impl ClaimKey {
-    /// Must cover every typed field on `Claims`: a field missed here would
-    /// fall through to `Extra`, which serde only populates with *unknown*
-    /// claims, so the guard would silently never match.
     pub fn parse(name: String) -> Self {
-        match name.as_str() {
-            "permissions" => Self::Permissions,
-            "sub" => Self::Sub,
-            "iss" => Self::Iss,
-            "jti" => Self::Jti,
-            "typ" => Self::Typ,
-            "fam" => Self::Fam,
-            "exp" => Self::Exp,
-            "iat" => Self::Iat,
-            "nbf" => Self::Nbf,
-            "oat" => Self::Oat,
-            "ver" => Self::Ver,
-            "is_staff" => Self::IsStaff,
-            "is_superuser" => Self::IsSuperuser,
-            "is_admin" => Self::IsAdmin,
-            "amr" => Self::Amr,
-            "aud" => Self::Aud,
-            _ => Self::Extra(name),
-        }
+        TypedClaim::from_name(&name).map_or(Self::Extra(name), Self::Typed)
     }
 }
 
@@ -213,6 +177,11 @@ fn requires_matches(
     quantifier: Quantifier,
 ) -> bool {
     let resolved = resolve_claim(ctx, claim);
+    if matches!(resolved, ClaimValue::Malformed) {
+        // A guard cannot read a claim in another JSON form. It refuses in
+        // each form, `none_of` too: the token may hold a refused value there.
+        return false;
+    }
     if values.is_empty() {
         // Python rejects an empty `none_of`, so this arm is only reachable
         // through a bare presence check; the inverse is still the coherent
@@ -232,16 +201,41 @@ fn requires_matches(
 /// A claim's value, resolved once per request from the `AuthContext`.
 enum ClaimValue<'a> {
     Absent,
+    /// A typed claim in another JSON form, also `null`.
+    Malformed,
     Permissions(&'a HashSet<String>),
     Str(&'a str),
     Int(i64),
+    /// A NumericDate claim (`exp`, `iat`, `nbf`), also with a fraction.
+    Num(&'a Number),
     Bool(bool),
     StrList(&'a [String]),
     Json(&'a Json),
 }
 
 fn resolve_claim<'a>(ctx: &'a AuthContext, claim: &'a ClaimKey) -> ClaimValue<'a> {
-    if matches!(claim, ClaimKey::Permissions) {
+    let typed = match claim {
+        ClaimKey::Typed(typed) => *typed,
+        ClaimKey::Extra(name) => {
+            return match ctx
+                .claims
+                .as_ref()
+                .and_then(|claims| claims.extra.get(name))
+            {
+                // A null claim is neither present nor matchable.
+                None | Some(Json::Null) => ClaimValue::Absent,
+                Some(value) => ClaimValue::Json(value),
+            };
+        }
+    };
+    if ctx
+        .claims
+        .as_ref()
+        .is_some_and(|claims| claims.malformed.contains(typed))
+    {
+        return ClaimValue::Malformed;
+    }
+    if typed == TypedClaim::Permissions {
         return ClaimValue::Permissions(&ctx.permissions);
     }
     let claims = match &ctx.claims {
@@ -255,38 +249,36 @@ fn resolve_claim<'a>(ctx: &'a AuthContext, claim: &'a ClaimKey) -> ClaimValue<'a
     fn opt_int(value: Option<i64>) -> ClaimValue<'static> {
         value.map_or(ClaimValue::Absent, ClaimValue::Int)
     }
+    fn opt_num(value: &Option<Number>) -> ClaimValue<'_> {
+        value.as_ref().map_or(ClaimValue::Absent, ClaimValue::Num)
+    }
     fn opt_bool(value: Option<bool>) -> ClaimValue<'static> {
         value.map_or(ClaimValue::Absent, ClaimValue::Bool)
     }
 
-    match claim {
-        ClaimKey::Permissions => unreachable!("handled above"),
-        ClaimKey::Sub => opt_str(&claims.sub),
-        ClaimKey::Iss => opt_str(&claims.iss),
-        ClaimKey::Jti => opt_str(&claims.jti),
-        ClaimKey::Typ => opt_str(&claims.typ),
-        ClaimKey::Fam => opt_str(&claims.fam),
-        ClaimKey::Exp => opt_int(claims.exp),
-        ClaimKey::Iat => opt_int(claims.iat),
-        ClaimKey::Nbf => opt_int(claims.nbf),
-        ClaimKey::Oat => opt_int(claims.oat),
-        ClaimKey::Ver => opt_int(claims.ver),
-        ClaimKey::IsStaff => opt_bool(claims.is_staff),
-        ClaimKey::IsSuperuser => opt_bool(claims.is_superuser),
-        ClaimKey::IsAdmin => opt_bool(claims.is_admin),
-        ClaimKey::Amr => claims
+    match typed {
+        TypedClaim::Permissions => unreachable!("handled above"),
+        TypedClaim::Sub => opt_str(&claims.sub),
+        TypedClaim::Iss => opt_str(&claims.iss),
+        TypedClaim::Jti => opt_str(&claims.jti),
+        TypedClaim::Typ => opt_str(&claims.typ),
+        TypedClaim::Fam => opt_str(&claims.fam),
+        TypedClaim::Exp => opt_num(&claims.exp),
+        TypedClaim::Iat => opt_num(&claims.iat),
+        TypedClaim::Nbf => opt_num(&claims.nbf),
+        TypedClaim::Oat => opt_int(claims.oat),
+        TypedClaim::Ver => opt_int(claims.ver),
+        TypedClaim::IsStaff => opt_bool(claims.is_staff),
+        TypedClaim::IsSuperuser => opt_bool(claims.is_superuser),
+        TypedClaim::IsAdmin => opt_bool(claims.is_admin),
+        TypedClaim::Amr => claims
             .amr
             .as_deref()
             .map_or(ClaimValue::Absent, ClaimValue::StrList),
-        ClaimKey::Aud => match &claims.aud {
+        TypedClaim::Aud => match &claims.aud {
             None => ClaimValue::Absent,
             Some(Audience::Single(aud)) => ClaimValue::Str(aud),
             Some(Audience::Multiple(list)) => ClaimValue::StrList(list),
-        },
-        ClaimKey::Extra(name) => match claims.extra.get(name) {
-            // A null claim is neither present nor matchable.
-            None | Some(Json::Null) => ClaimValue::Absent,
-            Some(value) => ClaimValue::Json(value),
         },
     }
 }
@@ -294,7 +286,7 @@ fn resolve_claim<'a>(ctx: &'a AuthContext, claim: &'a ClaimKey) -> ClaimValue<'a
 impl ClaimValue<'_> {
     fn is_present(&self) -> bool {
         match self {
-            ClaimValue::Absent => false,
+            ClaimValue::Absent | ClaimValue::Malformed => false,
             ClaimValue::Permissions(perms) => !perms.is_empty(),
             // A bare `Requires("flag")` on a boolean claim means "the flag is
             // set" — `flag: false` must not satisfy a presence check.
@@ -307,12 +299,13 @@ impl ClaimValue<'_> {
     /// A scalar claim matches by equality; a list claim by membership.
     fn matches(&self, expected: &Json) -> bool {
         match self {
-            ClaimValue::Absent => false,
+            ClaimValue::Absent | ClaimValue::Malformed => false,
             ClaimValue::Permissions(perms) => {
                 expected.as_str().is_some_and(|perm| perms.contains(perm))
             }
             ClaimValue::Str(v) => expected.as_str() == Some(v),
             ClaimValue::Int(v) => expected.as_i64() == Some(*v),
+            ClaimValue::Num(v) => expected.as_number() == Some(*v),
             ClaimValue::Bool(v) => expected.as_bool() == Some(*v),
             ClaimValue::StrList(list) => list.iter().any(|v| expected.as_str() == Some(v)),
             ClaimValue::Json(value) => match value {
@@ -345,20 +338,7 @@ mod tests {
     fn jwt_ctx(permissions: &[&str], extra: &[(&str, Json)]) -> AuthContext {
         let claims = Claims {
             sub: Some("user1".to_string()),
-            exp: None,
-            iat: None,
-            nbf: None,
-            aud: None,
-            iss: None,
-            jti: None,
-            typ: None,
-            fam: None,
-            oat: None,
-            ver: None,
-            amr: None,
             is_staff: Some(true),
-            is_superuser: None,
-            is_admin: None,
             permissions: if permissions.is_empty() {
                 None
             } else {
@@ -368,6 +348,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect::<HashMap<_, _>>(),
+            ..Claims::default()
         };
         AuthContext::from_jwt_claims(claims, "jwt", false)
     }
@@ -429,6 +410,133 @@ mod tests {
                 GuardResult::Forbidden(None),
                 "{name}"
             );
+        }
+    }
+
+    /// A NumericDate with a fraction matches the same JSON number only.
+    #[test]
+    fn a_fractional_time_claim_matches_its_guard() {
+        let claims: Claims =
+            serde_json::from_value(serde_json::json!({"exp": 2_000_000_000.5, "iat": 7})).unwrap();
+        let ctx = AuthContext::from_jwt_claims(claims, "jwt", false);
+        for (name, value, expected) in [
+            ("exp", Json::from(2_000_000_000.5), GuardResult::Allow),
+            (
+                "exp",
+                Json::from(2_000_000_000i64),
+                GuardResult::Forbidden(None),
+            ),
+            ("iat", Json::from(7), GuardResult::Allow),
+            ("iat", Json::from(7.5), GuardResult::Forbidden(None)),
+        ] {
+            assert_eq!(
+                evaluate_guards(&any_of(name, &[value]), Some(&ctx)),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// A typed claim in another JSON form, also `null`, fails each guard
+    /// form, `none_of` too. A missing claim passes `none_of`, and a claim of
+    /// the exact form gives the usual answers.
+    #[test]
+    fn a_malformed_claim_fails_each_guard_form() {
+        // Each claim that `Claims` types: a valid value and a scalar of another
+        // JSON type. A token cannot have a malformed `sub`, `jti`, `typ`, `exp`,
+        // `nbf` or `iat`, but the claims of an MCP principal can.
+        let typed = [
+            ("sub", Json::from("u1"), Json::from(1)),
+            ("jti", Json::from("j1"), Json::from(1)),
+            ("typ", Json::from("access"), Json::from(1)),
+            (
+                "exp",
+                Json::from(2_000_000_000i64),
+                Json::from("2000000000"),
+            ),
+            ("nbf", Json::from(1), Json::from(true)),
+            ("iat", Json::from(1), Json::from("1")),
+            ("iss", Json::from("https://a"), Json::from(1)),
+            ("aud", Json::from("api"), Json::from(1)),
+            ("fam", Json::from("f1"), Json::from(7)),
+            ("oat", Json::from(1), Json::from(1.5)),
+            ("ver", Json::from(1), Json::from("1")),
+            ("amr", Json::from("pwd"), Json::from("pwd")),
+            ("is_staff", Json::from(true), Json::from(1)),
+            ("is_superuser", Json::from(true), Json::from("true")),
+            ("is_admin", Json::from(true), Json::from("false")),
+            ("permissions", Json::from("admin"), Json::from("admin")),
+        ];
+        // The guard forms: (name, values, quantifier). No value is a presence check.
+        let forms = |value: &Json| {
+            let other = match value {
+                Json::Bool(flag) => Json::from(!flag),
+                Json::Number(_) => Json::from(3),
+                _ => Json::from("other"),
+            };
+            [
+                ("presence", vec![], Quantifier::Any),
+                ("equality", vec![value.clone()], Quantifier::Any),
+                ("any_of", vec![value.clone(), other], Quantifier::Any),
+                ("all_of", vec![value.clone()], Quantifier::All),
+                ("none_of", vec![value.clone()], Quantifier::None),
+            ]
+        };
+        for (name, valid, wrong_scalar) in typed {
+            let list_claim = matches!(name, "amr" | "permissions");
+            let malformed = [
+                wrong_scalar,
+                Json::Array(vec![valid.clone(), Json::from(1)]),
+                Json::Null,
+                serde_json::json!({ "x": valid.clone() }),
+            ];
+            for value in malformed {
+                let claims: Claims =
+                    serde_json::from_value(serde_json::json!({ name: value })).unwrap();
+                let ctx = AuthContext::from_jwt_claims(claims, "jwt", false);
+                for (form, values, quantifier) in forms(&valid) {
+                    let guard = requires(name, &values, quantifier);
+                    assert_eq!(
+                        evaluate_guards(&guard, Some(&ctx)),
+                        GuardResult::Forbidden(None),
+                        "{name}={value} {form}"
+                    );
+                }
+            }
+
+            let exact = if list_claim {
+                Json::Array(vec![valid.clone()])
+            } else {
+                valid.clone()
+            };
+            let claims: Claims =
+                serde_json::from_value(serde_json::json!({ name: exact })).unwrap();
+            let present = AuthContext::from_jwt_claims(claims, "jwt", false);
+            let absent = AuthContext::from_jwt_claims(Claims::default(), "jwt", false);
+            for (form, values, quantifier) in forms(&valid) {
+                let guard = requires(name, &values, quantifier);
+                let (allowed_when_present, allowed_when_absent) = match form {
+                    "none_of" => (false, true),
+                    _ => (true, false),
+                };
+                let verdict = |allowed: bool| {
+                    if allowed {
+                        GuardResult::Allow
+                    } else {
+                        GuardResult::Forbidden(None)
+                    }
+                };
+                assert_eq!(
+                    evaluate_guards(&guard, Some(&present)),
+                    verdict(allowed_when_present),
+                    "{name}={exact} {form}"
+                );
+                assert_eq!(
+                    evaluate_guards(&guard, Some(&absent)),
+                    verdict(allowed_when_absent),
+                    "{name} absent {form}"
+                );
+            }
         }
     }
 

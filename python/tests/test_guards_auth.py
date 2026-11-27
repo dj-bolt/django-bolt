@@ -125,6 +125,14 @@ class TestAuthenticationClasses:
 
         assert str(error.value) == f"APIKeyAuthentication {message}."
 
+    @pytest.mark.parametrize("api_keys", [["key-1", " sk-prod-123abc"], ("key-1", "  sk-prod-123abc")])
+    def test_the_error_for_a_key_that_starts_with_a_space_shows_no_part_of_the_key(self, api_keys):
+        """No request can send such a key. The error names the position of the key, not the key."""
+        with pytest.raises(ImproperlyConfigured) as error:
+            APIKeyAuthentication(api_keys=api_keys)
+
+        assert str(error.value) == "APIKeyAuthentication api_keys has a key that starts with a space, at index 1."
+
 
 class TestPermissionGuards:
     """Test the guard classes: AllowAny, IsAuthenticated, and Requires."""

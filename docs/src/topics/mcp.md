@@ -800,6 +800,11 @@ api.mount_mcp(
 
 `token_verifier` is a `def` function. It gets the bearer token and returns the claims as a dict, or `None` to refuse the token.
 Bolt reads `sub`, `is_staff`, `is_superuser` and `permissions` from the claims for the guards.
+Each claim needs its JSON type, as for a token on a route. A `sub` of another JSON type gets 401.
+A `null` `sub` counts as a missing `sub`: the session has no user.
+`is_staff` and `is_superuser` grant only for `true`, and `permissions` only as a list of strings.
+A tool guard on a claim of another type refuses the call.
+See [Give each claim its JSON type](authentication.md#give-each-claim-its-json-type).
 With `required_scopes`, the `scope` or `scp` claim must have each scope.
 
 Bolt serves the metadata of [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) at `/.well-known/oauth-protected-resource/mcp`.

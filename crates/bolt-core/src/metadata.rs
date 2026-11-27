@@ -1723,7 +1723,7 @@ fn parse_rust_arg_bindings(py_meta: &Bound<'_, PyDict>) -> Option<Vec<RustArgBin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::auth::authenticate;
+    use crate::middleware::auth::{TypedClaim, authenticate};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use jsonwebtoken::{Algorithm, EncodingKey, crypto, get_current_timestamp};
@@ -3493,11 +3493,11 @@ mod tests {
         let (claim, ..) = requires(
             "{'type': 'requires', 'claim': 'is_staff', 'values': [True], 'quantifier': 0, 'message': None}",
         );
-        assert_eq!(claim, ClaimKey::IsStaff);
+        assert_eq!(claim, ClaimKey::Typed(TypedClaim::IsStaff));
         let (claim, ..) = requires(
             "{'type': 'requires', 'claim': 'permissions', 'values': [], 'quantifier': 0, 'message': None}",
         );
-        assert_eq!(claim, ClaimKey::Permissions);
+        assert_eq!(claim, ClaimKey::Typed(TypedClaim::Permissions));
     }
 
     #[test]
