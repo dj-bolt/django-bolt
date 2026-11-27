@@ -6,7 +6,7 @@
 /// permission primitive. A `Requires` guard's claim name and expected
 /// values are extracted from Python once at registration, so request-time
 /// evaluation happens entirely in Rust with zero GIL overhead.
-use crate::middleware::auth::{Audience, AuthContext, TypedClaim};
+use crate::middleware::auth::{Audience, AuthContext, TypedClaim, json_number};
 use bytes::Bytes;
 use serde_json::{Number, Value as Json};
 use std::collections::HashSet;
@@ -309,10 +309,21 @@ impl ClaimValue<'_> {
             ClaimValue::Bool(v) => expected.as_bool() == Some(*v),
             ClaimValue::StrList(list) => list.iter().any(|v| expected.as_str() == Some(v)),
             ClaimValue::Json(value) => match value {
-                Json::Array(items) => items.contains(expected),
-                other => *other == expected,
+                Json::Array(items) => items.iter().any(|item| same_json(item, expected)),
+                other => same_json(other, expected),
             },
         }
+    }
+}
+
+/// A private claim equals a guard value as in Python: the number `7.0` in
+/// a token equals `7`. A guard value is in the form of [`json_number`].
+fn same_json(claim: &Json, expected: &Json) -> bool {
+    match (claim, expected) {
+        (Json::Number(claim), Json::Number(expected)) if claim.is_f64() => {
+            claim.as_f64().and_then(json_number).as_ref() == Some(expected)
+        }
+        _ => claim == expected,
     }
 }
 
@@ -433,6 +444,42 @@ mod tests {
                 evaluate_guards(&any_of(name, &[value]), Some(&ctx)),
                 expected,
                 "{name}"
+            );
+        }
+    }
+
+    /// A private number equals a guard value of the same value, as in Python.
+    /// A guard value is in the form that registration gives: `7.0` is `7`.
+    #[test]
+    fn a_private_number_matches_a_guard_value_of_the_same_value() {
+        for (claim, value, expected) in [
+            (Json::from(7.0), Json::from(7), GuardResult::Allow),
+            (Json::from(7), Json::from(7), GuardResult::Allow),
+            (
+                serde_json::json!([1, 7.0]),
+                Json::from(7),
+                GuardResult::Allow,
+            ),
+            (Json::from(7.5), Json::from(7.5), GuardResult::Allow),
+            (Json::from(7.5), Json::from(7), GuardResult::Forbidden(None)),
+            (
+                Json::from(7.0),
+                Json::from("7"),
+                GuardResult::Forbidden(None),
+            ),
+            (
+                Json::from(1.0),
+                Json::from(true),
+                GuardResult::Forbidden(None),
+            ),
+        ] {
+            let claims: Claims =
+                serde_json::from_value(serde_json::json!({ "level": claim })).unwrap();
+            let ctx = AuthContext::from_jwt_claims(claims, "jwt", false);
+            assert_eq!(
+                evaluate_guards(&any_of("level", std::slice::from_ref(&value)), Some(&ctx)),
+                expected,
+                "{claim} {value}"
             );
         }
     }

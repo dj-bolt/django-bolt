@@ -32,6 +32,9 @@ from django_bolt.auth import (
 )
 from django_bolt.testing import TestClient
 
+from .jwt_parity import SECRET as RAW_TOKEN_SECRET
+from .jwt_parity import make_token
+
 pytestmark = pytest.mark.django_db
 
 SECRET = "requires-guard-test-secret-long-enough-for-hs256"
@@ -205,6 +208,56 @@ class TestMatchingSemantics:
         with TestClient(make_api([Requires("sub", str(user.id))])) as client:
             resp = client.get("/protected", headers=bearer(user))
         assert resp.status_code == 200
+
+
+NUMBER_CLAIMS = ("iat", "oat", "ver", "level")
+# Guard values by name: a dict key cannot tell 7 from 7.0.
+GUARD_NUMBERS = {"int": 7, "whole-float": 7.0, "fraction": 7.5}
+NUMBER_FORMS = {
+    "equality": lambda claim, value: Requires(claim, value),
+    "any_of": lambda claim, value: Requires(claim, value, 99),
+    "all_of": lambda claim, value: Requires(claim, all_of=[value]),
+    "none_of": lambda claim, value: Requires(claim, none_of=[value]),
+}
+
+
+@pytest.fixture(scope="module")
+def number_client():
+    api = BoltAPI()
+    # `make_token` signs raw JSON, so a token can hold `7.0` as JSON writes it.
+    auth = [JWTAuthentication(secret=RAW_TOKEN_SECRET)]
+    for claim in NUMBER_CLAIMS:
+        for form, guard in NUMBER_FORMS.items():
+            for name, value in GUARD_NUMBERS.items():
+
+                async def handler():
+                    return {"ok": True}
+
+                api.get(f"/{claim}/{form}/{name}", auth=auth, guards=[guard(claim, value)])(handler)
+    with TestClient(api) as test_client:
+        yield test_client
+
+
+class TestNumberValues:
+    """A number equals a number of the same value, as in Python: ``7 == 7.0``."""
+
+    @pytest.mark.parametrize("token_value", ["7", "7.0", "7e0"])
+    @pytest.mark.parametrize("claim", NUMBER_CLAIMS)
+    def test_a_whole_number_matches_in_each_form(self, number_client, claim, token_value):
+        token = make_token({"alg": "HS256"}, f'{{"sub":"1","exp":4000000000,"{claim}":{token_value}}}')
+        headers = {"Authorization": f"Bearer {token}"}
+        statuses = {
+            (form, name): number_client.get(f"/{claim}/{form}/{name}", headers=headers).status_code
+            for form in NUMBER_FORMS
+            for name in GUARD_NUMBERS
+        }
+        match = {"equality": 200, "any_of": 200, "all_of": 200, "none_of": 403}
+        no_match = {"equality": 403, "any_of": 403, "all_of": 403, "none_of": 200}
+        assert statuses == {
+            (form, name): (no_match if name == "fraction" else match)[form]
+            for form in NUMBER_FORMS
+            for name in GUARD_NUMBERS
+        }
 
 
 class TestPermissionsClaim:

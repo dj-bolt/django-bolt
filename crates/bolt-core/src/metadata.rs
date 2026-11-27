@@ -1527,7 +1527,8 @@ pub fn parse_guard(dict: &HashMap<String, Py<PyAny>>, py: Python) -> PyResult<Gu
                 } else if let Ok(i) = bound.extract::<i64>() {
                     serde_json::Value::from(i)
                 } else if let Ok(f) = bound.extract::<f64>() {
-                    serde_json::Number::from_f64(f)
+                    // A whole float becomes an integer, as a number in a token does.
+                    crate::middleware::auth::json_number(f)
                         .map(serde_json::Value::Number)
                         .ok_or_else(|| {
                             PyValueError::new_err(format!(
@@ -3580,6 +3581,8 @@ mod tests {
         }
     }
 
+    /// Each value keeps its JSON type. A whole float becomes an integer, as a
+    /// number in a token does: thus the guard value `2.0` equals the claim `2`.
     #[test]
     fn requires_values_keep_their_json_type() {
         let (_, values, ..) = requires(
@@ -3595,13 +3598,13 @@ mod tests {
                 serde_json::json!(0),
                 serde_json::json!(-7),
                 serde_json::json!(1.5),
-                serde_json::json!(2.0),
+                serde_json::json!(2),
                 serde_json::json!("text"),
             ]
         );
         // A bool is not a number: `True` must not become 1.
         assert!(values[0].is_boolean() && values[2].is_i64());
-        assert!(values[6].is_f64());
+        assert!(values[5].is_f64() && values[6].is_i64());
     }
 
     #[test]
