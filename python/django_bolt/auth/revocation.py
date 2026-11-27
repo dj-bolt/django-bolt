@@ -28,6 +28,7 @@ _NEVER_EXPIRES = datetime(9999, 1, 1, tzinfo=UTC)
 # A store keeps an entry until a `datetime`, and the last one is 9999-12-31 23:59:59.999999 UTC.
 # An entry that ends at this second ends in that range: an `exp` near it plus the leeway does not.
 _LAST_ENTRY_SECOND = int(datetime(9999, 12, 31, 23, 59, 58, tzinfo=UTC).timestamp())
+_LAST_DATETIME = datetime.max.replace(tzinfo=UTC)
 
 
 class ReservedJtiError(ValueError):
@@ -168,6 +169,18 @@ def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS, *, leeway: in
     if exp is None:
         return default
     return max(0, min(int(exp) + leeway, _LAST_ENTRY_SECOND) - int(time.time()) + 1)
+
+
+def _entry_end(ttl: int) -> datetime:
+    """
+    Return the time when an entry that lives ``ttl`` seconds ends.
+
+    The result is at the latest the last ``datetime``. ``_ttl_for`` and this
+    function each read the clock. When the second changes between the two
+    reads, an entry for the year 9999 would end after the last ``datetime``.
+    """
+    now = datetime.now(UTC)
+    return now + min(timedelta(seconds=ttl), _LAST_DATETIME - now)
 
 
 def _checked_leeway(store_name: str, leeway: int) -> int:
@@ -692,7 +705,7 @@ class DjangoORMRevocation(RevocationStore):
     async def _upsert(self, jti: str, exp: int | None) -> None:
         # Read the TTL first: expires_at is then never before the end of exp + leeway.
         ttl = _ttl_for(exp, self.default_ttl, leeway=self.leeway)
-        expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
+        expires_at = _entry_end(ttl)
         await self._model_for(jti).objects.aupdate_or_create(jti=jti, defaults={"expires_at": expires_at})
 
     async def consume(self, jti: str, *, exp: int | None = None) -> bool:
@@ -703,7 +716,7 @@ class DjangoORMRevocation(RevocationStore):
             # The cleanup task deletes an expired row, and a later consume would then
             # succeed. The backend refuses this token, so refuse it here too.
             return False
-        expires_at = datetime.now(UTC) + timedelta(seconds=ttl)
+        expires_at = _entry_end(ttl)
         try:
             await model.objects.acreate(jti=jti, expires_at=expires_at)
         except IntegrityError:

@@ -26,6 +26,7 @@ from django_bolt.auth.revocation import (
     InMemoryRevocation,
     ReservedJtiError,
     RevocationStore,
+    _entry_end,
     _ttl_for,
 )
 from django_bolt.auth.revocation_db.models import RevokedToken
@@ -105,6 +106,21 @@ def test_ttl_for_ends_an_entry_in_the_last_year_of_a_datetime():
     last = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
     for exp in (253402300799, 2**62, 10**300):
         assert datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, leeway=60)) <= last
+
+
+def test_entry_end_is_at_the_latest_the_last_datetime():
+    """The clock can move between the read of ``_ttl_for`` and the read of the store."""
+    last = datetime.max.replace(tzinfo=UTC)
+    left = int((last - datetime.now(UTC)).total_seconds())
+    for late in (0, 1, 2, 3600):
+        assert _entry_end(left + late) <= last
+    assert _entry_end(left + 3600) == last
+
+
+def test_entry_end_of_a_usual_entry_is_now_plus_its_seconds():
+    before = datetime.now(UTC)
+    end = _entry_end(3600)
+    assert before + timedelta(seconds=3600) <= end <= datetime.now(UTC) + timedelta(seconds=3600)
 
 
 def test_orm_store_keeps_an_entry_for_an_exp_in_the_last_second_of_a_datetime(orm_store):

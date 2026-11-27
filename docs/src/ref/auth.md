@@ -211,6 +211,7 @@ Compares one claim of the credential with the values.
 
 A scalar claim matches an equal value. A list claim matches a value that it contains.
 A number equals a number of the same value, as in Python: `Requires("ver", 7.0)` matches `"ver": 7`. A number never equals a `bool` or a string.
+This rule is for a float and for an integer from -2^63 to 2^63 - 1. Bolt does not compare a larger integer accurately. Do not use one as a guard value.
 A request with no credential gets 401 for each `Requires`, also for a `none_of` one. A credential that does not match gets 403.
 A claim that Bolt types, in another JSON type, is malformed. Each `Requires` on a malformed claim gives 403, also `none_of`. See [Give each claim its JSON type](../topics/authentication.md#give-each-claim-its-json-type).
 
