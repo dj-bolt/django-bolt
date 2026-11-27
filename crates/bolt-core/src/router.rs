@@ -675,19 +675,164 @@ fn hex_digit(byte: Option<&u8>) -> Option<u8> {
     }
 }
 
-/// Split a query string into decoded (key, value) pairs, in their order.
+/// The number of bytes of a raw key or value after its percent-decoding.
+///
+/// `DJANGO_BOLT_MAX_PARAM_LENGTH` counts these bytes. The decoded text can be
+/// longer, because U+FFFD has three bytes and a Latin-1 character has two.
+pub fn percent_decoded_len(raw: &[u8]) -> usize {
+    let mut escapes = 0;
+    let mut start = 0;
+    while let Some(offset) = memchr::memchr(b'%', &raw[start..]) {
+        let at = start + offset;
+        if hex_digit(raw.get(at + 1)).is_some() && hex_digit(raw.get(at + 2)).is_some() {
+            escapes += 1;
+            start = at + 3;
+        } else {
+            start = at + 1;
+        }
+    }
+    raw.len() - 2 * escapes
+}
+
+/// Decode one key or value of a form body that is not UTF-8, as Django does.
+///
+/// Django `QueryDict` reads such a body as Latin-1, as a whole. Thus a byte
+/// that is not ASCII gives the character with the same code. Each run of ASCII
+/// bytes decodes as in `decode_query_component`, as Python `unquote_plus` does.
+pub fn decode_latin1_query_component(raw: &[u8]) -> String {
+    let mut text = String::with_capacity(raw.len() * 2);
+    let mut run = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            b'+' => run.push(b' '),
+            b'%' => match (hex_digit(raw.get(i + 1)), hex_digit(raw.get(i + 2))) {
+                (Some(high), Some(low)) => {
+                    run.push((high << 4) | low);
+                    i += 2;
+                }
+                _ => run.push(b'%'),
+            },
+            byte if byte.is_ascii() => run.push(byte),
+            byte => {
+                text.push_str(&String::from_utf8_lossy(&run));
+                run.clear();
+                text.push(char::from(byte));
+            }
+        }
+        i += 1;
+    }
+    text.push_str(&String::from_utf8_lossy(&run));
+    text
+}
+
+/// Split a query string into raw (key, value) pairs, in their order.
 /// The rules are those of Python `parse_qsl` for Django `QueryDict`, and of the
 /// WHATWG `application/x-www-form-urlencoded` parser. An empty pair is skipped.
 /// A pair with no `=` has an empty value. An empty key stays.
 #[inline]
-pub fn query_pairs(query: &str) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+pub fn raw_query_pairs(query: &str) -> impl Iterator<Item = (&str, &str)> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (decode_query_component(key), decode_query_component(value))
-        })
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+}
+
+/// Split a query string into decoded (key, value) pairs, in their order.
+/// See `raw_query_pairs` for the rules.
+#[inline]
+pub fn query_pairs(query: &str) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+    raw_query_pairs(query)
+        .map(|(key, value)| (decode_query_component(key), decode_query_component(value)))
+}
+
+/// The byte counts that the client sent for the values of a raw query.
+///
+/// `DJANGO_BOLT_MAX_PARAM_LENGTH` counts the bytes of a query value after its
+/// percent-decoding. The decoded text is never shorter, so a check needs these
+/// counts only for a text over the limit. The first such check reads the whole
+/// query in one pass. Each later check uses the result of that pass.
+pub struct QuerySentLens<'q> {
+    query: &'q str,
+    max_length: usize,
+    lens: Option<AHashMap<Cow<'q, str>, SentLens>>,
+}
+
+/// The byte counts of the values of one query key.
+#[derive(Clone, Copy)]
+struct SentLens {
+    /// The count of the last value, which the query map keeps.
+    last: usize,
+    /// The count of the first value over the limit.
+    first_over: Option<usize>,
+}
+
+impl<'q> QuerySentLens<'q> {
+    /// Hold `query` for the checks against `max_length`. This does not read it.
+    #[inline]
+    pub const fn new(query: &'q str, max_length: usize) -> Self {
+        Self {
+            query,
+            max_length,
+            lens: None,
+        }
+    }
+
+    #[inline]
+    pub const fn query(&self) -> &'q str {
+        self.query
+    }
+
+    #[inline]
+    pub const fn max_length(&self) -> usize {
+        self.max_length
+    }
+
+    /// The byte count of the last value of `name`.
+    pub fn last(&mut self, name: &str) -> Option<usize> {
+        self.lens_of(name).map(|lens| lens.last)
+    }
+
+    /// The byte count of the first value of `name` that is over the limit.
+    pub fn first_over(&mut self, name: &str) -> Option<usize> {
+        self.lens_of(name).and_then(|lens| lens.first_over)
+    }
+
+    #[cold]
+    fn lens_of(&mut self, name: &str) -> Option<SentLens> {
+        let (query, max_length) = (self.query, self.max_length);
+        self.lens
+            .get_or_insert_with(|| read_sent_lens(query, max_length))
+            .get(name)
+            .copied()
+    }
+}
+
+#[cold]
+fn read_sent_lens(query: &str, max_length: usize) -> AHashMap<Cow<'_, str>, SentLens> {
+    #[cfg(test)]
+    QUERY_SCANS.with(|scans| scans.set(scans.get() + 1));
+    let mut lens: AHashMap<Cow<'_, str>, SentLens> = AHashMap::new();
+    for (key, value) in raw_query_pairs(query) {
+        let len = percent_decoded_len(value.as_bytes());
+        let over = (len > max_length).then_some(len);
+        lens.entry(decode_query_component(key))
+            .and_modify(|lens| {
+                lens.last = len;
+                lens.first_over = lens.first_over.or(over);
+            })
+            .or_insert(SentLens {
+                last: len,
+                first_over: over,
+            });
+    }
+    lens
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The number of passes of `read_sent_lens` on this thread.
+    pub(crate) static QUERY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Parse a query string into a map. A repeated key keeps its last value, as `QueryDict[key]` does.
@@ -1280,6 +1425,74 @@ mod tests {
             .prop_map(|pieces| pieces.concat())
     }
 
+    /// Bytes of a raw component: escapes, valid and not, and any byte.
+    fn raw_bytes() -> impl Strategy<Value = Vec<u8>> {
+        let piece = prop_oneof![
+            prop::sample::select(QUERY_PIECES).prop_map(|piece| piece.as_bytes().to_vec()),
+            any::<u8>().prop_map(|byte| vec![byte]),
+            Just(b"%C3".to_vec()),
+        ];
+        prop::collection::vec(piece, 0..16).prop_map(|pieces| pieces.concat())
+    }
+
+    /// What Django gives for one component of a body that is not UTF-8.
+    ///
+    /// `QueryDict` decodes the body as Latin-1. Python `unquote_plus` then
+    /// changes `+` to a space, and unquotes each run of ASCII characters to
+    /// bytes, which decode as UTF-8 with U+FFFD for a bad sequence.
+    fn django_latin1_component(raw: &[u8]) -> String {
+        let text: String = raw.iter().map(|&byte| char::from(byte)).collect();
+        let text = text.replace('+', " ");
+        let unquote = |run: &str| {
+            String::from_utf8_lossy(&urlencoding::decode_binary(run.as_bytes())).into_owned()
+        };
+        let mut decoded = String::new();
+        let mut run = String::new();
+        for character in text.chars() {
+            if character.is_ascii() {
+                run.push(character);
+            } else {
+                decoded.push_str(&unquote(&run));
+                run.clear();
+                decoded.push(character);
+            }
+        }
+        decoded.push_str(&unquote(&run));
+        decoded
+    }
+
+    /// The decoded byte count of each value of `name`, in order: one pass for each name.
+    fn query_value_lens<'q>(query: &'q str, name: &'q str) -> impl Iterator<Item = usize> + 'q {
+        raw_query_pairs(query)
+            .filter(move |(key, _)| decode_query_component(key) == name)
+            .map(|(_, value)| percent_decoded_len(value.as_bytes()))
+    }
+
+    #[test]
+    fn query_sent_lens_counts_each_value_of_a_name_after_its_decode() {
+        let query = "v=%FF%FF&w=abc&v=a+b%FF&%76=%C3%A9";
+        assert_eq!(query_value_lens(query, "v").collect::<Vec<_>>(), [2, 4, 2]);
+        let mut lens = QuerySentLens::new(query, 2);
+        assert_eq!(lens.last("v"), Some(2));
+        assert_eq!(lens.first_over("v"), Some(4));
+        assert_eq!(lens.last("w"), Some(3));
+        assert_eq!(lens.last("x"), None);
+        assert_eq!(lens.first_over("x"), None);
+    }
+
+    #[test]
+    fn query_sent_lens_reads_the_query_once_and_only_when_asked() {
+        let scans = || QUERY_SCANS.with(std::cell::Cell::get);
+        let before = scans();
+        let mut lens = QuerySentLens::new("a=1&b=%FF&a=%FF%FF", 1);
+        assert_eq!(scans(), before);
+        for name in ["a", "b", "c", "a"] {
+            lens.last(name);
+            lens.first_over(name);
+        }
+        assert_eq!(scans(), before + 1);
+    }
+
     /// Encode a form component, with `+` or `%20` for a space.
     fn form_encode(text: &str, plus_for_space: bool) -> String {
         let encoded = urlencoding::encode(text).into_owned();
@@ -1362,6 +1575,36 @@ mod tests {
                 .map(|(key, value)| (key.into_owned(), value.into_owned()))
                 .collect();
             prop_assert_eq!(decoded, pairs);
+        }
+
+        /// One pass gives each count that a pass for each name gives.
+        #[test]
+        fn query_sent_lens_equal_the_lens_of_one_pass_for_each_name(
+            query in raw_query(),
+            max_length in 0usize..8,
+        ) {
+            let mut lens = QuerySentLens::new(&query, max_length);
+            let names: Vec<Cow<'_, str>> = raw_query_pairs(&query)
+                .map(|(key, _)| decode_query_component(key))
+                .chain([Cow::Borrowed("absent")])
+                .collect();
+            for name in &names {
+                prop_assert_eq!(lens.last(name), query_value_lens(&query, name).last());
+                prop_assert_eq!(
+                    lens.first_over(name),
+                    query_value_lens(&query, name).find(|&len| len > max_length)
+                );
+            }
+        }
+
+        #[test]
+        fn percent_decoded_len_counts_the_decoded_bytes(raw in raw_bytes()) {
+            prop_assert_eq!(percent_decoded_len(&raw), urlencoding::decode_binary(&raw).len());
+        }
+
+        #[test]
+        fn a_latin1_component_decodes_as_django_decodes_it(raw in raw_bytes()) {
+            prop_assert_eq!(decode_latin1_query_component(&raw), django_latin1_component(&raw));
         }
 
         /// A path param decodes `%XX` only. A `+` stays a `+`.

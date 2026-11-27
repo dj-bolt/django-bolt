@@ -21,9 +21,8 @@ class AdminRouteRegistrar:
     def __init__(self, api: "BoltAPI"):
         self.api = api
 
-    def register_routes(self, host: str = "localhost", port: int = 8000) -> None:
-        """Mount Django admin. host/port accepted for backward compat only."""
-        _ = (host, port)
+    def register_routes(self) -> None:
+        """Mount Django admin."""
         if self.api._admin_routes_registered:
             return
 

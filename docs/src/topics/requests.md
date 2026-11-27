@@ -346,6 +346,19 @@ curl -X POST localhost:8000/login -d "username=ana&password=secret&remember=true
 
 A repeated field takes its last value. Declare a `list` to take each value.
 
+Bolt decodes the text of a form as Django `request.POST` does:
+
+- A URL-encoded body that is UTF-8 decodes as a query string. An escape such as `%E9` that does not give UTF-8 becomes U+FFFD.
+- A URL-encoded body that is not UTF-8 decodes as Latin-1, as a whole. Thus `name=caf` and the byte `0xE9` give `café`.
+- A multipart text field decodes as UTF-8. Each bad byte sequence becomes U+FFFD.
+
+A `bytes` form argument gets the UTF-8 bytes of this text. A file keeps the bytes that the client sent.
+Bolt ignores the `charset` of a URL-encoded body and reads the body by the rules above.
+For example, a body `name=caf` and the byte `0xE9` with `charset=latin-1` gives `café`.
+Django answers `400` for a URL-encoded body with a `charset` that it knows and that is not `utf-8`. Bolt does not.
+Bolt always decodes multipart text as UTF-8. It ignores the `charset` of the `Content-Type` header and the `DEFAULT_CHARSET` setting.
+A multipart field name that is not UTF-8 gets `422`. Django drops such a field.
+
 ## Upload files
 
 Use `UploadFile` with `File()`:

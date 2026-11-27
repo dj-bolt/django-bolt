@@ -26,7 +26,7 @@ from django_bolt import BoltAPI, WebSocket
 from django_bolt.auth import IsAuthenticated, JWTAuthentication, Requires
 from django_bolt.param_functions import Cookie, Header, Query
 from django_bolt.testing import ConnectionClosed, TestClient, WebSocketTestClient
-from django_bolt.websocket import CloseCode, is_websocket_handler
+from django_bolt.websocket import CloseCode
 
 # Test secret for JWT tokens
 TEST_JWT_SECRET = "test-secret-key-for-websocket-tests"
@@ -1004,7 +1004,7 @@ async def test_websocket_handler_may_be_a_callable_object_or_a_bound_method(kind
 
     assert api.websocket("/ws/{room}")(handler) is handler
     # The mark is on the method that the route registered.
-    assert is_websocket_handler(handlers.__call__ if kind == "call" else handler)
+    assert (handlers.__call__ if kind == "call" else handler)._is_websocket_handler is True
 
     async with WebSocketTestClient(api, "/ws/blue") as ws:
         assert await ws.receive_text() == f"{kind}:blue"

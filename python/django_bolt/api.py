@@ -43,7 +43,6 @@ from ._urlconf import ApiURLConf, join_mount_path
 from ._view_context import _current_action, _current_request
 from .admin.routes import AdminRouteRegistrar
 from .analysis import analyze_dependency_tree, analyze_handler, annotation_globals
-from .auth import register_auth_backend
 from .auth.backends import revocation_takes_claims
 from .auth.session import auth_without_session, build_session_guard_check, session_middleware, uses_session
 from .auth.user_loader import (
@@ -1392,8 +1391,8 @@ class BoltAPI:
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
-                # Store the auth backend instances for user resolution and for the
-                # OpenAPI schema: the explicit ones, or the defaults that Rust gets.
+                # Store the auth backend instances for the OpenAPI schema: the
+                # explicit ones, or the defaults that Rust gets.
                 if ws_auth_backends:
                     middleware_meta["_auth_backend_instances"] = ws_auth_backends
 
@@ -2420,8 +2419,7 @@ class BoltAPI:
 
             if middleware_meta:
                 self._handler_middleware[handler_id] = middleware_meta
-                # Backend instances (not metadata) are kept so user resolution
-                # can call their get_user() methods.
+                # The OpenAPI schema reads the backend instances.
                 if effective_auth_backends:
                     middleware_meta["_auth_backend_instances"] = effective_auth_backends
 
@@ -4005,24 +4003,6 @@ class BoltAPI:
 
         registrar = AdminRouteRegistrar(self)
         registrar.register_routes()
-
-    def _register_auth_backends(self) -> None:
-        """
-        Register authentication backends for user resolution.
-
-        Scans all handler middleware metadata to find unique auth backends,
-        then registers them for request.user lazy loading.
-        """
-        registered = set()
-
-        for _handler_id, metadata in self._handler_middleware.items():
-            # Get stored backend instances (stored during route decoration)
-            backend_instances = metadata.get("_auth_backend_instances", [])
-            for backend_instance in backend_instances:
-                backend_type = backend_instance.scheme_name
-                if backend_type and backend_type not in registered:
-                    registered.add(backend_type)
-                    register_auth_backend(backend_type, backend_instance)
 
     def native_route(self, method: str, path: str, capsule: Any) -> None:
         """Serve ``method path`` with a Rust handler from another extension module.
