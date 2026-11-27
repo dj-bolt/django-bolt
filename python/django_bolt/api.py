@@ -47,7 +47,6 @@ from .auth.backends import revocation_takes_claims
 from .auth.session import auth_without_session, build_session_guard_check, session_middleware, uses_session
 from .auth.user_loader import (
     LazyUser,
-    _register_auth_backend,
     resolve_user_loader,
 )
 from .concurrency import (
@@ -4005,24 +4004,6 @@ class BoltAPI:
 
         registrar = AdminRouteRegistrar(self)
         registrar.register_routes()
-
-    def _register_auth_backends(self) -> None:
-        """
-        Register authentication backends for user resolution.
-
-        Scans all handler middleware metadata to find unique auth backends,
-        then registers them for the deprecated load_user() and load_user_sync().
-        """
-        registered = set()
-
-        for _handler_id, metadata in self._handler_middleware.items():
-            # Get stored backend instances (stored during route decoration)
-            backend_instances = metadata.get("_auth_backend_instances", [])
-            for backend_instance in backend_instances:
-                backend_type = backend_instance.scheme_name
-                if backend_type and backend_type not in registered:
-                    registered.add(backend_type)
-                    _register_auth_backend(backend_type, backend_instance)
 
     def native_route(self, method: str, path: str, capsule: Any) -> None:
         """Serve ``method path`` with a Rust handler from another extension module.

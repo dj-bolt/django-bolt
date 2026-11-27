@@ -1,9 +1,7 @@
 """
 User loading system for request.user
 
-Supports both eager and lazy loading strategies.
-Lazy loading (default): Uses SimpleLazyObject to defer DB query until first access
-Eager loading (optional): Loads user immediately at dispatch time
+Bolt loads the user lazily. LazyUser runs the query at the first read only.
 
 Backends customize user loading by overriding get_user (async) and/or
 get_user_sync (sync) — overriding either one alone is honored. The effective
@@ -36,10 +34,8 @@ from collections.abc import Callable, Coroutine
 from functools import partial
 from typing import Any
 
-from django.contrib.auth import get_user_model
 from django.utils.functional import SimpleLazyObject, empty
 
-from .._deprecation import warn_deprecated
 from ..concurrency import run_in_orm_executor, run_orm_blocking
 from ..exceptions import Unauthorized
 from .backends import BaseAuthentication, JWTAuthentication
@@ -49,13 +45,7 @@ __all__ = [
     "LazyUser",
     "aload_bolt_user",
     "load_user_by_pk_sync",
-    "register_auth_backend",
-    "get_registered_backend",
     "resolve_user_loader",
-    "load_user",
-    "load_user_sync",
-    "default_django_user_loader",
-    "default_django_user_aloader",
 ]
 
 SyncLoader = Callable[[str, dict | None], Any]
@@ -66,13 +56,6 @@ UserLoaders = tuple[SyncLoader, AsyncLoader]
 # was NOT overridden by the user — only genuine overrides take priority.
 _FRAMEWORK_GET_USER = (BaseAuthentication.get_user, JWTAuthentication.get_user)
 _FRAMEWORK_GET_USER_SYNC = (JWTAuthentication.get_user_sync,)
-
-# Global registry of auth backend instances for user resolution
-_auth_backend_registry: dict[str, Any] = {}
-
-# (backend_name) -> resolved (sync loader, async loader), each (user_id, auth_context) -> user,
-# or None when the backend has no user resolution. Built at registration time.
-_resolved_loader_registry: dict[str, UserLoaders | None] = {}
 
 
 class LazyUser(SimpleLazyObject):
@@ -205,120 +188,3 @@ def resolve_user_loader(backend: Any) -> UserLoaders | None:
         return reject_sync_access, aload_via_async
 
     return None
-
-
-def _load_default_user(user_id: str, auth_context: dict | None) -> Any:
-    """Load the Django user with the primary key ``user_id``, or None when no row has it."""
-    return run_orm_blocking(load_user_by_pk_sync, get_user_model(), user_id)
-
-
-async def _aload_default_user(user_id: str, auth_context: dict | None) -> Any:
-    """Async form of :func:`_load_default_user`."""
-    return await run_in_orm_executor(load_user_by_pk_sync, get_user_model(), user_id)
-
-
-def default_django_user_loader(user_id: str, auth_context: dict | None) -> Any:
-    """Deprecated. Load the Django user with the primary key ``user_id``, or None."""
-    warn_deprecated("default_django_user_loader()", "Use `request.user`.")
-    return _load_default_user(user_id, auth_context)
-
-
-async def default_django_user_aloader(user_id: str, auth_context: dict | None) -> Any:
-    """Deprecated. Async form of :func:`default_django_user_loader`."""
-    warn_deprecated("default_django_user_aloader()", "Use `await request.auser()`.")
-    return await _aload_default_user(user_id, auth_context)
-
-
-def __getattr__(name: str) -> Any:
-    # A module constant cannot warn on use. This function gives the deprecated constant.
-    if name == "DEFAULT_USER_LOADERS":
-        warn_deprecated("DEFAULT_USER_LOADERS")
-        return (_load_default_user, _aload_default_user)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def _register_auth_backend(backend_name: str, backend_instance: Any) -> None:
-    """Register a backend for :func:`load_user` and :func:`load_user_sync`.
-
-    BoltAPI calls this function at startup. Request dispatch does not use the
-    registry: it uses the user loaders of the route.
-    """
-    _auth_backend_registry[backend_name] = backend_instance
-    _resolved_loader_registry[backend_name] = resolve_user_loader(backend_instance)
-
-
-def register_auth_backend(backend_name: str, backend_instance: Any) -> None:
-    """Deprecated. Register an authentication backend instance by name.
-
-    Args:
-        backend_name: Unique identifier for the backend (e.g., "jwt", "api_key")
-        backend_instance: Instance of the authentication backend class
-    """
-    warn_deprecated("register_auth_backend()", "Bolt registers the auth backends of each route.")
-    _register_auth_backend(backend_name, backend_instance)
-
-
-def get_registered_backend(backend_name: str) -> Any | None:
-    """Deprecated. Get a registered auth backend by name."""
-    warn_deprecated("get_registered_backend()", "Keep a reference to the backend that you give to the route.")
-    return _auth_backend_registry.get(backend_name)
-
-
-async def load_user(user_id: str | None, backend_name: str | None, auth_context: dict | None = None) -> Any | None:
-    """
-    Deprecated. Eagerly load user from auth context.
-
-    Loads user immediately (not lazy). Suitable for authenticated endpoints
-    where user is always needed.
-
-    Args:
-        user_id: User identifier from auth context
-        backend_name: Authentication backend name (e.g., "jwt", "api_key")
-        auth_context: Full authentication context dict
-
-    Returns:
-        User object, or None if not found or no user_id
-    """
-    warn_deprecated("load_user()", "Use `await request.auser()`.")
-    if not user_id:
-        return None
-
-    loaders = _resolved_loader_registry.get(backend_name) if backend_name else None
-    if loaders is None:
-        return None
-    return await loaders[1](user_id, auth_context)
-
-
-def load_user_sync(
-    user_id: str | None,
-    backend_name: str | None,
-    auth_context: dict | None = None,
-) -> Any | None:
-    """
-    Deprecated. Synchronously load user from auth context.
-
-    This is the sync form of :func:`load_user`, with the rules of
-    ``request.user``: the query runs on the calling thread. With a running
-    loop, it runs on the ORM pool.
-
-    Args:
-        user_id: User identifier from auth context
-        backend_name: Authentication backend name (e.g., "jwt", "api_key")
-        auth_context: Full authentication context dict
-
-    Returns:
-        User object, or None if not found or no user_id
-    """
-    warn_deprecated("load_user_sync()", "Use `request.user`.")
-    if not user_id:
-        return None
-
-    if backend_name in _auth_backend_registry:
-        loaders = _resolved_loader_registry[backend_name]
-        if loaders is None:
-            # Backend provides no user resolution (e.g. plain APIKeyAuthentication)
-            return None
-        return loaders[0](user_id, auth_context)
-
-    # Unregistered backend (e.g. session auth): default Django user query
-    return _load_default_user(user_id, auth_context)
