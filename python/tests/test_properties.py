@@ -877,8 +877,8 @@ def test_a_uuid_or_hex_jti_is_not_refused(revocation_client, path, value, form):
 # valid token with zero to three changes: a header parameter or a claim gets a new
 # value, of its own form or of any JSON type, or goes away. Bolt and PyJWT must
 # agree, except for the wanted differences that `known_difference` names. Each
-# time claim is at least 29 seconds from its limit, so the few milliseconds
-# between the two checks cannot change an answer.
+# time claim is at least 29 seconds from its limit, also a number of any JSON
+# value, so the few milliseconds between the two checks cannot change an answer.
 
 json_scalars = st.one_of(
     st.none(),
@@ -916,6 +916,11 @@ CLAIM_FORMS = {
 REMOVE = object()
 
 
+def _near_now(value, now: int) -> bool:
+    """True for a number less than 90 seconds from now: the limits of a leeway of 0 or 60 are near."""
+    return isinstance(value, int | float) and not isinstance(value, bool) and abs(value - now) < 90
+
+
 @st.composite
 def jwt_parts(draw) -> tuple[dict, dict]:
     now = int(time.time())
@@ -927,7 +932,10 @@ def jwt_parts(draw) -> tuple[dict, dict]:
     for _ in range(draw(st.integers(min_value=0, max_value=3))):
         part, forms = draw(st.sampled_from([(header, HEADER_FORMS), (claims, claim_forms)]))
         name = draw(st.sampled_from(sorted(forms)))
-        value = draw(st.one_of(forms[name], forms[name], json_values, st.just(REMOVE)))
+        values = json_values
+        if name in jwt_parity.TIME_CLAIMS:
+            values = json_values.filter(lambda value: not _near_now(value, now))
+        value = draw(st.one_of(forms[name], forms[name], values, st.just(REMOVE)))
         if value is REMOVE:
             part.pop(name, None)
         else:

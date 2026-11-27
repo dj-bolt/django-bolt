@@ -25,6 +25,9 @@ from django.db.models import F
 _DEFAULT_TTL_SECONDS = 86400 * 7  # 7 days — fallback when caller doesn't pass `exp`
 # A user version row must stay, so the cleanup task of expired rows must not find it.
 _NEVER_EXPIRES = datetime(9999, 1, 1, tzinfo=UTC)
+# A store keeps an entry until a `datetime`, and the last one is 9999-12-31 23:59:59.999999 UTC.
+# An entry that ends at this second ends in that range: an `exp` near it plus the leeway does not.
+_LAST_ENTRY_SECOND = int(datetime(9999, 12, 31, 23, 59, 58, tzinfo=UTC).timestamp())
 
 
 class ReservedJtiError(ValueError):
@@ -158,12 +161,13 @@ def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS, *, leeway: in
     ``JWTAuthentication`` accepts a token until the end of that second, so the
     entry must not expire before it. A token after that second gets 0, not a
     negative value, because ``timedelta`` subtracts a negative duration from
-    now. Without ``exp``, the result is ``default``, usually the
+    now. An entry ends at the latest in the year 9999, the last year of
+    ``datetime``. Without ``exp``, the result is ``default``, usually the
     ``default_ttl`` of the store. ``leeway`` does not change ``default``.
     """
     if exp is None:
         return default
-    return max(0, int(exp) + leeway - int(time.time()) + 1)
+    return max(0, min(int(exp) + leeway, _LAST_ENTRY_SECOND) - int(time.time()) + 1)
 
 
 def _checked_leeway(store_name: str, leeway: int) -> int:

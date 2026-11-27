@@ -40,6 +40,9 @@ BACKENDS: dict[str, tuple[str | None, str | None, int]] = {
 TOKEN_TYPE_CLAIMS = ("typ", "token_type", "token_use")
 NON_ACCESS_TYPES = ("refresh", "offline", "id")
 TIME_CLAIMS = ("exp", "nbf", "iat")
+# The NumericDates that a Python datetime in UTC holds: 0001-01-01 to 9999-12-31T23:59:59.999999.
+NUMERIC_DATE_START = -62135596800
+NUMERIC_DATE_END = 253402300800
 
 
 def parity_api() -> BoltAPI:
@@ -96,8 +99,11 @@ def known_difference(header: dict[str, Any], claims: dict[str, Any]) -> str | No
     Each reason is a wanted difference. The table in test_jwt_parity.py has a case for each.
     """
     for name in TIME_CLAIMS:
-        if isinstance(claims.get(name), str | bool):
+        value = claims.get(name)
+        if isinstance(value, str | bool):
             return "a NumericDate is a JSON number (RFC 7519, section 2); PyJWT's int() also reads a str or a bool"
+        if isinstance(value, int | float) and not NUMERIC_DATE_START <= value < NUMERIC_DATE_END:
+            return "a NumericDate must be a time that a Python datetime holds; PyJWT reads any number"
     for name in TOKEN_TYPE_CLAIMS:
         if name in claims:
             value = claims[name]

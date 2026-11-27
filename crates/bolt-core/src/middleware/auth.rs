@@ -6,7 +6,7 @@ use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, crypto};
 use pyo3::IntoPyObjectExt;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyFloat, PyString};
+use pyo3::types::{PyDict, PyString};
 use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Number;
@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasher, RandomState};
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -247,18 +248,31 @@ impl ExactForm for String {
     }
 }
 
-/// A NumericDate (RFC 7519, section 2): any JSON number, also with a fraction.
-/// A whole number in the range of `i64`, also as `N.0` or `Ne0`, becomes an
-/// integer. Thus a guard and Python see the same value as for `N`.
+/// `value` as a JSON number. A whole number in the range of `i64`, also as
+/// `N.0` or `Ne0`, becomes an integer. Thus it equals `N`, as in Python.
+/// None for NaN and the infinities.
+pub fn json_number(value: f64) -> Option<Number> {
+    whole_i64(value).map_or_else(|| Number::from_f64(value), |whole| Some(whole.into()))
+}
+
+/// The NumericDates that a Python `datetime` in UTC can hold: the years 1 to
+/// 9999. Python reads the time claims, and a revocation store keeps an entry
+/// until a `datetime`. A time out of this range is not a valid time claim.
+const NUMERIC_DATE_RANGE: Range<f64> = -62_135_596_800.0..253_402_300_800.0;
+
+/// A NumericDate (RFC 7519, section 2): a JSON number, also with a fraction,
+/// in [`NUMERIC_DATE_RANGE`]. A whole number becomes an integer, see
+/// [`json_number`]. Thus a guard and Python see the same value as for `N`.
 impl ExactForm for Number {
     fn from_i64(value: i64) -> Option<Self> {
-        Some(value.into())
-    }
-    fn from_u64(value: u64) -> Option<Self> {
-        Some(value.into())
+        NUMERIC_DATE_RANGE
+            .contains(&(value as f64))
+            .then(|| value.into())
     }
     fn from_f64(value: f64) -> Option<Self> {
-        whole_i64(value).map_or_else(|| Number::from_f64(value), |whole| Some(whole.into()))
+        NUMERIC_DATE_RANGE
+            .contains(&value)
+            .then(|| json_number(value))?
     }
 }
 
@@ -1495,13 +1509,13 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
         claims_dict,
         py,
         "exp",
-        claims.exp.as_ref().map(|n| numeric_date_to_py(py, n))
+        claims.exp.as_ref().map(|n| number_to_py(py, n))
     );
     set_if_some!(
         claims_dict,
         py,
         "iat",
-        claims.iat.as_ref().map(|n| numeric_date_to_py(py, n))
+        claims.iat.as_ref().map(|n| number_to_py(py, n))
     );
     set_if_some!(claims_dict, py, "is_staff", claims.is_staff);
     set_if_some!(claims_dict, py, "is_superuser", claims.is_superuser);
@@ -1509,7 +1523,7 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
         claims_dict,
         py,
         "nbf",
-        claims.nbf.as_ref().map(|n| numeric_date_to_py(py, n))
+        claims.nbf.as_ref().map(|n| number_to_py(py, n))
     );
     match &claims.aud {
         Some(Audience::Single(aud)) => {
@@ -1546,17 +1560,6 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
     }
 
     claims_dict
-}
-
-/// A NumericDate as a Python int when it is a whole number, else a float.
-/// The parse makes a whole number in the range of `i64` an integer already.
-fn numeric_date_to_py(py: Python<'_>, number: &Number) -> Py<PyAny> {
-    match number.as_f64() {
-        Some(value) if number.is_f64() && value.fract() == 0.0 => PyFloat::new(py, value)
-            .call_method0(intern!(py, "__int__"))
-            .map_or_else(|_| py.None(), Bound::unbind),
-        _ => number_to_py(py, number),
-    }
 }
 
 /// A JSON number as Python's `json.loads` gives it: an int for an integer,
@@ -3057,8 +3060,16 @@ mod tests {
             r#""token_type":null"#,
             r#""token_use":{"id":true}"#,
         ] {
-            let token = sign_token(r#"{"alg":"HS256"}"#, &with_exp(claim), Algorithm::HS256);
             for expected in [None, Some("refresh")] {
+                // A refresh route needs `typ: "refresh"`. With it, only the
+                // check of the other type claims refuses the token.
+                let claims = match expected {
+                    Some(_) if !claim.starts_with(r#""typ""#) => {
+                        format!(r#""typ":"refresh",{claim}"#)
+                    }
+                    _ => claim.to_owned(),
+                };
+                let token = sign_token(r#"{"alg":"HS256"}"#, &with_exp(&claims), Algorithm::HS256);
                 let checked = decode_and_validate(
                     &token,
                     &hs256_key(),
@@ -3138,6 +3149,22 @@ mod tests {
         let leeway = |claims: &str| time_check(claims, now, 60.0);
         assert_eq!(leeway(r#"{"exp":1795714789}"#), Ok(()));
         assert_eq!(leeway(r#"{"exp":1795714788.9}"#), Err("token expired"));
+        // The limit is exclusive: now must be before trunc(exp) + leeway.
+        assert_eq!(
+            time_check(r#"{"exp":1795714849}"#, 1_795_714_849.0, 0.0),
+            Err("token expired")
+        );
+        assert_eq!(
+            time_check(r#"{"exp":1795714789.5}"#, second + 1.0, 60.0),
+            Err("token expired")
+        );
+        assert_eq!(
+            time_check(r#"{"exp":1795714849}"#, 1_795_714_848.999_999, 0.0),
+            Ok(())
+        );
+        // The decimal is read as the nearest f64, as Python does: 1795714848.9999998,
+        // not 1795714849.0. Thus int(exp) is 1795714848, and the token expired.
+        assert_eq!(exp("1795714848.99999985"), Err("token expired"));
 
         for (name, error) in [
             ("nbf", "token not yet valid (nbf)"),
@@ -3155,67 +3182,102 @@ mod tests {
         }
     }
 
-    /// A huge or negative NumericDate, or a huge leeway, does not panic or wrap.
+    /// A NumericDate must be a time that a Python `datetime` holds: from
+    /// 0001-01-01 to 9999-12-31T23:59:59.999 UTC. Out of that range, the claim
+    /// is malformed, and an `exp`, `nbf` or `iat` fails the token. PyJWT
+    /// accepts `"exp": 1e300`, and a revocation store then raised
+    /// `OverflowError`.
     #[test]
-    fn a_huge_numeric_date_neither_panics_nor_wraps() {
+    fn a_numeric_date_that_a_datetime_cannot_hold_fails_the_token() {
+        for name in ["exp", "nbf", "iat"] {
+            for time in [
+                "253402300800",
+                "253402300800.0",
+                "-62135596801",
+                "-62135596800.5",
+                "1e300",
+                "-1e300",
+                "9223372036854775807",
+                "18446744073709551615",
+                "184467440737095516150",
+            ] {
+                let claims = format!(r#"{{"{name}":{time}}}"#);
+                assert!(parse_token_claims(claims.as_bytes()).is_err(), "{claims}");
+                let lenient: Claims = serde_json::from_str(&claims).unwrap();
+                assert!(
+                    lenient
+                        .malformed
+                        .contains(TypedClaim::from_name(name).unwrap())
+                );
+            }
+            for (time, value) in [
+                ("253402300799", Number::from(253_402_300_799i64)),
+                ("253402300799.0", Number::from(253_402_300_799i64)),
+                ("-62135596800", Number::from(-62_135_596_800i64)),
+                (
+                    "2.534023007995e11",
+                    Number::from_f64(253_402_300_799.5).unwrap(),
+                ),
+            ] {
+                let claims = parse_token_claims(format!(r#"{{"{name}":{time}}}"#).as_bytes());
+                let field = |claims: Claims| match name {
+                    "exp" => claims.exp,
+                    "nbf" => claims.nbf,
+                    _ => claims.iat,
+                };
+                assert_eq!(field(claims.unwrap()), Some(value), "{name}={time}");
+            }
+        }
+        // The time checks with the limits, and with a huge leeway, do not wrap.
         let now = 1_795_714_848.5;
-        for (claims, expected) in [
-            (r#"{"exp":1e300}"#, Ok(())),
-            (r#"{"exp":18446744073709551615}"#, Ok(())),
-            (r#"{"exp":184467440737095516150}"#, Ok(())),
-            (r#"{"exp":-1e300}"#, Err("token expired")),
-            (r#"{"exp":-9223372036854775808}"#, Err("token expired")),
-            (r#"{"exp":1e300,"nbf":-1e300,"iat":-1e300}"#, Ok(())),
+        let huge = i64::MAX as f64;
+        for (claims, leeway, expected) in [
+            (r#"{"exp":253402300799}"#, 0.0, Ok(())),
+            (r#"{"exp":-62135596800}"#, 0.0, Err("token expired")),
+            (r#"{"exp":-62135596800}"#, huge, Ok(())),
+            (r#"{"exp":1,"nbf":253402300799}"#, huge, Ok(())),
             (
-                r#"{"exp":1e300,"nbf":1e300}"#,
+                r#"{"exp":253402300799,"nbf":253402300799}"#,
+                0.0,
                 Err("token not yet valid (nbf)"),
             ),
             (
-                r#"{"exp":1e300,"iat":18446744073709551615}"#,
+                r#"{"exp":253402300799,"iat":253402300799}"#,
+                0.0,
                 Err("token issued in the future (iat)"),
             ),
+            (
+                r#"{"exp":253402300799,"nbf":-62135596800,"iat":-62135596800}"#,
+                0.0,
+                Ok(()),
+            ),
         ] {
-            assert_eq!(time_check(claims, now, 0.0), expected, "{claims}");
+            assert_eq!(time_check(claims, now, leeway), expected, "{claims}");
         }
-        let huge = i64::MAX as f64;
-        assert_eq!(time_check(r#"{"exp":1,"nbf":9e18}"#, now, huge), Ok(()));
-        assert_eq!(
-            time_check(r#"{"exp":1,"iat":1e300}"#, now, huge),
-            Err("token issued in the future (iat)")
-        );
         // JSON has no Infinity or NaN, and a number beyond f64 is an error.
         for claims in [r#"{"exp":1e400}"#, r#"{"exp":Infinity}"#, r#"{"exp":NaN}"#] {
             assert!(parse_token_claims(claims.as_bytes()).is_err(), "{claims}");
         }
     }
 
-    /// A whole number reaches Python as an int, also as `N.0`, `Ne0` or
-    /// beyond `i64`. Only a number with a fraction is a float.
+    /// A whole number reaches Python as an int, also as `N.0` or `Ne0`. Only
+    /// a number with a fraction is a float.
     #[test]
     fn a_numeric_date_reaches_python_as_an_int_unless_it_has_a_fraction() {
         Python::initialize();
-        let claims =
-            parse_token_claims(br#"{"exp":1795714848.0,"iat":1795714848.5,"nbf":1e3}"#).unwrap();
-        let huge = parse_token_claims(br#"{"exp":1e300,"iat":-1e19}"#).unwrap();
+        let claims = parse_token_claims(
+            br#"{"exp":253402300799.0,"iat":1795714848.5,"nbf":-6.21355968e10}"#,
+        )
+        .unwrap();
         Python::attach(|py| {
             let dict = claims_to_dict(py, &claims);
             let item = |key: &str| dict.get_item(key).unwrap().unwrap();
             assert_eq!(item("exp").get_type().name().unwrap(), "int");
-            assert_eq!(item("exp").extract::<i64>().unwrap(), 1_795_714_848);
+            assert_eq!(item("exp").extract::<i64>().unwrap(), 253_402_300_799);
             assert_eq!(item("iat").get_type().name().unwrap(), "float");
             assert_eq!(item("iat").extract::<f64>().unwrap(), 1_795_714_848.5);
             assert_eq!(item("nbf").get_type().name().unwrap(), "int");
-            assert_eq!(item("nbf").extract::<i64>().unwrap(), 1000);
-
-            let dict = claims_to_dict(py, &huge);
-            let item = |key: &str| dict.get_item(key).unwrap().unwrap();
-            assert_eq!(item("exp").get_type().name().unwrap(), "int");
-            assert_eq!(item("exp").str().unwrap().to_string().len(), 301);
-            assert_eq!(item("iat").get_type().name().unwrap(), "int");
-            assert_eq!(
-                item("iat").str().unwrap().to_string(),
-                "-10000000000000000000"
-            );
+            assert_eq!(item("nbf").extract::<i64>().unwrap(), -62_135_596_800);
         });
     }
 
@@ -3344,19 +3406,35 @@ mod tests {
             prop_assert_eq!(strip_scheme(&value, "Bearer"), expected);
         }
 
-        /// A JSON number of any form is a NumericDate with the same value.
-        /// With no `float_roundtrip` feature, serde_json can round the last
-        /// bits of a float in another way. Near now, they are below a microsecond.
+        /// A JSON number of any form in the range of `datetime` is a
+        /// NumericDate with the value that Python reads: the nearest f64. Out
+        /// of that range, the token fails.
         #[test]
-        fn a_json_number_parses_as_a_numeric_date(value in any::<f64>().prop_filter("finite", |v| v.is_finite()), int in any::<i64>(), uint in any::<u64>()) {
-            for text in [serde_json::to_string(&value).unwrap(), format!("{value:e}"), int.to_string(), uint.to_string()] {
-                let claims = parse_token_claims(format!(r#"{{"exp":{text}}}"#).as_bytes()).unwrap();
+        fn a_json_number_parses_as_a_numeric_date(
+            value in any::<f64>().prop_filter("finite", |v| v.is_finite()),
+            date in -62_135_596_800.0..253_402_300_800.0f64,
+            int in any::<i64>(),
+            uint in any::<u64>(),
+            whole in -62_135_596_800i64..253_402_300_800i64,
+        ) {
+            for text in [
+                serde_json::to_string(&value).unwrap(),
+                format!("{value:e}"),
+                serde_json::to_string(&date).unwrap(),
+                format!("{date:e}"),
+                int.to_string(),
+                uint.to_string(),
+            ] {
+                let claims = parse_token_claims(format!(r#"{{"exp":{text}}}"#).as_bytes());
                 let expected: f64 = text.parse().unwrap();
-                let parsed = claims.exp.unwrap().as_f64().unwrap();
-                prop_assert!((parsed - expected).abs() <= expected.abs() * 4.0 * f64::EPSILON + f64::MIN_POSITIVE, "{} {} {}", text, parsed, expected);
+                if NUMERIC_DATE_RANGE.contains(&expected) {
+                    prop_assert_eq!(claims.unwrap().exp.unwrap().as_f64(), Some(expected), "{}", text);
+                } else {
+                    prop_assert!(claims.is_err(), "{}", text);
+                }
             }
-            let exact = parse_token_claims(format!(r#"{{"exp":{int}}}"#).as_bytes()).unwrap();
-            prop_assert_eq!(exact.exp.unwrap().as_i64(), Some(int));
+            let exact = parse_token_claims(format!(r#"{{"exp":{whole}}}"#).as_bytes()).unwrap();
+            prop_assert_eq!(exact.exp.unwrap().as_i64(), Some(whole));
         }
 
         /// Any other JSON value of a checked time claim refuses the token.

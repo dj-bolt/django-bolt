@@ -38,7 +38,7 @@ dashmap = "6"  # Fast concurrent hashmap for rate limiting
 parking_lot = "0.12"  # Fast RwLock for shared state
 serde = { version = "1", features = ["derive"] }
 memchr = "2"  # SIMD byte search for the path param decode check
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 ahash = "0.8"
 # Memory allocators (optional features)
 mimalloc = { version = "0.1", default-features = false }

@@ -62,7 +62,13 @@ AGREE = [
     Case("j1-expired-exp-with-a-fraction", at(exp=-100.5)),
     Case("j1-nbf-with-a-fraction", at(nbf=-100.25)),
     Case("j1-iat-with-a-fraction", at(iat=-100.75)),
-    Case("j1-huge-exp", live(exp=1e300)),
+    Case("j1-exp-in-the-year-9999", live(exp=253402300799)),
+    Case("j1-nbf-in-the-year-1", live(nbf=-62135596800)),
+    Case("j1-iat-in-the-year-1", live(iat=-62135596800.0)),
+    Case("j1-nbf-after-the-year-9999", live(nbf=1e300)),
+    Case("j1-iat-after-the-year-9999", live(iat=253402300800)),
+    # The nearest float of the decimal, as Python reads it: not the next whole second.
+    Case("j1-exp-just-below-a-whole-second", raw('{"sub":"1","exp":{exp}.99999985}')),
     # J2: a claim that Bolt does not check, in any JSON type.
     Case("j2-iss-number", live(iss=123)),
     Case("j2-iss-null", live(iss=None)),
@@ -136,6 +142,8 @@ AGREE = [
     Case("nbf-in-30-seconds-with-leeway", at(nbf=30), backend="leeway"),
 ]
 
+OUT_OF_DATETIME = "a NumericDate must be a time that a Python datetime holds, years 1 to 9999; PyJWT reads any number"
+
 DIFFERENT = [
     Case(
         "duplicate-claim",
@@ -168,6 +176,10 @@ DIFFERENT = [
         live(iat="1"),
         difference="a NumericDate is a JSON number (RFC 7519, section 2); PyJWT's int() also reads a str",
     ),
+    Case("exp-after-the-year-9999", live(exp=253402300800), difference=OUT_OF_DATETIME),
+    Case("exp-huge", live(exp=1e300), difference=OUT_OF_DATETIME),
+    Case("nbf-before-the-year-1", live(nbf=-62135596801), difference=OUT_OF_DATETIME),
+    Case("iat-huge-negative", live(iat=-1e300), difference=OUT_OF_DATETIME),
     Case("typ-null", live(typ=None), difference="Bolt cannot read the type of the token, so it refuses it"),
     Case(
         "token-type-array",

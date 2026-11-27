@@ -35,6 +35,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import jwt
@@ -297,7 +298,10 @@ async def rotate_refresh_token(
     if rotate:
         try:
             token_exp = int(refresh_claims["exp"])
-        except (KeyError, TypeError, ValueError) as exc:
+            # A store keeps the consumed marker until a `datetime`. Bolt's check
+            # refuses a time that a `datetime` cannot hold, so a caller's claims must too.
+            datetime.fromtimestamp(token_exp, UTC)
+        except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
             raise TokenRotationError("Refresh token has invalid expiry") from exc
 
     # The Rust validator accepts a token until `exp + leeway`. A store can keep

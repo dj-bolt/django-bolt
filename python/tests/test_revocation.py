@@ -100,6 +100,22 @@ def test_ttl_for_keeps_an_entry_for_a_token_inside_the_leeway():
     assert _ttl_for(just_expired, leeway=0) == 0
 
 
+def test_ttl_for_ends_an_entry_in_the_last_year_of_a_datetime():
+    """``exp`` plus the leeway can pass 9999-12-31. ``datetime`` then raised ``OverflowError``."""
+    last = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
+    for exp in (253402300799, 2**62, 10**300):
+        assert datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, leeway=60)) <= last
+
+
+def test_orm_store_keeps_an_entry_for_an_exp_in_the_last_second_of_a_datetime(orm_store):
+    store = orm_store(leeway=60)
+    asyncio.run(store.revoke("a", exp=253402300799))
+    assert asyncio.run(store.consume("b", exp=253402300799)) is True
+    assert asyncio.run(store.is_revoked("a")) is True
+    assert asyncio.run(store.consume("b", exp=253402300799)) is False
+    assert RevokedToken.objects.get(jti="a").expires_at.year == 9999
+
+
 def test_ttl_for_falls_back_to_default_when_exp_none():
     """No exp → falls back to the supplied default. The leeway does not change it."""
     assert _ttl_for(None, leeway=60) == _DEFAULT_TTL_SECONDS
@@ -1095,6 +1111,22 @@ def test_rotation_of_a_refresh_token_with_a_claim_that_the_store_cannot_keep_rai
 
     with pytest.raises(TokenRotationError):
         asyncio.run(rotate_refresh_token(claims, store=store, secret=_SECRET, rotate=rotate))
+
+
+@pytest.mark.parametrize("exp", [1e300, 2**62, 253402300800, -1e300, float("inf"), float("nan")])
+def test_rotation_with_an_exp_that_a_datetime_cannot_hold_is_a_rotation_error(orm_store, exp):
+    """``auth_claims`` never gives such an ``exp``. A caller's claims gave ``OverflowError`` from the store."""
+    store = orm_store()
+    claims = jwt.decode(_signed_claims("refresh"), _SECRET, algorithms=["HS256"])
+
+    with pytest.raises(TokenRotationError, match="invalid expiry"):
+        asyncio.run(rotate_refresh_token({**claims, "exp": exp}, store=store, secret=_SECRET))
+    assert not RevokedToken.objects.exists()
+    # Nothing consumed the token, so its claims with a valid exp rotate.
+    asyncio.run(rotate_refresh_token(claims, store=store, secret=_SECRET))
+    asyncio.run(
+        rotate_refresh_token({**claims, "jti": "last-second", "exp": 253402300799}, store=store, secret=_SECRET)
+    )
 
 
 # ---------------------------------------------------------------------------
