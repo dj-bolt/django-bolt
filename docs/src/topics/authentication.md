@@ -348,8 +348,9 @@ A route that reads no malformed claim accepts the token. A handler that reads `a
 A claim name that occurs two times fails the token. A header parameter of the table that occurs two times also fails it.
 Each of the three parts of the token is base64url with no `=` padding (RFC 7515). A token with padding fails.
 
-Bolt removes the fraction of `exp`, as PyJWT does. Thus a token with `"exp": 100.5` expires at 100 seconds.
-Bolt reads a decimal as the nearest float, as Python does. Thus `"exp": 100.99999999` is 100, not 101.
+For the expiry check, Bolt removes the fraction of `exp`, as PyJWT does. Thus a token with `"exp": 100.5` expires at 100 seconds plus the `leeway`.
+With the default `leeway` of 60 seconds, it expires at 160. With `leeway=0`, it expires at 100. `auth_claims` still gives `100.5`.
+Bolt reads a decimal as the nearest float, as Python does. Thus the expiry check reads `"exp": 100.99999999` as 100, not 101.
 Bolt does not round `nbf` and `iat`. A token is valid from `leeway` seconds before the time that `nbf` or `iat` gives.
 In `auth_claims`, a time with a fraction is a `float`. A whole number is an `int`.
 
