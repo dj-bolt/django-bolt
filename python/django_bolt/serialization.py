@@ -1154,9 +1154,16 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     # The async response handler can load a returned QuerySet on the event
     # loop when its rows are ``.values()`` dicts, or when no validator reads
     # them. A list of Serializers of model instances stays on the ORM pool:
-    # there, a relation that the QuerySet did not load can still load.
-    meta["_queryset_on_loop"] = queryset_serializer_async is not None or (
-        validator_async is None and not _response_serializer_info(meta.get("response_type"))[1]
+    # there, a relation that the QuerySet did not load can still load. A
+    # Serializer with validators stays there too. This flag is for the
+    # QuerySet of a sync handler, whose validators run on a thread with the
+    # setting off. A validator is code of the application, and it can query.
+    serializer_cls, serializer_many = _response_serializer_info(meta.get("response_type"))
+    serializer_validates = serializer_cls is not None and (
+        serializer_cls.__has_field_validators__ or serializer_cls.__has_model_validators__
+    )
+    meta["_queryset_on_loop"] = not serializer_validates and (
+        queryset_serializer_async is not None or (validator_async is None and not serializer_many)
     )
     meta["_stream_item_validator"] = stream_validator_sync
     meta["_stream_item_validator_async"] = stream_validator_async

@@ -49,7 +49,7 @@ from django_bolt import BoltAPI, LimitOffsetPagination, Request, async_orm, conc
 from django_bolt.auth import IsAuthenticated, JWTAuthentication
 from django_bolt.auth.jwt_utils import create_jwt_for_user
 from django_bolt.middleware import DjangoMiddlewareStack
-from django_bolt.serializers import Serializer, computed_field
+from django_bolt.serializers import Serializer, computed_field, field_validator
 from django_bolt.testing import TestClient
 from tests.test_models import Author, BlogPost, Tag
 from tests.thread_pools import shutdown_closing_connections
@@ -103,6 +103,18 @@ class PostWithAuthor(msgspec.Struct):
 class ProbeSerializer(Serializer):
     label: str
     built_on: str
+
+
+class ProbeWithQueryingValidator(Serializer):
+    """A Serializer whose validator reads the database, as one that checks a value against a table."""
+
+    label: str
+    built_on: str
+
+    @field_validator("label")
+    def label_is_known(cls, value: str) -> str:  # noqa: N805
+        assert Author.objects.using(ALIAS).filter(name="Ada").exists()
+        return value
 
 
 class ProbeWithComputedField(Serializer):
@@ -660,6 +672,10 @@ def _returned_queryset_routes(api: BoltAPI) -> None:
 
     @api.get("/returned/serializer")
     async def returned_serializer() -> list[ProbeSerializer]:
+        return _probes().order_by("id")
+
+    @api.get("/returned/validator-sync")
+    def returned_validator_sync() -> list[ProbeWithQueryingValidator]:
         return _probes().order_by("id")
 
     @api.get("/returned/computed")
@@ -1682,6 +1698,18 @@ def test_the_pagination_of_bolt_counts_the_rows_as_with_the_setting_off(on_loop)
 
     with TestClient(_api()) as client:
         response = client.get("/authors-after/0?limit=2&offset=1")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+
+
+def test_a_serializer_validator_of_a_sync_handler_can_query(on_loop):
+    """The validators of a sync handler run on a thread. Sync code cannot query on the event loop."""
+    expected = _with_the_setting_off(_api, "/returned/validator-sync")
+    assert [row["label"] for row in expected] == ["a", "b"]
+
+    with TestClient(_api(), raise_server_exceptions=False) as client:
+        response = client.get("/returned/validator-sync")
 
     assert response.status_code == 200, response.text
     assert response.json() == expected

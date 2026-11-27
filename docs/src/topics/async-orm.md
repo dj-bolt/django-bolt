@@ -224,6 +224,7 @@ Some reads need the database connection of a thread, or sync code. For these rea
 | A QuerySet class with its own `get()`, `first()`, `last()`, `exists()`, `count()`, `aggregate()` or `_fetch_all()`, or with its own iterable class | Your code runs in place of Django's code, and it can query. |
 | A model whose rows need a query, for example in `from_db()` or in a `post_init` receiver | Sync code cannot query on the event loop. Bolt finds this at the first read of the model. That read runs two times. |
 | A returned QuerySet with the return type `list[SomeSerializer]`, when the Serializer reads model instances | On the ORM pool, a relation that the QuerySet did not load can still load. A plain Serializer reads `.values()` rows, and its QuerySet loads on the event loop. |
+| A QuerySet that a sync handler returns with the return type `list[SomeSerializer]`, when the Serializer has validators | A validator is your code, and it can query. With an async handler, validators run on the event loop, also with the setting off. |
 | `await request.auser()` with a `get_user` or a `get_user_sync` of your own, or with a user model whose default manager has its own `get_queryset()` | Bolt runs your code, or the manager, for each load. |
 | The rows of a page of `@paginate` | Bolt moved only the count of the rows to the event loop. |
 | A read whose database router queries in `db_for_read()` | Sync code cannot query on the event loop. |
