@@ -18,7 +18,9 @@ use futures_util::future::{FutureExt, Map};
 use std::future::{Ready, ready};
 use std::sync::Arc;
 
-use crate::cors::{add_cors_headers_with_config, add_preflight_headers_with_config};
+use crate::cors::{
+    add_cors_headers_with_config, add_preflight_headers_with_config, add_preflight_vary,
+};
 use crate::metadata::CorsConfig;
 use crate::router::normalize_request_path;
 use crate::state::AppState;
@@ -96,15 +98,17 @@ fn add_cors_headers<B>(res: Outcome<B>) -> Outcome<B> {
         return Ok(ServiceResponse::new(req, response));
     }
 
-    // No Origin header means no CORS needed. This is the fast path for
-    // same-origin requests.
-    let Some(origin) = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok()) else {
-        return Ok(ServiceResponse::new(req, response));
-    };
     let Some(state) = req.app_data::<actix_web::web::Data<Arc<AppState>>>() else {
         return Ok(ServiceResponse::new(req, response));
     };
     let state_ref = state.get_ref();
+    // Fast path: an app with no CORS config adds no header.
+    if state_ref.global_cors_config.is_none() && !state_ref.route_metadata.has_cors() {
+        return Ok(ServiceResponse::new(req, response));
+    }
+    // A request with no Origin still gets `Vary: Origin` when the answer
+    // depends on the Origin. A cache can then keep it apart from CORS answers.
+    let origin = req.headers().get(ORIGIN).and_then(|v| v.to_str().ok());
     let method = req.method();
     // A preflight names the method of the real request.
     let requested_method = if method == Method::OPTIONS {
@@ -119,32 +123,18 @@ fn add_cors_headers<B>(res: Outcome<B>) -> Outcome<B> {
     let route_path = normalize_request_path(req.path());
     let cors_config = find_cors_config(method, requested_method, &route_path, state_ref);
 
-    // Apply CORS headers
-    match cors_config {
-        Some(CorsConfigRef::Route(cors_cfg)) => {
-            let origin_allowed = add_cors_headers_with_config(
-                headers,
-                Some(origin),
-                cors_cfg,
-                state_ref.global_cors_config.as_ref(),
-            );
-            if method == Method::OPTIONS && origin_allowed {
+    if let Some(CorsConfigRef::Route(cors_cfg) | CorsConfigRef::Global(cors_cfg)) = cors_config {
+        let origin_allowed = add_cors_headers_with_config(
+            headers,
+            origin,
+            cors_cfg,
+            state_ref.global_cors_config.as_ref(),
+        );
+        if method == Method::OPTIONS && origin.is_some() {
+            add_preflight_vary(headers);
+            if origin_allowed {
                 add_preflight_headers_with_config(headers, cors_cfg);
             }
-        }
-        Some(CorsConfigRef::Global(cors_cfg)) => {
-            let origin_allowed = add_cors_headers_with_config(
-                headers,
-                Some(origin),
-                cors_cfg,
-                state_ref.global_cors_config.as_ref(),
-            );
-            if method == Method::OPTIONS && origin_allowed {
-                add_preflight_headers_with_config(headers, cors_cfg);
-            }
-        }
-        Some(CorsConfigRef::Skipped) | None => {
-            // No CORS headers needed
         }
     }
 
@@ -211,7 +201,9 @@ mod tests {
     use crate::middleware::rate_limit::RateLimiters;
     use crate::router::Router;
     use crate::streaming::StreamConfig;
-    use actix_web::http::header::{ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN};
+    use actix_web::http::header::{
+        ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, HeaderMap, VARY,
+    };
     use actix_web::middleware::{Condition, NormalizePath, TrailingSlash};
     use actix_web::test::{self, TestRequest};
     use actix_web::{App, HttpRequest, HttpResponse, web};
@@ -236,6 +228,22 @@ mod tests {
 
     /// An app state with `routes` and a global config that allows `GLOBAL`.
     fn state(routes: &[(&str, &str, RouteCors)]) -> Arc<AppState> {
+        let global = CorsConfig::from_django_settings(
+            vec![GLOBAL.to_string()],
+            Vec::new(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        state_with(routes, Some(global))
+    }
+
+    /// An app state with `routes` and the global config `global`.
+    fn state_with(routes: &[(&str, &str, RouteCors)], global: Option<CorsConfig>) -> Arc<AppState> {
         Python::initialize();
         Python::attach(|py| {
             let mut router = Router::new();
@@ -282,19 +290,7 @@ mod tests {
                     channel_capacity: 32,
                     max_sync_threads: 1000,
                 },
-                global_cors_config: Some(
-                    CorsConfig::from_django_settings(
-                        vec![GLOBAL.to_string()],
-                        Vec::new(),
-                        false,
-                        false,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .unwrap(),
-                ),
+                global_cors_config: global,
                 global_compression_config: None,
                 trusted_proxies: Arc::new(TrustedProxies::default()),
                 rate_limiters: Arc::new(RateLimiters::default()),
@@ -306,6 +302,7 @@ mod tests {
                 media_files_config: None,
                 access_loggers: Vec::new(),
                 error_renderer: None,
+                script_name: None,
             })
         })
     }
@@ -346,6 +343,30 @@ mod tests {
     /// in `runbolt`. The handler of `/marker` sets the skip marker. Also check
     /// that the marker never reaches the client.
     async fn call_with(state: &Arc<AppState>, request: TestRequest, merge_slashes: bool) -> Cors {
+        let headers = respond(state, request, merge_slashes).await;
+        Cors {
+            origin: headers
+                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|value| value.to_str().unwrap().to_string()),
+            preflight: headers.contains_key(ACCESS_CONTROL_ALLOW_METHODS),
+        }
+    }
+
+    /// The `Vary` values of the response to `request`.
+    async fn vary(state: &Arc<AppState>, request: TestRequest) -> Vec<String> {
+        respond(state, request, false)
+            .await
+            .get_all(VARY)
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The response headers of `request`. See `call_with`.
+    async fn respond(
+        state: &Arc<AppState>,
+        request: TestRequest,
+        merge_slashes: bool,
+    ) -> HeaderMap {
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(state.clone()))
@@ -364,14 +385,9 @@ mod tests {
         )
         .await;
         let response = test::call_service(&app, request.to_request()).await;
-        let headers = response.headers();
+        let headers = response.headers().clone();
         assert!(headers.get("x-bolt-skip-cors").is_none());
-        Cors {
-            origin: headers
-                .get(ACCESS_CONTROL_ALLOW_ORIGIN)
-                .map(|value| value.to_str().unwrap().to_string()),
-            preflight: headers.contains_key(ACCESS_CONTROL_ALLOW_METHODS),
-        }
+        headers
     }
 
     fn get(path: &str, origin: &str) -> TestRequest {
@@ -477,5 +493,86 @@ mod tests {
             NONE
         );
         assert_eq!(call(&state, get("/marker", GLOBAL)).await, NONE);
+    }
+
+    const PREFLIGHT_VARY: [&str; 3] = [
+        "Origin",
+        "Access-Control-Request-Method",
+        "Access-Control-Request-Headers",
+    ];
+
+    #[actix_web::test]
+    async fn each_response_of_an_origin_list_varies_on_the_origin() {
+        let state = state(&[
+            ("GET", "/route", RouteCors::Own),
+            ("GET", "/skip", RouteCors::Skip),
+        ]);
+        for path in ["/items", "/route"] {
+            assert_eq!(vary(&state, TestRequest::get().uri(path)).await, ["Origin"]);
+            assert_eq!(vary(&state, get(path, OTHER)).await, ["Origin"]);
+        }
+        assert_eq!(vary(&state, get("/items", GLOBAL)).await, ["Origin"]);
+        assert_eq!(vary(&state, get("/route", ROUTE)).await, ["Origin"]);
+        // A route that turns CORS off, or the skip marker, gets no CORS header.
+        for path in ["/skip", "/marker"] {
+            assert!(vary(&state, TestRequest::get().uri(path)).await.is_empty());
+            assert!(vary(&state, get(path, GLOBAL)).await.is_empty());
+        }
+    }
+
+    #[actix_web::test]
+    async fn a_preflight_varies_on_the_origin_and_the_request_headers_also_when_refused() {
+        let state = state(&[]);
+        for origin in [GLOBAL, OTHER] {
+            for requested in [Some("GET"), None] {
+                assert_eq!(
+                    vary(&state, options("/items", origin, requested)).await,
+                    PREFLIGHT_VARY
+                );
+            }
+        }
+        // With no Origin, the OPTIONS request is not a preflight.
+        let request = TestRequest::default().method(Method::OPTIONS).uri("/items");
+        assert_eq!(vary(&state, request).await, ["Origin"]);
+    }
+
+    #[actix_web::test]
+    async fn a_wildcard_is_on_each_response_with_no_vary_origin() {
+        let wildcard = CorsConfig::from_django_settings(
+            Vec::new(),
+            Vec::new(),
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let state = state_with(&[], Some(wildcard));
+        for request in [TestRequest::get().uri("/items"), get("/items", OTHER)] {
+            assert_eq!(call(&state, request).await, allowed("*"));
+        }
+        assert!(vary(&state, get("/items", OTHER)).await.is_empty());
+        assert_eq!(
+            vary(&state, options("/items", OTHER, Some("GET"))).await,
+            PREFLIGHT_VARY[1..]
+        );
+    }
+
+    #[actix_web::test]
+    async fn an_app_with_no_cors_config_adds_no_vary() {
+        let state = state_with(&[("GET", "/items", RouteCors::Inherit)], None);
+        assert!(
+            vary(&state, TestRequest::get().uri("/items"))
+                .await
+                .is_empty()
+        );
+        assert!(vary(&state, get("/items", OTHER)).await.is_empty());
+        assert!(
+            vary(&state, options("/items", OTHER, Some("GET")))
+                .await
+                .is_empty()
+        );
     }
 }

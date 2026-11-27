@@ -247,14 +247,19 @@ def django_db_setup(django_db_blocker):
                 Article,
                 Author,
                 BlogPost,
+                CaseInsensitiveRevokedToken,
                 Comment,
                 Country,
                 Document,
+                Note,
+                Notebook,
                 Release,
                 ShortJtiRevokedToken,
                 Tag,
                 User,
+                UserBadge,
                 UserProfile,
+                UserSecret,
             )
 
             models = [
@@ -265,10 +270,15 @@ def django_db_setup(django_db_blocker):
                 Comment,
                 User,
                 UserProfile,
+                UserBadge,
+                UserSecret,
+                Note,
+                Notebook,
                 Document,
                 Release,
                 Country,
                 ShortJtiRevokedToken,
+                CaseInsensitiveRevokedToken,
             ]
             for model in models:
                 # Check if table already exists

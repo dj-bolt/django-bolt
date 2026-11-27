@@ -11,20 +11,32 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import itertools
+import re
+import sys
+import time
+import types
+import unicodedata
 import uuid
 from http.cookies import SimpleCookie
 from typing import Annotated
 from urllib.parse import quote
 
 import httpx
+import jwt
 import pytest
-from django.http import QueryDict
+from django.http import HttpResponse, QueryDict
 from django.http.cookie import parse_cookie
 from django.test import override_settings
+from django.urls import include, reverse
+from django.urls import path as django_path
 from hypothesis import example, given
 from hypothesis import strategies as st
 
 from django_bolt import BoltAPI
+from django_bolt._urlconf import join_mount_path, urlconf_mounts
+from django_bolt.auth import JWTAuthentication
+from django_bolt.auth.revocation import DjangoCacheRevocation, DjangoORMRevocation
 from django_bolt.param_functions import Cookie, Form, Query
 from django_bolt.responses import JSON, FileResponse
 from django_bolt.testing import TestClient
@@ -95,6 +107,73 @@ async def datetime_value(v: datetime.datetime):
 @api.get("/time")
 async def time_value(v: datetime.time):
     return {"v": v.isoformat()}
+
+
+def _describe(value):
+    """Give the JSON form of a converted value: its type, its fields and its UTC offset.
+
+    An int is in hex: str() and repr() refuse more digits than the digit limit of int().
+    """
+    if isinstance(value, datetime.datetime | datetime.time):
+        offset = value.utcoffset()
+        seconds = None if offset is None else offset.total_seconds()
+        utc = value.tzinfo is datetime.UTC
+        return [type(value).__name__, value.replace(tzinfo=None).isoformat(), seconds, utc]
+    if isinstance(value, datetime.date):
+        return ["date", value.isoformat()]
+    if type(value) is int:
+        return ["int", hex(value)]
+    return [type(value).__name__, repr(value)]
+
+
+@api.get("/scalar/int")
+async def scalar_int(v: int):
+    return _describe(v)
+
+
+@api.get("/list/int")
+async def list_int(v: Annotated[list[int], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/float")
+async def scalar_float(v: float):
+    return _describe(v)
+
+
+@api.get("/list/float")
+async def list_float(v: Annotated[list[float], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/date")
+async def scalar_date(v: datetime.date):
+    return _describe(v)
+
+
+@api.get("/list/date")
+async def list_date(v: Annotated[list[datetime.date], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/time")
+async def scalar_time(v: datetime.time):
+    return _describe(v)
+
+
+@api.get("/list/time")
+async def list_time(v: Annotated[list[datetime.time], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/datetime")
+async def scalar_datetime(v: datetime.datetime):
+    return _describe(v)
+
+
+@api.get("/list/datetime")
+async def list_datetime(v: Annotated[list[datetime.datetime], Query()]):
+    return _describe(v[0])
 
 
 @api.get("/cookies")
@@ -231,23 +310,233 @@ def test_a_naive_datetime_query_param_round_trips(client, value, separator):
     assert response.json() == {"v": value.isoformat()}
 
 
-# RFC 3339 offsets have whole minutes. Bolt gives the handler the time in UTC,
-# so the instant must be in the years that Python can show in UTC.
+# RFC 3339 offsets have whole minutes.
 utc_offsets = st.integers(min_value=-(24 * 60 - 1), max_value=24 * 60 - 1).map(
     lambda minutes: datetime.timezone(datetime.timedelta(minutes=minutes))
 )
 
 
-@given(
-    value=st.datetimes(min_value=datetime.datetime(2, 1, 1), max_value=datetime.datetime(9998, 12, 31)),
-    offset=utc_offsets,
-)
-def test_an_aware_datetime_query_param_is_the_same_instant(client, value, offset):
+@given(value=st.datetimes(), offset=utc_offsets)
+def test_an_aware_datetime_query_param_keeps_its_offset(client, value, offset):
     aware = value.replace(tzinfo=offset)
     response = client.get("/datetime", params={"v": aware.isoformat()})
     returned = datetime.datetime.fromisoformat(response.json()["v"])
-    assert returned == aware
-    assert returned.utcoffset() == datetime.timedelta(0)
+    assert returned.replace(tzinfo=None) == value
+    assert returned.utcoffset() == aware.utcoffset()
+
+
+# Texts for the parameter types that Rust converts: the forms that Python reads,
+# fields out of range, and mutations of each one.
+_MUTATION_CHARS = [
+    " ",
+    "\t",
+    "\0",
+    "+",
+    "-",
+    "0",
+    "9",
+    ":",
+    ".",
+    ",",
+    "e",
+    "T",
+    "t",
+    "x",
+    "Z",
+    "z",
+    "W",
+    "_",
+    "é",
+    "٣",
+]
+
+
+def _digits(min_size, max_size):
+    return st.text("0123456789", min_size=min_size, max_size=max_size)
+
+
+@st.composite
+def _mutated(draw, texts):
+    """Insert, delete or replace up to two characters of a text."""
+    text = draw(texts)
+    for _ in range(draw(st.integers(min_value=0, max_value=2))):
+        at = draw(st.integers(min_value=0, max_value=len(text)))
+        char = draw(st.sampled_from(_MUTATION_CHARS))
+        operation = draw(st.sampled_from(["insert", "delete", "replace"]))
+        if operation == "insert":
+            text = text[:at] + char + text[at:]
+        elif operation == "delete":
+            text = text[:at] + text[at + 1 :]
+        else:
+            text = text[:at] + char + text[at + 1 :]
+    return text
+
+
+# Mostly in range. Hour 24 and minute or second 60 also occur.
+_two_digit_fields = st.one_of(st.integers(min_value=0, max_value=59), st.sampled_from([23, 24, 60, 99]))
+
+
+@st.composite
+def _hms_texts(draw):
+    """HH, HH:MM, HH:MM:SS, HHMM or HHMMSS, with a fraction after SS, or after HH or MM."""
+    fields = [draw(_two_digit_fields) for _ in range(draw(st.integers(min_value=1, max_value=3)))]
+    separator = draw(st.sampled_from([":", ""]))
+    text = separator.join(f"{field:02}" for field in fields)
+    if draw(st.booleans()):
+        text += draw(st.sampled_from(".,")) + draw(_digits(0, 9))
+    return text
+
+
+@st.composite
+def _clock_texts(draw):
+    zone = draw(st.sampled_from(["", "", "Z", "+", "-"]))
+    if zone in "+-":
+        zone += draw(_hms_texts())
+    return draw(_hms_texts()) + zone
+
+
+@st.composite
+def _date_texts(draw):
+    day = draw(st.dates())
+    year, week, weekday = day.isocalendar()
+    return draw(
+        st.sampled_from(
+            [
+                day.isoformat(),
+                f"{day.year:04}{day.month:02}{day.day:02}",
+                f"{year:04}-W{week:02}-{weekday}",
+                f"{year:04}W{week:02}{weekday}",
+                f"{year:04}-W{week:02}",
+                f"{year:04}W{week:02}",
+                f"{draw(_digits(4, 4))}-{draw(_digits(2, 2))}-{draw(_digits(2, 2))}",
+                f"{draw(_digits(4, 4))}-W{draw(_digits(2, 2))}-{draw(_digits(1, 1))}",
+            ]
+        )
+    )
+
+
+@st.composite
+def _datetime_texts(draw):
+    date = draw(_date_texts())
+    if draw(st.integers(min_value=0, max_value=4)) == 0:
+        return date
+    return date + draw(st.sampled_from(["T", "t", " ", "x", "\t", "\u3000", "\x1f", "  "])) + draw(_clock_texts())
+
+
+_number_texts = st.one_of(
+    st.integers().map(str),
+    st.integers(min_value=-(10**60), max_value=10**60).map(str),
+    st.integers(min_value=4290, max_value=4310).map(lambda length: "1" * length),
+    st.integers(min_value=-(2**54), max_value=2**54).map(lambda value: f"{value}.0"),
+    st.floats().map(repr),
+    st.from_regex(r"[+-]?\d{0,5}(\.\d{0,5})?([eE][+-]?\d{1,3})?", fullmatch=True),
+    st.sampled_from(["inf", "-Infinity", "NaN", "+nan", "+5", "007", "1_000", ".5", "5.", "0x10", "1e999"]),
+)
+PARAM_TEXTS = st.one_of(
+    st.tuples(st.just("int"), _mutated(_number_texts)),
+    st.tuples(st.just("float"), _mutated(_number_texts)),
+    st.tuples(st.just("date"), _mutated(_date_texts())),
+    st.tuples(st.just("time"), _mutated(st.builds("{}{}".format, st.sampled_from(["", "T"]), _clock_texts()))),
+    st.tuples(st.just("datetime"), _mutated(_datetime_texts())),
+)
+
+# The ISO 8601 forms that Bolt reads (see docs/src/topics/requests.md).
+_ISO_DATE = r"\d{4}(?:-\d{2}-\d{2}|\d{4}|-?W\d{2}|-W\d{2}-\d|W\d{3})"
+_HMS = r"\d{2}(?::\d{2}(?::\d{2}(?:[.,]\d+)?)?|\d{2}(?:\d{2}(?:[.,]\d+)?)?)?"
+# RFC 3339 has no seconds in an offset, so Bolt refuses them, although Python reads them.
+_CLOCK = rf"(?P<clock>{_HMS})(?:Z|[+-](?P<zone>\d{{2}}(?::?\d{{2}})?))?"
+ISO_FORMS = {
+    "date": re.compile(_ISO_DATE, re.ASCII),
+    "time": re.compile(rf"T?{_CLOCK}", re.ASCII),
+    # The separator is T, t or one whitespace character of Rust's char::is_whitespace().
+    "datetime": re.compile(
+        rf"{_ISO_DATE}(?:[Tt\t\n\x0b\x0c\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]{_CLOCK})?",
+        re.ASCII,
+    ),
+}
+PARAM_TYPES = {"date": datetime.date, "time": datetime.time, "datetime": datetime.datetime}
+
+
+def _python_reads_it_on_each_version(match: re.Match) -> bool:
+    """False for a text of the ISO forms that Bolt refuses although a Python version reads it."""
+    groups = match.groupdict()
+    if (groups.get("clock") or "").startswith("24"):
+        # Only Python 3.14 reads hour 24, as midnight of the next day.
+        return False
+    zone = groups.get("zone")
+    # Each version reads +05:60 as six hours. It is not ISO 8601.
+    return zone is None or int(zone.replace(":", "")[2:] or 0) <= 59
+
+
+# The digit limit of an int that Bolt reads at startup: that of int(), at most 4300.
+_INT_DIGITS = min(4300, sys.get_int_max_str_digits() or 4300)
+
+
+def _python_value(kind: str, text: str):
+    """Give the value that Python reads from `text`, or None when Bolt must refuse the text.
+
+    Bolt reads a number as `int()` or `float()` reads it, with no whitespace,
+    `_` or digits that are not ASCII. It reads an ISO 8601 form of the grammar
+    as `fromisoformat()` reads it on each supported Python version.
+    """
+    try:
+        if kind == "int":
+            readable = re.fullmatch(r"[+-]?[0-9]+", text, re.ASCII) and len(text.lstrip("+-")) <= _INT_DIGITS
+            return int(text) if readable else None
+        if kind == "float":
+            readable = text.isascii() and "_" not in text and not any(char.isspace() for char in text)
+            return float(text) if readable else None
+        match = ISO_FORMS[kind].fullmatch(text)
+        if match is None or not _python_reads_it_on_each_version(match):
+            return None
+        return PARAM_TYPES[kind].fromisoformat(text)
+    except ValueError:
+        return None
+
+
+@example(case=("datetime", "2024-01-15T10:30"))
+@example(case=("datetime", "2024-01-15T10:30:00+05:30"))
+@example(case=("datetime", "2024-01-15"))
+@example(case=("datetime", "20240115"))
+@example(case=("datetime", "2024-01-15x10:30:00"))
+@example(case=("datetime", "2024-01-15T10:30:00z"))
+@example(case=("datetime", "1700000000"))
+@example(case=("datetime", "24-01-15"))
+@example(case=("datetime", "-16964e15"))
+@example(case=("time", "10:30"))
+@example(case=("time", "10:30:00+05:00"))
+@example(case=("time", "10:30:00 +05:00"))
+@example(case=("time", "24:00"))
+@example(case=("time", "10:30.5"))
+@example(case=("time", "10:30:00+00:00:00.5"))
+@example(case=("time", "10:30:00+05:60"))
+@example(case=("time", "10:30:00+05:30:15"))
+@example(case=("datetime", "2024-01-15T10:30:00+05:30:00"))
+@example(case=("date", "20240115xx"))
+@example(case=("int", "9223372036854775808"))
+@example(case=("int", "007"))
+@example(case=("int", "+5"))
+@example(case=("int", "5.0"))
+@example(case=("int", "-16964e15"))
+@example(case=("float", ".5"))
+@example(case=("float", "-0"))
+@example(case=("float", "1e999"))
+@given(case=PARAM_TEXTS)
+def test_a_scalar_and_a_list_param_convert_as_python(client, case):
+    """A scalar and a list parameter of one type accept the texts that Python reads, with the same value.
+
+    The reference is `int()`, `float()` and `fromisoformat()`. See `_python_value`
+    for the texts that Python reads and Bolt refuses.
+    """
+    kind, text = case
+    value = _python_value(kind, text)
+    for path in (f"/scalar/{kind}", f"/list/{kind}"):
+        response = client.get(path, params={"v": text})
+        if value is None:
+            assert response.status_code == 422, (path, text, response.text)
+        else:
+            assert response.status_code == 200, (path, text, response.text)
+            assert response.json() == _describe(value), (path, text)
 
 
 @given(value=st.times())
@@ -433,3 +722,150 @@ def test_a_file_response_status_does_not_show_whether_a_file_out_of_the_allowed_
     finally:
         probe.unlink()
     assert without_file == with_file
+
+
+# A segment of a URLconf prefix or of a route: a static word or a parameter.
+mount_words = st.from_regex(r"[a-z0-9_.~-]{1,6}", fullmatch=True)
+mount_segments = st.lists(st.one_of(mount_words, st.just(None)), max_size=3)
+_urlconf_names = itertools.count()
+
+
+def _django_mount_view(request, **kwargs):
+    return HttpResponse()
+
+
+def _segments(segments: list[str | None], tag: str, django_form: str) -> tuple[str, str, dict[str, str]]:
+    """Return the Django route, the Bolt route, and a value for each parameter of ``segments``."""
+    django_parts, bolt_parts, values = [], [], {}
+    for index, segment in enumerate(segments):
+        if segment is None:
+            name = f"{tag}{index}"
+            django_parts.append(django_form.format(name=name))
+            bolt_parts.append("{" + name + "}")
+            values[name] = f"v{index}"
+        else:
+            django_parts.append(segment)
+            bolt_parts.append(segment)
+    return "/".join(django_parts), "/".join(bolt_parts), values
+
+
+def _urlconf_module(urlpatterns: list) -> str:
+    name = f"tests._property_urlconf_{next(_urlconf_names)}"
+    module = types.ModuleType(name)
+    module.urlpatterns = urlpatterns
+    sys.modules[name] = module
+    return name
+
+
+@given(
+    prefix=mount_segments,
+    route=mount_segments,
+    trailing_slash=st.booleans(),
+    form=st.sampled_from(["<{name}>", "<str:{name}>"]),
+)
+@example(prefix=["missions"], route=[], trailing_slash=False, form="<{name}>")
+@example(prefix=[], route=[], trailing_slash=False, form="<{name}>")
+@example(prefix=[None, "missions"], route=[None], trailing_slash=True, form="<str:{name}>")
+def test_a_mounted_route_path_is_the_path_that_django_reverses(prefix, route, trailing_slash, form):
+    django_prefix, _bolt_prefix, prefix_values = _segments(prefix, "p", form)
+    django_route, bolt_route, route_values = _segments(route, "r", "<{name}>")
+    django_prefix += "/" if prefix else ""
+    if route and trailing_slash:
+        django_route += "/"
+        bolt_route += "/"
+    values = {**prefix_values, **route_values}
+    api = BoltAPI()
+    plain = [django_path(django_prefix, include([django_path(django_route, _django_mount_view, name="r")]))]
+    names = [_urlconf_module(plain), _urlconf_module([django_path(django_prefix, api.urls)])]
+    try:
+        expected = reverse("r", urlconf=names[0], kwargs=values)
+        (mount,) = urlconf_mounts(names[1])
+        served = join_mount_path(mount.prefix, "/" + bolt_route)
+        for name, value in values.items():
+            served = served.replace("{" + name + "}", value)
+    finally:
+        for name in names:
+            sys.modules.pop(name)
+    assert served == expected
+
+
+# A revocation store refuses a jti that a database collation can read as the key
+# of a family or of a user version (#931). MySQL compares text without case or
+# accents by default, and it skips some characters.
+
+REVOCATION_SECRET = "a-secure-test-secret-that-is-long-enough"
+STORE_PREFIXES = {"/cache": ("fam:", "ver:"), "/orm": ("family:", "version:")}
+revocation_api = BoltAPI()
+
+
+@revocation_api.get(
+    "/cache", auth=[JWTAuthentication(secret=REVOCATION_SECRET, revocation_store=DjangoCacheRevocation())]
+)
+async def cache_store_route():
+    return {"ok": True}
+
+
+@revocation_api.get("/orm", auth=[JWTAuthentication(secret=REVOCATION_SECRET, revocation_store=DjangoORMRevocation())])
+async def orm_store_route():
+    return {"ok": True}
+
+
+@pytest.fixture(scope="module")
+def revocation_client(django_db_setup, django_db_blocker):
+    # The ORM store reads its table for each token that it does not refuse. No test writes to it.
+    with django_db_blocker.unblock(), TestClient(revocation_api) as test_client:
+        yield test_client
+
+
+def _bearer(jti: str) -> dict[str, str]:
+    now = int(time.time())
+    token = jwt.encode({"sub": "u", "iat": now, "exp": now + 3600, "jti": jti}, REVOCATION_SECRET, algorithm="HS256")
+    return {"Authorization": f"Bearer {token}"}
+
+
+# MySQL 8.0 skips each of these characters (utf8mb4_0900_ai_ci and utf8mb4_unicode_ci).
+SKIPPED_CHARACTERS = ["\u00ad", "\u200b", "\u200d", "\u2060", "\ufeff", "\u034f", "\x01", "\x7f"]
+# A collation of MySQL 8.0 compares each of these letters equal to the prefix letter. For example,
+# utf8mb4_general_ci has ß = s and ı = i, and utf8mb4_la_0900_ai_ci has u = v.
+LOOK_ALIKE_LETTERS = {"i": "ıjy", "o": "ø", "l": "ł", "s": "ß", "y": "iü", "v": "u"}
+COMBINING_MARKS = [chr(n) for n in range(0x0300, 0x0363)]
+
+
+@st.composite
+def look_alike(draw, char: str) -> str:
+    """Draw a text that a collation of MySQL 8.0 compares equal to the prefix character ``char``."""
+    skipped = "".join(draw(st.lists(st.sampled_from(SKIPPED_CHARACTERS), max_size=2)))
+    look_alikes = LOOK_ALIKE_LETTERS.get(char, "")
+    # Each printable ASCII character has a fullwidth form at this offset.
+    letter = draw(st.sampled_from([char, char.upper(), chr(ord(char) + 0xFEE0), *look_alikes]))
+    if letter in look_alikes:
+        # MySQL compares only the whole letter equal, with no mark and not split by NFD.
+        return skipped + letter
+    marks = "".join(draw(st.lists(st.sampled_from(COMBINING_MARKS), max_size=2)))
+    return skipped + unicodedata.normalize(draw(st.sampled_from(["NFC", "NFD"])), letter + marks)
+
+
+@st.composite
+def reserved_look_alikes(draw) -> tuple[str, str]:
+    """Draw a route and a jti that starts with a look-alike of a reserved prefix of its store."""
+    path = draw(st.sampled_from(sorted(STORE_PREFIXES)))
+    prefix = draw(st.sampled_from(STORE_PREFIXES[path]))
+    return path, "".join(draw(look_alike(char)) for char in prefix) + draw(st.text(max_size=20))
+
+
+@given(case=reserved_look_alikes())
+@example(case=("/orm", "VERSION:u"))
+@example(case=("/orm", "vérsion:u"))
+@example(case=("/cache", "f\u00adam:f"))
+def test_a_jti_that_a_collation_reads_as_a_reserved_key_gets_a_401(revocation_client, case):
+    path, jti = case
+    assert revocation_client.get(path, headers=_bearer(jti)).status_code == 401
+
+
+@given(
+    path=st.sampled_from(sorted(STORE_PREFIXES)),
+    value=st.uuids(),
+    form=st.sampled_from([str, lambda u: u.hex, lambda u: str(u).upper(), lambda u: u.hex.upper()]),
+)
+def test_a_uuid_or_hex_jti_is_not_refused(revocation_client, path, value, form):
+    assert revocation_client.get(path, headers=_bearer(form(value))).status_code == 200

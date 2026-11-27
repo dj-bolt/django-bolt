@@ -289,7 +289,7 @@ def test_invalid_sequence_item_error_points_at_the_item(client):
         {
             "type": "validation_error",
             "loc": ["query", "ids"],
-            "msg": "Expected `int`, got `str` - at `$[1]`",
+            "msg": "Invalid integer 'x': expected a whole number such as 42 or -7 - at `$[1]`",
             "input": ["1", "x"],
         }
     ]

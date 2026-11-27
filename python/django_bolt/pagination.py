@@ -317,6 +317,10 @@ class PaginationBase(ABC):
 
         convert_page = _struct_page_converter(self.serializer_class)
         if convert_page is not None:
+            relation_loader = _struct_relation_loader(self.serializer_class)
+            if relation_loader is not None:
+                # After the cursor: a CursorPagination reads it from the instances.
+                items = relation_loader.rows(items)
             return convert_page(items)
 
         if getattr(self.serializer_class, "__is_bolt_serializer__", False):

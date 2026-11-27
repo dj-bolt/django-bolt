@@ -103,6 +103,7 @@ dev = [
     "brotlicffi>=1.2.1.0", # patched decoder for GHSA-9v8h-qqgm-4m35
     "cryptography>=42", # RSA/EC keypair generation for asymmetric JWT tests
     "bolt-mcp", # workspace member: MCP server support (editable)
+    "opentelemetry-sdk>=1.27", # in-memory span exporter for the bolt_mcp.otel tests
     "django-debug-toolbar>=7.1.1",
     # Pure-Python wheel (no cp314t build of psycopg-binary exists); needs libpq at run time.
     "psycopg>=3.3", # PostgreSQL recovery tests (`just test-pg`)

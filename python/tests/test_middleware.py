@@ -100,7 +100,7 @@ class TestMiddlewareDecorators:
             return {"status": "ok"}
 
         # Check that middleware metadata was attached
-        handler = api._handlers[0]
+        handler = api._routes[0][3]
         assert hasattr(handler, "__bolt_middleware__")
         middleware = handler.__bolt_middleware__
         assert len(middleware) > 0
@@ -199,7 +199,7 @@ class TestMiddlewareDecorators:
         async def cors_endpoint():
             return {"status": "ok"}
 
-        handler = api._handlers[0]
+        handler = api._routes[0][3]
         assert hasattr(handler, "__bolt_middleware__")
         middleware = handler.__bolt_middleware__
         assert len(middleware) > 0
@@ -239,7 +239,7 @@ class TestMiddlewareDecorators:
         async def no_middleware_endpoint():
             return {"status": "ok"}
 
-        handler = api._handlers[0]
+        handler = api._routes[0][3]
         assert hasattr(handler, "__bolt_skip_middleware__")
         skip = handler.__bolt_skip_middleware__
         assert "cors" in skip
@@ -255,7 +255,7 @@ class TestMiddlewareDecorators:
         async def secure_endpoint(data: dict):
             return {"received": data}
 
-        handler = api._handlers[0]
+        handler = api._routes[0][3]
         middleware = handler.__bolt_middleware__
         assert len(middleware) == 2  # rate_limit and cors
 
@@ -1194,7 +1194,7 @@ class TestMiddlewareExecution:
 
         # Get handler and handler_id
         handler_id = 0  # First registered handler
-        handler = api._handlers[handler_id]
+        handler = api._routes[0][3]
 
         # Dispatch with handler_id
         result = await api._dispatch(handler, test_request, handler_id)
@@ -1243,7 +1243,7 @@ class TestMiddlewareExecution:
         }
 
         handler_id = 0  # First registered handler
-        handler = api._handlers[handler_id]
+        handler = api._routes[0][3]
         result = await api._dispatch(handler, test_request, handler_id)
         status, meta, body_kind, body = result
 

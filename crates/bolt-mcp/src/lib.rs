@@ -5,7 +5,8 @@
 //! DNS-rebinding checks. This module owns the integration: the Actix bridge
 //! (`bridge`), the registry snapshot compiled from Python at mount time
 //! (`registry`), the `ServerHandler` (`handler`), the per-call Python context
-//! (`context`), and the MRTR requestState policy (`state_codec`).
+//! (`context`), the MRTR requestState policy (`state_codec`), and the task
+//! store of the Tasks extension (`tasks`).
 //!
 //! MCP mounts are checked only on router miss (see `handler.rs` /
 //! `testing.rs`), so the non-MCP hot path pays nothing.
@@ -15,6 +16,7 @@ pub mod context;
 pub mod handler;
 pub mod registry;
 pub mod state_codec;
+pub mod tasks;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,6 +58,8 @@ pub struct McpRouteRequest {
     pub conn_scheme: &'static str,
     /// The client address, as for a route request.
     pub conn_remote_addr: Option<std::net::IpAddr>,
+    /// `FORCE_SCRIPT_NAME` of the app, as for a route request.
+    pub script_name: Option<Arc<str>>,
 }
 
 /// Carries an `McpRouteRequest` through the http request extensions into
@@ -106,6 +110,9 @@ pub struct McpMount {
     /// for the handler.
     pub needs_request_parts: bool,
     pub service: McpService,
+    /// The registry that the handler of the service also holds. A stop of the
+    /// server reaches the task store through it.
+    pub registry: Arc<McpRegistry>,
 }
 
 impl McpMount {
@@ -232,7 +239,9 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
     }
 
     let needs_request_parts = registry.route_gates || registry.needs_request;
-    let mcp_handler = McpHandler { registry };
+    let mcp_handler = McpHandler {
+        registry: Arc::clone(&registry),
+    };
     let service = if legacy_sessions {
         McpService::Sessions(StreamableHttpService::new(
             move || Ok(mcp_handler.clone()),
@@ -255,7 +264,31 @@ pub fn parse_mount(py: Python<'_>, mount_def: &Bound<'_, PyDict>) -> PyResult<Mc
         oauth,
         needs_request_parts,
         service,
+        registry,
     })
+}
+
+/// Cancel each running task of the production mounts, for a stop of the
+/// server. Each task body then cancels its coroutine and ends.
+pub fn cancel_running_tasks() {
+    for store in production_task_stores() {
+        store.cancel_running();
+    }
+}
+
+/// The task bodies of the production mounts that did not end yet.
+pub fn running_task_bodies() -> usize {
+    production_task_stores()
+        .map(tasks::TaskStore::running_bodies)
+        .sum()
+}
+
+fn production_task_stores() -> impl Iterator<Item = &'static tasks::TaskStore> {
+    GLOBAL_MCP_MOUNTS
+        .get()
+        .into_iter()
+        .flat_map(|mounts| mounts.iter())
+        .filter_map(|mount| mount.registry.tasks.as_ref())
 }
 
 /// Register production MCP mounts. Called once at startup by `mount_mcp`

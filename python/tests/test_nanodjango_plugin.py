@@ -21,6 +21,7 @@ from django_bolt.nanodjango import (
     convert_build_settings,
     django_pre_setup,
 )
+from django_bolt.testing import TestClient
 
 
 @pytest.fixture(autouse=True)
@@ -234,6 +235,52 @@ class TestRouteDecoratorsHookConfigure:
             pass
 
         assert bolt_in_module._bolt_api_configured is True
+
+
+class TestRouteDecoratorsKeepTheirOptions:
+    """The subclass decorators give each option to the routes of BoltAPI."""
+
+    @pytest.fixture
+    def bolt(self):
+        mod = types.ModuleType("fake_mod_options")
+        bolt = BoltAPI(module="fake_mod_options")
+        mod.bolt = bolt
+        sys.modules["fake_mod_options"] = mod
+        try:
+            yield bolt
+        finally:
+            sys.modules.pop("fake_mod_options", None)
+
+    def test_http_route_uses_its_status_code(self, bolt):
+        @bolt.post("/items", status_code=201)
+        async def create_item():
+            return {"id": 1}
+
+        with TestClient(bolt) as client:
+            response = client.post("/items")
+
+        assert response.status_code == 201
+        assert response.json() == {"id": 1}
+
+    def test_websocket_route_uses_its_summary(self, bolt):
+        @bolt.websocket("/ws", summary="Chat room")
+        async def chat(websocket: WebSocket):
+            await websocket.accept()
+
+        bolt._register_openapi_routes()
+        with TestClient(bolt) as client:
+            schema = client.get("/docs/openapi.json").json()
+
+        assert schema["paths"]["/ws"]["get"]["summary"] == "WebSocket: Chat room"
+
+    def test_first_route_adds_the_api_to_the_bolt_api_setting(self, bolt):
+        with override_settings(BOLT_API=["project.api:api"]):
+
+            @bolt.get("/hello")
+            async def hello():
+                return {}
+
+            assert settings.BOLT_API == ["project.api:api", "fake_mod_options:bolt"]
 
 
 class TestDjangoPreSetup:
@@ -583,6 +630,19 @@ other.mount_django("/")
         convert_build_app_api(converter, resolver, extra_src)
 
         assert len(extra_src) == 1
+
+    def test_ignores_an_assignment_from_a_call_of_a_subscript(self):
+        """Only a call of a BoltAPI or Router name makes an API object."""
+        source = """\
+bolt = BoltAPI()
+handler = handlers["main"]()
+"""
+        converter = _make_converter(source)
+        extra_src = []
+
+        convert_build_app_api(converter, _make_resolver(), extra_src)
+
+        assert extra_src == ["bolt = BoltAPI()"]
 
 
 class TestEntryPointWiring:

@@ -29,9 +29,13 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from django_bolt import BoltAPI, _core
+from django_bolt._script_prefix import asgi_mounts
+from django_bolt._script_prefix import configure as configure_script_prefix
+from django_bolt._urlconf import served_api
+from django_bolt.exceptions import RequestValidationError
 from django_bolt.websocket import CloseCode, WebSocket, WebSocketDisconnect, WebSocketException
 from django_bolt.websocket.close_codes import check_close_frame
-from django_bolt.websocket.handlers import build_websocket_request
+from django_bolt.websocket.handlers import build_websocket_request, invalid_request_detail
 
 # Each WebSocketTestClient is one connection with its own test app. The
 # connections to one API share its rate-limit buckets, as the connections to
@@ -98,7 +102,10 @@ class WebSocketTestClient:
             read_django_settings: If True, read CORS settings from Django settings
                                  when cors_allowed_origins is None. Default True.
         """
-        self.api = api
+        # runbolt serves an API that the URLconf mounts under its prefixes.
+        self.api = served_api(api)
+        # The served API is new for each client. The connections share the buckets of the API.
+        self._rate_limit_api = api
         self.path = path
         self.headers = headers or {}
         self.query_string = query_string
@@ -132,6 +139,8 @@ class WebSocketTestClient:
         if self._app_id is not None:
             return self._app_id
 
+        # FORCE_SCRIPT_NAME: the handler and its dependencies run with the script prefix, as in runbolt.
+        script_prefix = configure_script_prefix()
         # Create a test app instance for this WebSocket test with CORS config
         # This ensures WebSocket origin validation uses same config as HTTP
         self._app_id = _core.create_test_app(
@@ -140,23 +149,19 @@ class WebSocketTestClient:
             self._cors_allowed_origins,
             None,
             self.api._rust_compression_config(),
-            _rate_limiters(self.api),
-            error_renderer=self.api._rust_error_renderer(),
+            _rate_limiters(self._rate_limit_api),
+            error_renderer=self.api._rust_error_renderer(script_prefix),
         )
 
         # Register WebSocket routes with pre-compiled injectors (same as production)
-        ws_routes = []
-        for path, handler_id, handler in self.api._websocket_routes:
-            # Get pre-compiled injector from handler metadata (same as runbolt.py)
-            meta = self.api._handler_meta.get(handler_id, {})
-            injector = meta.get("injector")
-            ws_routes.append((path, handler_id, handler, injector))
+        ws_routes = self.api._rust_websocket_routes(script_prefix)
+        self._injectors = {handler_id: injector for _path, handler_id, _handler, injector in ws_routes}
         if ws_routes:
             _core.register_test_websocket_routes(self._app_id, ws_routes)
 
         # Register ASGI mounts so an unmatched path can fall back to one
         if self.api._asgi_mounts:
-            _core.register_test_asgi_mounts(self._app_id, list(self.api._asgi_mounts))
+            _core.register_test_asgi_mounts(self._app_id, asgi_mounts(self.api._asgi_mounts, script_prefix))
 
         # Register middleware metadata for guards/auth
         if self.api._handler_middleware:
@@ -349,15 +354,15 @@ class WebSocketTestClient:
         # Use production code path for parameter injection
         # This ensures tests actually verify the injector implementation
 
-        # Each WebSocket route has a pre-compiled injector in its metadata (same as Rust uses)
-        meta = self.api._handler_meta[handler_id]
-
         # Build request dict from scope (same as Rust's build_websocket_request call)
         request = build_websocket_request(scope)
 
-        # Call the pre-compiled injector to get (args, kwargs). The server
-        # calls it with no await, so this client does the same.
-        args, kwargs = meta["injector"](request)
+        # Call the pre-compiled injector of the route to get (args, kwargs), as
+        # Rust does. The server calls it with no await, so this client does the same.
+        try:
+            args, kwargs = self._injectors[handler_id](request)
+        except RequestValidationError as error:
+            raise _invalid_request(error) from error
 
         # Prepend websocket to args (same as Rust does)
         args = [ws] + list(args)
@@ -416,6 +421,15 @@ class WebSocketTestClient:
         """Record an error of the handler: a failed handshake, or a close with 1011."""
         if not self._accepted:
             # An error before accept fails the handshake, as the server answers 500.
+            # A refused request value fails it as a refused scalar does.
+            if isinstance(error, RequestValidationError):
+                try:
+                    error = _invalid_request(error)
+                except Exception:
+                    # The detail cannot be made, for example for RequestValidationError(None).
+                    # The handshake fails with the error itself, as for another error.
+                    self._decide(error)
+                    return
             self._decide(error)
             return
         # The server does not report a client that left as a handler error.
@@ -616,6 +630,16 @@ class WebSocketTestClient:
                 yield await self.receive_json(timeout=timeout)
             except (ConnectionClosed, TimeoutError):
                 break
+
+
+def _invalid_request(error: RequestValidationError) -> ValueError:
+    """Give the ValueError that Rust raises for a refused scalar, for a value that an extractor refused.
+
+    The server answers 400 for both.
+    """
+    invalid = ValueError(invalid_request_detail(error))
+    invalid.__cause__ = error
+    return invalid
 
 
 class HandshakeRejected(Exception):

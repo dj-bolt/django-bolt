@@ -20,8 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use bolt_core::metadata::RouteMetadata;
 use bolt_core::middleware::auth::{AuthContext, populate_auth_context};
-use bolt_core::middleware::client_ip::{TrustedProxies, resolve_scheme};
+use bolt_core::middleware::client_ip::resolve_scheme;
 use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
+use bolt_core::request::client_path;
 use bolt_core::request_pipeline::{
     EMPTY_TYPES, header_str, insert_header_line, query_sequences, set_declared_item,
     set_param_item, set_query_sequences,
@@ -41,6 +42,7 @@ use super::{ACTIVE_WS_CONNECTIONS, ConnectionSlot};
 static WS_CLASS: OnceCell<Py<PyAny>> = OnceCell::new();
 static BUILD_REQUEST_FN: OnceCell<Py<PyAny>> = OnceCell::new();
 static DISCONNECT_CLASS: OnceCell<Py<PyAny>> = OnceCell::new();
+static INVALID_REQUEST_DETAIL_FN: OnceCell<Py<PyAny>> = OnceCell::new();
 
 /// Get cached WebSocket class (imports once, reuses)
 fn get_ws_class(py: Python<'_>) -> PyResult<&Py<PyAny>> {
@@ -91,6 +93,36 @@ fn requested_close(error: &PyErr) -> Option<(u16, String)> {
         }
         Some((code, reason))
     })
+}
+
+/// The detail of a request value that a parameter extractor refused, or None.
+///
+/// Rust refuses a bad scalar value in [`build_scope`]. An extractor refuses
+/// other values, such as an item of a `list[int]`, with
+/// `RequestValidationError`. Python formats the detail as Rust does.
+fn invalid_request_detail(error: &PyErr) -> Option<String> {
+    Python::attach(|py| {
+        let detail = INVALID_REQUEST_DETAIL_FN
+            .get_or_try_init(|| {
+                py.import("django_bolt.websocket.handlers")?
+                    .getattr("invalid_request_detail")
+                    .map(Bound::unbind)
+            })
+            .and_then(|detail| detail.call1(py, (error.value(py),)))
+            .and_then(|detail| detail.extract::<Option<String>>(py));
+        detail.unwrap_or_else(|e| {
+            eprintln!(
+                "[django-bolt] WebSocket invalid_request_detail error: {}",
+                e
+            );
+            None
+        })
+    })
+}
+
+/// The 400 response of a request value that Bolt refuses at the upgrade.
+fn invalid_request(error: impl std::fmt::Display) -> actix_web::Error {
+    actix_web::error::ErrorBadRequest(format!("Invalid request: {}", error))
 }
 
 /// The error of a send to a client that left. ASGI requires an `OSError`.
@@ -150,6 +182,12 @@ pub fn requested_subprotocols<'a>(values: impl Iterator<Item = &'a str>) -> Vec<
 /// Parses and coerces query, path, header and cookie values to typed Python
 /// objects using the same type coercion as HTTP handlers.
 /// `headers` holds the request headers, with the `Cookie` lines joined.
+/// `path` starts with the script name (`FORCE_SCRIPT_NAME`), as `request.path`
+/// does, and `root_path` is the script name.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parts of a request and the settings of the app that the scope reads"
+)]
 fn build_scope(
     py: Python<'_>,
     req: &HttpRequest,
@@ -158,6 +196,7 @@ fn build_scope(
     path_params: &AHashMap<String, String>,
     route_meta: Option<&RouteMetadata>,
     max_param_length: usize,
+    script_name: Option<&str>,
 ) -> PyResult<Py<PyAny>> {
     let empty_types: &TypeHints = &EMPTY_TYPES;
     let path_types = route_meta.map_or(empty_types, |m| &m.path_types);
@@ -167,7 +206,8 @@ fn build_scope(
 
     let scope_dict = PyDict::new(py);
     scope_dict.set_item("type", "websocket")?;
-    scope_dict.set_item("path", req.path())?;
+    scope_dict.set_item("path", client_path(script_name, req.path().to_owned()))?;
+    scope_dict.set_item("root_path", client_path(script_name, String::new()))?;
 
     // Parse the query string with the HTTP parser: the last value of a repeated key wins.
     // A value that is too long or a bad typed value rejects the upgrade, as in HTTP.
@@ -266,6 +306,8 @@ enum Handshake {
     },
     /// Refuse the upgrade with this HTTP status.
     Refuse(StatusCode),
+    /// Refuse the upgrade with 400: a parameter extractor refused a request value.
+    Invalid(PyErr),
 }
 
 /// Build an ASGI WebSocket scope for a mounted application.
@@ -274,15 +316,21 @@ enum Handshake {
 /// reads. This one follows the ASGI specification instead.
 ///
 /// `path` keeps the mount prefix, and `root_path` reports it, as the
-/// specification requires. `path` is percent-decoded. `raw_path` keeps the
-/// request bytes. A router such as `channels.routing.URLRouter`
+/// specification requires. Both start with the script name
+/// (`FORCE_SCRIPT_NAME`), which the proxy removed. `path` is
+/// percent-decoded. `raw_path` keeps the request bytes. A router such as `channels.routing.URLRouter`
 /// strips `root_path` itself. A scope with the prefix already removed makes
 /// such a router strip it twice and match nothing.
 ///
 /// Takes parts, not an `HttpRequest`, so the `TestClient` backend builds the
 /// same scope as the server.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parts of a request: the server and the TestClient backend give them"
+)]
 pub fn build_asgi_scope_from_parts<'a, I>(
     py: Python<'_>,
+    script_name: Option<&str>,
     mount_prefix: &str,
     request_path: &str,
     query_string: &[u8],
@@ -303,16 +351,21 @@ where
     scope.set_item("type", "websocket")?;
     scope.set_item("scheme", if secure { "wss" } else { "ws" })?;
 
+    let request_path = client_path(script_name, request_path.to_owned());
     scope.set_item("raw_path", PyBytes::new(py, request_path.as_bytes()))?;
     let path =
         String::from_utf8_lossy(&urlencoding::decode_binary(request_path.as_bytes())).into_owned();
     scope.set_item("path", path)?;
     scope.set_item("query_string", PyBytes::new(py, query_string))?;
-    if mount_prefix == "/" {
-        scope.set_item("root_path", "")?;
+    let mount_prefix = if mount_prefix == "/" {
+        ""
     } else {
-        scope.set_item("root_path", mount_prefix)?;
-    }
+        mount_prefix
+    };
+    scope.set_item(
+        "root_path",
+        client_path(script_name, mount_prefix.to_owned()),
+    )?;
 
     let header_list = PyList::empty(py);
     let mut protocol_values = Vec::new();
@@ -337,14 +390,14 @@ fn build_asgi_scope(
     py: Python<'_>,
     req: &HttpRequest,
     mount_prefix: &str,
-    trusted_proxies: &TrustedProxies,
+    state: &AppState,
 ) -> PyResult<Py<PyAny>> {
     // Only a trusted proxy sets the scheme with `X-Forwarded-Proto`.
     let secure = resolve_scheme(
         req.headers(),
         req.peer_addr().map(|address| address.ip()),
         req.app_config().secure(),
-        trusted_proxies,
+        &state.trusted_proxies,
     ) == "https";
     let headers = req
         .headers()
@@ -353,6 +406,7 @@ fn build_asgi_scope(
 
     build_asgi_scope_from_parts(
         py,
+        state.script_name.as_deref(),
         mount_prefix,
         req.path(),
         req.query_string().as_bytes(),
@@ -902,19 +956,15 @@ pub async fn handle_websocket_upgrade(
                 path_params,
                 route_meta,
                 state.max_param_length,
+                state.script_name.as_deref(),
             )
         }
         WsTarget::AsgiMount { mount_prefix, .. } => {
-            build_asgi_scope(py, &req, mount_prefix, &state.trusted_proxies)
+            build_asgi_scope(py, &req, mount_prefix, &state)
         }
     }) {
         Ok(s) => s,
-        Err(e) => {
-            return Err(actix_web::error::ErrorBadRequest(format!(
-                "Invalid request: {}",
-                e
-            )));
-        }
+        Err(e) => return Err(invalid_request(e)),
     };
 
     // The handler decides the handshake: accept sends the 101, close refuses it.
@@ -962,6 +1012,7 @@ pub async fn handle_websocket_upgrade(
             Ok(resp)
         }
         Ok(Handshake::Refuse(status)) => Ok(refusal(status)),
+        Ok(Handshake::Invalid(error)) => Err(invalid_request(error)),
         // The handler task ends with a decision, so a dropped sender is a bug.
         Err(_) => Ok(refusal(StatusCode::INTERNAL_SERVER_ERROR)),
     }
@@ -1079,6 +1130,17 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
                     if let Some((code, reason)) = requested_close(&e) {
                         ws_state.refuse(StatusCode::FORBIDDEN);
                         close_accepted(&ws_state, code, &reason).await;
+                        return;
+                    }
+                    // A request value that an extractor refused before accept
+                    // refuses the upgrade with 400, as a refused scalar does.
+                    if ws_state.handshake_pending()
+                        && let Some(detail) = invalid_request_detail(&e)
+                    {
+                        if let Some(handshake) = ws_state.take_handshake() {
+                            let error = pyo3::exceptions::PyValueError::new_err(detail);
+                            let _ = handshake.send(Handshake::Invalid(error));
+                        }
                         return;
                     }
                     // A client that left is not an error of the handler.

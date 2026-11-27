@@ -120,6 +120,8 @@ class ToolDef:
     revocation_check: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     # An exposed route with route_auth: the user loaders of its auth backends, by auth_backend_index.
     user_loaders: tuple[Any, ...] = ()
+    # A tool with task=True: {"ttl_ms": int, "poll_interval_ms": int}. Rust runs its calls as tasks.
+    task: dict[str, int] | None = None
 
 
 @dataclass

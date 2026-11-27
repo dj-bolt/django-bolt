@@ -42,7 +42,12 @@ class Request(Protocol):
 
     @property
     def path(self) -> str:
-        """Request path"""
+        """Request path. With ``FORCE_SCRIPT_NAME``, the script name comes first, as in Django."""
+        ...
+
+    @property
+    def path_info(self) -> str:
+        """Request path without the script name. The router matches it."""
         ...
 
     @property

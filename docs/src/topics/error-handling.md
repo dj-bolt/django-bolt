@@ -276,7 +276,7 @@ curl -i localhost:8000/articles/x
 HTTP/1.1 422 Unprocessable Entity
 content-type: application/problem+json
 
-{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"Request validation failed","instance":"/articles/x","errors":[{"loc":["path","article_id"],"msg":"Invalid integer 'x': invalid digit found in string","type":"validation_error"}]}
+{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"Request validation failed","instance":"/articles/x","errors":[{"loc":["path","article_id"],"msg":"Invalid integer 'x': expected a whole number such as 42 or -7","type":"validation_error"}]}
 ```
 
 The body has `type`, `title`, `status`, `detail` and `instance`. It has `errors` when the error has field errors.

@@ -75,6 +75,10 @@ fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<bolt_core::lane::RequestLane>()?;
     m.add_class::<bolt_core::metadata::GuardCheck>()?;
     m.add_function(wrap_pyfunction!(bolt_core::lane::stop_idle_lanes, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        bolt_core::type_coercion::parse_text_items,
+        m
+    )?)?;
 
     // Production server functions
     m.add_function(wrap_pyfunction!(register_routes, m)?)?;

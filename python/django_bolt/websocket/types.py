@@ -54,8 +54,15 @@ class WebSocket:
 
     @property
     def path(self) -> str:
-        """The URL path."""
+        """The URL path. With ``FORCE_SCRIPT_NAME``, the script name comes first, as in ``request.path``."""
         return self._scope.get("path", "/")
+
+    @property
+    def path_info(self) -> str:
+        """The URL path without the script name (``root_path`` of the scope). The router matched it."""
+        path = self._scope.get("path", "/")
+        root_path = self._scope.get("root_path", "")
+        return path[len(root_path) :] if root_path and path.startswith(root_path) else path
 
     @property
     def query_string(self) -> bytes:

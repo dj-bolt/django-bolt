@@ -3,6 +3,7 @@
 //! This module provides the core CORS functionality:
 //! - `add_cors_headers_with_config` - Add CORS headers using CorsConfig (for middleware)
 //! - `add_preflight_headers_with_config` - Add preflight headers using CorsConfig (for middleware)
+//! - `add_preflight_vary` - Add the `Vary` names of a preflight (for middleware)
 
 use actix_web::http::header::{
     ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
@@ -14,36 +15,21 @@ use crate::metadata::CorsConfig;
 
 /// Add CORS headers to a HeaderMap using CorsConfig (supports regex patterns)
 /// This is the core function used by CorsMiddleware
-/// Returns true if CORS headers were added (origin was allowed), false otherwise
+/// Returns true if the origin is allowed, false otherwise
+///
+/// `*` with no credentials is the same value for each request, so it needs no
+/// `Vary: Origin`. Bolt sends it also when the request has no Origin. Each
+/// other config gives an answer that depends on the Origin. Thus its responses
+/// get `Vary: Origin`, also for a refused origin and for no Origin. A cache
+/// then keeps one response for each origin (Fetch standard, "CORS protocol and
+/// HTTP caches").
 pub fn add_cors_headers_with_config(
     headers: &mut HeaderMap,
     request_origin: Option<&str>,
     cors_config: &CorsConfig,
     global_cors_config: Option<&CorsConfig>,
 ) -> bool {
-    // Check if CORS_ALLOW_ALL_ORIGINS is True with credentials (invalid per spec)
-    if cors_config.allow_all_origins && cors_config.credentials {
-        // Per CORS spec, wildcard + credentials is invalid. Reflect the request origin instead.
-        if let Some(req_origin) = request_origin {
-            if let Ok(val) = HeaderValue::from_str(req_origin) {
-                headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, val);
-            }
-            headers.append(VARY, HeaderValue::from_static("Origin"));
-            headers.insert(
-                ACCESS_CONTROL_ALLOW_CREDENTIALS,
-                HeaderValue::from_static("true"),
-            );
-
-            if let Some(ref cached_val) = cors_config.expose_headers_header {
-                headers.insert(ACCESS_CONTROL_EXPOSE_HEADERS, cached_val.clone());
-            }
-            return true;
-        }
-        return false;
-    }
-
-    // Handle allow_all_origins (wildcard) without credentials
-    if cors_config.allow_all_origins {
+    if cors_config.allow_all_origins && !cors_config.credentials {
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
         if let Some(ref cached_val) = cors_config.expose_headers_header {
             headers.insert(ACCESS_CONTROL_EXPOSE_HEADERS, cached_val.clone());
@@ -51,41 +37,42 @@ pub fn add_cors_headers_with_config(
         return true;
     }
 
-    // Skip work if no Origin header present
-    let req_origin = match request_origin {
-        Some(o) => o,
-        None => return false,
-    };
+    add_vary(headers, "Origin");
 
-    // A config with its own origins or patterns is the complete allow list.
-    // A config with neither uses the origins and regexes of the global config.
-    // Check the pattern strings: a pattern that does not compile must not widen
-    // the route to the global list.
-    let allow_list = if !cors_config.origin_set.is_empty() || !cors_config.origin_regexes.is_empty()
-    {
-        cors_config
-    } else if let Some(global_config) = global_cors_config {
-        global_config
-    } else {
+    let Some(req_origin) = request_origin else {
         return false;
     };
 
-    // O(1) exact match, then the compiled regexes
-    let allowed = allow_list.origin_set.contains(req_origin)
-        || allow_list
-            .compiled_origin_regexes
-            .iter()
-            .any(|re| re.is_match(req_origin));
+    // A wildcard with credentials is not valid CORS, so Bolt reflects each
+    // origin. A config with its own origins or patterns is the complete allow
+    // list. A config with neither uses the origins and regexes of the global
+    // config. Check the pattern strings: a pattern that does not compile must
+    // not widen the route to the global list.
+    if !cors_config.allow_all_origins {
+        let allow_list =
+            if !cors_config.origin_set.is_empty() || !cors_config.origin_regexes.is_empty() {
+                cors_config
+            } else if let Some(global_config) = global_cors_config {
+                global_config
+            } else {
+                return false;
+            };
 
-    if !allowed {
-        return false;
+        // O(1) exact match, then the compiled regexes
+        let allowed = allow_list.origin_set.contains(req_origin)
+            || allow_list
+                .compiled_origin_regexes
+                .iter()
+                .any(|re| re.is_match(req_origin));
+        if !allowed {
+            return false;
+        }
     }
 
     // Reflect the request origin
     if let Ok(val) = HeaderValue::from_str(req_origin) {
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, val);
     }
-    headers.append(VARY, HeaderValue::from_static("Origin"));
 
     if cors_config.credentials {
         headers.insert(
@@ -99,6 +86,14 @@ pub fn add_cors_headers_with_config(
     }
 
     true
+}
+
+/// Add the `Vary` names of a preflight. The answer depends on the requested
+/// method, because the route of that method gives the config. Add them also
+/// when the origin is refused.
+pub fn add_preflight_vary(headers: &mut HeaderMap) {
+    add_vary(headers, "Access-Control-Request-Method");
+    add_vary(headers, "Access-Control-Request-Headers");
 }
 
 /// Add CORS preflight headers to a HeaderMap using CorsConfig
@@ -115,21 +110,20 @@ pub fn add_preflight_headers_with_config(headers: &mut HeaderMap, cors_config: &
     if let Some(ref cached_val) = cors_config.max_age_header {
         headers.insert(ACCESS_CONTROL_MAX_AGE, cached_val.clone());
     }
+}
 
-    // Add Vary headers for preflight requests (check for duplicates)
-    let has_preflight_vary = headers
-        .get(VARY)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("Access-Control-Request-Method"))
-        .unwrap_or(false);
-
-    if !has_preflight_vary {
-        headers.append(
-            VARY,
-            HeaderValue::from_static(
-                "Access-Control-Request-Method, Access-Control-Request-Headers",
-            ),
-        );
+/// Add `name` to `Vary`, unless a `Vary` value names it (in any letter case)
+/// or is `*`. The values of the handler stay. The new value is static, so it
+/// needs no allocation.
+fn add_vary(headers: &mut HeaderMap, name: &'static str) {
+    let named = headers.get_all(VARY).any(|value| {
+        value.as_bytes().split(|&byte| byte == b',').any(|token| {
+            let token = token.trim_ascii();
+            token == b"*" || token.eq_ignore_ascii_case(name.as_bytes())
+        })
+    });
+    if !named {
+        headers.append(VARY, HeaderValue::from_static(name));
     }
 }
 
@@ -192,8 +186,14 @@ mod tests {
     }
 
     #[test]
-    fn other_origin_or_no_origin_gets_no_headers() {
-        let config = cors(&["https://a.example"], &[], false, true);
+    fn other_origin_or_no_origin_gets_only_vary_origin() {
+        // The answer depends on the Origin, so a cache must key the response on it.
+        let config = cors(
+            &["https://a.example"],
+            &[r"^https://r\.example$"],
+            false,
+            true,
+        );
         for origin in [
             Some("https://b.example"),
             Some("https://a.example.evil"),
@@ -201,7 +201,8 @@ mod tests {
         ] {
             let (allowed, headers) = check(&config, origin);
             assert!(!allowed, "{origin:?}");
-            assert!(headers.is_empty(), "{origin:?}");
+            assert_eq!(headers.len(), 1, "{origin:?}");
+            assert_eq!(header(&headers, &VARY), Some("Origin"), "{origin:?}");
         }
     }
 
@@ -243,7 +244,8 @@ mod tests {
 
         let (allowed, headers) = check(&config, None);
         assert!(!allowed);
-        assert!(headers.is_empty());
+        assert_eq!(headers.len(), 1);
+        assert_eq!(header(&headers, &VARY), Some("Origin"));
     }
 
     #[test]
@@ -265,7 +267,7 @@ mod tests {
         // With no global config, a route with no origins allows nothing.
         let (allowed, headers) = check(&route, Some("https://g.example"));
         assert!(!allowed);
-        assert!(headers.is_empty());
+        assert!(headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
     }
 
     #[test]
@@ -279,7 +281,34 @@ mod tests {
             &route,
             Some(&global),
         ));
-        assert!(headers.is_empty());
+        assert!(headers.get(ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    }
+
+    #[test]
+    fn vary_origin_joins_the_vary_of_the_handler_once() {
+        // The existing values stay, in any letter case and in one or more fields.
+        let config = cors(&["https://a.example"], &[], false, false);
+        for (existing, expected) in [
+            (&["Cookie"][..], &["Cookie", "Origin"][..]),
+            (&["accept-encoding, ORIGIN"], &["accept-encoding, ORIGIN"]),
+            (
+                &["Accept-Encoding", " origin "],
+                &["Accept-Encoding", " origin "],
+            ),
+            (&["*"], &["*"]),
+            (&["Cookie,*"], &["Cookie,*"]),
+            (&["Origins"], &["Origins", "Origin"]),
+        ] {
+            for origin in [Some("https://a.example"), Some("https://b.example"), None] {
+                let mut headers = HeaderMap::new();
+                for value in existing {
+                    headers.append(VARY, HeaderValue::from_static(value));
+                }
+                add_cors_headers_with_config(&mut headers, origin, &config, None);
+                let vary: Vec<_> = headers.get_all(VARY).collect();
+                assert_eq!(vary, expected, "{existing:?} {origin:?}");
+            }
+        }
     }
 
     /// Run the check of a route config against a global config.
@@ -378,18 +407,24 @@ mod tests {
             Some("X-Token")
         );
         assert_eq!(header(&headers, &ACCESS_CONTROL_MAX_AGE), Some("600"));
-        assert_eq!(
-            header(&headers, &VARY),
-            Some("Access-Control-Request-Method, Access-Control-Request-Headers")
-        );
     }
 
     #[test]
     fn preflight_vary_is_added_once() {
-        let config = cors(&["https://a.example"], &[], false, false);
         let mut headers = HeaderMap::new();
-        add_preflight_headers_with_config(&mut headers, &config);
-        add_preflight_headers_with_config(&mut headers, &config);
-        assert_eq!(headers.get_all(VARY).count(), 1);
+        headers.append(
+            VARY,
+            HeaderValue::from_static("access-control-request-method"),
+        );
+        add_preflight_vary(&mut headers);
+        add_preflight_vary(&mut headers);
+        let vary: Vec<_> = headers.get_all(VARY).collect();
+        assert_eq!(
+            vary,
+            [
+                "access-control-request-method",
+                "Access-Control-Request-Headers"
+            ]
+        );
     }
 }

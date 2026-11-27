@@ -18,6 +18,7 @@ These tests validate the security measures implemented in src/type_coercion.rs.
 
 from __future__ import annotations
 
+import sys
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Annotated
@@ -28,6 +29,9 @@ import pytest
 from django_bolt import BoltAPI
 from django_bolt.param_functions import Form, Query
 from django_bolt.testing import TestClient
+
+# The digit limit of an int that Bolt reads at startup: that of int(), at most 4300.
+DIGITS = min(4300, sys.get_int_max_str_digits() or 4300)
 
 # =============================================================================
 # Test Fixtures
@@ -191,10 +195,12 @@ class TestParameterLengthLimits:
 
 class TestIntegerBoundaries:
     """
-    Test integer type coercion at i64 boundaries.
+    Test integer type coercion at and beyond the i64 boundaries.
 
-    Security: Rust uses i64, range: [-9223372036854775808, 9223372036854775807]
-    Validated by: src/type_coercion.rs coerce_param() using i64::parse()
+    Rust reads an int as Python's int() reads ASCII text. A value in the i64
+    range is an i64; a longer value is a Python int, up to the digit limit
+    of int() (4300 digits by default).
+    Validated by: crates/bolt-core/src/type_coercion.rs parse_int()
     """
 
     def test_int_max_i64_succeeds(self, client):
@@ -214,30 +220,47 @@ class TestIntegerBoundaries:
         assert data["value"] == min_i64
 
     @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("9223372036854775808", 2**63),
+            ("-9223372036854775809", -(2**63) - 1),
+            ("1" * DIGITS, (10**DIGITS - 1) // 9),
+            ("-" + "9" * DIGITS, 1 - 10**DIGITS),
+        ],
+        ids=["i64-max-plus-one", "i64-min-minus-one", "limit-digits", "limit-digits-negative"],
+    )
+    def test_f3_an_int_beyond_i64_converts_as_python_does(self, client, value, expected):
+        """An int beyond i64 is a Python int, as int() gives."""
+        response = client.get("/query/int", params={"value": value})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"value": expected, "type": "int"}
+
+    @pytest.mark.parametrize(
         ("path", "detail"),
         [
-            # i64::MAX + 1 and i64::MIN - 1: no overflow can bypass validation.
-            (
-                "/int/9223372036854775808",
-                "Path parameter 'value': Invalid integer '9223372036854775808': number too large to fit in target type",
-            ),
-            (
-                "/int/-9223372036854775809",
-                "Path parameter 'value': Invalid integer '-9223372036854775809': "
-                "number too small to fit in target type",
-            ),
             # No implicit truncation and no scientific notation.
-            ("/int/3.14", "Path parameter 'value': Invalid integer '3.14': invalid digit found in string"),
-            ("/int/1e10", "Path parameter 'value': Invalid integer '1e10': invalid digit found in string"),
+            (
+                "/int/3.14",
+                "Path parameter 'value': Invalid integer '3.14': expected a whole number such as 42 or -7",
+            ),
+            (
+                "/int/1e10",
+                "Path parameter 'value': Invalid integer '1e10': expected a whole number such as 42 or -7",
+            ),
             (
                 "/query/int?value=",
-                "Query parameter 'value': Invalid integer '': cannot parse integer from empty string",
+                "Query parameter 'value': Invalid integer '': expected a whole number such as 42 or -7",
+            ),
+            # int() refuses more digits than sys.get_int_max_str_digits().
+            (
+                "/query/int?value=" + "1" * (DIGITS + 1),
+                f"Query parameter 'value': Invalid integer '{'1' * (DIGITS + 1)}': more than {DIGITS} digits",
             ),
         ],
-        ids=["overflow", "underflow", "float", "scientific", "empty"],
+        ids=["float", "scientific", "empty", "too-many-digits"],
     )
     def test_invalid_int_rejected(self, client, path, detail):
-        """Each value that is not an i64 gets 422 with the reason."""
+        """Each value that int() refuses gets 422 with the reason."""
         response = client.get(path)
         assert response.status_code == 422
         assert response.json() == {"detail": detail}
@@ -248,6 +271,17 @@ class TestIntegerBoundaries:
         response = client.get("/query/int?value=%2B123")
         assert response.status_code == 200
         assert response.json() == {"value": 123, "type": "int"}
+
+    def test_int_with_leading_zeros_accepted(self, client):
+        """Leading zeros are valid, as for Python's int()."""
+        assert client.get("/query/int", params={"value": "007"}).json() == {"value": 7, "type": "int"}
+        assert client.get("/query/int", params={"value": "-007"}).json() == {"value": -7, "type": "int"}
+
+    @pytest.mark.parametrize("value", ["1_000", " 1", "1 ", "\u0661"])
+    def test_int_forms_that_master_refused_stay_refused(self, client, value):
+        """int() accepts `_`, whitespace and other digits than ASCII. Bolt keeps refusing them."""
+        response = client.get("/query/int", params={"value": value})
+        assert response.status_code == 422, response.text
 
 
 # =============================================================================

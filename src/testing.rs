@@ -26,6 +26,7 @@ use bolt_core::metadata::{RateLimitKey, RouteMetadata, RouteMetadataStore};
 use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::middleware::rate_limit::RateLimiters;
+use bolt_core::request::client_path;
 use bolt_core::router::{Router, normalize_request_path};
 use bolt_core::state::{
     AppState, AsgiMount, ScopeConfig, ServeDir, ServeMode, TASK_LOCALS,
@@ -658,6 +659,7 @@ pub fn test_request(
                         media_files_config: config.media_files_config,
                         access_loggers: Vec::new(),
                         error_renderer,
+                        script_name: config.script_name,
                     });
 
                     // Create Actix test service with production middleware stack
@@ -838,6 +840,7 @@ pub fn handle_test_websocket(
                     // Give the app the request path as sent, as the server does.
                     let scope = build_asgi_scope_from_parts(
                         py,
+                        app.config.script_name.as_deref(),
                         &mount.prefix,
                         &path,
                         query_string.as_deref().unwrap_or_default().as_bytes(),
@@ -991,7 +994,10 @@ pub fn handle_test_websocket(
     // Build scope dict
     let scope_dict = pyo3::types::PyDict::new(py);
     scope_dict.set_item("type", "websocket")?;
-    scope_dict.set_item("path", &path)?;
+    // As the server: the script name (FORCE_SCRIPT_NAME), then the path.
+    let script_name = app.config.script_name.as_deref();
+    scope_dict.set_item("path", client_path(script_name, path))?;
+    scope_dict.set_item("root_path", client_path(script_name, String::new()))?;
     if let Some(context) = revocation_auth {
         scope_dict.set_item("_bolt_revocation_auth", context)?;
     }
@@ -1130,6 +1136,7 @@ mod tests {
                 rate_limit_ipv6_prefix: 64,
                 static_files_config: None,
                 media_files_config: None,
+                script_name: None,
             },
             global_compression_config: None,
             rate_limiters: Arc::default(),

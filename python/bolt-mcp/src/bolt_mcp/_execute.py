@@ -8,13 +8,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import msgspec
 
+from django_bolt import _script_prefix
+from django_bolt._json import decode as json_decode
 from django_bolt._json import default_serializer
 from django_bolt._json import encode as json_encode
+from django_bolt.serialization import (
+    _BODY_BYTES,
+    _RESPONSE_META_EMPTY,
+    _RESPONSE_META_HTML,
+    _RESPONSE_META_JSON,
+    _RESPONSE_META_OCTETSTREAM,
+    _RESPONSE_META_PLAINTEXT,
+    ResponseWireV1,
+    _is_json_media_type,
+)
 
 from .context import McpClientError
 from .registry import ToolDef
@@ -92,11 +106,105 @@ def to_call_tool_result(result: Any) -> dict[str, Any]:
     }
 
 
+_TAG_MEDIA_TYPES = {
+    _RESPONSE_META_JSON: "application/json",
+    _RESPONSE_META_PLAINTEXT: "text/plain",
+    _RESPONSE_META_OCTETSTREAM: "application/octet-stream",
+    _RESPONSE_META_EMPTY: "",
+    _RESPONSE_META_HTML: "text/html",
+}
+_TYPE_MEDIA_TYPES = {"json": "application/json", "plaintext": "text/plain", "html": "text/html", "empty": ""}
+
+
+def _content_type(meta: Any) -> tuple[str, str]:
+    """Return the media type of a response and the charset of its text, ``utf-8`` when it declares none."""
+    if isinstance(meta, int):
+        return _TAG_MEDIA_TYPES[meta], "utf-8"
+    response_type, custom_content_type = meta[0], meta[1]
+    if not custom_content_type:
+        # Rust sends each other response type as application/octet-stream.
+        return _TYPE_MEDIA_TYPES.get(response_type, "application/octet-stream"), "utf-8"
+    media_type, *parameters = custom_content_type.split(";")
+    charset = "utf-8"
+    for parameter in parameters:
+        name, _, value = parameter.partition("=")
+        if name.strip().lower() == "charset" and value.strip():
+            charset = value.strip().strip('"')
+    return media_type.strip().lower(), charset
+
+
+def route_tool_result(name: str, output: tuple[int, msgspec.json.Decoder] | None, wire: ResponseWireV1) -> ToolResult:
+    """Map the HTTP response of an exposed route to its tool result.
+
+    ``wire`` is the response that Bolt serializes for the route, with its ``response_model``
+    and its response validation. A 2xx JSON body is the structured content, and its text is
+    the HTTP body. A 2xx text body is text content only. Any other status raises ``ToolError``
+    with the HTTP body. A tool result has no headers or cookies, so they are not sent.
+
+    ``output`` is None when the tool has no output schema. Else it holds the status of the body
+    that the output schema describes, and the decoder of the Struct of that schema. A success
+    body that this decoder refuses raises ``TypeError``. Bolt does not validate the bytes of a
+    ``Response``, so this check is necessary.
+    """
+    status, meta, body_kind, body = wire
+    if body_kind != _BODY_BYTES:
+        raise TypeError(f"Tool {name!r} returned a streaming or file response. A tool result cannot hold one.")
+    if not 200 <= status < 300:
+        raise ToolError(body.decode(errors="replace") if body else f"Tool {name!r} answered with HTTP status {status}.")
+    media_type, charset = _content_type(meta)
+    if output is not None:
+        schema_status, decoder = output
+        if status != schema_status or not _is_json_media_type(media_type):
+            raise TypeError(
+                f"Tool {name!r} returned a body that its output schema does not describe "
+                f"(status {status}, {media_type!r})."
+            )
+        try:
+            decoder.decode(body)
+        except msgspec.DecodeError as exc:
+            raise TypeError(f"Tool {name!r} returned a body that its output schema does not describe: {exc}") from exc
+    if not body:
+        return ToolResult(content=[])
+    if _is_json_media_type(media_type):
+        payload = json_decode(body)
+        return ToolResult(
+            content=body.decode(), structured=payload if isinstance(payload, dict) else {"result": payload}
+        )
+    if media_type.startswith("text/"):
+        return ToolResult(content=body.decode(charset))
+    raise TypeError(f"Tool {name!r} returned a body of type {media_type!r}. A tool result holds only JSON or text.")
+
+
+async def call_route_async(
+    handler: Callable[..., Awaitable[Any]],
+    serialize: Callable[[Any], Awaitable[ResponseWireV1]],
+    to_result: Callable[[ResponseWireV1], ToolResult],
+    /,
+    **kwargs: Any,
+) -> ToolResult:
+    """Call an async route handler and serialize its result as HTTP does."""
+    return to_result(await serialize(await handler(**kwargs)))
+
+
+def call_route_sync(
+    handler: Callable[..., Any],
+    serialize: Callable[[Any], ResponseWireV1],
+    to_result: Callable[[ResponseWireV1], ToolResult],
+    /,
+    **kwargs: Any,
+) -> ToolResult:
+    """Call a sync route handler and serialize its result as HTTP does, on the same thread."""
+    return to_result(serialize(handler(**kwargs)))
+
+
 async def run_tool(tool: ToolDef, kwargs: dict[str, Any]) -> Any:
     """Invoke a tool and return its result value (awaiting async, off-loading sync)."""
     if tool.is_async:
         return await tool.fn(**kwargs)
-    return await asyncio.to_thread(tool.fn, **kwargs)
+    # As asyncio.to_thread(), with the context of a hop: under FORCE_SCRIPT_NAME,
+    # the thread gets the script prefix of the call.
+    context = _script_prefix.copy_context()
+    return await asyncio.get_running_loop().run_in_executor(None, partial(context.run, tool.fn, **kwargs))
 
 
 async def execute_tool(tool: ToolDef, kwargs: dict[str, Any], *, mask_error_details: bool) -> dict[str, Any]:

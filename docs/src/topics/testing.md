@@ -268,7 +268,7 @@ def test_validation():
         response = client.get("/articles/abc")
         assert response.status_code == 422
         assert response.json() == {
-            "detail": "Path parameter 'article_id': Invalid integer 'abc': invalid digit found in string"
+            "detail": "Path parameter 'article_id': Invalid integer 'abc': expected a whole number such as 42 or -7"
         }
 
         # A path with no route is a 404.

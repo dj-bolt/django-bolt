@@ -24,6 +24,9 @@ import httpx
 from httpx import Response
 
 from django_bolt import BoltAPI, _core
+from django_bolt._script_prefix import asgi_mounts, lifespan_entry, mcp_mounts, refuse_files_at_script_name
+from django_bolt._script_prefix import configure as configure_script_prefix
+from django_bolt._urlconf import served_api
 from django_bolt.api import (
     _routes_and_native_routes,
     _validate_asgi_mount_conflicts,
@@ -430,6 +433,8 @@ class TestClient(httpx.Client):
         # use_http_layer is ignored - we always use the HTTP layer now
         _ = use_http_layer
 
+        # runbolt serves an API that the URLconf mounts under its prefixes.
+        api = served_api(api)
         # runbolt registers the docs routes before it validates the routes. Do the same.
         docs_routes = _prepare_api(api)
 
@@ -441,6 +446,10 @@ class TestClient(httpx.Client):
         self._validate_mcp_mount_conflicts(api, docs_routes)
         refuse_unread_route_config(api._routes, api._websocket_routes)
 
+        # FORCE_SCRIPT_NAME: the entries from Rust into Python set the script prefix, as in runbolt.
+        script_prefix = configure_script_prefix()
+        if read_django_settings:
+            refuse_files_at_script_name(script_prefix, static_files_replaced=static_files_config is not None)
         # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
             api._dispatch,
@@ -448,7 +457,7 @@ class TestClient(httpx.Client):
             cors_allowed_origins,
             static_files_config,
             api._rust_compression_config(),
-            error_renderer=api._rust_error_renderer(),
+            error_renderer=api._rust_error_renderer(script_prefix),
         )
         # Release the native app at close, or when nobody closed the client and
         # it is garbage. The native app holds the API, so a leak keeps it alive.
@@ -458,28 +467,27 @@ class TestClient(httpx.Client):
         # With raise_server_exceptions, a test-only dispatch brings the exception of a handler back.
         exceptions = ServerExceptions() if raise_server_exceptions else None
         rust_routes = [
-            (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
+            (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions, script_prefix))
             for method, path, handler_id, handler in [*api._routes, *docs_routes]
         ]
-        _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes), api._rust_no_route())
+        _core.register_test_routes(
+            self.app_id, rust_routes, list(api._native_routes), api._rust_no_route(script_prefix)
+        )
 
         # Register WebSocket routes with pre-compiled injectors (same as production)
-        ws_routes = []
-        for path, handler_id, handler in api._websocket_routes:
-            # Get pre-compiled injector from handler metadata (same as runbolt.py)
-            meta = api._handler_meta.get(handler_id, {})
-            injector = meta.get("injector")
-            ws_routes.append((path, handler_id, handler, injector))
+        ws_routes = api._rust_websocket_routes(script_prefix)
         if ws_routes:
             _core.register_test_websocket_routes(self.app_id, ws_routes)
 
         # Register HTTP ASGI mounts
         if api._asgi_mounts:
-            _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
+            _core.register_test_asgi_mounts(self.app_id, asgi_mounts(api._asgi_mounts, script_prefix))
 
         # Register MCP mounts (served by the Rust rmcp core, like production)
         if api._mcp_mounts:
-            _core.register_test_mcp_mounts(self.app_id, self._mcp_mounts_for_test(api, base_url))
+            _core.register_test_mcp_mounts(
+                self.app_id, mcp_mounts(self._mcp_mounts_for_test(api, base_url), script_prefix)
+            )
 
         # Register middleware metadata if any exists
         if api._handler_middleware:
@@ -496,6 +504,7 @@ class TestClient(httpx.Client):
             **kwargs,
         )
         self.api = api
+        self._script_prefix = script_prefix
         self._db_share = SharedConnections() if share_db_connection else None
         # The running lifespan: its loop and context manager. None before startup and after shutdown.
         self._lifespan: tuple[asyncio.AbstractEventLoop, Any] | None = None
@@ -514,7 +523,8 @@ class TestClient(httpx.Client):
             loop = asyncio.new_event_loop()
             cm = run_lifespans(self.api._source_lifespans)
             try:
-                loop.run_until_complete(cm.__aenter__())
+                with lifespan_entry(self._script_prefix):
+                    loop.run_until_complete(cm.__aenter__())
             except BaseException:
                 loop.close()
                 raise
@@ -532,7 +542,8 @@ class TestClient(httpx.Client):
         loop, cm = self._lifespan
         self._lifespan = None
         try:
-            loop.run_until_complete(cm.__aexit__(exc_type, exc_val, exc_tb))
+            with lifespan_entry(self._script_prefix):
+                loop.run_until_complete(cm.__aexit__(exc_type, exc_val, exc_tb))
         finally:
             loop.close()
 
@@ -765,6 +776,7 @@ class AsyncTestClient(httpx.AsyncClient):
                              redirect response.
             **kwargs: Additional arguments passed to httpx.AsyncClient
         """
+        api = served_api(api)
         # Register the docs routes as TestClient does.
         docs_routes = _prepare_api(api)
 
@@ -776,6 +788,10 @@ class AsyncTestClient(httpx.AsyncClient):
         TestClient._validate_mcp_mount_conflicts(api, docs_routes)
         refuse_unread_route_config(api._routes, api._websocket_routes)
 
+        # FORCE_SCRIPT_NAME: the entries from Rust into Python set the script prefix, as in runbolt.
+        script_prefix = configure_script_prefix()
+        if read_django_settings:
+            refuse_files_at_script_name(script_prefix, static_files_replaced=static_files_config is not None)
         # Rust reads the Django settings with the function that runbolt uses.
         self.app_id = _core.create_test_app(
             api._dispatch,
@@ -783,7 +799,7 @@ class AsyncTestClient(httpx.AsyncClient):
             cors_allowed_origins,
             static_files_config,
             api._rust_compression_config(),
-            error_renderer=api._rust_error_renderer(),
+            error_renderer=api._rust_error_renderer(script_prefix),
         )
         # Release the native app at close, or when nobody closed the client and
         # it is garbage. The native app holds the API, so a leak keeps it alive.
@@ -793,27 +809,27 @@ class AsyncTestClient(httpx.AsyncClient):
         # With raise_server_exceptions, a test-only dispatch brings the exception of a handler back.
         exceptions = ServerExceptions() if raise_server_exceptions else None
         rust_routes = [
-            (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions))
+            (method, path, handler_id, handler, *bound_dispatches(api, handler, handler_id, exceptions, script_prefix))
             for method, path, handler_id, handler in [*api._routes, *docs_routes]
         ]
-        _core.register_test_routes(self.app_id, rust_routes, list(api._native_routes), api._rust_no_route())
+        _core.register_test_routes(
+            self.app_id, rust_routes, list(api._native_routes), api._rust_no_route(script_prefix)
+        )
 
         # Register WebSocket routes
-        ws_routes = []
-        for path, handler_id, handler in api._websocket_routes:
-            meta = api._handler_meta.get(handler_id, {})
-            injector = meta.get("injector")
-            ws_routes.append((path, handler_id, handler, injector))
+        ws_routes = api._rust_websocket_routes(script_prefix)
         if ws_routes:
             _core.register_test_websocket_routes(self.app_id, ws_routes)
 
         # Register HTTP ASGI mounts
         if api._asgi_mounts:
-            _core.register_test_asgi_mounts(self.app_id, list(api._asgi_mounts))
+            _core.register_test_asgi_mounts(self.app_id, asgi_mounts(api._asgi_mounts, script_prefix))
 
         # Register MCP mounts (served by the Rust rmcp core, like production)
         if api._mcp_mounts:
-            _core.register_test_mcp_mounts(self.app_id, TestClient._mcp_mounts_for_test(api, base_url))
+            _core.register_test_mcp_mounts(
+                self.app_id, mcp_mounts(TestClient._mcp_mounts_for_test(api, base_url), script_prefix)
+            )
 
         # Register middleware metadata
         if api._handler_middleware:
@@ -829,6 +845,7 @@ class AsyncTestClient(httpx.AsyncClient):
             **kwargs,
         )
         self.api = api
+        self._script_prefix = script_prefix
         # The context manager of the running lifespan. None before startup and after shutdown.
         self._lifespan: Any | None = None
 
@@ -847,7 +864,8 @@ class AsyncTestClient(httpx.AsyncClient):
             raise RuntimeError("AsyncTestClient is already open. Enter it once.")
         if self.api._has_lifespan:
             cm = run_lifespans(self.api._source_lifespans)
-            await cm.__aenter__()
+            with lifespan_entry(self._script_prefix):
+                await cm.__aenter__()
             self._lifespan = cm
         try:
             return await super().__aenter__()
@@ -861,7 +879,8 @@ class AsyncTestClient(httpx.AsyncClient):
             return
         cm = self._lifespan
         self._lifespan = None
-        await cm.__aexit__(exc_type, exc_val, exc_tb)
+        with lifespan_entry(self._script_prefix):
+            await cm.__aexit__(exc_type, exc_val, exc_tb)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Exit async context manager — runs lifespan shutdown, then cleans up test app."""

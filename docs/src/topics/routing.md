@@ -1,5 +1,5 @@
 ---
-description: Map HTTP methods and paths to handlers, read path parameters, group routes with Router, and control trailing slashes.
+description: Map methods and paths to handlers, read path parameters, group routes, mount an API in the Django URLconf, and control trailing slashes.
 ---
 
 # Routing
@@ -136,7 +136,7 @@ curl localhost:8000/authors/abc/articles/hello
 ```
 
 ```json
-{"detail": "Path parameter 'author_id': Invalid integer 'abc': invalid digit found in string"}
+{"detail": "Path parameter 'author_id': Invalid integer 'abc': expected a whole number such as 42 or -7"}
 ```
 
 The type comes only from the type hint. Bolt ignores a type in the path, such as `{author_id:int}`.
@@ -180,8 +180,31 @@ async def get_current_author() -> dict:
 
 `GET /authors/me` calls `get_current_author`. `GET /authors/ana` calls `get_author`.
 
-Two routes with the same method and path stop the startup with `ValueError`.
-Two routes that are different only in a parameter name, such as `/articles/{slug}` and `/articles/{article_id}`, also stop the startup.
+### Routes that stop the startup
+
+The router refuses a route that can never get a request.
+The test clients then raise `ValueError`, and `runbolt` stops with `CommandError`.
+The message gives the method and the path of the route.
+For a WebSocket route, the method is `WEBSOCKET`.
+The path is the full path, with the prefix, the mount path and the trailing slash mode applied.
+
+- **The same method and path.** Two `GET /items/{id}` routes give `GET /items/{id} is already registered`.
+  With `trailing_slash="strip"`, `/tags` and `/tags/` are the same path.
+  A WebSocket path has no trailing slash, so `/live` and `/live/` are the same WebSocket path.
+  Remove one of the routes.
+- **Two parameters at one position.** `/files/{file_id}` and `/files/{file_path:path}` give `GET /files/{file_path:path} conflicts with GET /files/{file_id}`.
+  The same applies to `/articles/{slug}` and `/articles/{article_id}`, and to two `{name:path}` parameters.
+  The router cannot select one of the two for `/files/abc`.
+  Keep one route and read the value in its handler.
+  Or add a fixed segment before the parameter in one path, for example `/files/by-path/{file_path:path}`.
+- **A `{name:path}` parameter before the end.** `/files/{p:path}/meta` gives `has a {name:path} parameter before the end of the path`.
+  Move the parameter to the end of the path.
+- **Two parameters in one segment.** `/files/{name}-{version}` gives `has two parameters in one segment`.
+  Use one parameter for the segment, and split the value in the handler.
+- **A parameter with no name, or a brace with no pair.** `/files/{}`, `/files/{id` and `/files/id}/{item}` give `has a parameter with no name, or a brace with no pair`.
+  Write each parameter as `{name}` or `{name:type}`.
+  A path with no `{` is an exception: `/files/id}` does not stop the startup.
+  Do not use such a path. Most clients send `}` as `%7D`, and that request gets 404.
 
 ## Add a prefix to each route
 
@@ -276,8 +299,12 @@ api.mount("/admin", admin_api)  # GET /admin/stats
 
 Use a `Router` to share auth and guards. Use `mount()` for a group of routes that needs a different middleware stack.
 
+To put an API under a path of the Django URLconf, see [Mount an API in the URLconf](#mount-an-api-in-the-urlconf).
+
 A mount path can have a parameter, for example `/tenants/{tenant}`.
-A handler of the mounted API reads its value from `request.params["tenant"]`. It cannot take `tenant` as an argument, and `mount()` raises `ValueError` for such a handler.
+A handler or a dependency of the mounted API reads its value from `request.params["tenant"]`, or from an argument with the `Path()` marker.
+An argument with no marker cannot have the name `tenant`, because it reads the query string. `mount()` raises `ValueError` for such a handler or dependency.
+An argument with another marker, such as `Query()`, reads the source of its marker, as on each route.
 
 To serve a Django view or another ASGI application under a path, see [ASGI mounts](asgi-mounts.md).
 
@@ -321,7 +348,119 @@ async def get_article(article_id: int) -> dict:
     return {"id": article_id}
 ```
 
-Include `django_bolt.urls` in your root URLconf one time:
+A route with no `name` gets the name of its handler function, for example `"get_article"`.
+Two routes with the same explicit name and different paths raise `ImproperlyConfigured`.
+
+Put the API in your URLconf to give Django the names. Use one of the two forms below.
+
+## Mount an API in the URLconf
+
+`api.urls` puts an API in Django's URLconf, as `admin.site.urls` does:
+
+```python title="blog/urls.py"
+from django.urls import path
+
+from blog.api import api
+
+urlpatterns = [
+    path("blog/", api.urls),
+]
+```
+
+Bolt reads the URLconf one time at startup. It serves each route of the API under the prefix, and `reverse()` gives the same path:
+
+```pycon
+>>> from django.urls import reverse
+>>> reverse("article-detail", kwargs={"article_id": 42})
+'/blog/articles/42'
+```
+
+```bash
+curl localhost:8000/blog/articles/42
+```
+
+```json
+{"id": 42}
+```
+
+The API does not serve `/articles/42` any more.
+Bolt joins the prefix and the route path as Django does. Thus the root route `"/"` of the API serves at `/blog/`, also when `trailing_slash="strip"`.
+An API that the URLconf mounts and that `runbolt` also finds serves one time, under its prefixes. An API that the URLconf mounts is served also when `runbolt` does not find it.
+`TestClient(api)` serves an API that the URLconf mounts under its prefixes too. Thus it imports `ROOT_URLCONF`.
+A URLconf that does not import makes `TestClient` raise. It also makes the system checks of `runbolt` fail.
+Behind a proxy that removes a sub-path, `reverse()` also puts `FORCE_SCRIPT_NAME` first. See [Serve under a sub-path](deployment.md#serve-under-a-sub-path).
+
+### Reverse through namespaces
+
+`BoltAPI(namespace="blog")` is the app namespace and the instance namespace of `api.urls`. An enclosing `include()` adds its namespace in front, as for each Django app:
+
+```python title="blog/urls.py"
+from django.urls import path
+
+from blog.api import api  # BoltAPI(namespace="api")
+
+app_name = "blog"
+urlpatterns = [path("api/", api.urls)]
+```
+
+```python title="mysite/urls.py"
+from django.urls import include, path
+
+urlpatterns = [path("blog/", include("blog.urls"))]
+```
+
+```pycon
+>>> reverse("blog:api:article-detail", kwargs={"article_id": 42})
+'/blog/api/articles/42'
+```
+
+A route that the API copied with `mount()` also gets the namespace of the mounted API: `"blog:api:<namespace>:<name>"`.
+Each level of `mount()` adds the namespace of its API. Thus a mounted API can have the same namespace as its parent, for example `"blog:api:api:<name>"`.
+A mounted API with no namespace adds no level, so its names join the names of its parent.
+
+### Use a parameter in the prefix
+
+A `str` parameter in the prefix becomes a path parameter, for example `path("<tenant>/", api.urls)`.
+A handler or a dependency reads its value as for a [mount path](#mount-an-api-in-another-api): from `request.params["tenant"]`, or from an argument with `Path()`.
+`reverse()` needs it as a keyword argument.
+The docs of an API cannot be under such a prefix. Set `OpenAPIConfig(enabled=False)` on the API.
+An ASGI mount, a Django mount and an MCP server cannot be under such a prefix either. See [What moves with the prefix](#what-moves-with-the-prefix).
+
+Bolt serves an API at static paths. `runbolt` and the test clients refuse these prefixes with `ImproperlyConfigured`, and the message names the URLconf entry:
+
+- a `re_path()` prefix, an `i18n_patterns()` prefix, or a translated prefix
+- a converter other than `str`, for example `<int:org>`, because the Bolt router does not check it
+- two parameters in one path segment, for example `<a>-<b>/`, because the Bolt router allows one
+- one parameter name two times, for example `<org>/<org>/`, or a prefix parameter with the name of a route parameter
+- a prefix that does not end with a slash, or a prefix that gives an empty path segment
+- keyword arguments in the include, because a Bolt handler does not get them
+
+Django alone does not serve Bolt routes, so it does not refuse these prefixes.
+`manage.py check`, `manage.py migrate`, `reverse()` and the Django views work with such a URLconf.
+There is one exception. When one parameter name is two times in a path, `reverse()` raises the error of Django itself.
+
+### What moves with the prefix
+
+Each kind of route of the API moves under the prefix of `path("blog/", api.urls)`.
+The last column tells if the kind works under a prefix with a parameter, such as `path("<tenant>/", api.urls)`:
+
+| Kind | Path without a mount | Path with the mount | Under a prefix parameter |
+| --- | --- | --- | --- |
+| HTTP route | `/articles/{id}` | `/blog/articles/{id}` | Yes |
+| WebSocket route | `/live` | `/blog/live` | Yes |
+| Native route | `/items/{id}` | `/blog/items/{id}` | Yes |
+| `mount_asgi()`, `mount_django()` | `/files` | `/blog/files` | No, `runbolt` refuses the prefix |
+| `mount_mcp()` | `/mcp` | `/blog/mcp` | No, `runbolt` refuses the prefix |
+| Docs (`OpenAPIConfig.path`) | `/docs` | `/blog/docs` | No, set `OpenAPIConfig(enabled=False)` |
+
+The paths in the OpenAPI schema are the served paths.
+When `runbolt` joins several APIs, the docs of the first API list each route. They go under the first prefix of that API.
+An MCP server with `oauth=` cannot move, because its OAuth audience names its path. Mount its API with `path("", api.urls)`.
+The Django admin and the static files are not part of an API, so they do not move.
+
+### Reverse an API that the URLconf does not mount
+
+Include `django_bolt.urls` to name the routes of each API that `runbolt` finds and that no `api.urls` mounts:
 
 ```python title="mysite/urls.py"
 from django.urls import include, path
@@ -332,16 +471,19 @@ urlpatterns = [
 ```
 
 ```pycon
->>> from django.urls import reverse
 >>> reverse("article-detail", kwargs={"article_id": 42})
 '/articles/42'
 ```
 
-`django_bolt.urls` only adds names for `reverse()`. Bolt still serves the paths, and Django does not call these URL patterns.
-
-A route with no `name` gets the name of its handler function, for example `"get_article"`.
 `BoltAPI(namespace="blog")` puts each route of the API in a namespace. Then use `reverse("blog:article-detail", ...)`.
-Two routes with the same explicit name and different paths raise `ImproperlyConfigured`.
+
+A prefix on this include moves these APIs, as `api.urls` does. With `path("api/", include("django_bolt.urls"))`, Bolt serves `/api/articles/42`, and `reverse()` gives the same path.
+The prefix rules of `api.urls` apply, but Bolt ignores the keyword arguments of the include.
+`TestClient(api)` serves such an API under the prefix too.
+Under a prefix that Bolt cannot serve, such as `re_path(r"^api/", ...)`, Django alone gives the same names and paths as before. Only `runbolt` and the test clients refuse it.
+When `ROOT_URLCONF` changes, for example with `override_settings` in a test, `django_bolt.urls` reads the new URLconf.
+
+`django_bolt.urls.urlpatterns` is a list with one include. Thus a URLconf can copy it with `[*urlpatterns]` or join it to a list with `+`.
 
 ## Describe a route in the OpenAPI document
 
@@ -397,6 +539,7 @@ In each module, Bolt takes the first top-level assignment of a `BoltAPI()` call,
 It reads the source of the module to find it, so `api = make_api()` is not found.
 Bolt joins the routes of each API that it finds into one server.
 An API that another API mounts must come after the main API in the same module.
+An API that the URLconf mounts with `api.urls` serves under its prefixes. See [Mount an API in the URLconf](#mount-an-api-in-the-urlconf).
 
 [Installation](../intro/install.md) shows the minimum project layout.
 

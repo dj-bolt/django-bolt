@@ -430,3 +430,32 @@ def test_runbolt_refuses_the_same_route_in_two_apis():
 
     with pytest.raises(CommandError, match=r"Route conflict: GET /items/\{id\} defined in both a.api and b.api"):
         Command().merge_apis([("a.api", python_api), ("b.api", native_api())])
+
+
+def test_runbolt_names_the_api_of_the_native_route_in_a_conflict():
+    python_api = BoltAPI()
+
+    @python_api.post("/items/{id}")
+    async def item():
+        return {}
+
+    with pytest.raises(CommandError, match=r"Route conflict: POST /items/\{id\} defined in both a.api and b.api"):
+        Command().merge_apis([("a.api", native_api()), ("b.api", python_api)])
+
+
+def test_merged_api_serves_the_native_routes_of_each_api():
+    python_api = BoltAPI()
+
+    @python_api.get("/python")
+    async def python_route():
+        return {"api": "python"}
+
+    merged = Command().merge_apis([("a.api", python_api), ("b.api", native_api())])
+
+    with TestClient(merged) as client:
+        native = client.get("/items/a%20b", params={"q": "1"}, headers={"x-test": "yes"})
+        python = client.get("/python")
+
+    assert native.status_code == 201
+    assert native.json() == echo()
+    assert python.json() == {"api": "python"}
