@@ -311,7 +311,7 @@ A whole number is an integer, also when the token writes it as `1.0` or `1e0` (R
 | `b64` (header) | Each value but `false`. Bolt reads each payload as base64url (RFC 7797) | `false` fails the token |
 | `sub`, `jti` | A string | The token fails |
 | `typ`, `token_type`, `token_use` | A string | The token fails |
-| `exp`, `nbf`, `iat` | A number. It can have a fraction | The token fails |
+| `exp`, `nbf`, `iat` | A number from the year 1 to the end of the year 9999 UTC, the range of a Python `datetime`. It can have a fraction | The token fails |
 | `iss` | A string | The token fails when the backend has an `issuer`. Else the claim is malformed |
 | `aud` | A string, or an array of strings | The token fails when the backend has an `audience`. Else the claim is malformed |
 | `is_staff`, `is_superuser`, `is_admin` | `true` or `false` | The claim is malformed. `1` and `"true"` are not `true` |
@@ -320,11 +320,14 @@ A whole number is an integer, also when the token writes it as `1.0` or `1e0` (R
 | `oat`, `ver` | An integer | The claim is malformed |
 | Each other claim | Any type | Bolt keeps the value |
 
-A claim has three states: missing, valid and malformed. Bolt accepts a token with a malformed claim, as PyJWT does.
+A claim has three states: missing, valid and malformed.
+A wrong value fails the token when its row in the table says so, also on a route that does not read the claim.
+In each other case, the claim is malformed, and Bolt accepts the token, as PyJWT does.
 Each part of Bolt that reads a malformed claim fails:
 
 - Each `Requires` guard on the claim refuses the request with its 403. This applies to each form of `Requires`, also `none_of`.
-- The claim grants nothing. The context has `is_staff` and `is_superuser` as `False`, and no `permissions`.
+- The claim grants nothing. A malformed `is_staff` or `is_superuser` is `False` in the context. A malformed `permissions` gives no permission.
+  A malformed claim does not change the other claims. With `"permissions": "admin"` and `"is_staff": true`, `is_staff` stays `True`.
 - `auth_claims` gives the claim as `None`. A missing claim is not in `auth_claims`.
 - `rotate_refresh_token()` and the refresh route of `JWTAuthViews` refuse a malformed `fam`, `ver`, `oat` or `amr`. The logout routes refuse a malformed `fam` or `ver`.
 
@@ -346,6 +349,7 @@ A claim name that occurs two times fails the token. A header parameter of the ta
 Each of the three parts of the token is base64url with no `=` padding (RFC 7515). A token with padding fails.
 
 Bolt removes the fraction of `exp`, as PyJWT does. Thus a token with `"exp": 100.5` expires at 100 seconds.
+Bolt reads a decimal as the nearest float, as Python does. Thus `"exp": 100.99999999` is 100, not 101.
 Bolt does not round `nbf` and `iat`. A token is valid from `leeway` seconds before the time that `nbf` or `iat` gives.
 In `auth_claims`, a time with a fraction is a `float`. A whole number is an `int`.
 
@@ -364,6 +368,7 @@ Bolt refuses each of these tokens, and `jwt.decode` of PyJWT accepts it:
 | A header or claims in UTF-16, or with a UTF-8 byte order mark | RFC 7515, section 5.2 and RFC 7519, section 7.2: each part is UTF-8 JSON. Python's `json` reads the other forms |
 | `"jti": ""` on a backend with `require_jti=True` | An empty `jti` names no token. The `require` option of PyJWT checks only that the claim is present |
 | `nbf` or `iat` with a fraction, less than one second after now plus `leeway` | PyJWT rounds the claim down, so it accepts the token up to one second early. Bolt does not round |
+| `exp`, `nbf` or `iat` before the year 1 or after the year 9999, such as `"exp": 1e300` | A Python `datetime` cannot hold the time, so the revocation stores cannot keep the token. PyJWT reads any number with `int()` |
 
 ### Verify tokens from an identity provider
 

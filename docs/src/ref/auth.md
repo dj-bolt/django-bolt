@@ -67,8 +67,9 @@ Checks on each token:
 
 - The `alg` header is in `algorithms`, and the signature is valid. A `jwks` key is selected by the `kid` header.
 - The header has no `crit` and no `"b64": false`.
-- `exp` is present and not more than `leeway` seconds in the past. Bolt removes the fraction of `exp`.
+- `exp` is present. Bolt removes the fraction of `exp`. The current time must be before `exp + leeway`. At that time, the token fails.
 - `nbf` and `iat`, when present, are not more than `leeway` seconds in the future.
+- `exp`, `nbf` and `iat` are in the range of a Python `datetime`: the years 1 to 9999.
 - Each claim that Bolt reads has its JSON type. See [Give each claim its JSON type](../topics/authentication.md#give-each-claim-its-json-type).
 - `aud` and `iss`, when you configure them.
 - With `token_type=None`: the `typ`, `token_type` and `token_use` claims are not `refresh`, `offline` or `id`, in any case.
@@ -209,6 +210,7 @@ Compares one claim of the credential with the values.
 | `message` | The `detail` of the 403. The default is `"Permission denied"`. Not used for a 401. |
 
 A scalar claim matches an equal value. A list claim matches a value that it contains.
+A number equals a number of the same value, as in Python: `Requires("ver", 7.0)` matches `"ver": 7`. A number never equals a `bool` or a string.
 A request with no credential gets 401 for each `Requires`, also for a `none_of` one. A credential that does not match gets 403.
 A claim that Bolt types, in another JSON type, is malformed. Each `Requires` on a malformed claim gives 403, also `none_of`. See [Give each claim its JSON type](../topics/authentication.md#give-each-claim-its-json-type).
 
