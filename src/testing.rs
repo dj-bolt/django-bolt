@@ -27,7 +27,7 @@ use bolt_core::middleware::compression::CompressionMiddleware;
 use bolt_core::middleware::cors::CorsMiddleware;
 use bolt_core::middleware::rate_limit::RateLimiters;
 use bolt_core::request::client_path;
-use bolt_core::router::{Router, normalize_request_path};
+use bolt_core::router::{QuerySentLens, Router, normalize_request_path};
 use bolt_core::state::{
     AppState, AsgiMount, ScopeConfig, ServeDir, ServeMode, TASK_LOCALS,
     find_websocket_mount_in_slice,
@@ -39,7 +39,7 @@ use bolt_websocket::handler::build_asgi_scope_from_parts;
 use crate::server::{ServerConfig, configure_file_scopes, inject_global_cors, static_scope_prefix};
 use bolt_core::request_pipeline::{
     EMPTY_TYPES, insert_header_line, query_sequences, set_declared_item, set_param_item,
-    set_query_sequences,
+    set_query_item, set_query_sequences,
 };
 use bolt_core::type_coercion::TypeHints;
 
@@ -1004,27 +1004,20 @@ pub fn handle_test_websocket(
 
     // Parse the query string with the HTTP parser, as production does.
     let query_dict = pyo3::types::PyDict::new(py);
+    // Each length check of a query value shares one pass over the raw query.
+    let mut query_lens = QuerySentLens::new(
+        query_string.as_deref().unwrap_or_default(),
+        max_param_length,
+    );
     if let Some(ref qs) = query_string {
         for (key, value) in &parse_query_string(qs) {
-            set_param_item(
-                py,
-                &query_dict,
-                key,
-                value,
-                query_types,
-                max_param_length,
-                "Query parameter",
-            )?;
+            set_query_item(py, &query_dict, key, value, query_types, &mut query_lens)?;
         }
     }
     // A sequence parameter takes each value of its repeated key, as in production.
     // Each value gets the length check, as the loop above checks only the last one.
     if let Some(ws_route_meta) = ws_route_meta {
-        let sequences = query_sequences(
-            query_string.as_deref(),
-            &ws_route_meta.query_seq_fields,
-            max_param_length,
-        )?;
+        let sequences = query_sequences(&mut query_lens, &ws_route_meta.query_seq_fields)?;
         set_query_sequences(py, &query_dict, &sequences)?;
     }
     scope_dict.set_item("query_params", query_dict)?;

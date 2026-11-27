@@ -25,9 +25,9 @@ use bolt_core::middleware::rate_limit::{check_after_auth, check_before_auth};
 use bolt_core::request::client_path;
 use bolt_core::request_pipeline::{
     EMPTY_TYPES, header_str, insert_header_line, query_sequences, set_declared_item,
-    set_param_item, set_query_sequences,
+    set_param_item, set_query_item, set_query_sequences,
 };
-use bolt_core::router::parse_query_string;
+use bolt_core::router::{QuerySentLens, parse_query_string};
 use bolt_core::state::AppState;
 use bolt_core::type_coercion::TypeHints;
 use bolt_core::validation::{AuthGuardResult, validate_auth_and_guards};
@@ -42,6 +42,7 @@ use super::{ACTIVE_WS_CONNECTIONS, ConnectionSlot};
 static WS_CLASS: OnceCell<Py<PyAny>> = OnceCell::new();
 static BUILD_REQUEST_FN: OnceCell<Py<PyAny>> = OnceCell::new();
 static DISCONNECT_CLASS: OnceCell<Py<PyAny>> = OnceCell::new();
+static INVALID_REQUEST_DETAIL_FN: OnceCell<Py<PyAny>> = OnceCell::new();
 
 /// Get cached WebSocket class (imports once, reuses)
 fn get_ws_class(py: Python<'_>) -> PyResult<&Py<PyAny>> {
@@ -92,6 +93,36 @@ fn requested_close(error: &PyErr) -> Option<(u16, String)> {
         }
         Some((code, reason))
     })
+}
+
+/// The detail of a request value that a parameter extractor refused, or None.
+///
+/// Rust refuses a bad scalar value in [`build_scope`]. An extractor refuses
+/// other values, such as an item of a `list[int]`, with
+/// `RequestValidationError`. Python formats the detail as Rust does.
+fn invalid_request_detail(error: &PyErr) -> Option<String> {
+    Python::attach(|py| {
+        let detail = INVALID_REQUEST_DETAIL_FN
+            .get_or_try_init(|| {
+                py.import("django_bolt.websocket.handlers")?
+                    .getattr("invalid_request_detail")
+                    .map(Bound::unbind)
+            })
+            .and_then(|detail| detail.call1(py, (error.value(py),)))
+            .and_then(|detail| detail.extract::<Option<String>>(py));
+        detail.unwrap_or_else(|e| {
+            eprintln!(
+                "[django-bolt] WebSocket invalid_request_detail error: {}",
+                e
+            );
+            None
+        })
+    })
+}
+
+/// The 400 response of a request value that Bolt refuses at the upgrade.
+fn invalid_request(error: impl std::fmt::Display) -> actix_web::Error {
+    actix_web::error::ErrorBadRequest(format!("Invalid request: {}", error))
 }
 
 /// The error of a send to a client that left. ASGI requires an `OSError`.
@@ -180,26 +211,16 @@ fn build_scope(
 
     // Parse the query string with the HTTP parser: the last value of a repeated key wins.
     // A value that is too long or a bad typed value rejects the upgrade, as in HTTP.
+    // Each length check of a query value shares one pass over the raw query.
     let query_dict = PyDict::new(py);
+    let mut query_lens = QuerySentLens::new(req.query_string(), max_param_length);
     for (key, value) in &parse_query_string(req.query_string()) {
-        set_param_item(
-            py,
-            &query_dict,
-            key,
-            value,
-            query_types,
-            max_param_length,
-            "Query parameter",
-        )?;
+        set_query_item(py, &query_dict, key, value, query_types, &mut query_lens)?;
     }
     // A sequence parameter takes each value of its repeated key, as in HTTP.
     // Each value gets the length check, as the loop above checks only the last one.
     if let Some(route_meta) = route_meta {
-        let sequences = query_sequences(
-            Some(req.query_string()),
-            &route_meta.query_seq_fields,
-            max_param_length,
-        )?;
+        let sequences = query_sequences(&mut query_lens, &route_meta.query_seq_fields)?;
         set_query_sequences(py, &query_dict, &sequences)?;
     }
     scope_dict.set_item("query_params", query_dict)?;
@@ -275,6 +296,8 @@ enum Handshake {
     },
     /// Refuse the upgrade with this HTTP status.
     Refuse(StatusCode),
+    /// Refuse the upgrade with 400: a parameter extractor refused a request value.
+    Invalid(PyErr),
 }
 
 /// Build an ASGI WebSocket scope for a mounted application.
@@ -931,12 +954,7 @@ pub async fn handle_websocket_upgrade(
         }
     }) {
         Ok(s) => s,
-        Err(e) => {
-            return Err(actix_web::error::ErrorBadRequest(format!(
-                "Invalid request: {}",
-                e
-            )));
-        }
+        Err(e) => return Err(invalid_request(e)),
     };
 
     // The handler decides the handshake: accept sends the 101, close refuses it.
@@ -984,6 +1002,7 @@ pub async fn handle_websocket_upgrade(
             Ok(resp)
         }
         Ok(Handshake::Refuse(status)) => Ok(refusal(status)),
+        Ok(Handshake::Invalid(error)) => Err(invalid_request(error)),
         // The handler task ends with a decision, so a dropped sender is a bug.
         Err(_) => Ok(refusal(StatusCode::INTERNAL_SERVER_ERROR)),
     }
@@ -1101,6 +1120,17 @@ fn spawn_handler(ws_state: Arc<WsConnectionState>, scope: Py<PyAny>, target: WsT
                     if let Some((code, reason)) = requested_close(&e) {
                         ws_state.refuse(StatusCode::FORBIDDEN);
                         close_accepted(&ws_state, code, &reason).await;
+                        return;
+                    }
+                    // A request value that an extractor refused before accept
+                    // refuses the upgrade with 400, as a refused scalar does.
+                    if ws_state.handshake_pending()
+                        && let Some(detail) = invalid_request_detail(&e)
+                    {
+                        if let Some(handshake) = ws_state.take_handshake() {
+                            let error = pyo3::exceptions::PyValueError::new_err(detail);
+                            let _ = handshake.send(Handshake::Invalid(error));
+                        }
                         return;
                     }
                     // A client that left is not an error of the handler.

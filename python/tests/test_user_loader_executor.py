@@ -25,7 +25,7 @@ from django.db import connections
 from django_bolt import concurrency
 from django_bolt.auth import APIKeyAuthentication, JWTAuthentication, user_loader
 from django_bolt.auth.pk_loader import load_user_by_pk_sync
-from django_bolt.auth.user_loader import default_django_user_loader, resolve_user_loader
+from django_bolt.auth.user_loader import resolve_user_loader
 from tests.thread_pools import shutdown_closing_connections
 
 # Loads are asserted from other threads, which cannot see rows held open in an
@@ -133,27 +133,6 @@ def _force_on_event_loop(loader, *args):
     return asyncio.run(force())
 
 
-def test_default_user_loader_runs_on_the_reading_thread(fresh_orm_executor, monkeypatch):
-    """The no-backend default loader (Rust session auth) runs on the thread that reads the user."""
-    fresh_orm_executor()
-    user = _make_user("default-loader")
-
-    seen: list[str] = []
-    real_pk_load = user_loader.load_user_by_pk_sync
-
-    def recording_pk_load(model, user_id):
-        seen.append(threading.current_thread().name)
-        return real_pk_load(model, user_id)
-
-    monkeypatch.setattr(user_loader, "load_user_by_pk_sync", recording_pk_load)
-
-    loaded = _force_on_event_loop(default_django_user_loader, str(user.pk), None)
-    assert loaded is not None
-    assert loaded.pk == user.pk
-
-    assert seen == [threading.current_thread().name], f"default user load ran on {seen!r}; expected the reading thread."
-
-
 def test_backend_user_loader_runs_on_the_reading_thread(fresh_orm_executor):
     """A backend's get_user_sync runs on the thread that reads the user, not on a pool."""
     fresh_orm_executor()
@@ -173,7 +152,7 @@ def test_backend_user_loader_runs_on_the_reading_thread(fresh_orm_executor):
     )
 
 
-def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
+def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor):
     """A user load already on an ORM thread runs there, not via a second hand-off.
 
     `request.user` is a SimpleLazyObject, so it can be forced during work
@@ -189,25 +168,20 @@ def test_user_load_from_orm_thread_runs_inline(fresh_orm_executor, monkeypatch):
     fresh_orm_executor(workers=1)
     user = _make_user("reentrant")
 
-    seen: list[str] = []
-    real_pk_load = user_loader.load_user_by_pk_sync
-
-    def recording_pk_load(model, user_id):
-        seen.append(threading.current_thread().name)
-        return real_pk_load(model, user_id)
-
-    monkeypatch.setattr(user_loader, "load_user_by_pk_sync", recording_pk_load)
+    backend = RecordingJWTAuth(secret="user-loader-orm-pool-test-secret", algorithms=["HS256"])
+    backend.release.set()
+    loader, _ = resolve_user_loader(backend)
 
     def resolve_inside_pool():
         assert concurrency.in_orm_executor_thread()
-        return threading.current_thread().name, default_django_user_loader(str(user.pk), None)
+        return threading.current_thread().name, loader(str(user.pk), None)
 
     pool_thread, loaded = concurrency._get_orm_executor().submit(resolve_inside_pool).result(timeout=5)
 
     assert loaded is not None
     assert loaded.pk == user.pk
-    assert seen == [pool_thread], (
-        f"query ran on {seen!r} instead of inline on {pool_thread!r}; "
+    assert backend.threads == [pool_thread], (
+        f"query ran on {backend.threads!r} instead of inline on {pool_thread!r}; "
         "re-submitting into the ORM pool from its own worker deadlocks a one-thread pool"
     )
 
@@ -503,13 +477,6 @@ class CoroutineGetUserAuth(APIKeyAuthentication):
         return ("async", user_id, auth_context)
 
 
-@pytest.fixture
-def backend_registry(monkeypatch):
-    """Give the test an empty registry of auth backends, and restore the real one after."""
-    monkeypatch.setattr(user_loader, "_auth_backend_registry", {})
-    monkeypatch.setattr(user_loader, "_resolved_loader_registry", {})
-
-
 def test_lazy_user_passes_the_auth_context_to_the_backend():
     """A backend with its own ``get_user`` reads the claims of the request."""
     lazy = user_loader.LazyUser(resolve_user_loader(SyncGetUserAuth()), "7", {"role": "a"})
@@ -518,68 +485,15 @@ def test_lazy_user_passes_the_auth_context_to_the_backend():
     assert repr(lazy) == "<LazyUser: ('sync', '7', {'role': 'a'})>"
 
 
-def test_registered_backend_is_found_by_name(backend_registry):
-    backend = SyncGetUserAuth()
-    user_loader.register_auth_backend("custom", backend)
-
-    assert user_loader.get_registered_backend("custom") is backend
-    assert user_loader.get_registered_backend("other") is None
-
-
-def test_load_user_sync_calls_the_registered_backend(backend_registry, fresh_orm_executor):
+def test_lazy_user_aload_passes_the_auth_context_to_the_backend(fresh_orm_executor):
+    """``await request.auser()`` gives the claims of the request to an async or a sync ``get_user``."""
     fresh_orm_executor()
-    user_loader.register_auth_backend("custom", SyncGetUserAuth())
+    for backend, kind in ((CoroutineGetUserAuth(), "async"), (SyncGetUserAuth(), "sync")):
+        lazy = user_loader.LazyUser(resolve_user_loader(backend), "7", {"role": "a"})
 
-    assert user_loader.load_user_sync("7", "custom", {"role": "a"}) == ("sync", "7", {"role": "a"})
-    # A request with no user ID has no user, also when the backend can load one.
-    assert user_loader.load_user_sync(None, "custom", {"role": "a"}) is None
-    assert user_loader.load_user_sync("", "custom", {"role": "a"}) is None
+        assert asyncio.run(lazy.aload()) == (kind, "7", {"role": "a"})
 
 
-def test_load_user_sync_gives_none_for_a_backend_without_user_resolution(backend_registry):
-    user_loader.register_auth_backend("api_key", APIKeyAuthentication(api_keys={"k"}))
-
-    assert user_loader.load_user_sync("7", "api_key", {}) is None
-
-
-def test_load_user_sync_loads_the_django_user_for_an_unregistered_backend(backend_registry, fresh_orm_executor):
-    """Session auth has no backend instance. It loads the user from the Django user model."""
-    fresh_orm_executor()
-    user = _make_user("session-user")
-
-    loaded = user_loader.load_user_sync(str(user.pk), "session", {})
-
-    assert loaded is not None
-    assert loaded.pk == user.pk
-    assert user_loader.load_user_sync("999999", "session", {}) is None
-
-
-def test_load_user_awaits_the_registered_backend(backend_registry, fresh_orm_executor):
-    fresh_orm_executor()
-    user_loader.register_auth_backend("async", CoroutineGetUserAuth())
-    user_loader.register_auth_backend("sync", SyncGetUserAuth())
-
-    assert asyncio.run(user_loader.load_user("7", "async", {"role": "a"})) == ("async", "7", {"role": "a"})
-    assert asyncio.run(user_loader.load_user("7", "sync", {"role": "a"})) == ("sync", "7", {"role": "a"})
-    # A request with no user ID has no user, also when the backend can load one.
-    assert asyncio.run(user_loader.load_user(None, "async", {"role": "a"})) is None
-    assert asyncio.run(user_loader.load_user("", "async", {"role": "a"})) is None
-
-
-def test_load_user_gives_none_without_a_backend_that_resolves_users(backend_registry):
-    user_loader.register_auth_backend("api_key", APIKeyAuthentication(api_keys={"k"}))
-
-    assert asyncio.run(user_loader.load_user("7", "api_key", {})) is None
-    assert asyncio.run(user_loader.load_user("7", "unregistered", {})) is None
-    assert asyncio.run(user_loader.load_user("7", None, {})) is None
-
-
-def test_default_async_loader_loads_the_django_user(fresh_orm_executor):
-    fresh_orm_executor()
-    user = _make_user("async-default")
-
-    loaded = asyncio.run(user_loader.default_django_user_aloader(str(user.pk), None))
-
-    assert loaded is not None
-    assert loaded.pk == user.pk
-    assert asyncio.run(user_loader.default_django_user_aloader("999999", None)) is None
+def test_a_backend_with_no_get_user_has_no_user_loader():
+    """Bolt does not set ``request.user`` for such a backend, so ``request.user`` is anonymous."""
+    assert resolve_user_loader(APIKeyAuthentication(api_keys={"k"})) is None

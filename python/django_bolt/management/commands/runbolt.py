@@ -1102,7 +1102,10 @@ class Command(BaseCommand):
         # Register WebSocket routes with Rust (including pre-compiled injectors)
         ws_routes = merged_api._rust_websocket_routes(script_prefix)
         if ws_routes:
-            _core.register_websocket_routes(ws_routes)
+            try:
+                _core.register_websocket_routes(ws_routes)
+            except ValueError as e:
+                raise CommandError(str(e)) from e
 
         # Register middleware metadata if present
         middleware_count = 0
@@ -1141,10 +1144,6 @@ class Command(BaseCommand):
 
         if middleware_count:
             features.append(("Middleware", f"{middleware_count} handlers"))
-
-        # Register authentication backends for user resolution (request.user loading)
-        # CRITICAL: Must be called BEFORE starting server so backends are available for user loading
-        merged_api._register_auth_backends()
 
         # Print structured startup banner (only for main process or single-process mode)
         if process_id is None:

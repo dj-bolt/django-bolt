@@ -87,7 +87,7 @@ def test_a_constrained_list_field_of_a_query_struct_takes_each_value():
 
 # --- Rust converts a typed value before Python runs ----------------------------
 
-RUST_INT_ERROR = "Query parameter '{key}': Invalid integer 'abc': invalid digit found in string"
+RUST_INT_ERROR = "Query parameter '{key}': Invalid integer 'abc': expected a whole number such as 42 or -7"
 
 
 def test_rust_converts_a_constrained_int():

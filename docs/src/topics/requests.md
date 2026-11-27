@@ -132,6 +132,49 @@ curl "localhost:8000/articles?page=2&search=django&tag=python&tag=web"
 - A `bool` takes `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`.
 - A `+` in the query string is a space, as in Django. Send a literal `+` as `%2B`.
 
+### Send typed values as text
+
+Bolt converts the text of a path, query, header, cookie or form value to the type of the argument.
+For `int`, `float`, `date`, `time` and `datetime`, Bolt reads the text as Python reads it, with `int()`, `float()` and `fromisoformat()`.
+A single argument and a `list`, `set`, `frozenset`, `tuple[T]` or `tuple[T, ...]` of these types accept the same text.
+This also applies to a field of a parameter model.
+Other containers still give their items to msgspec, for example `tuple[int, int]` or `list[int | None]`.
+msgspec converts `5.0` to an `int` and refuses `+5`.
+
+| Type | Text | Examples |
+| --- | --- | --- |
+| `int` | An optional `+` or `-`, then ASCII digits. | `42`, `-7`, `+5`, `007`, `9223372036854775808` |
+| `float` | An optional `+` or `-`, then digits with an optional point and exponent. Or `nan`, `inf` or `infinity` in any case. | `1.5`, `.5`, `-2e3`, `1e999`, `inf` |
+| `date` | `YYYY-MM-DD` or `YYYYMMDD`. Or a week date: `YYYY-Www-D`, `YYYYWwwD`, `YYYY-Www` or `YYYYWww`. | `2024-01-15`, `20240115`, `2024-W03-1` |
+| `time` | An optional `T`, then `HH`, `HH:MM`, `HH:MM:SS`, `HHMM` or `HHMMSS`. A fraction of the second can follow, after `.` or `,`. Then an optional offset: `Z`, or a sign and `HH`, `HHMM` or `HH:MM`. | `10:30`, `10:30:00.5`, `103000`, `10:30:00+05:30`, `10:30:00Z` |
+| `datetime` | A `date`, then optionally `T`, `t` or one whitespace character and a `time` with no `T`. | `2024-01-15T10:30`, `2024-01-15 10:30:00Z`, `20240115T103000+0530` |
+
+- A `datetime` or a `time` keeps the offset of its text. `Z`, `+00:00` and `-00:00` give `datetime.timezone.utc`. A text with no offset gives a naive value.
+- A `date` alone gives a `datetime` at midnight.
+- Bolt keeps the first six digits of a fraction, as Python does.
+- An HTML `<input type="datetime-local">` sends `2024-01-15T10:30`. A `datetime` argument accepts it.
+- An `int` has at most the digits of `sys.get_int_max_str_digits()`: 4300 by default, and never more than 4300. With the limit 0 (no limit in Python), Bolt uses 4300. Bolt reads the limit when the server starts. A later `sys.set_int_max_str_digits()` call has no effect.
+- A process has one digit limit, as Python has one for each interpreter. The last server or test client that starts sets it.
+
+Bolt refuses some text that Python reads:
+
+- In a number: `_`, whitespace and digits that are not ASCII, as in `1_000`, ` 5` or `٣`.
+- Between the date and the time: a character other than `T`, `t` or Unicode whitespace, as in `2024-01-15x10:30`. The characters `\x1c` to `\x1f` are refused too. Python's `str.isspace()` calls them whitespace, but Unicode does not.
+- After a date in the basic format, two more characters, as in `0002121227`. `date.fromisoformat()` reads the first eight characters as `0002-12-12`.
+- Hour 24 and a fraction of an hour or a minute, as in `24:00` or `10:30.5`. Python 3.12 and 3.14 read them differently.
+- An offset with seconds, as in `+05:30:15` or `+05:30:00`. RFC 3339 has no seconds in an offset. The JSON encoder writes an offset in whole minutes, so a second would change the instant in a response.
+- An offset with a minute of 60 or more, as in `+05:60`.
+- Text between the time and the offset, as in `10:30:00 +05:00`.
+- A NUL character, as in `2024-01-15T10:30:00\0`. Python stops at the NUL and reads the text before it.
+
+A `bool`, a `UUID` and a `Decimal` still differ between a single argument and a `list[...]` argument:
+
+| Type | Only a single argument accepts | Only a `list[...]` item accepts |
+| --- | --- | --- |
+| `bool` | `yes`, `no`, `on`, `off` | |
+| `UUID` | `{...}` and `urn:uuid:...` | |
+| `Decimal` | | `NaN`, `Infinity`, `_` and whitespace |
+
 ### Rename and limit a query parameter
 
 Use `Query()` to read another key or to add limits:
@@ -251,7 +294,7 @@ curl localhost:8000/articles/export -H "X-Api-Key: secret" -H "X-Page-Size: abc"
 ```
 
 ```json
-{"detail": "Header 'x-page-size': Invalid integer 'abc': invalid digit found in string"}
+{"detail": "Header 'x-page-size': Invalid integer 'abc': expected a whole number such as 42 or -7"}
 ```
 
 To read all the headers, use `request.headers`. It is a `dict` with lower-case names.
@@ -302,6 +345,19 @@ curl -X POST localhost:8000/login -d "username=ana&password=secret&remember=true
 ```
 
 A repeated field takes its last value. Declare a `list` to take each value.
+
+Bolt decodes the text of a form as Django `request.POST` does:
+
+- A URL-encoded body that is UTF-8 decodes as a query string. An escape such as `%E9` that does not give UTF-8 becomes U+FFFD.
+- A URL-encoded body that is not UTF-8 decodes as Latin-1, as a whole. Thus `name=caf` and the byte `0xE9` give `café`.
+- A multipart text field decodes as UTF-8. Each bad byte sequence becomes U+FFFD.
+
+A `bytes` form argument gets the UTF-8 bytes of this text. A file keeps the bytes that the client sent.
+Bolt ignores the `charset` of a URL-encoded body and reads the body by the rules above.
+For example, a body `name=caf` and the byte `0xE9` with `charset=latin-1` gives `café`.
+Django answers `400` for a URL-encoded body with a `charset` that it knows and that is not `utf-8`. Bolt does not.
+Bolt always decodes multipart text as UTF-8. It ignores the `charset` of the `Content-Type` header and the `DEFAULT_CHARSET` setting.
+A multipart field name that is not UTF-8 gets `422`. Django drops such a field.
 
 ## Upload files
 
@@ -480,7 +536,7 @@ The body has one of two forms.
 A value that Bolt converts before Python runs gives a `detail` string. This covers a path, query, header, cookie or form value with the wrong type, and a missing value of these kinds:
 
 ```json
-{"detail": "Query parameter 'page': Invalid integer 'x': invalid digit found in string"}
+{"detail": "Query parameter 'page': Invalid integer 'x': expected a whole number such as 42 or -7"}
 ```
 
 ```json

@@ -495,9 +495,6 @@ class TestClient(httpx.Client):
             middleware_data = [(handler_id, meta) for handler_id, meta in api._handler_middleware.items()]
             _core.register_test_middleware_metadata(self.app_id, middleware_data)
 
-        # Register authentication backends for user resolution (lazy loading in request.user)
-        api._register_auth_backends()
-
         super().__init__(
             base_url=base_url,
             transport=BoltTestTransport(self.app_id, exceptions, raise_server_exceptions),
@@ -836,8 +833,6 @@ class AsyncTestClient(httpx.AsyncClient):
         if api._handler_middleware:
             middleware_data = [(handler_id, meta) for handler_id, meta in api._handler_middleware.items()]
             _core.register_test_middleware_metadata(self.app_id, middleware_data)
-
-        api._register_auth_backends()
 
         super().__init__(
             base_url=base_url,

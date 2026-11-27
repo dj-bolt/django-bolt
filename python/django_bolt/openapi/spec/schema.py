@@ -28,7 +28,7 @@ if TYPE_CHECKING:
         __dataclass_fields__: Any
 
 
-__all__ = ("ReferenceWithKeywords", "Schema", "SchemaDataContainer")
+__all__ = ("ReferenceWithKeywords", "Schema")
 
 _DEFAULT_UNSET = object()
 
@@ -696,13 +696,3 @@ class ReferenceWithKeywords(Schema):
 
     def to_schema(self) -> dict[str, Any]:
         return {"$ref": self.reference.ref, **super().to_schema()}
-
-
-@dataclass
-class SchemaDataContainer(Schema):
-    """Special class that allows using python data containers, e.g. dataclasses or pydantic models, to represent a
-    schema
-    """
-
-    data_container: Any = None
-    """A data container instance that will be used to generate the schema."""

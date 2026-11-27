@@ -43,9 +43,7 @@ from .exceptions import (
 )
 from .handlers import (
     get_websocket_param_name,
-    is_websocket_handler,
     mark_websocket_handler,
-    run_websocket_handler,
 )
 from .state import WebSocketState
 from .types import WebSocket
@@ -71,8 +69,6 @@ __all__ = [
     "WebSocketDisconnect",
     "WebSocketClose",
     # Handler utilities
-    "is_websocket_handler",
     "mark_websocket_handler",
     "get_websocket_param_name",
-    "run_websocket_handler",
 ]

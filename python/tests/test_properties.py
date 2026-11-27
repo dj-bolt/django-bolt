@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import io
 import itertools
+import re
 import sys
 import time
 import types
@@ -24,12 +26,13 @@ from urllib.parse import quote
 import httpx
 import jwt
 import pytest
+from django.core.handlers.wsgi import WSGIRequest
 from django.http import HttpResponse, QueryDict
 from django.http.cookie import parse_cookie
 from django.test import override_settings
 from django.urls import include, reverse
 from django.urls import path as django_path
-from hypothesis import example, given
+from hypothesis import assume, example, given
 from hypothesis import strategies as st
 
 from django_bolt import BoltAPI
@@ -61,6 +64,11 @@ async def sequence(k: Annotated[list[str], Query()] = []):  # noqa: B006
 @api.post("/form")
 async def form(k: Annotated[list[str], Form()] = []):  # noqa: B006
     return k
+
+
+@api.post("/form-fields")
+async def form_fields(request, k: Annotated[list[str], Form()] = []):  # noqa: B006
+    return {key: value if isinstance(value, list) else [value] for key, value in request.form.items()}
 
 
 @api.get("/path/{value}")
@@ -106,6 +114,73 @@ async def datetime_value(v: datetime.datetime):
 @api.get("/time")
 async def time_value(v: datetime.time):
     return {"v": v.isoformat()}
+
+
+def _describe(value):
+    """Give the JSON form of a converted value: its type, its fields and its UTC offset.
+
+    An int is in hex: str() and repr() refuse more digits than the digit limit of int().
+    """
+    if isinstance(value, datetime.datetime | datetime.time):
+        offset = value.utcoffset()
+        seconds = None if offset is None else offset.total_seconds()
+        utc = value.tzinfo is datetime.UTC
+        return [type(value).__name__, value.replace(tzinfo=None).isoformat(), seconds, utc]
+    if isinstance(value, datetime.date):
+        return ["date", value.isoformat()]
+    if type(value) is int:
+        return ["int", hex(value)]
+    return [type(value).__name__, repr(value)]
+
+
+@api.get("/scalar/int")
+async def scalar_int(v: int):
+    return _describe(v)
+
+
+@api.get("/list/int")
+async def list_int(v: Annotated[list[int], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/float")
+async def scalar_float(v: float):
+    return _describe(v)
+
+
+@api.get("/list/float")
+async def list_float(v: Annotated[list[float], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/date")
+async def scalar_date(v: datetime.date):
+    return _describe(v)
+
+
+@api.get("/list/date")
+async def list_date(v: Annotated[list[datetime.date], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/time")
+async def scalar_time(v: datetime.time):
+    return _describe(v)
+
+
+@api.get("/list/time")
+async def list_time(v: Annotated[list[datetime.time], Query()]):
+    return _describe(v[0])
+
+
+@api.get("/scalar/datetime")
+async def scalar_datetime(v: datetime.datetime):
+    return _describe(v)
+
+
+@api.get("/list/datetime")
+async def list_datetime(v: Annotated[list[datetime.datetime], Query()]):
+    return _describe(v[0])
 
 
 @api.get("/cookies")
@@ -190,6 +265,80 @@ def test_a_urlencoded_form_matches_django_getlist(client, raw):
     assert response.json() == QueryDict(raw).getlist("k")
 
 
+# Pieces of a form body: separators, escapes, Latin-1 and UTF-8 bytes, and any bytes.
+FORM_BODY_PIECES = [b"&", b"=", b"+", b"%", b"k", b"%FF", b"%C3", b"%C3%A9", b"\xe9", b"\xc3\xa9", b"\xa9"]
+form_bodies = st.lists(
+    st.one_of(st.sampled_from(FORM_BODY_PIECES), st.binary(min_size=1, max_size=4)), max_size=30
+).map(b"".join)
+
+
+@example(body=b"name=caf\xe9")
+@example(body=b"a=\xc3\xa9&b=\xe9")
+@example(body=b"a=%C3\xa9")
+@given(body=form_bodies)
+def test_a_urlencoded_body_of_any_bytes_matches_django(client, body):
+    response = client.post("/form-fields", content=body, headers={"content-type": "application/x-www-form-urlencoded"})
+    assert response.status_code == 200, response.text
+    # Django request.POST of a urlencoded body (HttpRequest._load_post_and_files).
+    assert response.json() == dict(QueryDict(body, encoding="utf-8").lists())
+
+
+MULTIPART_BOUNDARY = b"bolt-property-boundary-7d3f"
+
+
+def _django_post(body: bytes, content_type: str) -> dict[str, list[str]]:
+    environ = {
+        "REQUEST_METHOD": "POST",
+        "CONTENT_TYPE": content_type,
+        "CONTENT_LENGTH": str(len(body)),
+        "wsgi.input": io.BytesIO(body),
+        "PATH_INFO": "/",
+        "SERVER_NAME": "testserver",
+        "SERVER_PORT": "80",
+        "wsgi.url_scheme": "http",
+    }
+    return dict(WSGIRequest(environ).POST.lists())
+
+
+def _is_header_name_safe(name: bytes) -> bool:
+    """Leave out what is not about text decoding.
+
+    A quote, a backslash or a control byte changes the header syntax, and
+    Django strips white space around a name.
+    """
+    if any(byte < 0x20 or byte in b'"\\\x7f' for byte in name):
+        return False
+    text = name.decode("utf-8", "replace")
+    return text == text.strip()
+
+
+@example(name=b"v", value=b"caf\xe9")
+@example(name=b"caf\xc3\xa9", value=b"\xff" * 17)
+@example(name=b"caf\xe9", value=b"1")
+@given(name=st.binary(min_size=1, max_size=12).filter(_is_header_name_safe), value=st.binary(max_size=40))
+def test_a_multipart_field_of_any_bytes_matches_django(client, name, value):
+    assume(MULTIPART_BOUNDARY not in value)
+    body = (
+        b"--" + MULTIPART_BOUNDARY + b"\r\n"
+        b'Content-Disposition: form-data; name="' + name + b'"\r\n\r\n' + value + b"\r\n"
+        b"--" + MULTIPART_BOUNDARY + b"--\r\n"
+    )
+    content_type = f"multipart/form-data; boundary={MULTIPART_BOUNDARY.decode()}"
+    response = client.post("/form-fields", content=body, headers={"content-type": content_type})
+    django_post = _django_post(body, content_type)
+    try:
+        name.decode("utf-8")
+    except UnicodeDecodeError:
+        # Django drops a part whose header is not UTF-8. The multipart parser
+        # of Bolt cannot skip a part, so the request gets 422.
+        assert django_post == {}
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"][0]["type"] == "multipart_error"
+    else:
+        assert response.status_code == 200, response.text
+        assert response.json() == django_post
+
+
 # httpx removes the dot segments "." and "..", as a browser does.
 @given(value=st.text(min_size=1).filter(lambda text: text not in {".", ".."}))
 def test_a_path_param_round_trips(client, value):
@@ -242,23 +391,233 @@ def test_a_naive_datetime_query_param_round_trips(client, value, separator):
     assert response.json() == {"v": value.isoformat()}
 
 
-# RFC 3339 offsets have whole minutes. Bolt gives the handler the time in UTC,
-# so the instant must be in the years that Python can show in UTC.
+# RFC 3339 offsets have whole minutes.
 utc_offsets = st.integers(min_value=-(24 * 60 - 1), max_value=24 * 60 - 1).map(
     lambda minutes: datetime.timezone(datetime.timedelta(minutes=minutes))
 )
 
 
-@given(
-    value=st.datetimes(min_value=datetime.datetime(2, 1, 1), max_value=datetime.datetime(9998, 12, 31)),
-    offset=utc_offsets,
-)
-def test_an_aware_datetime_query_param_is_the_same_instant(client, value, offset):
+@given(value=st.datetimes(), offset=utc_offsets)
+def test_an_aware_datetime_query_param_keeps_its_offset(client, value, offset):
     aware = value.replace(tzinfo=offset)
     response = client.get("/datetime", params={"v": aware.isoformat()})
     returned = datetime.datetime.fromisoformat(response.json()["v"])
-    assert returned == aware
-    assert returned.utcoffset() == datetime.timedelta(0)
+    assert returned.replace(tzinfo=None) == value
+    assert returned.utcoffset() == aware.utcoffset()
+
+
+# Texts for the parameter types that Rust converts: the forms that Python reads,
+# fields out of range, and mutations of each one.
+_MUTATION_CHARS = [
+    " ",
+    "\t",
+    "\0",
+    "+",
+    "-",
+    "0",
+    "9",
+    ":",
+    ".",
+    ",",
+    "e",
+    "T",
+    "t",
+    "x",
+    "Z",
+    "z",
+    "W",
+    "_",
+    "é",
+    "٣",
+]
+
+
+def _digits(min_size, max_size):
+    return st.text("0123456789", min_size=min_size, max_size=max_size)
+
+
+@st.composite
+def _mutated(draw, texts):
+    """Insert, delete or replace up to two characters of a text."""
+    text = draw(texts)
+    for _ in range(draw(st.integers(min_value=0, max_value=2))):
+        at = draw(st.integers(min_value=0, max_value=len(text)))
+        char = draw(st.sampled_from(_MUTATION_CHARS))
+        operation = draw(st.sampled_from(["insert", "delete", "replace"]))
+        if operation == "insert":
+            text = text[:at] + char + text[at:]
+        elif operation == "delete":
+            text = text[:at] + text[at + 1 :]
+        else:
+            text = text[:at] + char + text[at + 1 :]
+    return text
+
+
+# Mostly in range. Hour 24 and minute or second 60 also occur.
+_two_digit_fields = st.one_of(st.integers(min_value=0, max_value=59), st.sampled_from([23, 24, 60, 99]))
+
+
+@st.composite
+def _hms_texts(draw):
+    """HH, HH:MM, HH:MM:SS, HHMM or HHMMSS, with a fraction after SS, or after HH or MM."""
+    fields = [draw(_two_digit_fields) for _ in range(draw(st.integers(min_value=1, max_value=3)))]
+    separator = draw(st.sampled_from([":", ""]))
+    text = separator.join(f"{field:02}" for field in fields)
+    if draw(st.booleans()):
+        text += draw(st.sampled_from(".,")) + draw(_digits(0, 9))
+    return text
+
+
+@st.composite
+def _clock_texts(draw):
+    zone = draw(st.sampled_from(["", "", "Z", "+", "-"]))
+    if zone in "+-":
+        zone += draw(_hms_texts())
+    return draw(_hms_texts()) + zone
+
+
+@st.composite
+def _date_texts(draw):
+    day = draw(st.dates())
+    year, week, weekday = day.isocalendar()
+    return draw(
+        st.sampled_from(
+            [
+                day.isoformat(),
+                f"{day.year:04}{day.month:02}{day.day:02}",
+                f"{year:04}-W{week:02}-{weekday}",
+                f"{year:04}W{week:02}{weekday}",
+                f"{year:04}-W{week:02}",
+                f"{year:04}W{week:02}",
+                f"{draw(_digits(4, 4))}-{draw(_digits(2, 2))}-{draw(_digits(2, 2))}",
+                f"{draw(_digits(4, 4))}-W{draw(_digits(2, 2))}-{draw(_digits(1, 1))}",
+            ]
+        )
+    )
+
+
+@st.composite
+def _datetime_texts(draw):
+    date = draw(_date_texts())
+    if draw(st.integers(min_value=0, max_value=4)) == 0:
+        return date
+    return date + draw(st.sampled_from(["T", "t", " ", "x", "\t", "\u3000", "\x1f", "  "])) + draw(_clock_texts())
+
+
+_number_texts = st.one_of(
+    st.integers().map(str),
+    st.integers(min_value=-(10**60), max_value=10**60).map(str),
+    st.integers(min_value=4290, max_value=4310).map(lambda length: "1" * length),
+    st.integers(min_value=-(2**54), max_value=2**54).map(lambda value: f"{value}.0"),
+    st.floats().map(repr),
+    st.from_regex(r"[+-]?\d{0,5}(\.\d{0,5})?([eE][+-]?\d{1,3})?", fullmatch=True),
+    st.sampled_from(["inf", "-Infinity", "NaN", "+nan", "+5", "007", "1_000", ".5", "5.", "0x10", "1e999"]),
+)
+PARAM_TEXTS = st.one_of(
+    st.tuples(st.just("int"), _mutated(_number_texts)),
+    st.tuples(st.just("float"), _mutated(_number_texts)),
+    st.tuples(st.just("date"), _mutated(_date_texts())),
+    st.tuples(st.just("time"), _mutated(st.builds("{}{}".format, st.sampled_from(["", "T"]), _clock_texts()))),
+    st.tuples(st.just("datetime"), _mutated(_datetime_texts())),
+)
+
+# The ISO 8601 forms that Bolt reads (see docs/src/topics/requests.md).
+_ISO_DATE = r"\d{4}(?:-\d{2}-\d{2}|\d{4}|-?W\d{2}|-W\d{2}-\d|W\d{3})"
+_HMS = r"\d{2}(?::\d{2}(?::\d{2}(?:[.,]\d+)?)?|\d{2}(?:\d{2}(?:[.,]\d+)?)?)?"
+# RFC 3339 has no seconds in an offset, so Bolt refuses them, although Python reads them.
+_CLOCK = rf"(?P<clock>{_HMS})(?:Z|[+-](?P<zone>\d{{2}}(?::?\d{{2}})?))?"
+ISO_FORMS = {
+    "date": re.compile(_ISO_DATE, re.ASCII),
+    "time": re.compile(rf"T?{_CLOCK}", re.ASCII),
+    # The separator is T, t or one whitespace character of Rust's char::is_whitespace().
+    "datetime": re.compile(
+        rf"{_ISO_DATE}(?:[Tt\t\n\x0b\x0c\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]{_CLOCK})?",
+        re.ASCII,
+    ),
+}
+PARAM_TYPES = {"date": datetime.date, "time": datetime.time, "datetime": datetime.datetime}
+
+
+def _python_reads_it_on_each_version(match: re.Match) -> bool:
+    """False for a text of the ISO forms that Bolt refuses although a Python version reads it."""
+    groups = match.groupdict()
+    if (groups.get("clock") or "").startswith("24"):
+        # Only Python 3.14 reads hour 24, as midnight of the next day.
+        return False
+    zone = groups.get("zone")
+    # Each version reads +05:60 as six hours. It is not ISO 8601.
+    return zone is None or int(zone.replace(":", "")[2:] or 0) <= 59
+
+
+# The digit limit of an int that Bolt reads at startup: that of int(), at most 4300.
+_INT_DIGITS = min(4300, sys.get_int_max_str_digits() or 4300)
+
+
+def _python_value(kind: str, text: str):
+    """Give the value that Python reads from `text`, or None when Bolt must refuse the text.
+
+    Bolt reads a number as `int()` or `float()` reads it, with no whitespace,
+    `_` or digits that are not ASCII. It reads an ISO 8601 form of the grammar
+    as `fromisoformat()` reads it on each supported Python version.
+    """
+    try:
+        if kind == "int":
+            readable = re.fullmatch(r"[+-]?[0-9]+", text, re.ASCII) and len(text.lstrip("+-")) <= _INT_DIGITS
+            return int(text) if readable else None
+        if kind == "float":
+            readable = text.isascii() and "_" not in text and not any(char.isspace() for char in text)
+            return float(text) if readable else None
+        match = ISO_FORMS[kind].fullmatch(text)
+        if match is None or not _python_reads_it_on_each_version(match):
+            return None
+        return PARAM_TYPES[kind].fromisoformat(text)
+    except ValueError:
+        return None
+
+
+@example(case=("datetime", "2024-01-15T10:30"))
+@example(case=("datetime", "2024-01-15T10:30:00+05:30"))
+@example(case=("datetime", "2024-01-15"))
+@example(case=("datetime", "20240115"))
+@example(case=("datetime", "2024-01-15x10:30:00"))
+@example(case=("datetime", "2024-01-15T10:30:00z"))
+@example(case=("datetime", "1700000000"))
+@example(case=("datetime", "24-01-15"))
+@example(case=("datetime", "-16964e15"))
+@example(case=("time", "10:30"))
+@example(case=("time", "10:30:00+05:00"))
+@example(case=("time", "10:30:00 +05:00"))
+@example(case=("time", "24:00"))
+@example(case=("time", "10:30.5"))
+@example(case=("time", "10:30:00+00:00:00.5"))
+@example(case=("time", "10:30:00+05:60"))
+@example(case=("time", "10:30:00+05:30:15"))
+@example(case=("datetime", "2024-01-15T10:30:00+05:30:00"))
+@example(case=("date", "20240115xx"))
+@example(case=("int", "9223372036854775808"))
+@example(case=("int", "007"))
+@example(case=("int", "+5"))
+@example(case=("int", "5.0"))
+@example(case=("int", "-16964e15"))
+@example(case=("float", ".5"))
+@example(case=("float", "-0"))
+@example(case=("float", "1e999"))
+@given(case=PARAM_TEXTS)
+def test_a_scalar_and_a_list_param_convert_as_python(client, case):
+    """A scalar and a list parameter of one type accept the texts that Python reads, with the same value.
+
+    The reference is `int()`, `float()` and `fromisoformat()`. See `_python_value`
+    for the texts that Python reads and Bolt refuses.
+    """
+    kind, text = case
+    value = _python_value(kind, text)
+    for path in (f"/scalar/{kind}", f"/list/{kind}"):
+        response = client.get(path, params={"v": text})
+        if value is None:
+            assert response.status_code == 422, (path, text, response.text)
+        else:
+            assert response.status_code == 200, (path, text, response.text)
+            assert response.json() == _describe(value), (path, text)
 
 
 @given(value=st.times())

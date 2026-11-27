@@ -5,10 +5,9 @@ from __future__ import annotations
 import contextlib
 import inspect
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from .types import WebSocket
+from ..exceptions import RequestValidationError
 
 
 def build_websocket_request(scope: dict[str, Any]) -> dict[str, Any]:
@@ -49,16 +48,45 @@ def build_websocket_request(scope: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def is_websocket_handler(func: Callable[..., Any]) -> bool:
-    """Check if a function is a WebSocket handler."""
-    return getattr(func, "_is_websocket_handler", False)
+# The name of each request source in the detail of a refused WebSocket upgrade, as Rust names it.
+_SOURCE_LABELS = {"query": "Query parameter", "path": "Path parameter", "header": "Header", "cookie": "Cookie"}
+
+
+def invalid_request_detail(error: BaseException) -> str | None:
+    """Give the detail of a request value that a parameter extractor refused, or None.
+
+    Rust refuses a bad scalar value before the handler runs, and the upgrade
+    gets 400. An extractor refuses other values, such as an item of a
+    ``list[int]``, with ``RequestValidationError``. Before accept, Bolt then
+    refuses the upgrade with 400 too, with a detail of the same form:
+    ``Query parameter 'ids': ...``. For another error, give None.
+
+    An error item can come from a handler, so each key is optional. An item
+    with no "msg" uses its "type", then "Invalid value".
+    """
+    if not isinstance(error, RequestValidationError):
+        return None
+    details = []
+    for item in error.errors():
+        if not isinstance(item, dict):
+            details.append(str(item))
+            continue
+        message = item.get("msg") or item.get("type") or "Invalid value"
+        loc = item.get("loc")
+        if not isinstance(loc, (list, tuple)) or len(loc) < 2:
+            details.append(str(message))
+            continue
+        source, *names = loc
+        label = _SOURCE_LABELS.get(source, source) if isinstance(source, str) else source
+        details.append(f"{label} '{'.'.join(str(name) for name in names)}': {message}")
+    return "; ".join(details) or str(error)
 
 
 def mark_websocket_handler(func: Callable[..., Any]) -> Callable[..., Any]:
     """Mark a function as a WebSocket handler.
 
     A bound method cannot hold an attribute. The mark goes on its function, and
-    `is_websocket_handler` reads it through the method.
+    a read of the attribute through the method finds it.
     """
     getattr(func, "__func__", func)._is_websocket_handler = True
     return func
@@ -97,41 +125,3 @@ def get_websocket_param_name(func: Callable[..., Any]) -> str | None:
     # Return first parameter as fallback
     params = list(sig.parameters.keys())
     return params[0] if params else None
-
-
-async def run_websocket_handler(
-    handler: Callable[..., Any],
-    websocket: WebSocket,
-    path_params: dict[str, str] | None = None,
-    **extra_kwargs: Any,
-) -> None:
-    """
-    Run a WebSocket handler with proper parameter injection.
-
-    Args:
-        handler: The WebSocket handler function
-        websocket: The WebSocket connection object
-        path_params: Path parameters from URL matching
-        extra_kwargs: Additional keyword arguments
-    """
-    kwargs: dict[str, Any] = {}
-
-    # Find the WebSocket parameter name
-    ws_param = get_websocket_param_name(handler)
-    if ws_param:
-        kwargs[ws_param] = websocket
-
-    # Add path parameters
-    if path_params:
-        sig = inspect.signature(handler)
-        for name, value in path_params.items():
-            if name in sig.parameters and name != ws_param:
-                kwargs[name] = value
-
-    # Add extra kwargs
-    kwargs.update(extra_kwargs)
-
-    # Call the handler
-    result = handler(**kwargs)
-    if inspect.iscoroutine(result):
-        await result

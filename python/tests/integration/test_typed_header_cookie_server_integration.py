@@ -55,6 +55,45 @@ def test_websocket_typed_header_and_cookie(make_server_project):
         assert "Cookie 'page'" in body, f"body={body!r}"
 
 
+def test_websocket_list_item_is_refused_as_a_scalar_is(make_server_project):
+    """A bad item of a list rejects the upgrade with 400, as a bad scalar value does.
+
+    Rust refuses a scalar in build_scope. A parameter extractor refuses a list
+    item, before accept. Master gave 101 for `5.0`, as msgspec read it, and 500
+    for `abc`.
+    """
+    project = make_server_project(api_module=app_module("typed_header_cookie"))
+
+    with project.start() as server:
+        with SimpleWebSocketClient(server.host, server.port, "/ws/list?ids=1&ids=%2B2") as websocket:
+            assert websocket.receive_text() == "[1, 2] None"
+
+        for text in ["5.0", "abc"]:
+            status_line, body = attempt_ws_upgrade(server.host, server.port, f"/ws/list?ids=1&ids={text}")
+            assert "400" in status_line, f"status={status_line!r} body={body!r}"
+            assert f"Query parameter 'ids': Invalid integer '{text}'" in body, f"body={body!r}"
+            assert "at `$[1]`" in body, f"body={body!r}"
+
+        status_line, body = attempt_ws_upgrade(server.host, server.port, "/ws/list?ids=1", headers={"X-Ids": "5.0"})
+        assert "400" in status_line, f"status={status_line!r} body={body!r}"
+        assert "Header 'x-ids': Invalid integer '5.0'" in body, f"body={body!r}"
+
+        # A bad scalar gives the same status and the same form of detail.
+        status_line, body = attempt_ws_upgrade(server.host, server.port, "/ws/typed", headers={"X-Count": "5.0"})
+        assert "400" in status_line, f"status={status_line!r} body={body!r}"
+        assert "Invalid request: ValueError: Header 'x-count': Invalid integer '5.0'" in body, f"body={body!r}"
+
+
+def test_websocket_validation_error_with_no_message_refuses_the_upgrade_with_400(make_server_project):
+    """An error item with no "msg" gives 400 at once, as WebSocketTestClient raises a ValueError."""
+    project = make_server_project(api_module=app_module("typed_header_cookie"))
+
+    with project.start() as server:
+        status_line, body = attempt_ws_upgrade(server.host, server.port, "/ws/validation-error")
+        assert "400" in status_line, f"status={status_line!r} body={body!r}"
+        assert "Query parameter 'x': missing" in body, f"body={body!r}"
+
+
 def test_a_cookie_is_read_as_django_reads_it(make_server_project):
     """A quoted cookie loses its quotes, and spaces around `=` do not count."""
     project = make_server_project(api_module=app_module("typed_header_cookie"))
