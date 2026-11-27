@@ -32,7 +32,7 @@ from django.http.cookie import parse_cookie
 from django.test import override_settings
 from django.urls import include, reverse
 from django.urls import path as django_path
-from hypothesis import assume, example, given
+from hypothesis import assume, event, example, given
 from hypothesis import strategies as st
 
 from django_bolt import BoltAPI
@@ -42,6 +42,8 @@ from django_bolt.auth.revocation import DjangoCacheRevocation, DjangoORMRevocati
 from django_bolt.param_functions import Cookie, Form, Query
 from django_bolt.responses import JSON, FileResponse
 from django_bolt.testing import TestClient
+
+from . import jwt_parity
 
 api = BoltAPI()
 
@@ -950,3 +952,97 @@ def test_a_jti_that_a_collation_reads_as_a_reserved_key_gets_a_401(revocation_cl
 )
 def test_a_uuid_or_hex_jti_is_not_refused(revocation_client, path, value, form):
     assert revocation_client.get(path, headers=_bearer(form(value))).status_code == 200
+
+
+# Bolt's Rust JWT check against PyJWT (audit findings J1 to J6). Each example is a
+# valid token with zero to three changes: a header parameter or a claim gets a new
+# value, of its own form or of any JSON type, or goes away. Bolt and PyJWT must
+# agree, except for the wanted differences that `known_difference` names. Each
+# time claim is at least 29 seconds from its limit, also a number of any JSON
+# value, so the few milliseconds between the two checks cannot change an answer.
+
+json_scalars = st.one_of(
+    st.none(),
+    st.booleans(),
+    st.integers(min_value=-(2**70), max_value=2**70),
+    st.floats(allow_nan=False, allow_infinity=False),
+    st.text(max_size=6),
+)
+json_values = st.recursive(
+    json_scalars,
+    lambda inner: st.one_of(st.lists(inner, max_size=3), st.dictionaries(st.text(max_size=4), inner, max_size=3)),
+    max_leaves=5,
+)
+# Seconds from now, each at least 29 seconds from 0, -60 and 60 (the limits with a leeway of 0 or 60).
+TIME_OFFSETS = [-7200, -90, -30, 30, 90, 7200]
+HEADER_FORMS = {
+    "alg": st.sampled_from(["HS256", "HS384", "none", "hs256"]),
+    "kid": st.just("key-1"),
+    "typ": st.just("JWT"),
+    "crit": st.sampled_from([["b64"], ["exp"], []]),
+    "b64": st.booleans(),
+    "x5t": st.just("abc"),
+}
+CLAIM_FORMS = {
+    "sub": st.sampled_from(["1", ""]),
+    "jti": st.just("token-1"),
+    "iss": st.sampled_from(["https://issuer.example", "https://other.example"]),
+    "aud": st.sampled_from(["api", "web", ["web", "api"], [], ["api", 1]]),
+    "is_staff": st.booleans(),
+    "permissions": st.lists(st.sampled_from(["read", "write"]), max_size=2),
+    "typ": st.sampled_from(["access", "refresh", "Bearer"]),
+    "token_use": st.sampled_from(["access", "id"]),
+    "role": st.just("editor"),
+}
+REMOVE = object()
+
+
+def _near_now(value, now: int) -> bool:
+    """True for a number less than 90 seconds from now: the limits of a leeway of 0 or 60 are near."""
+    return isinstance(value, int | float) and not isinstance(value, bool) and abs(value - now) < 90
+
+
+@st.composite
+def jwt_parts(draw) -> tuple[dict, dict]:
+    now = int(time.time())
+    fraction = st.one_of(st.just(0), st.floats(min_value=0.001, max_value=0.999))
+    dates = st.builds(lambda offset, part: now + offset + part, st.sampled_from(TIME_OFFSETS), fraction)
+    claim_forms = {**CLAIM_FORMS, "exp": dates, "nbf": dates, "iat": dates}
+    header = {"alg": "HS256"}
+    claims = {"sub": "1", "exp": now + 7200, "iss": "https://issuer.example", "aud": "api"}
+    for _ in range(draw(st.integers(min_value=0, max_value=3))):
+        part, forms = draw(st.sampled_from([(header, HEADER_FORMS), (claims, claim_forms)]))
+        name = draw(st.sampled_from(sorted(forms)))
+        values = json_values
+        if name in jwt_parity.TIME_CLAIMS:
+            values = json_values.filter(lambda value: not _near_now(value, now))
+        value = draw(st.one_of(forms[name], forms[name], values, st.just(REMOVE)))
+        if value is REMOVE:
+            part.pop(name, None)
+        else:
+            part[name] = value
+    return header, claims
+
+
+@pytest.fixture(scope="module")
+def jwt_client():
+    with TestClient(jwt_parity.parity_api()) as test_client:
+        yield test_client
+
+
+@given(parts=jwt_parts(), backend=st.sampled_from(sorted(jwt_parity.BACKENDS)))
+@example(parts=({"alg": "HS256", "kid": None}, {"exp": 2**40}), backend="plain")
+@example(parts=({"alg": "HS256", "crit": ["exp"]}, {"exp": 2**40}), backend="plain")
+@example(parts=({"alg": "HS256"}, {"exp": 2**40, "sub": None}), backend="plain")
+@example(parts=({"alg": "HS256"}, {"exp": 2**40, "iat": 2**40}), backend="leeway")
+@example(parts=({"alg": "HS256"}, {"exp": 2**40 + 0.5, "iss": 1, "is_staff": 1}), backend="plain")
+def test_bolt_and_pyjwt_agree_on_a_random_token(jwt_client, parts, backend):
+    header, claims = parts
+    token = jwt_parity.make_token(header, claims)
+    bolt = jwt_parity.bolt_accepts(jwt_client, backend, token)
+    reason = jwt_parity.known_difference(header, claims)
+    event("accepted" if bolt else "refused" if reason is None else "known difference")
+    if reason is None:
+        assert bolt == jwt_parity.pyjwt_accepts(backend, token)
+    else:
+        assert not bolt, reason

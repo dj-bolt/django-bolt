@@ -26,6 +26,7 @@ from django_bolt.auth.revocation import (
     InMemoryRevocation,
     ReservedJtiError,
     RevocationStore,
+    _entry_end,
     _ttl_for,
 )
 from django_bolt.auth.revocation_db.models import RevokedToken
@@ -98,6 +99,37 @@ def test_ttl_for_keeps_an_entry_for_a_token_inside_the_leeway():
     just_expired = int(time.time()) - 10
     assert 49 <= _ttl_for(just_expired, leeway=60) <= 51
     assert _ttl_for(just_expired, leeway=0) == 0
+
+
+def test_ttl_for_ends_an_entry_in_the_last_year_of_a_datetime():
+    """``exp`` plus the leeway can pass 9999-12-31. ``datetime`` then raised ``OverflowError``."""
+    last = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=UTC)
+    for exp in (253402300799, 2**62, 10**300):
+        assert datetime.now(UTC) + timedelta(seconds=_ttl_for(exp, leeway=60)) <= last
+
+
+def test_entry_end_is_at_the_latest_the_last_datetime():
+    """The clock can move between the read of ``_ttl_for`` and the read of the store."""
+    last = datetime.max.replace(tzinfo=UTC)
+    left = int((last - datetime.now(UTC)).total_seconds())
+    for late in (0, 1, 2, 3600):
+        assert _entry_end(left + late) <= last
+    assert _entry_end(left + 3600) == last
+
+
+def test_entry_end_of_a_usual_entry_is_now_plus_its_seconds():
+    before = datetime.now(UTC)
+    end = _entry_end(3600)
+    assert before + timedelta(seconds=3600) <= end <= datetime.now(UTC) + timedelta(seconds=3600)
+
+
+def test_orm_store_keeps_an_entry_for_an_exp_in_the_last_second_of_a_datetime(orm_store):
+    store = orm_store(leeway=60)
+    asyncio.run(store.revoke("a", exp=253402300799))
+    assert asyncio.run(store.consume("b", exp=253402300799)) is True
+    assert asyncio.run(store.is_revoked("a")) is True
+    assert asyncio.run(store.consume("b", exp=253402300799)) is False
+    assert RevokedToken.objects.get(jti="a").expires_at.year == 9999
 
 
 def test_ttl_for_falls_back_to_default_when_exp_none():
@@ -1095,6 +1127,22 @@ def test_rotation_of_a_refresh_token_with_a_claim_that_the_store_cannot_keep_rai
 
     with pytest.raises(TokenRotationError):
         asyncio.run(rotate_refresh_token(claims, store=store, secret=_SECRET, rotate=rotate))
+
+
+@pytest.mark.parametrize("exp", [1e300, 2**62, 253402300800, -1e300, float("inf"), float("nan")])
+def test_rotation_with_an_exp_that_a_datetime_cannot_hold_is_a_rotation_error(orm_store, exp):
+    """``auth_claims`` never gives such an ``exp``. A caller's claims gave ``OverflowError`` from the store."""
+    store = orm_store()
+    claims = jwt.decode(_signed_claims("refresh"), _SECRET, algorithms=["HS256"])
+
+    with pytest.raises(TokenRotationError, match="invalid expiry"):
+        asyncio.run(rotate_refresh_token({**claims, "exp": exp}, store=store, secret=_SECRET))
+    assert not RevokedToken.objects.exists()
+    # Nothing consumed the token, so its claims with a valid exp rotate.
+    asyncio.run(rotate_refresh_token(claims, store=store, secret=_SECRET))
+    asyncio.run(
+        rotate_refresh_token({**claims, "jti": "last-second", "exp": 253402300799}, store=store, secret=_SECRET)
+    )
 
 
 # ---------------------------------------------------------------------------

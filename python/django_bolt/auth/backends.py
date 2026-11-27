@@ -166,8 +166,8 @@ class JWTAuthentication(BaseAuthentication):
             (RS*/PS*/ES*/EdDSA). Preferred over passing a PEM via ``secret``
             (which also works, for compatibility). Mutually exclusive with
             ``secret``.
-        leeway: Clock-skew tolerance in seconds applied to ``exp``/``nbf``
-            validation (default: 60). A ``revocation_store`` with a
+        leeway: Clock-skew tolerance in seconds applied to ``exp``, ``nbf``
+            and ``iat`` validation (default: 60). A ``revocation_store`` with a
             ``leeway`` must have one that is not smaller, or the backend
             raises ``ImproperlyConfigured``.
         token_type: Expected ``typ`` claim. When set (e.g. ``"refresh"`` for
@@ -505,7 +505,8 @@ class APIKeyAuthentication(BaseAuthentication):
 
     Args:
         api_keys: Set, list or tuple of valid API keys. Each key is a
-            non-empty str that does not start with ``Bearer `` or ``ApiKey ``.
+            non-empty str that does not start with a space, ``Bearer `` or
+            ``ApiKey ``.
         header: Header name to extract API key from (default: "x-api-key")
         key_permissions: Optional mapping of API keys to permission sets.
             Each key must be in ``api_keys``.
@@ -513,7 +514,7 @@ class APIKeyAuthentication(BaseAuthentication):
     Raises:
         ImproperlyConfigured: ``api_keys`` or ``key_permissions`` has a
             value of the wrong type, an empty key, a key that starts with a
-            scheme, or a key that is not in ``api_keys``.
+            space or a scheme, or a key that is not in ``api_keys``.
     """
 
     def __init__(
@@ -531,7 +532,14 @@ class APIKeyAuthentication(BaseAuthentication):
             # Rust removes one scheme word from the header value. Thus a key that
             # starts with a scheme cannot authenticate as sent, and its header
             # value can name another valid key.
-            for key in api_keys:
+            for index, key in enumerate(api_keys):
+                # Rust also removes the spaces after a scheme, and a header value
+                # cannot start with a space. Thus no request can send such a key.
+                # The message must not show the key, so it gives the position.
+                if key.startswith(" "):
+                    raise ImproperlyConfigured(
+                        f"APIKeyAuthentication api_keys has a key that starts with a space, at index {index}."
+                    )
                 for scheme in _API_KEY_SCHEMES:
                     if key[: len(scheme)].lower() == scheme.lower():
                         raise ImproperlyConfigured(

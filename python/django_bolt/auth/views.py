@@ -105,6 +105,7 @@ class JWTAuthViews:
 
     async def _token_live(self, claims: dict[str, Any], user_id: str) -> bool:
         # The Rust layer gives ``fam`` as a str and ``ver`` as an int, or leaves the claim out.
+        # It gives a claim of another JSON form as None, and None fails each test below.
         fam = claims.get("fam")
         try:
             return bool(

@@ -45,7 +45,7 @@ Verifies a JSON Web Token in Rust.
 | --- | --- | --- |
 | `secret` | `None` | The HMAC key. `None` uses `settings.SECRET_KEY`, read when Bolt registers the route. |
 | `algorithms` | `None` | The accepted `alg` values. `None` means `["HS256"]`. All values must use one kind of key. |
-| `header` | `"authorization"` | The header that holds the token. Bolt removes a `Bearer ` scheme, in any case. A token with no scheme also works. |
+| `header` | `"authorization"` | The header that holds the token. Bolt removes a `Bearer` scheme in any case, and the spaces after it. A token with no scheme also works. |
 | `cookie` | `None` | Read the token from this cookie only. The header is then not read. |
 | `audience` | `None` | Require this value in the `aud` claim, a string or a list. `None` does not check `aud`. |
 | `issuer` | `None` | Require this exact `iss` claim. `None` does not check `iss`. |
@@ -53,7 +53,7 @@ Verifies a JSON Web Token in Rust.
 | `revocation_store` | `None` | A [revocation store](#revocation). Bolt checks the `jti` of each token in it. |
 | `require_jti` | `False` | Reject a token with no `jti` claim. A handler or a store sets it to `True`. |
 | `public_key` | `None` | A PEM public key for an `RS*`, `PS*`, `ES*` or `EdDSA` algorithm. |
-| `leeway` | `60` | Seconds of clock skew allowed on `exp` and `nbf`. |
+| `leeway` | `60` | Seconds of clock skew allowed on `exp`, `nbf` and `iat`. |
 | `token_type` | `None` | Require this `typ` claim, for example `"refresh"`. See below. |
 | `csrf` | `True` | With `cookie`, check the origin of each unsafe request. See below. |
 | `jwks_url` | `None` | An HTTPS URL of a JSON Web Key Set. Needs `issuer` and `audience`. |
@@ -66,7 +66,11 @@ Supported algorithms: `HS256`, `HS384`, `HS512`, `RS256`, `RS384`, `RS512`, `PS2
 Checks on each token:
 
 - The `alg` header is in `algorithms`, and the signature is valid. A `jwks` key is selected by the `kid` header.
-- `exp` is present and not more than `leeway` seconds in the past. `nbf`, when present, is not more than `leeway` seconds in the future.
+- The header has no `crit` and no `"b64": false`.
+- `exp` is present. Bolt removes the fraction of `exp`. The current time must be before `exp + leeway`. At that time, the token fails.
+- `nbf` and `iat`, when present, are not more than `leeway` seconds in the future.
+- `exp`, `nbf` and `iat` are in the range of a Python `datetime`: the years 1 to 9999.
+- Each claim that Bolt reads has its JSON type. See [Give each claim its JSON type](../topics/authentication.md#give-each-claim-its-json-type).
 - `aud` and `iss`, when you configure them.
 - With `token_type=None`: the `typ`, `token_type` and `token_use` claims are not `refresh`, `offline` or `id`, in any case.
 - With `token_type="refresh"`: `typ` is `"refresh"`, and `token_type` and `token_use` do not name another type.
@@ -120,7 +124,7 @@ Bolt compares keys in constant time. The context of an accepted request has `"us
 The backend loads no user: `request.user` and `await request.auser()` give `AnonymousUser`.
 Its `WWW-Authenticate` scheme is `ApiKey`.
 
-**Errors.** `ImproperlyConfigured` for `api_keys` that is a string or holds a value that is not a string, an empty key, a key that starts with `Bearer ` or `ApiKey ` in any case, an empty `header`, a `key_permissions` that is not a dict, or a `key_permissions` key that is not in `api_keys`.
+**Errors.** `ImproperlyConfigured` for `api_keys` that is a string or holds a value that is not a string, an empty key, a key that starts with a space, or with `Bearer ` or `ApiKey ` in any case, an empty `header`, a `key_permissions` that is not a dict, or a `key_permissions` key that is not in `api_keys`.
 
 ### SessionAuthentication
 
@@ -202,11 +206,14 @@ Compares one claim of the credential with the values.
 | `claim` | The name of the claim. `"permissions"` reads the permission set of any backend. |
 | `values` | The claim must match one of them. With no values and no `all_of` or `none_of`, the claim must be present, not `null`, and not `false`. |
 | `all_of` | The claim, a list, must contain each value. |
-| `none_of` | The claim must match no value. An absent claim passes. |
+| `none_of` | The claim must match no value. An absent claim passes. A malformed claim fails. |
 | `message` | The `detail` of the 403. The default is `"Permission denied"`. Not used for a 401. |
 
 A scalar claim matches an equal value. A list claim matches a value that it contains.
+A number equals a number of the same value, as in Python: `Requires("ver", 7.0)` matches `"ver": 7`. A number never equals a `bool` or a string.
+This rule is for a float and for an integer from -2^63 to 2^63 - 1. Bolt does not compare a larger integer accurately. Do not use one as a guard value.
 A request with no credential gets 401 for each `Requires`, also for a `none_of` one. A credential that does not match gets 403.
+A claim that Bolt types, in another JSON type, is malformed. Each `Requires` on a malformed claim gives 403, also `none_of`. See [Give each claim its JSON type](../topics/authentication.md#give-each-claim-its-json-type).
 
 **Errors.** `ImproperlyConfigured` for an empty or non-string `claim`, more than one of `values`, `all_of` and `none_of`, an `all_of` or `none_of` that is a string or is empty, a value that is not a `str`, `int`, `float` or `bool`, or an empty `message`.
 
@@ -222,7 +229,7 @@ A request with no credential gets 401 for each `Requires`, also for a `none_of` 
 | `auth_backend` | `str` | `"jwt"`, `"api_key"` or `"session"` |
 | `auth_backend_index` | `int` | The position of the backend in the list of the route |
 | `permissions` | `list[str]` | Present only when the credential has permissions |
-| `auth_claims` | `dict` | JWT only. The claims, without `permissions`. A custom claim that is a JSON array or object has the value `None`. |
+| `auth_claims` | `dict` | JWT only. The claims, without a valid `permissions`. A custom claim that is a JSON array or object, and a malformed claim, have the value `None`. |
 
 ### get_auth_context
 
@@ -353,6 +360,7 @@ Exchanges verified refresh claims, `request.context["auth_claims"]`, for new tok
 | `claims` | Extra claims for the new tokens. Custom claims of the old token are not copied. `amr` and `oat` are copied. |
 
 The checks: `typ` is `"refresh"`; `jti`, `sub` and (with `rotate=True`) `fam` are present; the family is not revoked; `ver` equals the current user version; the session is younger than `max_session_lifetime`.
+`auth_claims` gives a malformed claim as `None`. A `None` in `fam`, `oat`, `amr` or `ver` fails. A `fam` that is not a string and an `amr` that is not a list of strings also fail.
 A used token sent again revokes its family.
 
 **Errors.** `TokenRotationError` for each failed check, and for a store that cannot do the operation. `ValueError` for a negative `leeway` or `max_session_lifetime`, and for a reserved claim in `claims`.

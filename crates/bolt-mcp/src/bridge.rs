@@ -13,7 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::{McpAuthExt, McpMount, McpRouteRequest, McpRouteRequestExt};
-use bolt_core::middleware::auth::AuthContext;
+use bolt_core::middleware::auth::{AuthContext, strip_scheme};
 use bolt_core::middleware::client_ip;
 use bolt_core::request_pipeline::extract_headers;
 use bolt_core::responses;
@@ -121,10 +121,8 @@ pub async fn handle_mcp_request(
     if let Some(oauth) = &mount.oauth {
         let bearer = headers
             .get("authorization")
-            .and_then(|value| {
-                let (scheme, token) = value.split_once(' ')?;
-                (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
-            })
+            .and_then(|value| strip_scheme(value, "Bearer"))
+            .filter(|token| !token.is_empty())
             .map(str::to_owned);
         let Some(token) = bearer else {
             return oauth_401(&oauth.www_authenticate);

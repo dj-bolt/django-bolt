@@ -90,6 +90,8 @@ The rules:
 - Values in the positional arguments match when the claim matches one of them.
 - `all_of` matches when the claim, a list, contains each value.
 - `none_of` matches when the claim matches no value. An absent claim matches.
+- A typed claim in another JSON type is malformed. It matches no form, also `none_of`, and the guard gives 403.
+  See [Give each claim its JSON type](authentication.md#give-each-claim-its-json-type).
 - A scalar claim matches a value that is equal. A list claim matches a value that it contains.
 - With no values, the claim must be present and not `null`. For a boolean claim, present means `true`.
   Thus `Requires("is_admin")` rejects a token with `"is_admin": false`.

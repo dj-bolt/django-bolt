@@ -311,16 +311,27 @@ def make_verify_token(oauth_resource: Any) -> Any:
                 return None
             if not granted.issuperset(oauth_resource.required_scopes):
                 return None
+        # As for a token on a route: `sub` must be a string, and a claim
+        # grants only in its exact form. Rust reads the other claims.
+        user_id = claims.get("sub")
+        if user_id is not None and not isinstance(user_id, str):
+            return None
+        if "sub" in claims and user_id is None:
+            # A null `sub` is a missing `sub`. Rust reads a typed claim of null as malformed.
+            claims = {name: value for name, value in claims.items() if name != "sub"}
+        permissions = claims.get("permissions")
+        if not (isinstance(permissions, (list, tuple)) and all(isinstance(name, str) for name in permissions)):
+            permissions = []
         claims_json: str | None = None
         try:
             claims_json = json_encode(claims).decode()
         except Exception:
             logger.exception("Failed to encode OAuth token claims")
         return {
-            "user_id": str(claims["sub"]) if claims.get("sub") is not None else None,
-            "is_staff": bool(claims.get("is_staff")),
-            "is_superuser": bool(claims.get("is_superuser")),
-            "permissions": list(claims.get("permissions") or []),
+            "user_id": user_id,
+            "is_staff": claims.get("is_staff") is True,
+            "is_superuser": claims.get("is_superuser") is True,
+            "permissions": list(permissions),
             "claims_json": claims_json,
             "backend": "oauth",
         }

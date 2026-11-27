@@ -257,6 +257,7 @@ pub fn validate_auth_and_guards(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::auth::TypedClaim;
     use crate::permissions::{ClaimKey, Guard, Quantifier};
     use proptest::prelude::*;
 
@@ -366,7 +367,7 @@ mod tests {
 
     fn permission_guard(permission: &str) -> GuardSet {
         GuardSet::from_guards(vec![Guard::Requires {
-            claim: ClaimKey::Permissions,
+            claim: ClaimKey::Typed(TypedClaim::Permissions),
             values: vec![serde_json::Value::from(permission)],
             quantifier: Quantifier::Any,
             denial: None,

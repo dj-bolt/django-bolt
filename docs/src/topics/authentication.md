@@ -87,10 +87,12 @@ curl localhost:8000/me -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIs..."
 
 `JWTAuthentication()` with no arguments does these checks:
 
-- It reads the `Authorization` header and removes the `Bearer ` scheme. The scheme name has no case.
+- It reads the `Authorization` header and removes the `Bearer` scheme and the spaces after it. The scheme name has no case.
 - It verifies an `HS256` signature with Django's `SECRET_KEY`. A token with another `alg` fails.
-- It requires an `exp` claim and rejects an expired token. It allows 60 seconds of clock skew on `exp` and `nbf`.
+- It requires an `exp` claim and rejects an expired token. It rejects a token whose `nbf` or `iat` is in the future.
+- It allows 60 seconds of clock skew on `exp`, `nbf` and `iat`. The `leeway` argument sets this time.
 - It rejects a token whose type claim names a refresh token or an ID token. See [Use access and refresh tokens](#use-access-and-refresh-tokens).
+- It reads each claim in one JSON type. See [Give each claim its JSON type](#give-each-claim-its-json-type).
 
 Each failure gets the same 401. The body does not tell the client why the token failed.
 
@@ -291,10 +293,83 @@ Other routes get no backend and do no token work. `auth=[]` and `BOLT_AUTHENTICA
 | `cookie` | `None` | Read the token from this cookie, not from the header |
 | `audience` | `None` | Require this value in the `aud` claim |
 | `issuer` | `None` | Require this value in the `iss` claim |
-| `leeway` | `60` | Seconds of clock skew allowed on `exp` and `nbf` |
+| `leeway` | `60` | Seconds of clock skew allowed on `exp`, `nbf` and `iat` |
 
 The algorithms are `HS256`, `HS384`, `HS512`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384` and `EdDSA`.
 All algorithms of one backend must use the same kind of key. An unknown name, or a mix of key kinds, stops startup.
+
+### Give each claim its JSON type
+
+Bolt follows RFC 7515, RFC 7519 and PyJWT. Each claim and header parameter that Bolt reads has one JSON type.
+A whole number is an integer, also when the token writes it as `1.0` or `1e0` (RFC 8259, section 6).
+
+| Name | Bolt accepts | Another value, also `null` |
+| --- | --- | --- |
+| `alg` (header) | A string in `algorithms`, with the same case | The token fails |
+| `kid` (header) | A string | The token fails |
+| `crit` (header) | No value. Bolt supports no critical extension | The token fails |
+| `b64` (header) | Each value but `false`. Bolt reads each payload as base64url (RFC 7797) | `false` fails the token |
+| `sub`, `jti` | A string | The token fails |
+| `typ`, `token_type`, `token_use` | A string | The token fails |
+| `exp`, `nbf`, `iat` | A number from the year 1 to the end of the year 9999 UTC, the range of a Python `datetime`. It can have a fraction | The token fails |
+| `iss` | A string | The token fails when the backend has an `issuer`. Else the claim is malformed |
+| `aud` | A string, or an array of strings | The token fails when the backend has an `audience`. Else the claim is malformed |
+| `is_staff`, `is_superuser`, `is_admin` | `true` or `false` | The claim is malformed. `1` and `"true"` are not `true` |
+| `permissions`, `amr` | An array of strings | The claim is malformed |
+| `fam` | A string | The claim is malformed |
+| `oat`, `ver` | An integer | The claim is malformed |
+| Each other claim | Any type | Bolt keeps the value |
+
+A claim has three states: missing, valid and malformed.
+A wrong value fails the token when its row in the table says so, also on a route that does not read the claim.
+In each other case, the claim is malformed, and Bolt accepts the token, as PyJWT does.
+Each part of Bolt that reads a malformed claim fails:
+
+- Each `Requires` guard on the claim refuses the request with its 403. This applies to each form of `Requires`, also `none_of`.
+- The claim grants nothing. A malformed `is_staff` or `is_superuser` is `False` in the context. A malformed `permissions` gives no permission.
+  A malformed claim does not change the other claims. With `"permissions": "admin"` and `"is_staff": true`, `is_staff` stays `True`.
+- `auth_claims` gives the claim as `None`. A missing claim is not in `auth_claims`.
+- `rotate_refresh_token()` and the refresh route of `JWTAuthViews` refuse a malformed `fam`, `ver`, `oat` or `amr`. The logout routes refuse a malformed `fam` or `ver`.
+
+A guard with `none_of` also refuses a malformed claim, because the claim can hold a refused value in another form:
+
+<!-- fragment -->
+```python
+@api.get("/report", auth=[JWTAuthentication()], guards=[Requires("permissions", none_of=["banned"])])
+async def report(request):
+    # "permissions": ["read"] passes. "permissions": ["banned"] gets 403.
+    # "permissions": ["banned", 1] and "permissions": "banned" are malformed. They also get 403.
+    # A token with no "permissions" claim passes.
+    return {"ok": True}
+```
+
+A route that reads no malformed claim accepts the token. A handler that reads `auth_claims` must treat `None` as a failure too.
+
+A claim name that occurs two times fails the token. A header parameter of the table that occurs two times also fails it.
+Each of the three parts of the token is base64url with no `=` padding (RFC 7515). A token with padding fails.
+
+For the expiry check, Bolt removes the fraction of `exp`, as PyJWT does. Thus a token with `"exp": 100.5` expires at 100 seconds plus the `leeway`.
+With the default `leeway` of 60 seconds, it expires at 160. With `leeway=0`, it expires at 100. `auth_claims` still gives `100.5`.
+Bolt reads a decimal as the nearest float, as Python does. Thus the expiry check reads `"exp": 100.99999999` as 100, not 101.
+Bolt does not round `nbf` and `iat`. A token is valid from `leeway` seconds before the time that `nbf` or `iat` gives.
+In `auth_claims`, a time with a fraction is a `float`. A whole number is an `int`.
+
+### Differences from PyJWT
+
+Bolt refuses each of these tokens, and `jwt.decode` of PyJWT accepts it:
+
+| Token | Reason |
+| --- | --- |
+| A claim name that occurs two times, or two `alg`, `kid`, `crit` or `b64` header parameters | RFC 7515 and RFC 7519, section 4 allow a parser to refuse it. PyJWT keeps the last value |
+| A part with `=` padding | RFC 7515, section 2. PyJWT accepts padding for tokens of AWS ALB |
+| `exp`, `nbf` or `iat` as a string or as `true` or `false` | RFC 7519, section 2: a NumericDate is a JSON number. PyJWT reads `"123"` and `true` with `int()` |
+| A `typ`, `token_type` or `token_use` that is not a string, or that names `refresh`, `offline` or `id` | Bolt checks the type of each token. PyJWT does not |
+| `crit` with `["b64"]` and `"b64": true` | Bolt supports no critical extension. PyJWT supports RFC 7797 |
+| `NaN`, `Infinity`, a number beyond the range of a float, a private claim that makes the JSON 128 or more levels deep, or a lone surrogate | RFC 8259 has no `NaN`, and it allows limits on range and depth. A lone surrogate is not a Unicode string. Bolt does not read into a claim that has a type in Bolt, so depth there makes the claim malformed and does not refuse the token |
+| A header or claims in UTF-16, or with a UTF-8 byte order mark | RFC 7515, section 5.2 and RFC 7519, section 7.2: each part is UTF-8 JSON. Python's `json` reads the other forms |
+| `"jti": ""` on a backend with `require_jti=True` | An empty `jti` names no token. The `require` option of PyJWT checks only that the claim is present |
+| `nbf` or `iat` with a fraction, less than one second after now plus `leeway` | PyJWT rounds the claim down, so it accepts the token up to one second early. Bolt does not round |
+| `exp`, `nbf` or `iat` before the year 1 or after the year 9999, such as `"exp": 1e300` | A Python `datetime` cannot hold the time, so the revocation stores cannot keep the token. PyJWT reads any number with `int()` |
 
 ### Verify tokens from an identity provider
 
@@ -556,7 +631,7 @@ The header value is the key, `Bearer <key>` or `ApiKey <key>`. Bolt compares key
 The context has `"user_id": "apikey:<key>"`, so do not log the context.
 A key has no Django user: `request.user` and `await request.auser()` give `AnonymousUser`.
 
-`api_keys` must be a set, list or tuple of strings. A plain string, an empty key, or a key that starts with `Bearer ` or `ApiKey ` raises `ImproperlyConfigured`.
+`api_keys` must be a set, list or tuple of strings. A plain string, an empty key, or a key that starts with a space, `Bearer ` or `ApiKey ` raises `ImproperlyConfigured`.
 Thus a missing environment variable stops startup.
 `key_permissions` gives the permissions that `Requires("permissions", ...)` checks. Each key in it must be in `api_keys`.
 Use `header="authorization"` to read the key from another header.

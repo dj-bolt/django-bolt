@@ -16,11 +16,13 @@ from django.utils.module_loading import import_string
 from django_bolt import BoltAPI
 from django_bolt.auth import (
     DjangoCacheRevocation,
+    DjangoORMRevocation,
     InMemoryRevocation,
     IsAuthenticated,
     JWTAuthentication,
     JWTAuthViews,
 )
+from django_bolt.auth.revocation_db.models import RevokedToken
 from django_bolt.auth.tokens import create_token_pair, rotate_refresh_token
 from django_bolt.testing import TestClient
 
@@ -420,6 +422,102 @@ def test_refresh_token_without_a_version_has_version_zero():
         # Version 0 is now old.
         assert _post_with_refresh(client, "/auth/logout-all", second).status_code == 401
         assert _post_with_refresh(client, "/auth/refresh", second).status_code == 401
+
+
+MALFORMED_REFRESH_CLAIMS = {
+    "ver-string": ({"ver": "0"}, ("/auth/refresh", "/auth/logout", "/auth/logout-all")),
+    "ver-fraction": ({"ver": 0.5}, ("/auth/refresh", "/auth/logout", "/auth/logout-all")),
+    "ver-null": ({"ver": None}, ("/auth/refresh", "/auth/logout", "/auth/logout-all")),
+    "fam-number": ({"fam": 7}, ("/auth/refresh", "/auth/logout", "/auth/logout-all")),
+    "fam-array": ({"fam": ["family-1"]}, ("/auth/refresh", "/auth/logout", "/auth/logout-all")),
+    # Only the refresh route reads `oat` and `amr`.
+    "oat-string": ({"oat": "1"}, ("/auth/refresh",)),
+    "oat-null": ({"oat": None}, ("/auth/refresh",)),
+    "amr-string": ({"amr": "pwd"}, ("/auth/refresh",)),
+    "amr-mixed-array": ({"amr": ["pwd", 1]}, ("/auth/refresh",)),
+}
+
+
+@pytest.mark.parametrize("name", list(MALFORMED_REFRESH_CLAIMS))
+def test_a_route_that_reads_a_malformed_claim_refuses_the_token(name):
+    """Bolt accepts a token with a claim in another JSON form. Each route that reads that claim refuses it."""
+    changes, paths = MALFORMED_REFRESH_CLAIMS[name]
+    now = int(time.time())
+    claims = {
+        "sub": "view-user",
+        "typ": "refresh",
+        "jti": "jti-1",
+        "fam": "family-1",
+        "ver": 0,
+        "oat": now,
+        "amr": ["pwd"],
+        "iat": now,
+        "exp": now + 600,
+    }
+    malformed = jwt.encode({**claims, **changes}, SECRET, algorithm="HS256")
+
+    with TestClient(_views_api()) as client:
+        responses = {path: _post_with_refresh(client, path, malformed) for path in paths}
+        assert {path: (r.status_code, r.json()) for path, r in responses.items()} == dict.fromkeys(
+            paths, (401, {"detail": "Invalid token"})
+        )
+        # The user has version 0 still, so the same token with valid claims is live.
+        valid = jwt.encode({**claims, "jti": "jti-2"}, SECRET, algorithm="HS256")
+        assert _post_with_refresh(client, "/auth/refresh", valid).status_code == 200
+
+
+def _orm_views_api() -> BoltAPI:
+    api = BoltAPI()
+
+    async def validate(request, credentials):
+        return User()
+
+    JWTAuthViews(store=DjangoORMRevocation(), secret=SECRET, credential_validator=validate).register(api)
+    return api
+
+
+def _refresh_token(**changes) -> str:
+    now = int(time.time())
+    claims = {"sub": "view-user", "typ": "refresh", "jti": "jti-1", "fam": "family-1", "ver": 0, "iat": now}
+    return jwt.encode({**claims, "exp": now + 600, **changes}, SECRET, algorithm="HS256")
+
+
+LIFECYCLE_PATHS = ("/auth/refresh", "/auth/logout", "/auth/logout-all")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"exp": 1e300},
+        {"exp": 2**62},
+        {"exp": 253402300800},
+        {"nbf": -62135596801},
+        {"iat": -1e300},
+        {"iat": 253402300800},
+    ],
+    ids=["exp-1e300", "exp-2-62", "exp-year-10000", "nbf-year-0", "iat-negative-1e300", "iat-year-10000"],
+)
+@pytest.mark.parametrize("path", LIFECYCLE_PATHS)
+def test_a_time_that_a_datetime_cannot_hold_gets_a_401(changes, path):
+    """The store keeps an entry until a ``datetime``. Such an ``exp`` gave a 500 with ``DjangoORMRevocation``."""
+    with TestClient(_orm_views_api()) as client:
+        response = _post_with_refresh(client, path, _refresh_token(**changes))
+        expired = _post_with_refresh(client, path, _refresh_token(exp=int(time.time()) - 600))
+        assert response.status_code == 401
+        assert (response.json(), response.headers.get("www-authenticate")) == (
+            expired.json(),
+            expired.headers.get("www-authenticate"),
+        )
+        assert not RevokedToken.objects.exists()
+        # Nothing consumed the token: the same jti with a valid exp still works.
+        assert _post_with_refresh(client, path, _refresh_token()).status_code == 200
+
+
+@pytest.mark.parametrize("path", LIFECYCLE_PATHS)
+def test_an_exp_in_the_last_second_of_a_datetime_works_with_the_orm_store(path):
+    """``exp`` plus the leeway is after the year 9999. The store entry ends in the year 9999."""
+    with TestClient(_orm_views_api()) as client:
+        assert _post_with_refresh(client, path, _refresh_token(exp=253402300799)).status_code == 200
 
 
 class RecordingBackend(ModelBackend):

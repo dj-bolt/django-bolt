@@ -35,6 +35,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import jwt
@@ -228,9 +229,13 @@ async def rotate_refresh_token(
     fam = refresh_claims.get("fam")
     if rotate and (not isinstance(fam, str) or not fam):
         raise TokenRotationError("Rotating refresh token missing family id")
+    # ``auth_claims`` gives a claim of another JSON form as None. Mode B reads
+    # the family too, so such a claim fails there as well.
+    if "fam" in refresh_claims and not isinstance(fam, str):
+        raise TokenRotationError("Refresh token has invalid family id")
     # A revoked family blocks both modes: family revocation is the "kill this
     # session" switch, and a reusable (Mode B) token must not outlive it.
-    if isinstance(fam, str) and fam and await _is_family_revoked(store, fam):
+    if fam and await _is_family_revoked(store, fam):
         raise TokenRotationError("Refresh token family revoked")
 
     now = int(time.time())
@@ -250,13 +255,17 @@ async def rotate_refresh_token(
 
     oat = refresh_claims.get("oat")
     parsed_oat: int | None = None
-    if oat is not None:
+    if "oat" in refresh_claims:
         try:
             parsed_oat = int(oat)
         except (TypeError, ValueError) as exc:
             raise TokenRotationError("Refresh token has invalid origin auth time") from exc
         if parsed_oat > now:
             raise TokenRotationError("Refresh token origin auth time is in the future")
+
+    amr = refresh_claims.get("amr")
+    if "amr" in refresh_claims and not (isinstance(amr, list) and all(isinstance(method, str) for method in amr)):
+        raise TokenRotationError("Refresh token has invalid authentication methods")
 
     effective_access_ttl = access_ttl
     if max_session_lifetime is not None:
@@ -289,7 +298,10 @@ async def rotate_refresh_token(
     if rotate:
         try:
             token_exp = int(refresh_claims["exp"])
-        except (KeyError, TypeError, ValueError) as exc:
+            # A store keeps the consumed marker until a `datetime`. Bolt's check
+            # refuses a time that a `datetime` cannot hold, so a caller's claims must too.
+            datetime.fromtimestamp(token_exp, UTC)
+        except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
             raise TokenRotationError("Refresh token has invalid expiry") from exc
 
     # The Rust validator accepts a token until `exp + leeway`. A store can keep
@@ -313,7 +325,7 @@ async def rotate_refresh_token(
     # are deliberately NOT copied from the old token (see docstring).
     carried: dict[str, Any] = {}
     if "amr" in refresh_claims:
-        carried["amr"] = refresh_claims["amr"]
+        carried["amr"] = amr
     if claims:
         carried.update(claims)
 
