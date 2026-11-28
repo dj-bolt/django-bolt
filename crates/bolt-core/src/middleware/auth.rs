@@ -951,22 +951,47 @@ pub fn build_jwt_decoding_key(
 /// Build a `kid -> DecodingKey` map from a JWKS JSON document at
 /// registration time. The document is typically fetched from a provider's
 /// `jwks_url` (Clerk, Auth0, ...) by Python at startup and handed here as a
-/// string. Keys without a `kid` are skipped (they can't be selected).
+/// string.
+///
+/// A member that Bolt cannot use is skipped, as RFC 7517, section 5 asks:
+/// a key of an unknown type, a key with a missing or bad member, and a value
+/// that is not a JWK. A key with no `kid` is skipped, because no token can
+/// select it. A key whose `use` is not "sig" is skipped (RFC 7517, section
+/// 4.2), so an encryption key never verifies a token. A document with no
+/// usable key is an error.
 pub fn build_jwks_key_source(jwks_json: &str) -> Result<JwtKeySource, String> {
-    let set: jsonwebtoken::jwk::JwkSet = serde_json::from_str(jwks_json)
+    #[derive(serde::Deserialize)]
+    struct Members {
+        keys: Vec<serde_json::Value>,
+    }
+    let set: Members = serde_json::from_str(jwks_json)
         .map_err(|e| format!("Invalid JWKS document for JWT auth: {}", e))?;
     let mut keys = HashMap::new();
-    for jwk in &set.keys {
-        let kid = match &jwk.common.key_id {
-            Some(kid) => kid.clone(),
-            None => continue,
+    for member in set.keys {
+        let Ok(jwk) = serde_json::from_value::<jsonwebtoken::jwk::Jwk>(member) else {
+            continue;
         };
-        let key = DecodingKey::from_jwk(jwk)
-            .map_err(|e| format!("Invalid JWK '{}' in JWKS for JWT auth: {}", kid, e))?;
+        let Some(kid) = jwk.common.key_id.clone() else {
+            continue;
+        };
+        if jwk
+            .common
+            .public_key_use
+            .as_ref()
+            .is_some_and(|key_use| *key_use != jsonwebtoken::jwk::PublicKeyUse::Signature)
+        {
+            continue;
+        }
+        let Ok(key) = DecodingKey::from_jwk(&jwk) else {
+            continue;
+        };
         keys.insert(kid, key);
     }
     if keys.is_empty() {
-        return Err("JWKS document contained no usable keys (each key needs a 'kid')".to_string());
+        return Err(
+            "JWKS document contained no usable keys (each key needs a 'kid', a type that Bolt supports, and no 'use' other than 'sig')"
+                .to_string(),
+        );
     }
     Ok(JwtKeySource::Jwks(keys))
 }
@@ -2186,6 +2211,53 @@ mod tests {
     fn build_jwks_rejects_empty_or_invalid() {
         assert!(build_jwks_key_source("not json").is_err());
         assert!(build_jwks_key_source(r#"{"keys":[]}"#).is_err());
+    }
+
+    /// The kids of the keys that a JWKS document gives.
+    fn jwks_kids(document: &str) -> Vec<String> {
+        match build_jwks_key_source(document) {
+            Ok(JwtKeySource::Jwks(keys)) => {
+                let mut kids: Vec<String> = keys.into_keys().collect();
+                kids.sort();
+                kids
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An `oct` key: the smallest JWK that `DecodingKey::from_jwk` accepts.
+    const GOOD_JWK: &str = r#"{"kty":"oct","kid":"good","k":"c2VjcmV0"}"#;
+
+    #[test]
+    fn a_jwks_member_that_bolt_cannot_use_is_skipped() {
+        // RFC 7517, section 5: ignore a key of an unknown type, with a
+        // missing member, or with a value out of range.
+        for member in [
+            r#"{"kty":"OKP","crv":"X25519","x":"hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo","kid":"x"}"#,
+            r#"{"kty":"AKP","alg":"ML-DSA-44","pub":"AAAA","kid":"x"}"#,
+            r#"{"kty":"RSA","n":"AQAB","kid":"x"}"#,
+            r#""not-a-key""#,
+            r#"{"kid":"x"}"#,
+        ] {
+            let document = format!(r#"{{"keys":[{GOOD_JWK},{member}]}}"#);
+            assert_eq!(jwks_kids(&document), ["good"], "{member}");
+        }
+    }
+
+    #[test]
+    fn a_jwks_key_for_encryption_does_not_verify() {
+        // RFC 7517, section 4.2: "use" "enc" is for encryption.
+        let document = format!(
+            r#"{{"keys":[{GOOD_JWK},{{"kty":"oct","kid":"enc","use":"enc","k":"c2VjcmV0"}},{{"kty":"oct","kid":"sig","use":"sig","k":"c2VjcmV0"}}]}}"#
+        );
+        assert_eq!(jwks_kids(&document), ["good", "sig"]);
+    }
+
+    #[test]
+    fn a_jwks_with_no_usable_key_is_an_error() {
+        let document = r#"{"keys":[{"kty":"oct","kid":"enc","use":"enc","k":"c2VjcmV0"},"x"]}"#;
+        let error = build_jwks_key_source(document).unwrap_err();
+        assert!(error.contains("no usable keys"), "{error}");
     }
 
     #[test]

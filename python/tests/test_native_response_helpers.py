@@ -11,10 +11,19 @@ from django_bolt import _core
 from django_bolt.exceptions import ResponseFileNotAllowed, ResponseFileNotFound
 
 
-@pytest.mark.parametrize("tz", [None, UTC, timezone(timedelta(hours=5))])
-def test_native_cookie_date_preserves_wall_time(tz):
+@pytest.mark.parametrize(
+    ("tz", "expected"),
+    [
+        (None, "Sun, 09 Jun 2030 10:11:12 GMT"),
+        (UTC, "Sun, 09 Jun 2030 10:11:12 GMT"),
+        (timezone(timedelta(hours=5)), "Sun, 09 Jun 2030 05:11:12 GMT"),
+        (timezone(timedelta(hours=-11)), "Sun, 09 Jun 2030 21:11:12 GMT"),
+    ],
+)
+def test_native_cookie_date_is_in_utc(tz, expected):
+    """RFC 9110, section 5.6.7: an HTTP-date is in UTC. A naive datetime is UTC, as in Django."""
     value = datetime(2030, 6, 9, 10, 11, 12, tzinfo=tz)
-    assert _core.format_cookie_date(value) == "Sun, 09 Jun 2030 10:11:12 GMT"
+    assert _core.format_cookie_date(value) == expected
 
 
 def test_native_file_resolution(tmp_path):
