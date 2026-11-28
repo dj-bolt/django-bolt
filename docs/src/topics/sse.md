@@ -111,11 +111,15 @@ In the browser, listen for a named event with `source.addEventListener("publishe
 | `retry` | `int \| None` | `None` | `retry:` line. The time in milliseconds that the browser waits before it connects again. |
 | `comment` | `str \| None` | `None` | `:` line. The browser ignores it. |
 
-Text with line breaks becomes one `data:` line for each line.
+Text with line breaks becomes one `data:` line for each line. Only CR, LF and CRLF end a line, as in the browser.
+Thus U+2028 and the other Unicode line separators stay in the data, and a browser reads the data back unchanged.
+A browser joins the lines with LF, so a CR or CRLF in the data arrives as LF.
+Empty data, and data that ends with a line break, read back unchanged too.
 `ServerSentEvent` raises `ValueError` in these cases:
 
 - You set both `data` and `raw_data`.
 - `id` contains a null character.
+- `id` or `event` contains a line break (CR or LF). A line break would end the field, and the text after it would become another field or another event.
 - `retry` is less than 0.
 
 A stream can mix the two kinds of item.

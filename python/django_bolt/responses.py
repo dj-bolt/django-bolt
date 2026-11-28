@@ -350,8 +350,31 @@ class ServerSentEvent(msgspec.Struct, frozen=True):
             )
         if self.id is not None and "\0" in self.id:
             raise ValueError("SSE 'id' must not contain null characters")
+        _check_one_line("id", self.id)
+        _check_one_line("event", self.event)
         if self.retry is not None and self.retry < 0:
             raise ValueError("SSE 'retry' must be a non-negative integer")
+
+
+def _check_one_line(field: str, value: str | None) -> None:
+    """Raise ValueError for a CR or LF in a field that has one line.
+
+    A line break ends the field. The text after it becomes another field, or
+    another event after a blank line, so it cannot be sent.
+    """
+    if value is not None and ("\n" in value or "\r" in value):
+        raise ValueError(f"SSE {field!r} must not contain a line break (CR or LF)")
+
+
+def _lines(text: str) -> list[str]:
+    """The lines of a field value. Only CRLF, LF and CR end a line (WHATWG HTML, section 9.2.6).
+
+    ``str.splitlines`` also splits at U+2028 and other separators, and drops a
+    last empty line. Each line of the result becomes one field line.
+    """
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.split("\n")
 
 
 def format_sse_event(
@@ -366,6 +389,8 @@ def format_sse_event(
     """Build SSE wire-format bytes from pre-serialized data.
 
     The result always ends with ``\\n\\n`` (the event terminator).
+    A browser reads the data back unchanged: only CR, LF and CRLF split it
+    into ``data:`` lines. ``id`` and ``event`` must not contain CR or LF.
 
     Pass ``data_bytes`` instead of ``data_str`` when the payload is already
     encoded (e.g. from msgspec) to avoid a decode/encode round-trip.
@@ -384,20 +409,25 @@ def format_sse_event(
     ):
         return b"data: " + data_bytes + b"\n\n"
 
+    # The checks inline the common case: a value with no line break.
+    if id is not None and ("\n" in id or "\r" in id):
+        _check_one_line("id", id)
+    if event is not None and ("\n" in event or "\r" in event):
+        _check_one_line("event", event)
     lines: list[str] = []
 
     if comment is not None:
-        for line in comment.splitlines():
+        for line in _lines(comment):
             lines.append(f": {line}")
 
     if event is not None:
         lines.append(f"event: {event}")
 
     if data_str is not None:
-        for line in data_str.splitlines():
+        for line in _lines(data_str):
             lines.append(f"data: {line}")
     elif data_bytes is not None:
-        for line in data_bytes.decode("utf-8").splitlines():
+        for line in _lines(data_bytes.decode("utf-8")):
             lines.append(f"data: {line}")
 
     if id is not None:

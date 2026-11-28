@@ -228,6 +228,7 @@ format_sse_event(*, data_str=None, data_bytes=None, event=None, id=None, retry=N
 ```
 
 Return the wire form of one event. The result ends with a blank line. Give `data_bytes` for data that is already encoded.
+A browser reads the data back unchanged; only CR, LF and CRLF split it into `data:` lines. A line break in `id` or `event` raises `ValueError`.
 
 ## set_cookie()
 
