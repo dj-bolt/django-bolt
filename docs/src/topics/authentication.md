@@ -397,6 +397,9 @@ Bolt fetches the key set at startup and selects a key by the `kid` header of the
 It fetches the set again each `jwks_refresh_interval` seconds (default 300) in the background.
 A token with an unknown `kid` starts a fetch at once. After that fetch, an unknown `kid` starts the next fetch after 30 seconds or more.
 When a fetch fails, Bolt keeps the last keys.
+Bolt skips a key that it cannot use, as RFC 7517, section 5 asks. Examples are a key type that Bolt does not support and a key with a missing member.
+Bolt also skips a key with no `kid`, and a key whose `use` is not `sig`. Thus an encryption key never verifies a token.
+A key set with no usable key stops the startup. In a later fetch, Bolt logs it and keeps the last keys.
 
 `oidc_issuer="https://auth.example.com"` reads the issuer, the key set URL and the algorithms from the OpenID Connect discovery document. It needs `audience`.
 `jwks={...}` gives the key set directly, for tests or for a server with no network access.
