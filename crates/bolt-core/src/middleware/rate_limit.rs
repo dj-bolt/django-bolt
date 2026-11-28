@@ -5,6 +5,7 @@ use governor::clock::{Clock, DefaultClock, Reference};
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{IpAddr, Ipv6Addr};
@@ -170,6 +171,8 @@ pub struct RateLimiters {
     limiters: DashMap<(usize, u32, u32, LimiterKey), Arc<Bucket>, RandomState>,
     /// The number of limiters, for cleanup.
     count: AtomicUsize,
+    /// Lets one cleanup run at a time. See `cleanup_old_limiters`.
+    cleanup: Mutex<()>,
     /// The prefix length of the network that an IPv6 client keys on, and its
     /// mask. See `client`.
     ipv6_prefix: u8,
@@ -351,6 +354,7 @@ impl RateLimiters {
         Self {
             limiters: DashMap::default(),
             count: AtomicUsize::new(0),
+            cleanup: Mutex::new(()),
             ipv6_prefix,
             // The host bits are `MAX >> prefix`. A prefix over 128 keeps all bits.
             ipv6_mask: !(u128::MAX.checked_shr(u32::from(ipv6_prefix)).unwrap_or(0)),
@@ -387,7 +391,16 @@ impl RateLimiters {
     /// `check_n` of the whole burst passes only on a full bucket, and that
     /// bucket goes away in the same step. `retain` holds the write lock of
     /// each shard, so no request takes from a bucket while it is checked.
+    ///
+    /// Many requests can find the map full at the same time. One cleanup runs
+    /// at a time, and each cleanup first checks that the map is still full.
+    /// Thus a later cleanup does not delete spent buckets when an earlier
+    /// cleanup has already made room.
     fn cleanup_old_limiters(&self) {
+        let _cleanup = self.cleanup.lock();
+        if self.count.load(Ordering::Relaxed) < MAX_LIMITERS {
+            return;
+        }
         let to_remove = MAX_LIMITERS / 5;
         let mut removed = 0;
         self.limiters.retain(|&(_, _, burst, _), bucket| {
@@ -646,6 +659,20 @@ mod tests {
         assert!(
             (60_000..100_000).all(|n| !holds(&limiters, n)),
             "a full bucket stayed"
+        );
+        assert_eq!(limiters.limiters.len(), 60_001);
+        assert_eq!(limiters.count.load(Ordering::Relaxed), 60_001);
+    }
+
+    /// Two requests can find the map full before either cleanup ends. The
+    /// later cleanup then finds room and deletes no spent bucket.
+    #[test]
+    fn a_later_cleanup_finds_room_and_keeps_spent_buckets() {
+        let limiters = cleanup_after_fill(60_000, 40_000);
+        limiters.cleanup_old_limiters();
+        assert!(
+            (0..60_000).all(|n| holds(&limiters, n)),
+            "a spent bucket was deleted"
         );
         assert_eq!(limiters.limiters.len(), 60_001);
         assert_eq!(limiters.count.load(Ordering::Relaxed), 60_001);
