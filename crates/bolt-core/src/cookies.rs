@@ -20,6 +20,9 @@ use crate::response_meta::CookieData;
 /// - Rejects control characters in the value, as Django does
 /// - Rejects a value character above U+00FF, which Django cannot send
 /// - Quotes the value as Django does (see `quote_cookie_value`)
+/// - Rejects a `;` or a control character in the path, the domain and the
+///   expiry date (RFC 6265, section 4.1.1), so they cannot add an attribute
+/// - Sends `Secure` only when `secure` is set, as Django does
 ///
 /// Returns None if the cookie name or value is invalid, with a warning logged.
 #[inline]
@@ -54,6 +57,26 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
         return None;
     }
 
+    // RFC 6265, section 4.1.1: an attribute value has no control character
+    // and no `;`. A `;` would add an attribute after Bolt's own, for example
+    // a second `SameSite`, and a line break would fail the whole response.
+    let attributes = [
+        Some(c.path.as_str()),
+        c.domain.as_deref(),
+        c.expires.as_deref(),
+    ];
+    if attributes
+        .into_iter()
+        .flatten()
+        .any(|value| value.contains(';') || contains_control_chars(value))
+    {
+        eprintln!(
+            "[django-bolt] WARNING: Cookie '{}' has a ';' or a control character in its path, domain or expires - rejected",
+            c.name
+        );
+        return None;
+    }
+
     // Build cookie using the cookie crate
     let mut cookie =
         Cookie::build((c.name.as_str(), quote_cookie_value(&c.value))).path(c.path.as_str());
@@ -79,10 +102,9 @@ pub fn format_cookie(c: &CookieData) -> Option<String> {
         cookie = cookie.domain(domain);
     }
 
-    // Secure
-    if c.secure {
-        cookie = cookie.secure(true);
-    }
+    // Secure: always set, true or false. Without a value, the crate adds
+    // `Secure` for `SameSite=None`, and Django does not.
+    cookie = cookie.secure(c.secure);
 
     // HttpOnly
     if c.httponly {
@@ -383,6 +405,56 @@ mod tests {
             httponly: false,
             samesite: None,
         }
+    }
+
+    /// Django sends `Secure` only for `secure=True`, also with
+    /// `SameSite=None`. The `cookie` crate adds it for `SameSite=None` unless
+    /// `secure` is set to false.
+    #[test]
+    fn samesite_none_sends_secure_only_when_asked() {
+        let mut c = cookie_with_value("v");
+        c.samesite = Some("None".to_string());
+        let plain = format_cookie(&c).unwrap();
+        assert!(
+            plain.contains("SameSite=None") && !plain.contains("Secure"),
+            "{plain}"
+        );
+        c.secure = true;
+        assert!(format_cookie(&c).unwrap().contains("Secure"));
+    }
+
+    /// RFC 6265, section 4.1.1: an attribute value has no control character
+    /// and no `;`. A `;` would add an attribute that overrides Bolt's own.
+    #[test]
+    fn path_domain_and_expires_cannot_add_an_attribute() {
+        let bad = [
+            ("/a; SameSite=None", None, None),
+            ("/a\tb", None, None),
+            ("/a\r\nX-Evil: 1", None, None),
+            ("/", Some("example.com; SameSite=None"), None),
+            ("/", Some("example.com\x7f"), None),
+            (
+                "/",
+                None,
+                Some("Thu, 01 Jan 2099 00:00:00 GMT; Path=/admin"),
+            ),
+            ("/", None, Some("x\ny")),
+        ];
+        for (path, domain, expires) in bad {
+            let mut c = cookie_with_value("v");
+            c.path = path.to_string();
+            c.domain = domain.map(str::to_string);
+            c.expires = expires.map(str::to_string);
+            assert!(
+                format_cookie(&c).is_none(),
+                "{path:?} {domain:?} {expires:?}"
+            );
+        }
+        let mut good = cookie_with_value("v");
+        good.path = "/a b/ä".to_string();
+        good.domain = Some(".example.com".to_string());
+        good.expires = Some("Thu, 01 Jan 2099 00:00:00 GMT".to_string());
+        assert!(format_cookie(&good).is_some());
     }
 
     #[test]
