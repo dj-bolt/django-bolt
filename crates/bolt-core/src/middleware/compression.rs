@@ -11,7 +11,9 @@ use actix_web::{
     body::{BodySize, MessageBody},
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
     http::StatusCode,
-    http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding, ETAG, HeaderValue, VARY},
+    http::header::{
+        ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding, ETAG, HeaderValue, IF_NONE_MATCH, VARY,
+    },
 };
 use futures_util::future::{FutureExt, Map};
 use std::future::{Ready, ready};
@@ -120,6 +122,9 @@ fn encode_response<B: MessageBody>(res: Outcome<B>) -> Outcome<Encoder<B>> {
     let size = res.response().body().size();
     let encoding = response_encoding(accept_encoding, config, size);
     let negotiated = negotiates(config, size, res.status());
+    // A 304 has no body, so the size that decides a coding is not known here.
+    let coded_304 = res.status() == StatusCode::NOT_MODIFIED
+        && select_encoding(accept_encoding, config) != ContentEncoding::Identity;
 
     // When the encoder compresses the body, it sets Content-Encoding
     // and appends `Vary: accept-encoding` after a Vary of the handler.
@@ -136,6 +141,18 @@ fn encode_response<B: MessageBody>(res: Outcome<B>) -> Outcome<Encoder<B>> {
             // RFC 9110, section 8.8.1: the coded body is another
             // representation, so a strong ETag of the plain body becomes weak.
             headers.insert(ETAG, weak);
+        }
+    } else if coded_304 {
+        // RFC 9110, section 15.4.5: a 304 has the ETag that the 200 would have.
+        // A client that holds the coded 200 sends its weak ETag, so it gets the
+        // weak form back. A client that holds the plain 200 sends the strong one.
+        let weak = response
+            .headers()
+            .get(ETAG)
+            .filter(|etag| lists_weak_form(req.headers(), etag.as_bytes()))
+            .and_then(weak_etag);
+        if let Some(weak) = weak {
+            response.headers_mut().insert(ETAG, weak);
         }
     }
     Ok(ServiceResponse::new(
@@ -170,6 +187,35 @@ fn weak_etag(etag: &HeaderValue) -> Option<HeaderValue> {
         return None;
     }
     HeaderValue::from_bytes(&[b"W/", etag.as_bytes()].concat()).ok()
+}
+
+/// Whether `If-None-Match` lists the weak form of a strong `etag`, such as
+/// `W/"v1"` for `"v1"`.
+fn lists_weak_form(headers: &actix_web::http::header::HeaderMap, etag: &[u8]) -> bool {
+    headers.get_all(IF_NONE_MATCH).any(|value| {
+        let mut rest = value.as_bytes();
+        loop {
+            while let [b' ' | b'\t' | b',', tail @ ..] = rest {
+                rest = tail;
+            }
+            let (weak, tag) = match rest.strip_prefix(b"W/") {
+                Some(tag) => (true, tag),
+                None => (false, rest),
+            };
+            // An entity tag is a quoted string with no quote in it (RFC 9110,
+            // section 8.8.3). Anything else, such as `*`, ends the list.
+            let Some(end) = tag.get(1..).and_then(|t| t.iter().position(|&b| b == b'"')) else {
+                return false;
+            };
+            if !tag.starts_with(b"\"") {
+                return false;
+            }
+            if weak && &tag[..end + 2] == etag {
+                return true;
+            }
+            rest = &tag[end + 2..];
+        }
+    })
 }
 
 /// Whether a `Vary` of the handler names `accept-encoding` or is `*`.
@@ -358,6 +404,24 @@ mod representation_tests {
     use super::*;
     use actix_web::http::StatusCode;
     use actix_web::http::header::HeaderValue;
+
+    #[test]
+    fn if_none_match_lists_the_weak_form() {
+        use actix_web::http::header::{HeaderMap, IF_NONE_MATCH};
+        let lists = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(IF_NONE_MATCH, HeaderValue::from_static(value));
+            lists_weak_form(&headers, b"\"v1\"")
+        };
+        assert!(lists("W/\"v1\""));
+        assert!(lists("\"v0\", W/\"v1\""));
+        assert!(lists("W/\"a,b\", W/\"v1\""));
+        assert!(!lists("\"v1\""));
+        assert!(!lists("W/\"v2\", \"v1\""));
+        assert!(!lists("*"));
+        assert!(!lists("W/\"v1"));
+        assert!(!lists("W/\"v10\""));
+    }
 
     #[test]
     fn an_answer_negotiates_when_a_config_could_code_it() {

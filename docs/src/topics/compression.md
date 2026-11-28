@@ -44,9 +44,11 @@ The client chooses with its `Accept-Encoding` header. Bolt selects the encoding 
 A `q` value of 0 rejects an encoding, for example `br;q=0`. Other `q` values do not change the order above.
 
 Each response that Bolt can compress has `Vary: accept-encoding`, also when the client accepts no encoding and gets the plain body.
-A compressed response has a weak `ETag`: Bolt changes `"v1"` into `W/"v1"`, as Django's `GZipMiddleware` does.
+When a compressed response has an `ETag`, the `ETag` is weak: Bolt changes `"v1"` into `W/"v1"`, as Django's `GZipMiddleware` does.
+Bolt adds no `ETag` to a response that has none.
 The compressed body is another representation, and a strong `ETag` names only one (RFC 9110, section 8.8.1).
 A weak `ETag` still gives `304` for `If-None-Match`, but it never matches `If-Range`.
+A `304` gives the weak `ETag` back to a client that holds the compressed body.
 `*` accepts each encoding that the header does not name.
 Bolt does not use `deflate`, and it uses `zstd` only when `zstd` is the `backend`.
 
@@ -151,25 +153,49 @@ EXPORT = b'[{"id": 1, "title": "Hello"}]'
 CACHED_EXPORT = gzip.compress(EXPORT)
 
 
-def accepts_gzip(accept_encoding: str) -> bool:
+def coding_weights(accept_encoding: str) -> dict[str, float]:
+    weights = {}
     for item in accept_encoding.split(","):
-        coding, _, weight = item.partition(";")
-        if coding.strip().lower() == "gzip":
-            weight = weight.strip().lower()
-            return not weight.startswith("q=") or float(weight[2:]) > 0
-    return False
+        coding, *params = item.split(";")
+        coding = coding.strip().lower()
+        if not coding:
+            continue
+        weight = 1.0
+        for param in params:
+            name, _, value = param.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    weight = float(value)
+                except ValueError:
+                    weight = 0.0
+        weights[coding] = weight
+    return weights
+
+
+def choose_coding(accept_encoding: str) -> str | None:
+    weights = coding_weights(accept_encoding)
+    wildcard = weights.get("*")
+    if weights.get("gzip", wildcard or 0.0) > 0:
+        return "gzip"
+    if weights.get("identity", 1.0 if wildcard is None else wildcard) > 0:
+        return "identity"
+    return None
 
 
 @api.get("/articles/cached")
 async def cached_export(request: Request) -> Response:
     vary = {"Vary": "Accept-Encoding"}
-    if not accepts_gzip(request.headers.get("accept-encoding", "")):
+    coding = choose_coding(request.headers.get("accept-encoding", ""))
+    if coding == "gzip":
+        return Response(CACHED_EXPORT, media_type="application/json", headers={**vary, "Content-Encoding": "gzip"})
+    if coding == "identity":
         return Response(EXPORT, media_type="application/json", headers=vary)
-    return Response(CACHED_EXPORT, media_type="application/json", headers={**vary, "Content-Encoding": "gzip"})
+    return Response({"detail": "No acceptable encoding"}, status_code=406, headers=vary)
 ```
 
 Bolt does not check that the body matches the header, and it does not check the `Accept-Encoding` of the client. Thus the handler checks it.
-`gzip;q=0` refuses gzip, so the check reads the `q` value.
+`gzip;q=0` refuses gzip, and `*` accepts each encoding that the header does not name. A `q` value that is not a number refuses its encoding.
+A client that refuses gzip and the plain body gets `406`.
 Each answer has `Vary: Accept-Encoding`. Without it, a shared cache can send the gzip body to a client that cannot read it.
 
 ## Avoid the BREACH attack

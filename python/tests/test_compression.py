@@ -11,7 +11,7 @@ import msgspec
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Request
 from django_bolt.middleware import CompressionConfig, no_compress, skip_middleware
 from django_bolt.responses import HTML, PlainText, Response, StreamingResponse
 from django_bolt.testing import TestClient
@@ -545,6 +545,13 @@ def _etag_api():
     async def small():
         return Response({"data": "x"}, headers={"ETag": '"v1"'})
 
+    @api.get("/conditional")
+    async def conditional(request: Request):
+        # As actix-files does: the 304 carries the strong ETag of the file.
+        if request.headers.get("if-none-match"):
+            return PlainText("", status_code=304, headers={"ETag": '"v1"'})
+        return Response({"data": "x" * 1000}, headers={"ETag": '"v1"'})
+
     return api
 
 
@@ -568,6 +575,29 @@ def test_a_coded_response_has_a_weak_etag():
         small = client.get("/small", headers={"Accept-Encoding": "br"})
         assert small.headers.get("content-encoding") is None
         assert small.headers.get("etag") == '"v1"'
+
+
+def test_a_304_has_the_etag_that_the_client_holds():
+    """RFC 9110, section 15.4.5: a 304 has the ETag that the 200 would have.
+
+    A client that holds the coded answer sends its weak ETag, and gets the weak
+    form back. A client that holds the plain answer gets the strong ETag.
+    """
+    with TestClient(_etag_api(), use_http_layer=True) as client:
+        coded = client.get("/conditional", headers={"Accept-Encoding": "br"})
+        assert coded.headers.get("etag") == 'W/"v1"'
+
+        revalidated = client.get("/conditional", headers={"Accept-Encoding": "br", "If-None-Match": 'W/"v1"'})
+        assert revalidated.status_code == 304
+        assert revalidated.headers.get("etag") == 'W/"v1"'
+
+        plain = client.get("/conditional", headers={"Accept-Encoding": "identity", "If-None-Match": '"v1"'})
+        assert plain.status_code == 304
+        assert plain.headers.get("etag") == '"v1"'
+
+        other = client.get("/conditional", headers={"Accept-Encoding": "br", "If-None-Match": 'W/"v2", "v1"'})
+        assert other.status_code == 304
+        assert other.headers.get("etag") == '"v1"'
 
 
 @pytest.mark.parametrize("accept_encoding", [None, "identity", "deflate", "br;q=0, gzip;q=0"])
