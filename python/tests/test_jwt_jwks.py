@@ -112,6 +112,65 @@ class TestJwks:
         with pytest.raises(Exception, match="no usable keys"), TestClient(api):
             pass
 
+    @pytest.mark.parametrize(
+        "member",
+        [
+            {"kty": "OKP", "crv": "X25519", "x": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo", "kid": "x"},
+            {"kty": "AKP", "alg": "ML-DSA-44", "pub": "AAAA", "kid": "x"},
+            {"kty": "RSA", "n": KEY2_JWK["n"], "kid": "x"},
+            "not-a-key",
+        ],
+        ids=["x25519", "unknown-kty", "rsa-without-e", "not-an-object"],
+    )
+    def test_a_key_that_bolt_cannot_use_is_skipped(self, member):
+        """RFC 7517, section 5: a key set member that Bolt cannot use does not fail the set."""
+        api = BoltAPI()
+
+        @api.get(
+            "/k",
+            auth=[JWTAuthentication(jwks={"keys": [KEY1_JWK, member]}, algorithms=["RS256"])],
+            guards=[IsAuthenticated()],
+        )
+        async def route(request: dict):
+            return {"ok": True}
+
+        with TestClient(api) as c:
+            r = c.get("/k", headers={"Authorization": f"Bearer {make_token(KEY1_PRIV, 'key-1')}"})
+            assert r.status_code == 200
+
+    def test_an_encryption_key_does_not_verify_a_token(self):
+        """RFC 7517, section 4.2: a key with "use": "enc" is for encryption, not for signatures."""
+        enc_jwk = dict(KEY2_JWK, use="enc", alg="RSA-OAEP")
+        api = BoltAPI()
+
+        @api.get(
+            "/enc",
+            auth=[JWTAuthentication(jwks={"keys": [KEY1_JWK, enc_jwk]}, algorithms=["RS256"])],
+            guards=[IsAuthenticated()],
+        )
+        async def route(request: dict):
+            return {"ok": True}
+
+        with TestClient(api) as c:
+            signed_by_enc_key = make_token(KEY2_PRIV, "key-2")
+            assert c.get("/enc", headers={"Authorization": f"Bearer {signed_by_enc_key}"}).status_code == 401
+            signed_by_sig_key = make_token(KEY1_PRIV, "key-1")
+            assert c.get("/enc", headers={"Authorization": f"Bearer {signed_by_sig_key}"}).status_code == 200
+
+    def test_a_set_with_only_encryption_keys_fails_startup(self):
+        api = BoltAPI()
+
+        @api.get(
+            "/only-enc",
+            auth=[JWTAuthentication(jwks={"keys": [dict(KEY1_JWK, use="enc")]}, algorithms=["RS256"])],
+            guards=[IsAuthenticated()],
+        )
+        async def route():
+            return {"ok": True}
+
+        with pytest.raises(Exception, match="no usable keys"), TestClient(api):
+            pass
+
     def test_jwks_with_static_key_rejected_at_construction(self):
         with pytest.raises(ImproperlyConfigured, match="JWKS"):
             JWTAuthentication(secret="x", jwks=JWKS, algorithms=["RS256"])
