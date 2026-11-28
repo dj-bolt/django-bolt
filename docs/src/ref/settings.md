@@ -305,6 +305,31 @@ This is a Django setting, not an environment variable.
 A 1xx to 3xx response writes an access-log line only when it took this number of milliseconds or more.
 It applies to each API with no `logging_config`. It is the `min_duration_ms` of `LoggingConfig`.
 
+## Async ORM
+
+### BOLT_ASYNC_ORM_ON_LOOP
+
+Default: `False`. Type: `bool`.
+
+Run these reads on the event loop, with no thread: a QuerySet that a handler returns, `async for` over a QuerySet, `aiterator()`, `aget()`, `afirst()`, `alast()`, `aexists()`, `acount()`, `aaggregate()`, the count of the rows and the rows of a page for `@paginate`, and `await request.auser()`. The setting applies to PostgreSQL with psycopg 3.
+It has no effect on Windows.
+See [Async ORM](../topics/async-orm.md#run-async-reads-on-the-event-loop).
+
+## Garbage collector
+
+### BOLT_GC_FREEZE
+
+Default: `True`. Type: `bool`.
+
+`runbolt` calls `gc.freeze()` in each server process when the startup is complete, before the process takes requests.
+The garbage collector of Python then does not read the objects of the startup: the modules, the models and the routes.
+A full collection is thus much shorter, and the server answers no request during a collection.
+Measured with one process and 2,000 requests in one second: a full collection took 30 to 45 ms with `False`, and 1 to 4 ms with `True`.
+
+Reference counts still free a frozen object. The collector does not free a frozen object in a reference cycle.
+Set `False` when your application drops large objects of its startup later, and these objects have reference cycles.
+`TestClient` does not freeze objects.
+
 ## Signals
 
 ### BOLT_EMIT_SIGNALS
@@ -365,6 +390,11 @@ See [runbolt](runbolt.md) for the options.
 | `DJANGO_BOLT_ORM_THREADS` | int, 1 or more | `1` when each database is SQLite, else `4` | Threads of the ORM pool of one process. It runs the QuerySets that async handlers return, `await request.auser()`, and the async ORM calls of a route with no Django middleware. |
 | `DJANGO_BOLT_EXECUTOR_THREADS` | int, 1 or more | CPU count + 4, at most `32` | Threads of the shared pool of one process. Blocking sync handlers and `sync_to_thread` calls run on it. |
 | `DJANGO_BOLT_LANE_IDLE_SECONDS` | number, more than 0 | `10` | Idle seconds after which a request lane closes its database connections and stops. |
+| `DJANGO_BOLT_LOOP_CONNECTIONS` | int, 1 or more | `10` | Largest number of connections of one worker thread to one PostgreSQL database, for [`BOLT_ASYNC_ORM_ON_LOOP`](#bolt_async_orm_on_loop). |
+| `DJANGO_BOLT_LOOP_PIPELINE_DEPTH` | int, 1 or more | `16` | Largest number of statements in flight on one loop connection. With `1`, a connection runs one statement at a time. See [Statements in flight on one connection](../topics/async-orm.md#statements-in-flight-on-one-connection). |
+| `DJANGO_BOLT_LOOP_ACQUIRE_SECONDS` | number, more than 0 | `30` | Seconds that a read waits for a place on a loop connection. Then it fails with `OperationalError`. |
+| `DJANGO_BOLT_LOOP_IDLE_SECONDS` | number, more than 0 | `600` | Idle seconds after which a loop connection closes. |
+| `DJANGO_BOLT_LOOP_LIFETIME_SECONDS` | number, more than 0 | `1800` | Age in seconds after which a loop connection closes before its next use. |
 
 See [Async ORM](../topics/async-orm.md) and [Middleware](../topics/middleware.md).
 

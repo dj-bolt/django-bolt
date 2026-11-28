@@ -787,6 +787,12 @@ pub fn start_server(
     // before the runtime and the loop thread start.
     let config = ServerConfig::from_django_settings(py)?;
 
+    // The startup of Python is complete: the routes are registered, and each
+    // lifespan started. Only a server comes here. The test client does not,
+    // so the garbage collector of a test process stays as it is.
+    py.import("django_bolt._gc")?
+        .call_method0("freeze_startup_objects")?;
+
     // Read the environment variables of the server process before anything
     // starts. runbolt sets most of them from its options. An invalid value
     // raises ImproperlyConfigured.

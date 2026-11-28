@@ -35,7 +35,7 @@ from django.db import connections
 from django.db.models import CompositePrimaryKey, F, Field, IntegerField
 from django.db.models.fields.tuple_lookups import Tuple, TupleGreaterThan, TupleLessThan
 
-from . import _json
+from . import _json, async_orm
 from ._kwargs import StructRelationLoader, compile_struct_relation_loader
 from .concurrency import run_in_orm_executor
 from .exceptions import ResponseValidationError, UnloadedRelationError
@@ -272,6 +272,11 @@ class PaginationBase(ABC):
         # Django's acount() is sync_to_async(thread_sensitive=True) internally,
         # which funnels every concurrent request through ONE shared thread.
         if hasattr(queryset, "_iterable_class") and hasattr(queryset, "model"):
+            if async_orm.enabled:
+                # With BOLT_ASYNC_ORM_ON_LOOP, the event loop sends the statement.
+                total = await async_orm.count(queryset)
+                if total is not None:
+                    return total
             return await run_in_orm_executor(queryset.count)
         # Non-Django async collections that expose acount
         if hasattr(queryset, "acount"):
@@ -358,6 +363,9 @@ class PaginationBase(ABC):
             elif relation_loader is not None:
                 # Join the relations of a nested Struct item type, in the same hop.
                 return await run_in_orm_executor(relation_loader.evaluate, queryset)
+            # With BOLT_ASYNC_ORM_ON_LOOP, the event loop sends the statement.
+            if async_orm.enabled and await async_orm.load(queryset):
+                return list(queryset)
             return await run_in_orm_executor(list, queryset)
         # Non-QuerySet async iterables (has __aiter__)
         if hasattr(queryset, "__aiter__"):

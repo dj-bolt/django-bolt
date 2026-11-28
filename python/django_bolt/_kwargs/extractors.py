@@ -48,6 +48,7 @@ __all__ = [
     "compile_response_coercer",
     "compile_struct_relation_loader",
     "compile_struct_row_readers",
+    "compile_struct_row_steps",
     "get_msgspec_decoder",
     "StructRelationLoader",
 ]
@@ -1655,20 +1656,56 @@ def compile_struct_row_readers(
     def project(items: list[Any]) -> list[dict[str, Any]]:
         return [{wire: getattr(item, name, None) for name, wire in pairs} for item in items]
 
+    select, read = compile_struct_row_steps(item_type)
+
+    def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
+        return read(select(queryset))
+
     if _has_nested_struct(item_type):
-        return _compile_nested_row_loader(item_type), _compile_nested_projector(item_type)
+        return load_rows, _compile_nested_projector(item_type)
+    return load_rows, project
+
+
+def compile_struct_row_steps(
+    item_type: type,
+) -> tuple[Callable[[QuerySet], QuerySet], Callable[[QuerySet], list[dict[str, Any]]]]:
+    """Build the two steps of the QuerySet reader of ``compile_struct_row_readers``, once per route.
+
+    The first step gives the ``.values()`` QuerySet of the fields of the
+    Struct. It sends no query. The second step reads the rows of that QuerySet
+    and keys each row by the wire names. A caller can load the rows between
+    the steps, for example on the event loop.
+
+    A nested Struct names a foreign key or a one-to-one relation. ``.values()``
+    reads its fields across the relation, so one query loads all rows.
+    """
+    if _has_nested_struct(item_type):
+        plan_of = _compile_plan_getter(item_type)
+
+        def select_nested(queryset: QuerySet) -> QuerySet:
+            return queryset.values(*plan_of(queryset.model).paths)
+
+        def read_nested(values: QuerySet) -> list[dict[str, Any]]:
+            build = plan_of(values.model).build
+            return [build(row) for row in values]
+
+        return select_nested, read_nested
+
+    names = item_type.__struct_fields__
+    wire_names = item_type.__struct_encode_fields__
+
+    def select(queryset: QuerySet) -> QuerySet:
+        return queryset.values(*names)
 
     if names == wire_names:
+        return select, list
 
-        def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
-            return list(queryset.values(*names))
+    pairs = tuple(zip(names, wire_names, strict=True))
 
-    else:
+    def read(values: QuerySet) -> list[dict[str, Any]]:
+        return [{wire: row[name] for name, wire in pairs} for row in values]
 
-        def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
-            return [{wire: row[name] for name, wire in pairs} for row in queryset.values(*names)]
-
-    return load_rows, project
+    return select, read
 
 
 class _RowPlan(NamedTuple):
@@ -1741,22 +1778,6 @@ def _compile_plan_getter(item_type: type) -> Callable[[type], _RowPlan]:
         return plan
 
     return plan_of
-
-
-def _compile_nested_row_loader(item_type: type) -> Callable[[QuerySet], list[dict[str, Any]]]:
-    """Build the row reader of a Struct with a nested Struct field, once per route.
-
-    A nested Struct names a foreign key or a one-to-one relation. ``.values()``
-    reads its fields across the relation, so one query loads all rows.
-    """
-    plan_of = _compile_plan_getter(item_type)
-
-    def load_rows(queryset: QuerySet) -> list[dict[str, Any]]:
-        plan = plan_of(queryset.model)
-        build = plan.build
-        return [build(row) for row in queryset.values(*plan.paths)]
-
-    return load_rows
 
 
 def _compile_nested_projector(item_type: type) -> Callable[[list[Any]], list[dict[str, Any]]]:

@@ -145,6 +145,7 @@ curl localhost:8000/articles/99
 A sync ORM call in an `async def` handler raises Django's `SynchronousOnlyOperation`, and the client gets a `500` response. This also applies to a relation that is not loaded, for example `article.author` after `aget()`.
 
 Bolt sends each async ORM call to the ORM thread pool. Thus `DJANGO_BOLT_ORM_THREADS` limits the queries in flight. See [Tune the thread pools](#tune-the-thread-pools).
+On PostgreSQL, a returned QuerySet, `async for`, `aiterator()`, `aget()`, `afirst()`, `alast()`, `aexists()`, `acount()`, `aaggregate()` and `await request.auser()` can run with no thread. See [Run async reads on the event loop](#run-async-reads-on-the-event-loop).
 
 ## Iterate over a QuerySet
 
@@ -168,7 +169,162 @@ async def list_titles() -> list[str]:
 ```
 
 `async for` loads all rows in one call to the ORM thread pool. It then iterates over them in memory.
+
+For a result with many rows, use `aiterator()`. It reads `chunk_size` rows at a time, and it does not keep the rows:
+
+```python
+from django_bolt import BoltAPI
+from django_bolt.responses import EventSourceResponse
+
+from blog.models import Article
+
+api = BoltAPI()
+
+
+@api.get("/articles/export")
+async def export_articles() -> EventSourceResponse:
+    async def events():
+        async for article in Article.objects.order_by("id").aiterator(chunk_size=500):
+            yield {"id": article.id, "title": article.title}
+
+    return EventSourceResponse(events())
+```
+
+On PostgreSQL, Django reads the chunks from a cursor of the server. Thus the memory of the process holds one chunk.
 A returned QuerySet with a `list[Struct]` return type reads only the Struct fields, with `.values()`, and makes no model instances. Return the QuerySet when the rows need no change.
+
+## Run async reads on the event loop
+
+Django's async ORM runs each call on a thread, and Bolt loads a QuerySet that a handler returns on a thread. On PostgreSQL, Bolt can run these reads on the event loop, with no thread:
+
+- a QuerySet that a handler returns,
+- `async for` over a QuerySet,
+- `aiterator()`,
+- `aget()`, `afirst()`, `alast()` and `aexists()`,
+- `acount()` and `aaggregate()`,
+- the count of the rows and the rows of a page for `@paginate`,
+- `await request.auser()`, when the auth backend loads the user by primary key.
+
+Add the setting:
+
+```python title="blog/settings.py"
+BOLT_ASYNC_ORM_ON_LOOP = True
+```
+
+Your handlers do not change. Bolt reads the setting when the server starts. Each of these reads then has three steps:
+
+1. Django builds the SQL statement.
+2. Bolt sends the statement on a connection of the event loop. No Python code runs while the query waits for the database, and the event loop serves other requests.
+3. Django builds the rows and the model instances.
+
+The result is the result of the sync ORM. The setting is off by default.
+
+The setting removes the thread hop of each read, and the wait of the threads of one process for the GIL. Measure it on your deployment before you keep it.
+Measured on six routes with one process, a local PostgreSQL and 64 connections, against the same routes with the setting off:
+
+| The server process runs on | A returned QuerySet | The async ORM calls |
+| --- | --- | --- |
+| One core | 4 to 11% more requests in one second | 6 to 57% more |
+| Two cores | 82 to 119% more | 97 to 155% more |
+
+It needs PostgreSQL, psycopg 3 with libpq 14 or later, and the `django.db.backends.postgresql` engine. It has no effect on Windows.
+
+For each worker thread and database, the `django_bolt.async_orm` logger tells where the reads run, at the `INFO` level.
+
+### Reads that stay on the ORM thread pool
+
+Some reads need the database connection of a thread, or sync code. For these reads, Bolt uses the ORM thread pool, as with the setting off:
+
+| Read | Cause |
+| --- | --- |
+| A QuerySet with `prefetch_related()` | The prefetch queries are sync code. |
+| A read on a route with Django middleware | The thread of the request keeps state, for example the schema of a tenant. |
+| A read in a transaction | Only the connection of the transaction has its rows. A `TestClient` in a Django `TestCase` gives such a connection to the handlers. |
+| A read in async code that sync code calls with `async_to_sync()` | The thread of the sync code can have a transaction. |
+| A database with another `ENGINE`, for example PostGIS or django-tenants | Another backend can change how a connection opens. |
+| A database with `OPTIONS["server_side_binding"]` or `OPTIONS["cursor_factory"]`, or with `AUTOCOMMIT` off | Bolt sends a statement with its parameters in it, outside a transaction. The cursor of Django puts the parameters in. |
+| A database whose connections have an execute wrapper from a `connection_created` receiver | A wrapper of `connection.execute_wrapper()` is sync code around the query. It measures the time of the query and gets its error. |
+| A QuerySet class with its own `get()`, `first()`, `last()`, `exists()`, `count()`, `aggregate()` or `_fetch_all()`, or with its own iterable class | Your code runs in place of Django's code, and it can query. |
+| A model whose rows need a query, for example in `from_db()` or in a `post_init` receiver | Sync code cannot query on the event loop. Bolt finds this at the first read of the model. That read runs two times. |
+| A returned QuerySet with the return type `list[SomeSerializer]`, when the Serializer reads model instances | On the ORM pool, a relation that the QuerySet did not load can still load. A plain Serializer reads `.values()` rows, and its QuerySet loads on the event loop. |
+| A QuerySet that a sync handler returns with the return type `list[SomeSerializer]`, when the Serializer has validators | A validator is your code, and it can query. With an async handler, validators run on the event loop, also with the setting off. |
+| `await request.auser()` with a `get_user` or a `get_user_sync` of your own, or with a user model whose default manager has its own `get_queryset()` | Bolt runs your code, or the manager, for each load. |
+| The rows of a page of `@paginate` whose item type is a Struct with a nested Struct | Bolt loads the relations of the rows with sync code. The count of the rows runs on the event loop. |
+| A read whose database router queries in `db_for_read()` | Sync code cannot query on the event loop. |
+| The other async calls, for example `acontains()`, `ain_bulk()`, `acreate()` and `asave()` | Bolt replaces only the reads above. |
+
+### Connections of the event loop
+
+Django opens each loop connection, with the parameters of `DATABASES`. No thread has a loop connection. Each worker thread has its own loop connections for each database.
+
+- A loop connection has the role of `OPTIONS["assume_role"]`, the time zone and the type adapters of each Django connection.
+- Each `connection_created` receiver gets a loop connection when it opens. A session setting of a receiver is thus on it.
+- A loop connection is not in Django's connection pool (`OPTIONS["pool"]`), and `CONN_MAX_AGE` does not apply to it.
+- A read takes an idle connection. With no idle connection, the loop opens one, up to the limit. The pool of [sqlx](https://github.com/launchbadge/sqlx) has the same limits and the same defaults.
+- At the limit, a read uses a connection that is in use. See [Statements in flight on one connection](#statements-in-flight-on-one-connection).
+- `aiterator()` opens a cursor of the server, as Django does, and each chunk is one `FETCH` statement on the connection of the cursor. The cursor keeps one place on that connection. Other reads use the other places.
+- The cursor closes after the last row. It also closes when the code that reads it stops, for example when the client of a stream goes away.
+- With `DISABLE_SERVER_SIDE_CURSORS` in the database settings, `aiterator()` reads all rows with one statement, as Django does.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `DJANGO_BOLT_LOOP_CONNECTIONS` | `10` | The limit: connections of one worker thread to one database. |
+| `DJANGO_BOLT_LOOP_PIPELINE_DEPTH` | `16` | Statements that one connection can have in flight. With `1`, a connection runs one statement at a time. |
+| `DJANGO_BOLT_LOOP_ACQUIRE_SECONDS` | `30` | A read that waits this long for a place on a connection fails with Django's `OperationalError`. |
+| `DJANGO_BOLT_LOOP_IDLE_SECONDS` | `600` | A connection that no read used for this time closes. |
+| `DJANGO_BOLT_LOOP_LIFETIME_SECONDS` | `1800` | A connection older than this time closes. |
+
+- A read does not use a connection that the database closed while the connection was idle, for example after a database restart. The loop opens a new one.
+- A connection that ends during a query fails each read that has a statement in flight on it. Bolt does not send these statements again, because the database can have run them.
+- When a request stops during a query, Bolt asks the server to cancel the query. The request does not block the event loop. With more statements in flight on the connection, Bolt sends no request, and the query runs to its end. The server cancels the statement that it runs when the request comes, and that can be the statement of another read. A cancel request that does not end in 30 seconds closes its connection.
+- With a database router, one read uses one database: the database that the router gives for the first call.
+- With `DEBUG = True`, `connection.queries` and the `django.db.backends` logger have each read, with its time.
+- A database error is a `django.db` error around the psycopg error, with the fields that the sync ORM gives.
+- A tool that replaces `CursorWrapper.execute` gets the statement of each read. It gets no query time and no database error, because the query runs after that method returns.
+
+Add the loop connections to the connection count of your database. See [Tune the thread pools](#tune-the-thread-pools).
+
+### Statements in flight on one connection
+
+A loop connection is in the pipeline mode of libpq. Bolt sends a statement on it while the statements before are in flight.
+The server runs the statements of one connection in their order. Each statement is its own transaction, and an error of one statement does not fail the others.
+
+Thus a read at the connection limit does not wait for the round trip of another read. When a connection has a free place, the statement goes out at once, behind the statements in flight there.
+Bolt takes the connection with the fewest statements.
+`DJANGO_BOLT_LOOP_PIPELINE_DEPTH` sets how many statements one connection can have in flight.
+A read waits when no connection can take its statement. That is when each connection is at that number, cancels a statement, or runs a slow statement.
+The read that waited longest gets the next place.
+
+A statement behind a slow statement waits for it. Bolt keeps the time of the fastest reads of a database.
+It puts no statement behind a statement that runs for much longer than that time.
+
+Measured with one process on one core, 64 client connections, and a database 2 ms away. The values are requests in one second for a handler that returns a QuerySet:
+
+| `DJANGO_BOLT_LOOP_CONNECTIONS` | `DJANGO_BOLT_LOOP_PIPELINE_DEPTH=1` | `DJANGO_BOLT_LOOP_PIPELINE_DEPTH=16` |
+| --- | --- | --- |
+| `1` | 327 | 3,171 |
+| `4` | 1,155 | 3,510 |
+| `10` | 2,621 | 3,305 |
+| `16` | 3,075 | 3,324 |
+| `64` | 3,180 | 3,232 |
+
+With a depth of `16`, the server used one full core at each limit: the round trip to the database did not set the throughput.
+With a local database and a limit of `10`, a depth of `16` gave 8 to 24% more requests in one second than a depth of `1`.
+
+A string with two statements is an error in the pipeline mode. The reads of the ORM have one statement.
+A connection pooler between Bolt and the database must support the pipeline mode of libpq.
+
+### Set the number of loop connections
+
+The server runs the statements of one connection one after the other. Thus the limit sets how many statements the database runs at the same time for one worker thread.
+A short read needs few connections. A database that needs much time for each read needs more connections, up to the number of reads at the same time.
+A loop opens connections up to the limit when that number of reads run at the same time. A higher limit thus does not always give more throughput.
+
+```bash
+DJANGO_BOLT_LOOP_CONNECTIONS=16 python manage.py runbolt --processes 4
+```
+
+Set `DJANGO_BOLT_LOOP_PIPELINE_DEPTH=1` when each read must have a connection of its own. A read at the limit then waits for a free connection.
 
 ## Avoid N+1 queries
 
@@ -355,6 +511,7 @@ DJANGO_BOLT_ORM_THREADS=8 python manage.py runbolt --processes 4
 On a route with Django middleware, the ORM calls of a request run on the thread of that request, not on the ORM pool. See [Middleware](middleware.md).
 
 Each thread that runs a query keeps its own database connection. These are the threads of the two pools, the worker threads, and one thread for each running request with Django middleware. Add up the threads of all processes. Keep the total below the connection limit of your database.
+With `BOLT_ASYNC_ORM_ON_LOOP`, each worker thread also has up to `DJANGO_BOLT_LOOP_CONNECTIONS` connections (10 by default) to each PostgreSQL database.
 
 SQLite gets one ORM thread by default, because SQLite has one writer and a file lock. PostgreSQL and MySQL can serve parallel queries, so they get four.
 

@@ -158,8 +158,18 @@ def resolve_user_loader(backend: Any) -> UserLoaders | None:
         def load_via_sync(user_id: str, auth_context: dict | None) -> Any:
             return run_orm_blocking(get_user_sync, user_id)
 
-        async def aload_via_sync(user_id: str, auth_context: dict | None) -> Any:
-            return await run_in_orm_executor(get_user_sync, user_id)
+        if custom_sync:
+
+            async def aload_via_sync(user_id: str, auth_context: dict | None) -> Any:
+                return await run_in_orm_executor(get_user_sync, user_id)
+
+        else:
+            # The loader of the framework. It runs ``get_user_sync`` on the ORM
+            # pool, or its query on the event loop (BOLT_ASYNC_ORM_ON_LOOP).
+            framework_get_user = backend.get_user
+
+            async def aload_via_sync(user_id: str, auth_context: dict | None) -> Any:
+                return await framework_get_user(user_id, auth_context or {})
 
         return load_via_sync, aload_via_sync
 

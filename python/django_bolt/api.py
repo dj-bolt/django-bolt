@@ -114,6 +114,7 @@ from .serialization import (
     response_with_status,
     serialize_json_data,
     serialize_json_data_sync,
+    serialize_queryset,
     serialize_response,
     serialize_response_sync,
 )
@@ -3097,7 +3098,7 @@ class BoltAPI:
                             if isinstance(result, _fast_type):
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, QuerySet):
-                                return await run_in_orm_executor(serialize_response_sync, result, meta)
+                                return await serialize_queryset(result, meta)
                             return serialize_response_sync(result, meta)
                     else:
 
@@ -3109,7 +3110,7 @@ class BoltAPI:
                                 result = _convert_serializers(result)
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, QuerySet):
-                                return await run_in_orm_executor(serialize_response_sync, result, meta)
+                                return await serialize_queryset(result, meta)
                             return serialize_response_sync(result, meta)
                 else:
                     if _skip_convert:
@@ -3120,7 +3121,7 @@ class BoltAPI:
                             if isinstance(result, _fast_type):
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, QuerySet):
-                                return await run_in_orm_executor(serialize_response_sync, result, meta)
+                                return await serialize_queryset(result, meta)
                             return serialize_response_sync(result, meta)
                     else:
 
@@ -3133,7 +3134,7 @@ class BoltAPI:
                                 result = _convert_serializers(result)
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, QuerySet):
-                                return await run_in_orm_executor(serialize_response_sync, result, meta)
+                                return await serialize_queryset(result, meta)
                             return serialize_response_sync(result, meta)
 
                 return execute_sync_dict_fast
@@ -3183,7 +3184,7 @@ class BoltAPI:
                             if isinstance(result, _match_types):
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, QuerySet):
-                                return await run_in_orm_executor(serialize_response_sync, result, meta)
+                                return await serialize_queryset(result, meta)
                             return serialize_response_sync(result, meta)
                     else:
 
@@ -3195,7 +3196,7 @@ class BoltAPI:
                             if isinstance(result, _match_types):
                                 return (default_status, _meta_json, _BODY_BYTES, _encode(result))
                             if isinstance(result, QuerySet):
-                                return await run_in_orm_executor(serialize_response_sync, result, meta)
+                                return await serialize_queryset(result, meta)
                             return serialize_response_sync(result, meta)
 
                     return execute_sync_inline_validated
@@ -3270,7 +3271,7 @@ class BoltAPI:
                                 return serialize_response_sync(result, meta)
                             return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
                         if isinstance(result, QuerySet):
-                            return await run_in_orm_executor(serialize_response_sync, result, meta)
+                            return await serialize_queryset(result, meta)
                         return serialize_response_sync(result, meta)
                 else:
 
@@ -3294,7 +3295,7 @@ class BoltAPI:
                                 return serialize_response_sync(result, meta)
                             return (default_status, _meta_json, _BODY_BYTES, _encode(validated))
                         if isinstance(result, QuerySet):
-                            return await run_in_orm_executor(serialize_response_sync, result, meta)
+                            return await serialize_queryset(result, meta)
                         return serialize_response_sync(result, meta)
 
                 return execute_sync_inline_validated
@@ -3354,7 +3355,7 @@ class BoltAPI:
                 return await serialize_response(result, meta)
 
             if isinstance(result, QuerySet):
-                return await run_in_orm_executor(serialize_response_sync, result, meta)
+                return await serialize_queryset(result, meta)
             return serialize_response_sync(result, meta)
 
         return execute
@@ -3983,7 +3984,7 @@ class BoltAPI:
         become responses, as in ``_dispatch``.
         """
         try:
-            return await run_in_orm_executor(serialize_response_sync, result, meta)
+            return await serialize_queryset(result, meta)
         except HTTPException as he:
             return self._handle_http_exception(he, request)
         except Exception as e:

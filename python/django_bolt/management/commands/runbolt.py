@@ -23,6 +23,7 @@ from django.utils.autoreload import iter_all_python_module_files
 
 from django_bolt import _core
 from django_bolt._bridge import make_bound_dispatch
+from django_bolt._gc import freeze_setting
 from django_bolt._script_prefix import asgi_mounts, mcp_mounts, refuse_files_at_script_name
 from django_bolt._script_prefix import configure as configure_script_prefix
 from django_bolt._urlconf import served_apis
@@ -773,6 +774,8 @@ class Command(BaseCommand):
         A check error raises SystemCheckError, which stops startup with a
         non-zero exit code, like runserver.
         """
+        # Refuse the setting here, or each worker refuses it after the banner.
+        freeze_setting()
         if not options.get("skip_checks"):
             self.check(display_num_errors=True)
         self.check_migrations()

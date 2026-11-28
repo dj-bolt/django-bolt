@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
 import os
 import sys
@@ -364,9 +365,14 @@ def test_runbolt_passes_its_options_to_the_server(
         ),
     )
 
+    frozen = gc.get_freeze_count()
+
     call_command("runbolt", "--host", "127.0.0.1", "--port", "8123", *argv)
 
     assert started["address"] == ("127.0.0.1", 8123)
+    # Only a server that starts freezes the objects of its process: see ``django_bolt._gc``.
+    # A frozen object stays for the life of the process, and this process runs more tests.
+    assert gc.get_freeze_count() == frozen
     # The two APIs of BOLT_API are one server, and the lifespan of the second API runs around it.
     assert {"/ping", "/pong"} <= set(started["paths"])
     assert sys.modules["options_lifespan_api"].EVENTS == ["startup", "serve", "shutdown"]

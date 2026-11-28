@@ -70,6 +70,8 @@ class WorkerLoop(asyncio.SelectorEventLoop):
         # fd -> Handle, mirroring the stdlib selector's (reader, writer) data.
         self._readers = {}
         self._writers = {}
+        # Database alias -> the connections of this loop to that database (see async_orm.py).
+        self._query_pools = {}
 
     def _make_self_pipe(self):
         # Rust wakes the pump; there is no thread to interrupt with a pipe.

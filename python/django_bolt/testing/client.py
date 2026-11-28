@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 import httpx
 from httpx import Response
 
-from django_bolt import BoltAPI, _core
+from django_bolt import BoltAPI, _core, async_orm
 from django_bolt._script_prefix import asgi_mounts, lifespan_entry, mcp_mounts, refuse_files_at_script_name
 from django_bolt._script_prefix import configure as configure_script_prefix
 from django_bolt._urlconf import served_api
@@ -332,10 +332,11 @@ def _close_server_connections() -> None:
     A test client stands for a server, and a new server starts with no open
     connections. An open connection also blocks the drop of the test database
     at teardown. The lanes close theirs when they stop, and the test workers
-    close theirs here.
+    close theirs here. The event loops close theirs too (see async_orm.py).
     """
     _core.stop_idle_lanes()
     _core.close_test_worker_connections()
+    async_orm.close_connections()
 
 
 class TestClient(httpx.Client):

@@ -40,8 +40,13 @@ from django.http import HttpResponse as DjangoHttpResponse
 from django.http import HttpResponseRedirect as DjangoHttpResponseRedirect
 from django.template.response import SimpleTemplateResponse, TemplateResponse
 
-from . import _json
-from ._kwargs import compile_response_coercer, compile_struct_relation_loader, compile_struct_row_readers
+from . import _json, async_orm
+from ._kwargs import (
+    compile_response_coercer,
+    compile_struct_relation_loader,
+    compile_struct_row_readers,
+    compile_struct_row_steps,
+)
 from ._response_dump import compile_serializer_dumper
 from ._template_response import render_template_response
 from .concurrency import run_in_orm_executor, run_orm_blocking
@@ -665,7 +670,20 @@ def _compile_serializer_values_evaluators(serializer_cls: Any) -> tuple[Any, Any
             return dump_instances(queryset)
 
     async def evaluate_async(queryset: QuerySet) -> list[Any]:
-        return await run_in_orm_executor(evaluate_sync, queryset)
+        if not async_orm.enabled:
+            return await run_in_orm_executor(evaluate_sync, queryset)
+        queryset = serializer_cls._prepare_queryset(queryset)
+        if queryset.model in instance_models:
+            return await run_in_orm_executor(dump_instances, queryset)
+        try:
+            values = queryset.values(*field_names)
+        except FieldError:
+            instance_models.add(queryset.model)  # pragma: no mutate
+            return await run_in_orm_executor(dump_instances, queryset)
+        # The rows load on the event loop, or on the ORM pool for a read that needs the connection of Django.
+        if await async_orm.load(values):
+            return list(values)
+        return await run_in_orm_executor(list, values)
 
     return evaluate_sync, evaluate_async
 
@@ -780,8 +798,15 @@ def _compile_queryset_serializers(meta: HandlerMetadata | dict[str, Any]) -> tup
     if readers is None:
         return None, None
     load_rows, _ = readers
+    select, read = compile_struct_row_steps(get_args(meta["response_type"])[0])
 
     async def serialize_async(queryset: QuerySet) -> list[Any]:
+        if async_orm.enabled:
+            values = select(queryset)
+            # The rows load on the event loop, or on the ORM pool for a read that needs the connection of Django.
+            if await async_orm.load(values):
+                return read(values)
+            return await run_in_orm_executor(read, values)
         # Bounded ORM pool: parallel (unlike sync_to_async's thread_sensitive
         # single thread) but capped so DB connection count stays small.
         return await run_in_orm_executor(load_rows, queryset)
@@ -1126,6 +1151,20 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
     # Without the inline path, the slow path gives the same response.
     inline_validator = _compile_inline_response_validator(meta)  # pragma: no mutate
 
+    # The async response handler can load a returned QuerySet on the event
+    # loop when its rows are ``.values()`` dicts, or when no validator reads
+    # them. A list of Serializers of model instances stays on the ORM pool:
+    # there, a relation that the QuerySet did not load can still load. A
+    # Serializer with validators stays there too. This flag is for the
+    # QuerySet of a sync handler, whose validators run on a thread with the
+    # setting off. A validator is code of the application, and it can query.
+    serializer_cls, serializer_many = _response_serializer_info(meta.get("response_type"))
+    serializer_validates = serializer_cls is not None and (
+        serializer_cls.__has_field_validators__ or serializer_cls.__has_model_validators__
+    )
+    meta["_queryset_on_loop"] = not serializer_validates and (
+        queryset_serializer_async is not None or (validator_async is None and not serializer_many)
+    )
     meta["_stream_item_validator"] = stream_validator_sync
     meta["_stream_item_validator_async"] = stream_validator_async
     meta["_inline_response_validator"] = inline_validator  # pragma: no mutate
@@ -1242,6 +1281,8 @@ def compile_response_handlers(meta: HandlerMetadata | dict[str, Any]) -> None:
                 # Already dumped dicts — nothing left for the validator to do.
                 result = await evaluate_serializer_queryset_async(result)
                 return await _serialize_json_payload_async(result, current_status, None)
+            elif async_orm.enabled and await async_orm.load(result):
+                result = list(result)
             else:
                 # Bounded ORM pool — parallel, but capped connection count.
                 result = await run_in_orm_executor(list, result)
@@ -1463,6 +1504,19 @@ def serialize_response(result: Any, meta: HandlerMetadata | dict[str, Any]) -> C
     if isinstance(result, _RESPONSE_INSTANCE_TYPES):
         return meta["_response_type_handler"](result)
     return meta["_default_response_handler"](result)
+
+
+async def serialize_queryset(queryset: QuerySet, meta: HandlerMetadata | dict[str, Any]) -> ResponseWireV1:
+    """Serialize a QuerySet that a handler returned, where the handler did not load it.
+
+    The sync response handler loads the rows on the ORM pool. With
+    ``BOLT_ASYNC_ORM_ON_LOOP``, the async response handler loads them on the
+    event loop, for a route whose rows need no more queries (see
+    ``_queryset_on_loop`` in ``compile_response_handlers``).
+    """
+    if async_orm.enabled and meta["_queryset_on_loop"]:
+        return await serialize_response(queryset, meta)
+    return await run_in_orm_executor(serialize_response_sync, queryset, meta)
 
 
 def serialize_response_sync(result: Any, meta: HandlerMetadata | dict[str, Any]) -> ResponseWireV1:
