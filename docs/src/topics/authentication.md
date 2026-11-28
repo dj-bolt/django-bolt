@@ -423,6 +423,7 @@ For a `POST`, `PUT`, `PATCH`, `DELETE` or other unsafe method, the request must 
 
 - When the request has `Sec-Fetch-Site`, the value must be `same-origin` or `none`.
 - Otherwise the `Origin` header, or else the `Referer` header, must have the scheme and the host of the request.
+  A port that is not a number from 0 to 65535 fails, as in a browser.
 - A request with none of these headers fails.
 
 A failed check gets 403 `{"detail": "Permission denied"}`. The check applies only when the cookie backend accepted the request.

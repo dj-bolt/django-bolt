@@ -121,6 +121,24 @@ class TestCookieCsrf:
         )
         assert r.status_code == 403
 
+    @pytest.mark.parametrize(
+        ("origin", "host"),
+        [
+            ("http://testserver:99999", "testserver"),
+            ("http://testserver:1a", "testserver"),
+            ("http://testserver:+80", "testserver"),
+            ("http://testserver", "testserver:99999"),
+        ],
+    )
+    def test_origin_fallback_refuses_a_port_that_is_not_a_number_in_range(self, client, origin, host):
+        """WHATWG URL: such a port fails the URL, so it is not the default port of the scheme."""
+        r = client.request(
+            "POST",
+            "/cookie-write",
+            headers=cookie_hdr({"Origin": origin, "Host": host}),
+        )
+        assert r.status_code == 403
+
     @pytest.mark.parametrize("trusted_proxies", [[], ["127.0.0.1"]])
     @pytest.mark.parametrize(("origin", "status"), [("https://testserver", 200), ("http://testserver", 403)])
     def test_origin_fallback_follows_x_forwarded_proto_from_any_peer(self, trusted_proxies, origin, status):

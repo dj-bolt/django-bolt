@@ -180,13 +180,34 @@ fn origin_matches(url: &str, scheme: &str, host: &str) -> bool {
     } else {
         80
     };
-    let url_port = url_authority.port_u16().unwrap_or(default_port);
-    let request_port = request_authority.port_u16().unwrap_or(default_port);
+    let (Some(url_port), Some(request_port)) = (
+        authority_port(&url_authority, default_port),
+        authority_port(&request_authority, default_port),
+    ) else {
+        return false;
+    };
 
     url_authority
         .host()
         .eq_ignore_ascii_case(request_authority.host())
         && url_port == request_port
+}
+
+/// The port of an authority, or `default_port` when it has none. `None`
+/// when the text after the colon is not ASCII digits with a value of 65535
+/// or less (WHATWG URL, port state). `Authority` accepts such a port, and
+/// `port_u16()` gives `None` for it, so `None` must not mean the default.
+/// An authority with userinfo also gives `None`.
+fn authority_port(authority: &Authority, default_port: u16) -> Option<u16> {
+    match authority
+        .as_str()
+        .strip_prefix(authority.host())?
+        .strip_prefix(':')
+    {
+        None | Some("") => Some(default_port),
+        Some(port) if port.bytes().all(|b| b.is_ascii_digit()) => port.parse().ok(),
+        Some(_) => None,
+    }
 }
 
 /// Validate authentication and evaluate guards
@@ -305,6 +326,29 @@ mod tests {
             for url in other {
                 prop_assert!(!origin_matches(&url, scheme, &authority), "{}", url);
             }
+        }
+
+        /// WHATWG URL, port state: a port is ASCII digits with a value of
+        /// 65535 or less; any other port fails the URL, which then has no
+        /// origin. `port_u16()` gives `None` for such a port, which is not
+        /// the default port.
+        #[test]
+        fn a_port_that_is_not_a_number_in_range_never_matches(
+            https in any::<bool>(),
+            host in "[a-z]{1,10}\\.[a-z]{2,5}",
+            port in prop_oneof![
+                (65_536u32..10_000_000).prop_map(|port| port.to_string()),
+                "[0-9]{0,3}[a-z+_-][0-9a-z]{0,3}",
+            ],
+            in_host in any::<bool>(),
+        ) {
+            let scheme = if https { "https" } else { "http" };
+            let (url, request_host) = if in_host {
+                (format!("{scheme}://{host}"), format!("{host}:{port}"))
+            } else {
+                (format!("{scheme}://{host}:{port}"), host.clone())
+            };
+            prop_assert!(!origin_matches(&url, scheme, &request_host), "{} {}", url, request_host);
         }
 
         #[test]
@@ -653,6 +697,44 @@ mod tests {
             ]),
             "https"
         ));
+    }
+
+    #[test]
+    fn csrf_origin_port_must_be_a_number_in_range() {
+        for origin in [
+            "https://example.com:99999",
+            "https://example.com:65536",
+            "https://example.com:1a",
+            "https://example.com:+443",
+        ] {
+            assert!(
+                !passes_cookie_csrf(
+                    "POST",
+                    &headers_with(&[("host", "example.com"), ("origin", origin)]),
+                    "https"
+                ),
+                "{origin}"
+            );
+        }
+        assert!(!passes_cookie_csrf(
+            "POST",
+            &headers_with(&[
+                ("host", "example.com:99999"),
+                ("origin", "https://example.com")
+            ]),
+            "https"
+        ));
+        // An empty port and a leading zero are the WHATWG forms of a port.
+        for origin in ["https://example.com:", "https://example.com:0443"] {
+            assert!(
+                passes_cookie_csrf(
+                    "POST",
+                    &headers_with(&[("host", "example.com"), ("origin", origin)]),
+                    "https"
+                ),
+                "{origin}"
+            );
+        }
     }
 
     #[test]
