@@ -95,6 +95,8 @@ The rules:
 - A scalar claim matches a value that is equal. A list claim matches a value that it contains.
 - With no values, the claim must be present and not `null`. For a boolean claim, present means `true`.
   Thus `Requires("is_admin")` rejects a token with `"is_admin": false`.
+  For `permissions`, present means one permission or more. Thus `Requires("permissions")` rejects a token with `"permissions": []`,
+  an API key with no permissions and a session user with no permissions. An empty list gives no permission.
 - A value is a `str`, an `int`, a `float` or a `bool`.
 
 Give only one of: values, `all_of`, `none_of`. To require one value and exclude another, use two guards:

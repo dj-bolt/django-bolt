@@ -158,13 +158,15 @@ def _ttl_for(exp: int | None, default: int = _DEFAULT_TTL_SECONDS, *, leeway: in
     """
     Return the seconds that a revocation entry must live.
 
-    With ``exp``, the entry lives until the end of the second ``exp + leeway``.
-    ``JWTAuthentication`` accepts a token until the end of that second, so the
-    entry must not expire before it. A token after that second gets 0, not a
-    negative value, because ``timedelta`` subtracts a negative duration from
-    now. An entry ends at the latest in the year 9999, the last year of
-    ``datetime``. Without ``exp``, the result is ``default``, usually the
-    ``default_ttl`` of the store. ``leeway`` does not change ``default``.
+    With ``exp``, the result is ``exp + leeway`` minus the current whole
+    second, plus one. ``JWTAuthentication`` refuses a token from
+    ``exp + leeway``. Thus the entry lives longer than it must: one second,
+    plus the part of the current second that has passed. In all, this is less
+    than two seconds, which is safe. When the result would be negative, it is
+    0, because ``timedelta`` would subtract a negative duration from now. An
+    entry ends at the latest in the year 9999, the last year of ``datetime``.
+    Without ``exp``, the result is ``default``, usually the ``default_ttl`` of
+    the store. ``leeway`` does not change ``default``.
     """
     if exp is None:
         return default
