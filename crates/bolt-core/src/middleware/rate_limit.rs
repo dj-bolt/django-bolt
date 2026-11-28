@@ -376,21 +376,40 @@ impl RateLimiters {
         }
     }
 
-    /// Cleanup old rate limiters when limit is reached
-    /// Simple strategy: remove 20% of limiters to make room for new ones
+    /// Make room when the map holds `MAX_LIMITERS` buckets.
+    ///
+    /// A bucket that is full again holds no state: a new bucket for its key
+    /// is the same. The cleanup deletes each such bucket first. Only when
+    /// they are fewer than 20% of the map does it delete other buckets, in no
+    /// fixed order, up to 20%. Thus the cleanup keeps the state of the
+    /// buckets in use, unless the map holds few full buckets.
+    ///
+    /// `check_n` of the whole burst passes only on a full bucket, and that
+    /// bucket goes away in the same step. `retain` holds the write lock of
+    /// each shard, so no request takes from a bucket while it is checked.
     fn cleanup_old_limiters(&self) {
-        let to_remove = (MAX_LIMITERS as f64 * 0.2) as usize;
+        let to_remove = MAX_LIMITERS / 5;
         let mut removed = 0;
-
-        // Remove first N entries (simple cleanup, not LRU)
-        self.limiters.retain(|_, _| {
-            if removed < to_remove {
+        self.limiters.retain(|&(_, _, burst, _), bucket| {
+            let full = std::num::NonZeroU32::new(burst.max(1))
+                .is_some_and(|burst| matches!(bucket.limiter.check_n(burst), Ok(Ok(()))));
+            if full {
                 removed += 1;
                 self.count.fetch_sub(1, Ordering::Relaxed);
-                false // Remove this entry
-            } else {
-                true // Keep this entry
             }
+            !full
+        });
+        if removed >= to_remove {
+            return;
+        }
+        let mut more = to_remove - removed;
+        self.limiters.retain(|_, _| {
+            if more == 0 {
+                return true;
+            }
+            more -= 1;
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            false
         });
     }
 }
@@ -569,6 +588,78 @@ mod tests {
         );
         assert!(response.is_none());
         // The new key found the map full. The cleanup dropped 20 000 limiters first.
+        let expected = MAX_LIMITERS - MAX_LIMITERS / 5 + 1;
+        assert_eq!(limiters.limiters.len(), expected);
+        assert_eq!(limiters.count.load(Ordering::Relaxed), expected);
+    }
+
+    /// Fill the map with `spent` buckets that hold state and `full` buckets
+    /// that are full again, then make a new key find the map full.
+    fn cleanup_after_fill(spent: u64, full: u64) -> RateLimiters {
+        assert_eq!((spent + full) as usize, MAX_LIMITERS);
+        let limiters = RateLimiters::default();
+        // One token an hour: a spent bucket stays spent while the map fills.
+        let quota = Quota::per_hour(std::num::NonZeroU32::new(1).unwrap());
+        for n in 0..spent + full {
+            let bucket = Bucket::new(quota);
+            if n < spent {
+                assert!(bucket.take().is_ok());
+            }
+            limiters
+                .limiters
+                .insert((1, 1, 1, LimiterKey(n)), Arc::new(bucket));
+        }
+        limiters.count.store(MAX_LIMITERS, Ordering::Relaxed);
+        let config = RateLimitConfig {
+            rps: 100,
+            burst: 100,
+            key: RateLimitKey::Ip,
+        };
+        let address = ip("203.0.113.7");
+        let response = check_before_auth(
+            &limiters,
+            0,
+            &AHashMap::new(),
+            Some(&address),
+            &config,
+            "GET",
+            "/",
+        );
+        assert!(response.is_none());
+        limiters
+    }
+
+    fn holds(limiters: &RateLimiters, n: u64) -> bool {
+        limiters.limiters.contains_key(&(1, 1, 1, LimiterKey(n)))
+    }
+
+    /// A bucket that is full again holds no state, so the cleanup deletes
+    /// each of them first, also more than 20%. A spent bucket stays, so its
+    /// limit holds.
+    #[test]
+    fn cleanup_deletes_full_buckets_first() {
+        let limiters = cleanup_after_fill(60_000, 40_000);
+        assert!(
+            (0..60_000).all(|n| holds(&limiters, n)),
+            "a spent bucket was deleted"
+        );
+        assert!(
+            (60_000..100_000).all(|n| !holds(&limiters, n)),
+            "a full bucket stayed"
+        );
+        assert_eq!(limiters.limiters.len(), 60_001);
+        assert_eq!(limiters.count.load(Ordering::Relaxed), 60_001);
+    }
+
+    /// With fewer full buckets than 20%, the cleanup deletes each full bucket
+    /// and then other buckets, up to 20%.
+    #[test]
+    fn cleanup_deletes_up_to_one_fifth_when_few_buckets_are_full() {
+        let limiters = cleanup_after_fill(95_000, 5_000);
+        assert!(
+            (95_000..100_000).all(|n| !holds(&limiters, n)),
+            "a full bucket stayed"
+        );
         let expected = MAX_LIMITERS - MAX_LIMITERS / 5 + 1;
         assert_eq!(limiters.limiters.len(), expected);
         assert_eq!(limiters.count.load(Ordering::Relaxed), expected);

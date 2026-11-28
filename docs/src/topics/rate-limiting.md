@@ -149,7 +149,8 @@ A route takes one limit. A second `@rate_limit` on the same function raises `Val
 - Each `runbolt` process has its own buckets. With `--processes 4`, a client can get up to four times the limit, because the kernel spreads its connections over the processes.
   Divide the limit by the number of processes, or limit at the proxy.
 - A restart empties the buckets.
-- Each process keeps up to 100,000 buckets. Above that number, Bolt deletes 20% of the buckets, in no fixed order.
+- Each process keeps up to 100,000 buckets. Above that number, Bolt deletes each bucket that is full again.
+  Such a bucket holds no state, because a new bucket for its key is the same. When these are fewer than 20% of the buckets, Bolt also deletes other buckets, in no fixed order, up to 20%.
 - A 429 has the CORS headers of the route, so a browser page can read it.
 - `TestClient` counts requests as `runbolt` does. Each `TestClient` has its own buckets.
 
