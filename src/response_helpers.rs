@@ -12,10 +12,25 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDateTime, PyDict, PyTuple};
 
-/// Format the datetime's wall time, matching the existing Cookie API.
+/// Format a datetime as the HTTP-date of a cookie `Expires`.
+///
+/// RFC 9110, section 5.6.7: an HTTP-date is in UTC. An aware datetime gives
+/// its time in UTC, as Django's `set_cookie` does. A naive datetime is UTC.
 #[pyfunction]
 pub fn format_cookie_date(value: &Bound<'_, PyDateTime>) -> PyResult<String> {
     let py = value.py();
+    let value = if value
+        .call_method0(pyo3::intern!(py, "utcoffset"))?
+        .is_none()
+    {
+        value.clone().into_any()
+    } else {
+        let utc = py
+            .import(pyo3::intern!(py, "datetime"))?
+            .getattr(pyo3::intern!(py, "timezone"))?
+            .getattr(pyo3::intern!(py, "utc"))?;
+        value.call_method1(pyo3::intern!(py, "astimezone"), (utc,))?
+    };
     let year = value.getattr(pyo3::intern!(py, "year"))?.extract::<i32>()?;
     let month = value.getattr(pyo3::intern!(py, "month"))?.extract::<u8>()?;
     let day = value.getattr(pyo3::intern!(py, "day"))?.extract::<u8>()?;

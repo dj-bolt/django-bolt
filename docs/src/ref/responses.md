@@ -245,10 +245,10 @@ Add a `Set-Cookie` header. Return the response, so that you can chain calls.
 | `name` | `str` | (required) | The cookie name. |
 | `value` | `str` | `""` | The cookie value. |
 | `max_age` | `int \| None` | `None` | The age in seconds. `None` makes a session cookie. |
-| `expires` | `datetime \| str \| None` | `None` | The expiry date. |
+| `expires` | `datetime \| str \| None` | `None` | The expiry date. Bolt sends an aware `datetime` in UTC, as Django does. A naive `datetime` is UTC. |
 | `path` | `str` | `"/"` | The path of the cookie. |
 | `domain` | `str \| None` | `None` | The domain of the cookie. `None` is the domain of the request. |
-| `secure` | `bool` | `False` | Send the cookie only over HTTPS. |
+| `secure` | `bool` | `False` | Send the cookie only over HTTPS. A browser keeps a `SameSite=None` cookie only with `secure=True`. |
 | `httponly` | `bool` | `False` | Hide the cookie from JavaScript. |
 | `samesite` | `"Strict" \| "Lax" \| "None" \| False` | `"Lax"` | The `SameSite` attribute. `False` leaves it out. The letter case has no meaning. |
 
@@ -257,6 +257,8 @@ Add a `Set-Cookie` header. Return the response, so that you can chain calls.
 - `ValueError`: `samesite` has another value.
 
 Bolt does not send a cookie with a control character or a character above U+00FF in its value, and logs a warning.
+Bolt also does not send a cookie with a `;` or a control character in its `path`, `domain` or `expires`, and logs a warning. A `;` would add an attribute.
+Bolt sends `Secure` only for `secure=True`, as Django does. Thus `samesite="None"` alone gives no `Secure`.
 
 ## delete_cookie()
 
