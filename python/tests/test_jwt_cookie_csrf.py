@@ -128,6 +128,8 @@ class TestCookieCsrf:
             ("http://testserver:1a", "testserver"),
             ("http://testserver:+80", "testserver"),
             ("http://testserver", "testserver:99999"),
+            ("http://[::1]", "[::1]x:99999"),
+            ("http://[::1]", "[::1]x"),
         ],
     )
     def test_origin_fallback_refuses_a_port_that_is_not_a_number_in_range(self, client, origin, host):

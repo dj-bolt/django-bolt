@@ -197,16 +197,17 @@ fn origin_matches(url: &str, scheme: &str, host: &str) -> bool {
 /// when the text after the colon is not ASCII digits with a value of 65535
 /// or less (WHATWG URL, port state). `Authority` accepts such a port, and
 /// `port_u16()` gives `None` for it, so `None` must not mean the default.
-/// An authority with userinfo also gives `None`.
+/// An authority with userinfo also gives `None`. So does text between the
+/// host and the colon, as in `[::1]x:443`, which `Authority` also accepts.
 fn authority_port(authority: &Authority, default_port: u16) -> Option<u16> {
-    match authority
-        .as_str()
-        .strip_prefix(authority.host())?
-        .strip_prefix(':')
-    {
-        None | Some("") => Some(default_port),
-        Some(port) if port.bytes().all(|b| b.is_ascii_digit()) => port.parse().ok(),
-        Some(_) => None,
+    let rest = authority.as_str().strip_prefix(authority.host())?;
+    if rest.is_empty() {
+        return Some(default_port);
+    }
+    match rest.strip_prefix(':')? {
+        "" => Some(default_port),
+        port if port.bytes().all(|b| b.is_ascii_digit()) => port.parse().ok(),
+        _ => None,
     }
 }
 
@@ -722,6 +723,28 @@ mod tests {
                 ("host", "example.com:99999"),
                 ("origin", "https://example.com")
             ]),
+            "https"
+        ));
+        // `Authority` accepts text between the `]` of an IPv6 host and the
+        // port. A URL with such text has no origin (WHATWG URL, host parser).
+        for (host, origin) in [
+            ("[::1]x:99999", "https://[::1]"),
+            ("[::1]x", "https://[::1]"),
+            ("[::1]x:443", "https://[::1]"),
+            ("[::1]", "https://[::1]x"),
+        ] {
+            assert!(
+                !passes_cookie_csrf(
+                    "POST",
+                    &headers_with(&[("host", host), ("origin", origin)]),
+                    "https"
+                ),
+                "{host} {origin}"
+            );
+        }
+        assert!(passes_cookie_csrf(
+            "POST",
+            &headers_with(&[("host", "[::1]:443"), ("origin", "https://[::1]")]),
             "https"
         ));
         // An empty port and a leading zero are the WHATWG forms of a port.
