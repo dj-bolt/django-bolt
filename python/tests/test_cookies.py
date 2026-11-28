@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 from django.http import HttpResponse
+from django.utils.http import http_date
 
 from django_bolt import JSON, BoltAPI, Cookie, Response, StreamingResponse
 from django_bolt.cookies import make_delete_cookie
@@ -250,6 +252,13 @@ class TestCookieAttributesInSetCookieHeader:
                 "SameSite=Strict",
             ]
         )
+
+    def test_an_aware_expires_is_sent_in_gmt(self):
+        """An aware datetime gives the Expires of Django: the same instant in GMT."""
+        expires = datetime(2030, 1, 1, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        parts = self._set_cookie_parts(Cookie("session", "abc123", expires=expires))
+        assert "Expires=Tue, 01 Jan 2030 03:00:00 GMT" in parts
+        assert http_date(expires.timestamp()) == "Tue, 01 Jan 2030 03:00:00 GMT"
 
     def test_expires_string_reaches_the_header(self):
         """An expires string appears in the header."""
