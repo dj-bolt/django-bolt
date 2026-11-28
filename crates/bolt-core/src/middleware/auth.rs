@@ -1550,6 +1550,7 @@ fn claims_to_dict<'py>(py: Python<'py>, claims: &Claims) -> Bound<'py, PyDict> {
     );
     set_if_some!(claims_dict, py, "is_staff", claims.is_staff);
     set_if_some!(claims_dict, py, "is_superuser", claims.is_superuser);
+    set_if_some!(claims_dict, py, "is_admin", claims.is_admin);
     set_if_some!(
         claims_dict,
         py,
