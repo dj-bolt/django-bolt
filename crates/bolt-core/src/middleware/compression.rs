@@ -34,9 +34,13 @@ struct HeadBody(BodySize);
 /// RFC 9110, section 9.3.2: a HEAD answer has the header fields of the GET
 /// answer. This middleware reads the size from `HeadBody`, so a HEAD answer
 /// gets the same `Content-Encoding`, `Vary` and `ETag` as the GET answer.
+///
+/// The new body has no size, so actix sends no `Content-Length`. An empty
+/// body would send `Content-Length: 0`, and section 8.6 forbids a value that
+/// is not the length of the GET body.
 pub fn head_answer(response: HttpResponse) -> HttpResponse {
     let size = response.body().size();
-    let mut response = response.set_body(BoxBody::new(()));
+    let mut response = response.set_body(BoxBody::new(actix_web::body::None::new()));
     response.extensions_mut().insert(HeadBody(size));
     response
 }

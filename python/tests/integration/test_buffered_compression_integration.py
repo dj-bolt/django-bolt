@@ -46,6 +46,39 @@ def _make_buffered_project(make_server_project, *, backend: str, **kwargs: objec
     )
 
 
+# ─── HEAD ───────────────────────────────────────────────────────────────
+
+
+def test_a_head_answer_sends_no_wrong_content_length(make_server_project):
+    """RFC 9110, section 8.6: a HEAD answer sends no Content-Length, or the one of the GET answer.
+
+    Bolt empties the body of a HEAD answer. The empty body must not give
+    ``Content-Length: 0`` for a GET body that is not empty, also for an error.
+    TestClient does not show this header for HEAD, so the test runs runbolt.
+    """
+    project = make_server_project(
+        settings_extra="""
+        from django_bolt.middleware import CompressionConfig
+        BOLT_COMPRESSION = CompressionConfig(backend="brotli")
+        """,
+        api_module=app_module("head_answers"),
+    )
+    with project.start(startup_path="/health") as server:
+        for path in ("/data", "/missing"):
+            for accept_encoding in ("identity", "br"):
+                headers = {"Accept-Encoding": accept_encoding}
+                get = server.get(path, headers=headers)
+                head = server.request("HEAD", path, headers=headers)
+                assert head.status_code == get.status_code, (path, accept_encoding)
+                assert head.content == b"", (path, accept_encoding)
+                assert head.headers.get("content-length") in (None, get.headers.get("content-length")), (
+                    path,
+                    accept_encoding,
+                    head.headers.get("content-length"),
+                    get.headers.get("content-length"),
+                )
+
+
 # ─── Per-codec roundtrip ────────────────────────────────────────────────
 
 
