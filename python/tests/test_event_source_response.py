@@ -101,8 +101,9 @@ def _dispatched_events(stream: bytes) -> list[dict[str, str]]:
     return events
 
 
-# A field value that a line can hold: no CR, no LF, no NUL.
-field_text = st.text(st.characters(exclude_characters="\r\n\0"), min_size=1)
+# A field value that a line can hold: no CR, no LF, no NUL. No text has a lone
+# surrogate, because UTF-8 cannot encode it.
+field_text = st.text(st.characters(exclude_categories=("Cs",), exclude_characters="\r\n\0"), min_size=1)
 # Data text: each character, also CR, LF and the Unicode line separators.
 data_text = st.text(st.characters(exclude_categories=("Cs",)))
 
