@@ -261,6 +261,40 @@ class TestCookieAttributesInSetCookieHeader:
         parts = self._set_cookie_parts(Cookie("session", "abc123"))
         assert not any(part.lower().startswith("expires") for part in parts)
 
+    def test_samesite_none_without_secure_sends_no_secure(self):
+        """With samesite="None" and secure=False, the header has no Secure, as with Django."""
+        parts = self._set_cookie_parts(Cookie("session", "abc123", samesite="None"))
+        django_response = HttpResponse()
+        django_response.set_cookie("session", "abc123", samesite="None")
+        assert "SameSite=None" in parts
+        assert "Secure" not in parts
+        assert "Secure" not in django_response.cookies["session"].output()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("path", "/a; SameSite=None"),
+            ("domain", "example.com; SameSite=None"),
+            ("expires", "Thu, 01 Jan 2099 00:00:00 GMT; Path=/admin"),
+            ("path", "/a\tb"),
+            ("path", "/a\r\nX-Evil: 1"),
+        ],
+        ids=["path-semicolon", "domain-semicolon", "expires-semicolon", "path-tab", "path-line-break"],
+    )
+    def test_an_attribute_that_could_add_an_attribute_drops_the_cookie(self, field, value):
+        """A `;` or a control character in path, domain or expires drops the cookie, not the response."""
+        api = BoltAPI()
+
+        @api.get("/cookie")
+        async def set_cookie():
+            return Response({"ok": True}).set_cookie("session", "abc123", **{field: value})
+
+        with TestClient(api) as client:
+            response = client.get("/cookie")
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+        assert "set-cookie" not in response.headers
+
     def test_samesite_false_omits_the_attribute(self):
         """A cookie with samesite=False has no SameSite attribute."""
         parts = self._set_cookie_parts(Cookie("session", "abc123", samesite=False))
