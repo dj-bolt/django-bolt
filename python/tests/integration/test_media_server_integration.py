@@ -206,15 +206,51 @@ def test_media_range_with_a_stale_if_range_returns_the_whole_file(make_server_pr
     )
 
     with project.start() as server:
-        etag = server.get("/media/clip.bin").headers["etag"]
+        etag = server.get("/media/clip.bin", headers={"Accept-Encoding": "identity"}).headers["etag"]
         current = server.get("/media/clip.bin", headers={"Range": "bytes=0-15", "If-Range": etag})
         stale = server.get("/media/clip.bin", headers={"Range": "bytes=0-15", "If-Range": '"stale"'})
+        # A coded answer has a weak ETag (RFC 9110, section 8.8.1), and a weak
+        # ETag never matches If-Range. Thus plain range bytes never follow coded ones.
+        coded_etag = server.get("/media/clip.bin", headers={"Accept-Encoding": "br"}).headers["etag"]
+        from_coded = server.get("/media/clip.bin", headers={"Range": "bytes=0-15", "If-Range": coded_etag})
 
     assert current.status_code == 206
     assert current.content == body[:16]
     assert stale.status_code == 200
     assert stale.content == body
     assert "content-range" not in stale.headers
+    assert coded_etag == f"W/{etag}"
+    assert from_coded.status_code == 200
+    assert from_coded.content == body
+
+
+def test_media_revalidation_returns_the_etag_that_the_client_holds(make_server_project):
+    """RFC 9110 section 15.4.5: a 304 has the ETag that the 200 would have.
+
+    actix-files makes the 304 before compression. A client that holds the coded
+    answer gets its weak ETag back, so a cache can freshen that answer.
+    """
+    project = make_server_project(
+        settings_extra="""
+        MEDIA_URL = "/media/"
+        MEDIA_ROOT = str(BASE_DIR / "mediafiles")
+        """,
+        extra_files={
+            "mediafiles/clip.bin": b"abcdefghijklmnopqrstuvwxyz" * 64,
+        },
+    )
+
+    with project.start() as server:
+        coded_etag = server.get("/media/clip.bin", headers={"Accept-Encoding": "br"}).headers["etag"]
+        coded = server.get("/media/clip.bin", headers={"Accept-Encoding": "br", "If-None-Match": coded_etag})
+        plain_etag = server.get("/media/clip.bin", headers={"Accept-Encoding": "identity"}).headers["etag"]
+        plain = server.get("/media/clip.bin", headers={"Accept-Encoding": "identity", "If-None-Match": plain_etag})
+
+    assert coded_etag == f"W/{plain_etag}"
+    assert coded.status_code == 304
+    assert coded.headers["etag"] == coded_etag
+    assert plain.status_code == 304
+    assert plain.headers["etag"] == plain_etag
 
 
 @pytest.mark.parametrize(

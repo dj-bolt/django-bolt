@@ -4,6 +4,7 @@ Tests for compression middleware in Django-Bolt.
 Tests both global compression configuration and per-route skip functionality.
 """
 
+import asyncio
 import gzip
 import json
 
@@ -11,9 +12,9 @@ import msgspec
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 
-from django_bolt import BoltAPI
+from django_bolt import BoltAPI, Request
 from django_bolt.middleware import CompressionConfig, no_compress, skip_middleware
-from django_bolt.responses import HTML, PlainText, Response, StreamingResponse
+from django_bolt.responses import HTML, FileResponse, PlainText, Response, StreamingResponse
 from django_bolt.testing import TestClient
 
 
@@ -528,3 +529,244 @@ def test_compression_config_accepts_a_minimum_size_of_zero():
         response = client.get("/tiny", headers={"Accept-Encoding": "gzip"})
 
     assert response.headers.get("content-encoding") == "gzip"
+
+
+def _etag_api():
+    api = BoltAPI(compression=CompressionConfig(backend="brotli", minimum_size=500))
+
+    @api.get("/strong")
+    async def strong():
+        return Response({"data": "x" * 1000}, headers={"ETag": '"v1"'})
+
+    @api.get("/weak")
+    async def weak():
+        return Response({"data": "x" * 1000}, headers={"ETag": 'W/"v1"'})
+
+    @api.get("/small")
+    async def small():
+        return Response({"data": "x"}, headers={"ETag": '"v1"'})
+
+    @api.get("/conditional")
+    async def conditional(request: Request):
+        # As actix-files does: the 304 carries the strong ETag of the file.
+        if request.headers.get("if-none-match"):
+            return PlainText("", status_code=304, headers={"ETag": '"v1"'})
+        return Response({"data": "x" * 1000}, headers={"ETag": '"v1"'})
+
+    return api
+
+
+def test_a_coded_response_has_a_weak_etag():
+    """RFC 9110, section 8.8.1: the coded body is another representation, so a strong ETag becomes weak.
+
+    Django's GZipMiddleware does the same. A plain answer keeps the strong ETag.
+    """
+    with TestClient(_etag_api(), use_http_layer=True) as client:
+        coded = client.get("/strong", headers={"Accept-Encoding": "br"})
+        assert coded.headers.get("content-encoding") == "br"
+        assert coded.headers.get("etag") == 'W/"v1"'
+
+        plain = client.get("/strong", headers={"Accept-Encoding": "identity"})
+        assert plain.headers.get("content-encoding") is None
+        assert plain.headers.get("etag") == '"v1"'
+
+        weak = client.get("/weak", headers={"Accept-Encoding": "br"})
+        assert weak.headers.get("etag") == 'W/"v1"'
+
+        small = client.get("/small", headers={"Accept-Encoding": "br"})
+        assert small.headers.get("content-encoding") is None
+        assert small.headers.get("etag") == '"v1"'
+
+
+def test_a_304_has_the_etag_that_the_client_holds():
+    """RFC 9110, section 15.4.5: a 304 has the ETag that the 200 would have.
+
+    A client that holds the coded answer sends its weak ETag, and gets the weak
+    form back. A client that holds the plain answer gets the strong ETag.
+    """
+    with TestClient(_etag_api(), use_http_layer=True) as client:
+        coded = client.get("/conditional", headers={"Accept-Encoding": "br"})
+        assert coded.headers.get("etag") == 'W/"v1"'
+
+        revalidated = client.get("/conditional", headers={"Accept-Encoding": "br", "If-None-Match": 'W/"v1"'})
+        assert revalidated.status_code == 304
+        assert revalidated.headers.get("etag") == 'W/"v1"'
+
+        plain = client.get("/conditional", headers={"Accept-Encoding": "identity", "If-None-Match": '"v1"'})
+        assert plain.status_code == 304
+        assert plain.headers.get("etag") == '"v1"'
+
+        other = client.get("/conditional", headers={"Accept-Encoding": "br", "If-None-Match": 'W/"v2", "v1"'})
+        assert other.status_code == 304
+        assert other.headers.get("etag") == '"v1"'
+
+
+@pytest.mark.parametrize("accept_encoding", ["br", "identity"])
+def test_a_304_varies_as_the_200_does(accept_encoding):
+    """RFC 9110, section 15.4.5: a 304 has the Vary that the 200 would have.
+
+    The 200 names accept-encoding in Vary when Bolt can compress it. Bolt does
+    not see the size of the 200 body for a 304, so a 304 names it when
+    compression is on. With no compression config, a 304 has no such Vary.
+    """
+    headers = {"Accept-Encoding": accept_encoding, "If-None-Match": '"v1"'}
+    with TestClient(_etag_api(), use_http_layer=True) as client:
+        answer = client.get("/conditional", headers=headers)
+        assert answer.status_code == 304
+        assert answer.headers.get_list("vary") == ["accept-encoding"]
+
+    api = BoltAPI(compression=False)
+
+    @api.get("/conditional")
+    async def conditional():
+        return PlainText("", status_code=304, headers={"ETag": '"v1"'})
+
+    with TestClient(api, use_http_layer=True) as client:
+        answer = client.get("/conditional", headers=headers)
+        assert answer.status_code == 304
+        assert answer.headers.get_list("vary") == []
+
+
+def test_a_stream_that_bolt_codes_has_a_weak_etag():
+    """RFC 9110, section 8.8.1: Bolt codes the stream, so its strong ETag becomes weak.
+
+    A plain stream keeps the strong ETag. A stream with a Content-Encoding of
+    the handler keeps the ETag of the handler.
+    """
+    api = BoltAPI(compression=CompressionConfig(backend="brotli", minimum_size=500))
+
+    @api.get("/stream")
+    async def stream():
+        return StreamingResponse(iter([b"x" * 1000]), media_type="text/plain", headers={"ETag": '"v1"'})
+
+    @api.get("/events")
+    async def events():
+        return StreamingResponse(iter(["data: x\n\n"]), media_type="text/event-stream", headers={"ETag": '"v1"'})
+
+    @api.get("/own-coding")
+    async def own_coding():
+        body = gzip.compress(b"x" * 1000)
+        return StreamingResponse(
+            iter([body]), media_type="text/plain", headers={"ETag": '"v1"', "Content-Encoding": "gzip"}
+        )
+
+    with TestClient(api, use_http_layer=True) as client:
+        for path in ("/stream", "/events"):
+            coded = client.get(path, headers={"Accept-Encoding": "br"})
+            assert coded.headers.get("content-encoding") == "br"
+            assert coded.headers.get("etag") == 'W/"v1"'
+
+            plain = client.get(path, headers={"Accept-Encoding": "identity"})
+            assert plain.headers.get("content-encoding") is None
+            assert plain.headers.get("etag") == '"v1"'
+
+        own = client.get("/own-coding", headers={"Accept-Encoding": "br"})
+        assert own.headers.get("content-encoding") == "gzip"
+        assert own.headers.get("etag") == '"v1"'
+
+
+LARGE_FILE_SIZE = 10 * 1024 * 1024 + 1
+
+
+@pytest.fixture(scope="module")
+def head_files(tmp_path_factory):
+    """A small file and a file that Bolt streams (10 MiB or more)."""
+    directory = tmp_path_factory.mktemp("head")
+    small = directory / "small.txt"
+    small.write_bytes(b"x" * 1000)
+    large = directory / "large.txt"
+    large.write_bytes(b"x" * LARGE_FILE_SIZE)
+    return small, large
+
+
+def _head_api(small_file, large_file):
+    api = BoltAPI(compression=CompressionConfig(backend="brotli", minimum_size=500))
+
+    def get_and_head(path):
+        def register(handler):
+            api.head(path)(handler)
+            return api.get(path)(handler)
+
+        return register
+
+    @get_and_head("/async")
+    async def async_route():
+        # A real suspension, so the route takes the async dispatch path.
+        await asyncio.sleep(0)
+        return Response({"data": "x" * 1000}, headers={"ETag": '"v1"'})
+
+    @get_and_head("/sync")
+    def sync_route():
+        return Response({"data": "x" * 1000}, headers={"ETag": '"v1"'})
+
+    @get_and_head("/bare")
+    def bare_route():
+        return {"data": "x" * 1000}
+
+    @get_and_head("/small")
+    def small_route():
+        return Response({"data": "x"}, headers={"ETag": '"v1"'})
+
+    @get_and_head("/file")
+    async def file_route():
+        return FileResponse(str(small_file), headers={"ETag": '"v1"'})
+
+    @get_and_head("/large-file")
+    async def large_file_route():
+        return FileResponse(str(large_file), headers={"ETag": '"v1"'})
+
+    @get_and_head("/stream")
+    async def stream_route():
+        return StreamingResponse(iter([b"x" * 1000]), media_type="text/plain", headers={"ETag": '"v1"'})
+
+    return api
+
+
+HEAD_PATHS = ["/async", "/sync", "/bare", "/small", "/file", "/large-file", "/stream"]
+
+
+@pytest.mark.parametrize("accept_encoding", ["br", "identity"])
+def test_a_head_answer_has_the_coding_fields_of_the_get_answer(head_files, accept_encoding):
+    """RFC 9110, section 9.3.2: a HEAD answer has the header fields of the GET answer, with no body.
+
+    Bolt empties the body of a HEAD answer before compression, so the fields
+    must come from the size of the GET body.
+    """
+    with TestClient(_head_api(*head_files), use_http_layer=True) as client:
+        headers = {"Accept-Encoding": accept_encoding}
+        for path in HEAD_PATHS:
+            get = client.get(path, headers=headers)
+            head = client.head(path, headers=headers)
+            assert head.status_code == get.status_code == 200, path
+            assert head.content == b"", path
+            for name in ("content-encoding", "vary", "etag"):
+                assert head.headers.get_list(name) == get.headers.get_list(name), (path, name)
+
+
+@pytest.mark.parametrize("accept_encoding", [None, "identity", "deflate", "br;q=0, gzip;q=0"])
+def test_a_plain_answer_to_a_negotiated_request_varies(accept_encoding):
+    """RFC 9110, section 12.5.5: the choice read Accept-Encoding, so the plain answer varies on it too.
+
+    Django's GZipMiddleware adds Vary before it reads the request. A body below
+    minimum_size never varies.
+    """
+    api = BoltAPI(compression=CompressionConfig(backend="brotli", minimum_size=500))
+
+    @api.get("/data")
+    async def get_data():
+        return {"data": "x" * 1000}
+
+    @api.get("/small")
+    async def get_small():
+        return {"data": "x"}
+
+    headers = {} if accept_encoding is None else {"Accept-Encoding": accept_encoding}
+    with TestClient(api, use_http_layer=True) as client:
+        # The client sends its own Accept-Encoding unless the test removes it.
+        client.headers.pop("accept-encoding", None)
+        response = client.get("/data", headers=headers)
+        assert response.headers.get("content-encoding") is None
+        assert response.headers.get_list("vary") == ["accept-encoding"]
+
+        small = client.get("/small", headers=headers)
+        assert small.headers.get_list("vary") == []

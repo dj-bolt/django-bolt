@@ -86,7 +86,6 @@ pub async fn build_file_response(
     status: StatusCode,
     headers: Vec<(String, String)>,
     skip_compression: bool,
-    is_head_request: bool,
 ) -> HttpResponse {
     match File::open(file_path).await {
         Ok(mut file) => {
@@ -119,8 +118,7 @@ pub async fn build_file_response(
                         if skip_compression {
                             builder.append_header(("content-encoding", "identity"));
                         }
-                        let body = if is_head_request { Vec::new() } else { buffer };
-                        builder.body(body)
+                        builder.body(buffer)
                     }
                     Err(e) => {
                         let response = HttpResponse::InternalServerError()
@@ -143,9 +141,6 @@ pub async fn build_file_response(
                 }
                 if skip_compression {
                     builder.append_header(("content-encoding", "identity"));
-                }
-                if is_head_request {
-                    return builder.body(Vec::<u8>::new());
                 }
                 let stream = stream::unfold(file, |mut file| async move {
                     let mut buffer = vec![0u8; 64 * 1024];
@@ -484,12 +479,7 @@ async fn build_response_from_parsed(
     let meta_ref = parsed.meta.as_ref();
 
     match parsed.body {
-        ResponseWireBody::Bytes(body_bytes) => {
-            let body = if is_head_request {
-                Vec::new()
-            } else {
-                body_bytes
-            };
+        ResponseWireBody::Bytes(body) => {
             let mut response = response_builder::build_response_from_meta(
                 parsed.status,
                 meta_ref,
@@ -500,16 +490,10 @@ async fn build_response_from_parsed(
             response
         }
         ResponseWireBody::ZeroCopyBytes(backed) => {
-            let body = if is_head_request {
-                drop(backed);
-                Bytes::new()
-            } else {
-                Bytes::from_owner(backed)
-            };
             let mut response = response_builder::build_response_from_meta(
                 parsed.status,
                 meta_ref,
-                body,
+                Bytes::from_owner(backed),
                 skip_compression,
             );
             mark_skip_cors(&mut response, skip_cors);
@@ -517,14 +501,8 @@ async fn build_response_from_parsed(
         }
         ResponseWireBody::FilePath(file_path) => {
             let headers = response_builder::meta_to_headers(meta_ref);
-            let mut response = build_file_response(
-                &file_path,
-                parsed.status,
-                headers,
-                skip_compression,
-                is_head_request,
-            )
-            .await;
+            let mut response =
+                build_file_response(&file_path, parsed.status, headers, skip_compression).await;
             mark_skip_cors(&mut response, skip_cors);
             response
         }
@@ -534,7 +512,7 @@ async fn build_response_from_parsed(
             is_async_generator,
             ping_interval,
         } => {
-            let headers = response_builder::meta_to_headers(meta_ref);
+            let mut headers = response_builder::meta_to_headers(meta_ref);
 
             // If the user passed `Content-Encoding` via StreamingResponse
             // headers they have already encoded the body (or are claiming
@@ -554,6 +532,15 @@ async fn build_response_from_parsed(
                 )
             };
             let encoding_name = codec.map_or("identity", |c| c.header_name());
+            if codec.is_some() {
+                // RFC 9110, section 8.8.1: Bolt codes this body, so a strong
+                // ETag of the plain body becomes weak (`"x"` gives `W/"x"`).
+                for (name, value) in &mut headers {
+                    if name.eq_ignore_ascii_case("etag") && value.starts_with('"') {
+                        value.insert_str(0, "W/");
+                    }
+                }
+            }
 
             if media_type == "text/event-stream" {
                 if is_head_request {
@@ -1761,16 +1748,10 @@ async fn route_request(
                 let status = route_metadata
                     .map(|m| m.default_status_code)
                     .unwrap_or(StatusCode::OK);
-                let body = if is_head_request {
-                    drop(backed);
-                    Bytes::new()
-                } else {
-                    Bytes::from_owner(backed)
-                };
                 let mut resp = response_builder::build_response_from_meta(
                     status,
                     &bolt_core::response_meta::STATIC_META_JSON,
-                    body,
+                    Bytes::from_owner(backed),
                     skip_compression,
                 );
                 mark_skip_cors(&mut resp, skip_cors);
@@ -1791,27 +1772,16 @@ async fn route_request(
             let meta_ref = parsed.meta.as_ref();
             let response = match parsed.body {
                 ResponseWireBody::ZeroCopyBytes(backed) => {
-                    let body = if is_head_request {
-                        drop(backed);
-                        Bytes::new()
-                    } else {
-                        Bytes::from_owner(backed)
-                    };
                     let mut resp = response_builder::build_response_from_meta(
                         parsed.status,
                         meta_ref,
-                        body,
+                        Bytes::from_owner(backed),
                         skip_compression,
                     );
                     mark_skip_cors(&mut resp, skip_cors);
                     resp
                 }
-                ResponseWireBody::Bytes(body_bytes) => {
-                    let body = if is_head_request {
-                        Vec::new()
-                    } else {
-                        body_bytes
-                    };
+                ResponseWireBody::Bytes(body) => {
                     let mut resp = response_builder::build_response_from_meta(
                         parsed.status,
                         meta_ref,
@@ -1896,6 +1866,13 @@ async fn route_request(
             handle_python_error(py, e, req.path(), req.method().as_str(), state.debug)
         }),
     };
+
+    // RFC 9110, section 9.3.2: a HEAD answer has the header fields of the GET
+    // answer and no body. The compression middleware reads the size of the
+    // GET body, so it sets the same coding fields.
+    if is_head_request {
+        response = bolt_core::middleware::compression::head_answer(response);
+    }
 
     // A 401 from Python gets the challenge of the route, as a 401 from Rust.
     responses::add_challenge(
