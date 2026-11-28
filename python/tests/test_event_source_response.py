@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterable
 
 import msgspec
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from django_bolt import BoltAPI, EventSourceResponse, ServerSentEvent, format_sse_event
 from django_bolt.testing import TestClient
@@ -69,6 +72,80 @@ class TestFormatSSEEvent:
     )
     def test_data_bytes_is_framed_line_by_line_with_each_field(self, fields, expected):
         assert format_sse_event(data_bytes=b"a\nb", **fields) == expected
+
+
+def _dispatched_events(stream: bytes) -> list[dict[str, str]]:
+    """The events that a browser dispatches for an event stream.
+
+    WHATWG HTML, section 9.2.6, "Interpreting an event stream": lines end at
+    CRLF, LF or CR. A blank line dispatches the event when the data buffer is
+    not empty, with one trailing LF removed. A space after the colon goes away.
+    """
+    events, data, event_type, last_event_id = [], "", "", ""
+    for line in re.split(r"\r\n|\r|\n", stream.decode("utf-8")):
+        if line == "":
+            if data:
+                events.append({"type": event_type or "message", "data": data.removesuffix("\n"), "id": last_event_id})
+            data, event_type = "", ""
+            continue
+        if line.startswith(":"):
+            continue
+        name, colon, value = line.partition(":")
+        value = value.removeprefix(" ") if colon else ""
+        if name == "event":
+            event_type = value
+        elif name == "data":
+            data += value + "\n"
+        elif name == "id" and "\0" not in value:
+            last_event_id = value
+    return events
+
+
+# A field value that a line can hold: no CR, no LF, no NUL. No text has a lone
+# surrogate, because UTF-8 cannot encode it.
+field_text = st.text(st.characters(exclude_categories=("Cs",), exclude_characters="\r\n\0"), min_size=1)
+# Data text: each character, also CR, LF and the Unicode line separators.
+data_text = st.text(st.characters(exclude_categories=("Cs",)))
+
+
+class TestEventStreamRoundTrip:
+    """Each event reads back in a browser with its data, its type and its id."""
+
+    @given(
+        data=data_text,
+        as_bytes=st.booleans(),
+        event=st.none() | field_text,
+        event_id=st.none() | field_text,
+        retry=st.none() | st.integers(min_value=0, max_value=10**6),
+        comment=st.none() | data_text,
+    )
+    def test_an_event_reads_back_unchanged(self, data, as_bytes, event, event_id, retry, comment):
+        payload = {"data_bytes": data.encode()} if as_bytes else {"data_str": data}
+        wire = format_sse_event(**payload, event=event, id=event_id, retry=retry, comment=comment)
+        # A browser joins the data lines with LF, so a CR or CRLF arrives as LF.
+        received = data.replace("\r\n", "\n").replace("\r", "\n")
+        assert _dispatched_events(wire) == [{"type": event or "message", "data": received, "id": event_id or ""}]
+
+    @pytest.mark.parametrize("field", ["id", "event"])
+    @pytest.mark.parametrize("line_break", ["\n", "\r", "\r\n"])
+    def test_a_line_break_in_id_or_event_is_refused(self, field, line_break):
+        """A line break would end the field and add another field or event."""
+        value = f"1{line_break}{line_break}data: extra"
+        with pytest.raises(ValueError, match="line break"):
+            format_sse_event(data_str="hi", **{field: value})
+        with pytest.raises(ValueError, match="line break"):
+            ServerSentEvent(data="hi", **{field: value})
+
+    def test_a_unicode_line_separator_stays_in_the_data(self):
+        """Only CR and LF end a line. JSON with U+2028 stays valid JSON."""
+        data = msgspec.json.encode({"text": "a\u2028b\x85c"})
+        [received] = _dispatched_events(format_sse_event(data_bytes=data, event="message"))
+        assert msgspec.json.decode(received["data"]) == {"text": "a\u2028b\x85c"}
+
+    @pytest.mark.parametrize("data", ["", "\n", "line\n", "\n\nend"])
+    def test_empty_data_and_trailing_line_breaks_read_back(self, data):
+        """An empty event is dispatched, and no line break is lost."""
+        assert _dispatched_events(format_sse_event(data_str=data)) == [{"type": "message", "data": data, "id": ""}]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
