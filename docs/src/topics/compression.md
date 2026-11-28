@@ -45,10 +45,13 @@ A `q` value of 0 rejects an encoding, for example `br;q=0`. Other `q` values do 
 
 Each response that Bolt can compress has `Vary: accept-encoding`, also when the client accepts no encoding and gets the plain body.
 When a compressed response has an `ETag`, the `ETag` is weak: Bolt changes `"v1"` into `W/"v1"`, as Django's `GZipMiddleware` does.
+This also applies to a `StreamingResponse` that Bolt compresses.
 Bolt adds no `ETag` to a response that has none.
 The compressed body is another representation, and a strong `ETag` names only one (RFC 9110, section 8.8.1).
 A weak `ETag` still gives `304` for `If-None-Match`, but it never matches `If-Range`.
-A `304` gives the weak `ETag` back to a client that holds the compressed body.
+A `304` has the weak `ETag` when the request accepts an encoding that Bolt uses and its `If-None-Match` has the weak `ETag`.
+Otherwise, the `304` keeps the strong `ETag`.
+A `HEAD` answer has the `Content-Encoding`, `Vary` and `ETag` of the `GET` answer, with no body (RFC 9110, section 9.3.2).
 `*` accepts each encoding that the header does not name.
 Bolt does not use `deflate`, and it uses `zstd` only when `zstd` is the `backend`.
 

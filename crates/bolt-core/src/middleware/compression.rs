@@ -7,13 +7,14 @@ use actix_http::encoding::Encoder;
 /// it removes the header and returns the response uncompressed.
 /// Otherwise, it applies compression based on CompressionConfig and Accept-Encoding.
 use actix_web::{
-    Error,
-    body::{BodySize, MessageBody},
+    Error, HttpResponse,
+    body::{BodySize, BoxBody, MessageBody},
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
-    http::StatusCode,
     http::header::{
-        ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding, ETAG, HeaderValue, IF_NONE_MATCH, VARY,
+        ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding, ETAG, HeaderMap, HeaderValue,
+        IF_NONE_MATCH, VARY,
     },
+    http::{Method, StatusCode},
 };
 use futures_util::future::{FutureExt, Map};
 use std::future::{Ready, ready};
@@ -22,6 +23,31 @@ use std::sync::Arc;
 use crate::metadata::CompressionConfig;
 use crate::state::AppState;
 use crate::streaming_compression::accepts_encoding;
+
+/// The size of the body that the GET answer has. The handler empties the body
+/// of a HEAD answer before this middleware runs, so it keeps the size here.
+#[derive(Clone, Copy)]
+struct HeadBody(BodySize);
+
+/// Empty the body of a HEAD answer and keep its size.
+///
+/// RFC 9110, section 9.3.2: a HEAD answer has the header fields of the GET
+/// answer. This middleware reads the size from `HeadBody`, so a HEAD answer
+/// gets the same `Content-Encoding`, `Vary` and `ETag` as the GET answer.
+pub fn head_answer(response: HttpResponse) -> HttpResponse {
+    let size = response.body().size();
+    let mut response = response.set_body(BoxBody::new(()));
+    response.extensions_mut().insert(HeadBody(size));
+    response
+}
+
+/// Make a strong ETag weak (RFC 9110, section 8.8.1). Use this when Bolt
+/// codes the body: the coded body is another representation of the resource.
+pub fn weaken_etag(headers: &mut HeaderMap) {
+    if let Some(weak) = headers.get(ETAG).and_then(weak_etag) {
+        headers.insert(ETAG, weak);
+    }
+}
 
 /// Compression middleware factory
 pub struct CompressionMiddleware;
@@ -119,7 +145,11 @@ fn encode_response<B: MessageBody>(res: Outcome<B>) -> Outcome<Encoder<B>> {
     let config = request
         .app_data::<actix_web::web::Data<Arc<AppState>>>()
         .and_then(|state| state.global_compression_config.as_deref());
-    let size = res.response().body().size();
+    // A HEAD answer has no body here. The size of its GET body decides.
+    let head = (request.method() == Method::HEAD)
+        .then(|| res.response().extensions().get::<HeadBody>().copied())
+        .flatten();
+    let size = head.map_or_else(|| res.response().body().size(), |head| head.0);
     let encoding = response_encoding(accept_encoding, config, size);
     let negotiated = negotiates(config, size, res.status());
     // A 304 has no body, so the size that decides a coding is not known here.
@@ -137,10 +167,14 @@ fn encode_response<B: MessageBody>(res: Outcome<B>) -> Outcome<Encoder<B>> {
             if !varies_on_accept_encoding(headers) {
                 headers.append(VARY, HeaderValue::from_static("accept-encoding"));
             }
-        } else if let Some(weak) = headers.get(ETAG).and_then(weak_etag) {
-            // RFC 9110, section 8.8.1: the coded body is another
-            // representation, so a strong ETag of the plain body becomes weak.
-            headers.insert(ETAG, weak);
+        } else {
+            weaken_etag(headers);
+            if head.is_some() {
+                // The encoder sets these fields only on a body that it codes.
+                // Set them as it does for the GET answer.
+                headers.insert(CONTENT_ENCODING, encoding.to_header_value());
+                headers.append(VARY, HeaderValue::from_static("accept-encoding"));
+            }
         }
     } else if coded_304 {
         // RFC 9110, section 15.4.5: a 304 has the ETag that the 200 would have.
