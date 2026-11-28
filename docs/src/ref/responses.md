@@ -244,7 +244,7 @@ Add a `Set-Cookie` header. Return the response, so that you can chain calls.
 | `name` | `str` | (required) | The cookie name. |
 | `value` | `str` | `""` | The cookie value. |
 | `max_age` | `int \| None` | `None` | The age in seconds. `None` makes a session cookie. |
-| `expires` | `datetime \| str \| None` | `None` | The expiry date. |
+| `expires` | `datetime \| str \| None` | `None` | The expiry date. Bolt sends an aware `datetime` in UTC, as Django does. A naive `datetime` is UTC. |
 | `path` | `str` | `"/"` | The path of the cookie. |
 | `domain` | `str \| None` | `None` | The domain of the cookie. `None` is the domain of the request. |
 | `secure` | `bool` | `False` | Send the cookie only over HTTPS. A browser keeps a `SameSite=None` cookie only with `secure=True`. |
