@@ -10,7 +10,8 @@ use actix_web::{
     Error,
     body::{BodySize, MessageBody},
     dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready},
-    http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding},
+    http::StatusCode,
+    http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, ContentEncoding, ETAG, HeaderValue, VARY},
 };
 use futures_util::future::{FutureExt, Map};
 use std::future::{Ready, ready};
@@ -116,15 +117,69 @@ fn encode_response<B: MessageBody>(res: Outcome<B>) -> Outcome<Encoder<B>> {
     let config = request
         .app_data::<actix_web::web::Data<Arc<AppState>>>()
         .and_then(|state| state.global_compression_config.as_deref());
-    let encoding = response_encoding(accept_encoding, config, res.response().body().size());
+    let size = res.response().body().size();
+    let encoding = response_encoding(accept_encoding, config, size);
+    let negotiated = negotiates(config, size, res.status());
 
     // When the encoder compresses the body, it sets Content-Encoding
     // and appends `Vary: accept-encoding` after a Vary of the handler.
-    let (req, response) = res.into_parts();
+    let (req, mut response) = res.into_parts();
+    if negotiated {
+        let headers = response.headers_mut();
+        if encoding == ContentEncoding::Identity {
+            // RFC 9110, section 12.5.5: the choice read Accept-Encoding, so a
+            // plain answer varies on it too. The encoder adds no Vary here.
+            if !varies_on_accept_encoding(headers) {
+                headers.append(VARY, HeaderValue::from_static("accept-encoding"));
+            }
+        } else if let Some(weak) = headers.get(ETAG).and_then(weak_etag) {
+            // RFC 9110, section 8.8.1: the coded body is another
+            // representation, so a strong ETag of the plain body becomes weak.
+            headers.insert(ETAG, weak);
+        }
+    }
     Ok(ServiceResponse::new(
         req,
         response.map_body(|head, body| Encoder::response(encoding, head, body)),
     ))
+}
+
+/// Whether the choice of a coding read `Accept-Encoding` for this answer: a
+/// config is on, the body is not below its minimum size, and actix-http can
+/// code the status (not 204, 206 or 304) and the body (not empty).
+fn negotiates(config: Option<&CompressionConfig>, size: BodySize, status: StatusCode) -> bool {
+    let Some(cfg) = config else {
+        return false;
+    };
+    let codable_body = match size {
+        BodySize::None => false,
+        BodySize::Sized(n) => n > 0 && n >= cfg.minimum_size as u64,
+        BodySize::Stream => true,
+    };
+    codable_body
+        && !matches!(
+            status,
+            StatusCode::NO_CONTENT | StatusCode::PARTIAL_CONTENT | StatusCode::NOT_MODIFIED
+        )
+}
+
+/// The weak form of a strong ETag (`"x"` gives `W/"x"`), or `None` for an
+/// ETag that is weak already or not quoted.
+fn weak_etag(etag: &HeaderValue) -> Option<HeaderValue> {
+    if !etag.as_bytes().starts_with(b"\"") {
+        return None;
+    }
+    HeaderValue::from_bytes(&[b"W/", etag.as_bytes()].concat()).ok()
+}
+
+/// Whether a `Vary` of the handler names `accept-encoding` or is `*`.
+fn varies_on_accept_encoding(headers: &actix_web::http::header::HeaderMap) -> bool {
+    headers
+        .get_all(VARY)
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .any(|name| name == "*" || name.eq_ignore_ascii_case("accept-encoding"))
 }
 
 #[cfg(test)]
@@ -292,6 +347,54 @@ fn response_encoding(
             ContentEncoding::Identity
         }
         _ => select_encoding(accept_encoding, config),
+    }
+}
+
+#[cfg(test)]
+mod representation_tests {
+    //! The headers that tell a cache which answer it holds: `Vary` on each
+    //! negotiated answer (RFC 9110, section 12.5.5) and a weak ETag on a
+    //! coded one (RFC 9110, section 8.8.1).
+    use super::*;
+    use actix_web::http::StatusCode;
+    use actix_web::http::header::HeaderValue;
+
+    #[test]
+    fn an_answer_negotiates_when_a_config_could_code_it() {
+        let cfg = CompressionConfig::default();
+        let min = cfg.minimum_size as u64;
+        assert!(negotiates(Some(&cfg), BodySize::Sized(min), StatusCode::OK));
+        assert!(negotiates(
+            Some(&cfg),
+            BodySize::Stream,
+            StatusCode::NOT_FOUND
+        ));
+        assert!(!negotiates(None, BodySize::Sized(min), StatusCode::OK));
+        assert!(!negotiates(
+            Some(&cfg),
+            BodySize::Sized(min - 1),
+            StatusCode::OK
+        ));
+        assert!(!negotiates(Some(&cfg), BodySize::Sized(0), StatusCode::OK));
+        assert!(!negotiates(Some(&cfg), BodySize::None, StatusCode::OK));
+        for status in [
+            StatusCode::NO_CONTENT,
+            StatusCode::PARTIAL_CONTENT,
+            StatusCode::NOT_MODIFIED,
+        ] {
+            assert!(
+                !negotiates(Some(&cfg), BodySize::Sized(min), status),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_strong_etag_becomes_weak() {
+        let weak = weak_etag(&HeaderValue::from_static("\"v1\"")).unwrap();
+        assert_eq!(weak, "W/\"v1\"");
+        assert!(weak_etag(&HeaderValue::from_static("W/\"v1\"")).is_none());
+        assert!(weak_etag(&HeaderValue::from_static("v1")).is_none());
     }
 }
 

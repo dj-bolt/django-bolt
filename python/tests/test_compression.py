@@ -528,3 +528,72 @@ def test_compression_config_accepts_a_minimum_size_of_zero():
         response = client.get("/tiny", headers={"Accept-Encoding": "gzip"})
 
     assert response.headers.get("content-encoding") == "gzip"
+
+
+def _etag_api():
+    api = BoltAPI(compression=CompressionConfig(backend="brotli", minimum_size=500))
+
+    @api.get("/strong")
+    async def strong():
+        return Response({"data": "x" * 1000}, headers={"ETag": '"v1"'})
+
+    @api.get("/weak")
+    async def weak():
+        return Response({"data": "x" * 1000}, headers={"ETag": 'W/"v1"'})
+
+    @api.get("/small")
+    async def small():
+        return Response({"data": "x"}, headers={"ETag": '"v1"'})
+
+    return api
+
+
+def test_a_coded_response_has_a_weak_etag():
+    """RFC 9110, section 8.8.1: the coded body is another representation, so a strong ETag becomes weak.
+
+    Django's GZipMiddleware does the same. A plain answer keeps the strong ETag.
+    """
+    with TestClient(_etag_api(), use_http_layer=True) as client:
+        coded = client.get("/strong", headers={"Accept-Encoding": "br"})
+        assert coded.headers.get("content-encoding") == "br"
+        assert coded.headers.get("etag") == 'W/"v1"'
+
+        plain = client.get("/strong", headers={"Accept-Encoding": "identity"})
+        assert plain.headers.get("content-encoding") is None
+        assert plain.headers.get("etag") == '"v1"'
+
+        weak = client.get("/weak", headers={"Accept-Encoding": "br"})
+        assert weak.headers.get("etag") == 'W/"v1"'
+
+        small = client.get("/small", headers={"Accept-Encoding": "br"})
+        assert small.headers.get("content-encoding") is None
+        assert small.headers.get("etag") == '"v1"'
+
+
+@pytest.mark.parametrize("accept_encoding", [None, "identity", "deflate", "br;q=0, gzip;q=0"])
+def test_a_plain_answer_to_a_negotiated_request_varies(accept_encoding):
+    """RFC 9110, section 12.5.5: the choice read Accept-Encoding, so the plain answer varies on it too.
+
+    Django's GZipMiddleware adds Vary before it reads the request. A body below
+    minimum_size never varies.
+    """
+    api = BoltAPI(compression=CompressionConfig(backend="brotli", minimum_size=500))
+
+    @api.get("/data")
+    async def get_data():
+        return {"data": "x" * 1000}
+
+    @api.get("/small")
+    async def get_small():
+        return {"data": "x"}
+
+    headers = {} if accept_encoding is None else {"Accept-Encoding": accept_encoding}
+    with TestClient(api, use_http_layer=True) as client:
+        # The client sends its own Accept-Encoding unless the test removes it.
+        client.headers.pop("accept-encoding", None)
+        response = client.get("/data", headers=headers)
+        assert response.headers.get("content-encoding") is None
+        assert response.headers.get_list("vary") == ["accept-encoding"]
+
+        small = client.get("/small", headers=headers)
+        assert small.headers.get_list("vary") == []

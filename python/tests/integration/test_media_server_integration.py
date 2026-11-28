@@ -206,15 +206,22 @@ def test_media_range_with_a_stale_if_range_returns_the_whole_file(make_server_pr
     )
 
     with project.start() as server:
-        etag = server.get("/media/clip.bin").headers["etag"]
+        etag = server.get("/media/clip.bin", headers={"Accept-Encoding": "identity"}).headers["etag"]
         current = server.get("/media/clip.bin", headers={"Range": "bytes=0-15", "If-Range": etag})
         stale = server.get("/media/clip.bin", headers={"Range": "bytes=0-15", "If-Range": '"stale"'})
+        # A coded answer has a weak ETag (RFC 9110, section 8.8.1), and a weak
+        # ETag never matches If-Range. Thus plain range bytes never follow coded ones.
+        coded_etag = server.get("/media/clip.bin", headers={"Accept-Encoding": "br"}).headers["etag"]
+        from_coded = server.get("/media/clip.bin", headers={"Range": "bytes=0-15", "If-Range": coded_etag})
 
     assert current.status_code == 206
     assert current.content == body[:16]
     assert stale.status_code == 200
     assert stale.content == body
     assert "content-range" not in stale.headers
+    assert coded_etag == f"W/{etag}"
+    assert from_coded.status_code == 200
+    assert from_coded.content == body
 
 
 @pytest.mark.parametrize(

@@ -42,6 +42,11 @@ The client chooses with its `Accept-Encoding` header. Bolt selects the encoding 
 3. No encoding.
 
 A `q` value of 0 rejects an encoding, for example `br;q=0`. Other `q` values do not change the order above.
+
+Each response that Bolt can compress has `Vary: accept-encoding`, also when the client accepts no encoding and gets the plain body.
+A compressed response has a weak `ETag`: Bolt changes `"v1"` into `W/"v1"`, as Django's `GZipMiddleware` does.
+The compressed body is another representation, and a strong `ETag` names only one (RFC 9110, section 8.8.1).
+A weak `ETag` still gives `304` for `If-None-Match`, but it never matches `If-Range`.
 `*` accepts each encoding that the header does not name.
 Bolt does not use `deflate`, and it uses `zstd` only when `zstd` is the `backend`.
 
@@ -146,14 +151,26 @@ EXPORT = b'[{"id": 1, "title": "Hello"}]'
 CACHED_EXPORT = gzip.compress(EXPORT)
 
 
+def accepts_gzip(accept_encoding: str) -> bool:
+    for item in accept_encoding.split(","):
+        coding, _, weight = item.partition(";")
+        if coding.strip().lower() == "gzip":
+            weight = weight.strip().lower()
+            return not weight.startswith("q=") or float(weight[2:]) > 0
+    return False
+
+
 @api.get("/articles/cached")
 async def cached_export(request: Request) -> Response:
-    if "gzip" not in request.headers.get("accept-encoding", ""):
-        return Response(EXPORT, media_type="application/json")
-    return Response(CACHED_EXPORT, media_type="application/json", headers={"Content-Encoding": "gzip"})
+    vary = {"Vary": "Accept-Encoding"}
+    if not accepts_gzip(request.headers.get("accept-encoding", "")):
+        return Response(EXPORT, media_type="application/json", headers=vary)
+    return Response(CACHED_EXPORT, media_type="application/json", headers={**vary, "Content-Encoding": "gzip"})
 ```
 
 Bolt does not check that the body matches the header, and it does not check the `Accept-Encoding` of the client. Thus the handler checks it.
+`gzip;q=0` refuses gzip, so the check reads the `q` value.
+Each answer has `Vary: Accept-Encoding`. Without it, a shared cache can send the gzip body to a client that cannot read it.
 
 ## Avoid the BREACH attack
 
