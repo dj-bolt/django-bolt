@@ -157,8 +157,9 @@ fn encode_response<B: MessageBody>(res: Outcome<B>) -> Outcome<Encoder<B>> {
     let encoding = response_encoding(accept_encoding, config, size);
     let negotiated = negotiates(config, size, res.status());
     // A 304 has no body, so the size that decides a coding is not known here.
-    let coded_304 = res.status() == StatusCode::NOT_MODIFIED
-        && select_encoding(accept_encoding, config) != ContentEncoding::Identity;
+    let not_modified = res.status() == StatusCode::NOT_MODIFIED && config.is_some();
+    let coded_304 =
+        not_modified && select_encoding(accept_encoding, config) != ContentEncoding::Identity;
 
     // When the encoder compresses the body, it sets Content-Encoding
     // and appends `Vary: accept-encoding` after a Vary of the handler.
@@ -180,8 +181,16 @@ fn encode_response<B: MessageBody>(res: Outcome<B>) -> Outcome<Encoder<B>> {
                 headers.append(VARY, HeaderValue::from_static("accept-encoding"));
             }
         }
-    } else if coded_304 {
-        // RFC 9110, section 15.4.5: a 304 has the ETag that the 200 would have.
+    } else if not_modified {
+        // RFC 9110, section 15.4.5: a 304 has the Vary and the ETag that the
+        // 200 would have. The size of the 200 body is not known here, so a
+        // 304 varies on accept-encoding whenever a config is on.
+        let headers = response.headers_mut();
+        if !varies_on_accept_encoding(headers) {
+            headers.append(VARY, HeaderValue::from_static("accept-encoding"));
+        }
+    }
+    if coded_304 {
         // A client that holds the coded 200 sends its weak ETag, so it gets the
         // weak form back. A client that holds the plain 200 sends the strong one.
         let weak = response

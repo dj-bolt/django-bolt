@@ -4,6 +4,7 @@ Tests for compression middleware in Django-Bolt.
 Tests both global compression configuration and per-route skip functionality.
 """
 
+import asyncio
 import gzip
 import json
 
@@ -600,6 +601,32 @@ def test_a_304_has_the_etag_that_the_client_holds():
         assert other.headers.get("etag") == '"v1"'
 
 
+@pytest.mark.parametrize("accept_encoding", ["br", "identity"])
+def test_a_304_varies_as_the_200_does(accept_encoding):
+    """RFC 9110, section 15.4.5: a 304 has the Vary that the 200 would have.
+
+    The 200 names accept-encoding in Vary when Bolt can compress it. Bolt does
+    not see the size of the 200 body for a 304, so a 304 names it when
+    compression is on. With no compression config, a 304 has no such Vary.
+    """
+    headers = {"Accept-Encoding": accept_encoding, "If-None-Match": '"v1"'}
+    with TestClient(_etag_api(), use_http_layer=True) as client:
+        answer = client.get("/conditional", headers=headers)
+        assert answer.status_code == 304
+        assert answer.headers.get_list("vary") == ["accept-encoding"]
+
+    api = BoltAPI(compression=False)
+
+    @api.get("/conditional")
+    async def conditional():
+        return PlainText("", status_code=304, headers={"ETag": '"v1"'})
+
+    with TestClient(api, use_http_layer=True) as client:
+        answer = client.get("/conditional", headers=headers)
+        assert answer.status_code == 304
+        assert answer.headers.get_list("vary") == []
+
+
 def test_a_stream_that_bolt_codes_has_a_weak_etag():
     """RFC 9110, section 8.8.1: Bolt codes the stream, so its strong ETag becomes weak.
 
@@ -664,6 +691,8 @@ def _head_api(small_file, large_file):
 
     @get_and_head("/async")
     async def async_route():
+        # A real suspension, so the route takes the async dispatch path.
+        await asyncio.sleep(0)
         return Response({"data": "x" * 1000}, headers={"ETag": '"v1"'})
 
     @get_and_head("/sync")

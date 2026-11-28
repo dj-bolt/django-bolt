@@ -44,6 +44,7 @@ The client chooses with its `Accept-Encoding` header. Bolt selects the encoding 
 A `q` value of 0 rejects an encoding, for example `br;q=0`. Other `q` values do not change the order above.
 
 Each response that Bolt can compress has `Vary: accept-encoding`, also when the client accepts no encoding and gets the plain body.
+A `304` also has it when compression is on, because the `200` has it (RFC 9110, section 15.4.5).
 When a compressed response has an `ETag`, the `ETag` is weak: Bolt changes `"v1"` into `W/"v1"`, as Django's `GZipMiddleware` does.
 This also applies to a `StreamingResponse` that Bolt compresses.
 Bolt adds no `ETag` to a response that has none.
