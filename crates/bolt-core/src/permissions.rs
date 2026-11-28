@@ -390,6 +390,38 @@ mod tests {
         requires(claim, values, Quantifier::None)
     }
 
+    /// `topics/permissions.md`: for `permissions`, present means one
+    /// permission or more. An empty list gives no permission, for a JWT, an
+    /// API key and a session alike.
+    #[test]
+    fn requires_permissions_needs_one_permission() {
+        let present = requires("permissions", &[], Quantifier::Any);
+        let jwt = |permissions: Vec<String>| {
+            AuthContext::from_jwt_claims(
+                Claims {
+                    sub: Some("u1".to_string()),
+                    permissions: Some(permissions),
+                    ..Claims::default()
+                },
+                "jwt",
+                false,
+            )
+        };
+        assert!(matches!(
+            evaluate_guards(&present, Some(&jwt(Vec::new()))),
+            GuardResult::Forbidden(_)
+        ));
+        assert!(matches!(
+            evaluate_guards(&present, Some(&jwt(vec!["blog.add".to_string()]))),
+            GuardResult::Allow
+        ));
+        let no_key_permissions = AuthContext::from_api_key("k", &HashMap::new());
+        assert!(matches!(
+            evaluate_guards(&present, Some(&no_key_permissions)),
+            GuardResult::Forbidden(_)
+        ));
+    }
+
     /// Each typed claim of `Claims` matches its guard, and another value does
     /// not. A typed claim that `ClaimKey::parse` sent to `Extra` never
     /// matches: serde puts a known claim in its field, not in `extra`.

@@ -117,3 +117,48 @@ def test_a_valid_claim_gives_the_usual_answers(client, claim):
 def test_a_missing_claim_passes_only_none_of(client, claim):
     expected = {**dict.fromkeys(FORMS, 403), "none_of": 200}
     assert _statuses(client, claim, {}) == expected
+
+
+@pytest.fixture(scope="module")
+def claims_client():
+    api = BoltAPI()
+    backend = JWTAuthentication(secret=SECRET)
+
+    @api.get("/auth-claims", auth=[backend])
+    async def auth_claims(request) -> dict[str, Any]:
+        return {"claims": request["context"]["auth_claims"]}
+
+    for claim in LIST_CLAIMS:
+
+        async def present(request) -> dict[str, bool]:
+            return {"ok": True}
+
+        api.get(f"/present/{claim}", auth=[backend], guards=[Requires(claim)])(present)
+    with TestClient(api) as test_client:
+        yield test_client
+
+
+def _get(client, path: str, claims: dict[str, Any]):
+    token = make_token({"alg": "HS256"}, {"sub": "1", "exp": FUTURE, **claims})
+    return client.get(path, headers={"Authorization": f"Bearer {token}"})
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_a_valid_is_admin_is_in_auth_claims(claims_client, value):
+    """`auth_claims` holds the claims, so a valid `is_admin` is in it, as `is_staff` is."""
+    claims = _get(claims_client, "/auth-claims", {"is_admin": value, "is_staff": value}).json()["claims"]
+    assert claims["is_admin"] is value
+    assert claims["is_staff"] is value
+
+
+def test_an_empty_permissions_list_gives_no_permission(claims_client):
+    """`Requires("permissions")` needs one permission or more, so `[]` gets 403, as a missing claim does."""
+    assert _get(claims_client, "/present/permissions", {"permissions": []}).status_code == 403
+    assert _get(claims_client, "/present/permissions", {}).status_code == 403
+    assert _get(claims_client, "/present/permissions", {"permissions": ["blog.add"]}).status_code == 200
+
+
+def test_an_empty_amr_list_is_present(claims_client):
+    """`amr` is a list claim with no permission meaning: `[]` is present and not null."""
+    assert _get(claims_client, "/present/amr", {"amr": []}).status_code == 200
+    assert _get(claims_client, "/present/amr", {}).status_code == 403
